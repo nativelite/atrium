@@ -73,7 +73,7 @@ truncate-and-pad), and the mode-request filter (verified at every possible
 chunk split). End-to-end: amux runs **inside a `pty`**, driven with real
 keystrokes — passthrough of a one-shot command and auto-exit, an
 interactive shell round-trip with the bar present and `Ctrl+A q` quitting
-cleanly, and literal-prefix delivery. 14 tests; release binary ~420 KB.
+cleanly, and literal-prefix delivery. 14 tests; release binary 192 KB (measured).
 
 ## Development
 
