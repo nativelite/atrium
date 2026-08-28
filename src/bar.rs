@@ -14,8 +14,10 @@ pub struct PaneInfo {
     pub exited: bool,
 }
 
-/// The visible bar text (no escapes), truncated/padded to `cols`.
-pub fn bar_text(panes: &[PaneInfo], cols: usize) -> String {
+/// The visible bar text (no escapes), truncated/padded to `cols`. A
+/// non-empty `note` (e.g. a spawn error) replaces the keys help so
+/// failures are visible instead of silent.
+pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
     let mut s = String::from(" amux ");
     for (i, p) in panes.iter().enumerate() {
         let mark = if p.exited {
@@ -29,7 +31,11 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize) -> String {
         };
         s.push_str(&format!("| {}:{}{} ", i + 1, p.title, mark));
     }
-    s.push_str("| ^A c:new n/p:cycle 1-9:go x:kill q:quit");
+    if note.is_empty() {
+        s.push_str("| ^A c:new n/p:cycle 1-9:go x:kill q:quit");
+    } else {
+        s.push_str(&format!("| {note}"));
+    }
     let mut out: String = s.chars().take(cols).collect();
     while out.chars().count() < cols {
         out.push(' ');
@@ -39,7 +45,7 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize) -> String {
 
 /// The full escape sequence that paints the bar on `row` (1-based) without
 /// disturbing the pane: save cursor, jump, style, text, reset, restore.
-pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize) -> String {
+pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> String {
     let style = Style {
         reverse: true,
         fg: Color::Default,
@@ -48,6 +54,6 @@ pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize) -> String {
     format!(
         "\x1b7\x1b[{row};1H{}{}\x1b[0m\x1b8",
         style.sgr(),
-        bar_text(panes, cols)
+        bar_text(panes, cols, note)
     )
 }

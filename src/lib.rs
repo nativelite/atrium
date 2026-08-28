@@ -18,3 +18,4 @@
 pub mod bar;
 pub mod filter;
 pub mod input;
+pub mod resolve;

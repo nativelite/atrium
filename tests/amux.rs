@@ -85,6 +85,7 @@ fn bar_shows_every_pane_with_markers() {
             info("sh", false, false, true),
         ],
         120,
+        "",
     );
     assert!(text.contains("1:claude*"), "{text}");
     assert!(text.contains("2:cmd+"), "{text}");
@@ -96,8 +97,42 @@ fn bar_shows_every_pane_with_markers() {
 #[test]
 fn bar_truncates_and_pads_to_width() {
     let panes = vec![info("a-very-long-title", true, false, false); 6];
-    assert_eq!(bar_text(&panes, 40).chars().count(), 40);
-    assert_eq!(bar_text(&[], 10).chars().count(), 10);
+    assert_eq!(bar_text(&panes, 40, "").chars().count(), 40);
+    assert_eq!(bar_text(&[], 10, "").chars().count(), 10);
+}
+
+#[test]
+fn bar_note_replaces_keys_help() {
+    let panes = [info("claude", true, false, false)];
+    let text = bar_text(&panes, 120, "cannot start \"claude\": not found");
+    assert!(text.contains("cannot start"), "{text}");
+    assert!(!text.contains("c:new"), "{text}");
+}
+
+// --- command resolution (the npm .cmd shim trap) -----------------------------
+
+#[test]
+fn resolver_finds_shims_and_flags_shell_hosting() {
+    use amux::resolve::{needs_shell, resolve};
+    let td = std::env::temp_dir().join(format!("amux-resolve-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    std::fs::write(td.join("claude.CMD"), "@echo shim").unwrap();
+    std::fs::write(td.join("tool.exe"), "MZ").unwrap();
+    let dirs = vec![td.clone()];
+    let exts = vec![".COM".into(), ".EXE".into(), ".BAT".into(), ".CMD".into()];
+
+    let shim = resolve("claude", &dirs, &exts).expect("shim found");
+    assert!(needs_shell(&shim), "{shim:?}");
+    let exe = resolve("tool", &dirs, &exts).expect("exe found");
+    assert!(!needs_shell(&exe), "{exe:?}");
+    assert_eq!(resolve("missing", &dirs, &exts), None);
+    // explicit paths pass through untouched
+    assert_eq!(
+        resolve("dir\\thing", &dirs, &exts),
+        Some(std::path::PathBuf::from("dir\\thing"))
+    );
+    let _ = std::fs::remove_dir_all(&td);
 }
 
 // --- passthrough filter -----------------------------------------------------
@@ -225,6 +260,42 @@ fn interactive_roundtrip_bar_and_quit() {
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01q").unwrap(); // Ctrl+A q
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Ctrl+A c opens a second pane (bar shows it) and 1/2 switch between
+/// them with the round-trip still working afterwards.
+#[test]
+fn new_pane_opens_and_switches() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
+    let one: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    let out = read_until(&mut p, one, Duration::from_secs(15));
+    assert!(contains(&out, one), "no first pane bar");
+    p.write(b"\x01c").unwrap();
+    let out = read_until(&mut p, two, Duration::from_secs(15));
+    assert!(
+        contains(&out, two),
+        "no second pane in bar after Ctrl+A c: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Switch back to 1 and prove the pane still talks.
+    p.write(b"\x011").unwrap();
+    p.write(b"echo amux-np-9\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-np-9", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-np-9"),
+        "pane 1 dead after switching: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 

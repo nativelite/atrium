@@ -70,6 +70,7 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
     let mut last_bar_paint = Instant::now();
     let mut last_size_check = Instant::now();
     let mut last_bar = String::new();
+    let mut flash: Option<(String, Instant)> = None;
 
     'outer: loop {
         // 1. keystrokes -> scanner -> pane / commands
@@ -137,7 +138,14 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                             &mut force_bar,
                         );
                     }
-                    Err(_) => force_bar = true,
+                    Err(e) => {
+                        // Never fail silently: put the reason in the bar.
+                        flash = Some((
+                            format!("cannot start {:?}: {e}", command[0]),
+                            Instant::now(),
+                        ));
+                        force_bar = true;
+                    }
                 },
                 Action::KillPane => {
                     let _ = panes[active].pty.kill();
@@ -244,7 +252,15 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                 exited: p.exited,
             })
             .collect();
-        let painted = bar_paint(&infos, rows, cols as usize);
+        if flash
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5))
+        {
+            flash = None;
+            force_bar = true;
+        }
+        let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        let painted = bar_paint(&infos, rows, cols as usize, note);
         if force_bar
             || painted != last_bar
             || last_bar_paint.elapsed() >= Duration::from_millis(500)
@@ -276,12 +292,13 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
 }
 
 fn spawn_pane(command: &[String], rows: u16, cols: u16) -> std::io::Result<Pane> {
-    let argrefs: Vec<&str> = command[1..].iter().map(String::as_str).collect();
-    let pty = pty::Pty::spawn(&command[0], &argrefs, rows.saturating_sub(1).max(1), cols)?;
     let title = std::path::Path::new(&command[0])
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
+    let effective = effective_command(command);
+    let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
+    let pty = pty::Pty::spawn(&effective[0], &argrefs, rows.saturating_sub(1).max(1), cols)?;
     Ok(Pane {
         pty,
         title,
@@ -360,4 +377,41 @@ fn default_shell() -> String {
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
     }
+}
+
+/// On Windows, resolve the command the way the shell would (PATH x
+/// PATHEXT) and host `.cmd`/`.bat` shims under `cmd /C` — npm-installed
+/// CLIs (Claude Code included) are such shims, and `CreateProcessW`
+/// cannot launch them directly.
+#[cfg(windows)]
+fn effective_command(command: &[String]) -> Vec<String> {
+    use amux::resolve;
+    let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    match resolve::resolve(&command[0], &dirs, &exts) {
+        Some(path) if resolve::needs_shell(&path) => {
+            let mut v = vec!["cmd".to_string(), "/C".to_string()];
+            v.push(path.to_string_lossy().into_owned());
+            v.extend(command[1..].iter().cloned());
+            v
+        }
+        Some(path) => {
+            let mut v = vec![path.to_string_lossy().into_owned()];
+            v.extend(command[1..].iter().cloned());
+            v
+        }
+        None => command.to_vec(),
+    }
+}
+
+#[cfg(not(windows))]
+fn effective_command(command: &[String]) -> Vec<String> {
+    command.to_vec()
 }
