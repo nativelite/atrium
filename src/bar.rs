@@ -32,7 +32,7 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
         s.push_str(&format!("| {}:{}{} ", i + 1, p.title, mark));
     }
     if note.is_empty() {
-        s.push_str("| ^A c:new n/p:cycle 1-9:go x:kill q:quit");
+        s.push_str("| ^A c:win \":% split hjkl:focus z:zoom x:kill q:quit");
     } else {
         s.push_str(&format!("| {note}"));
     }

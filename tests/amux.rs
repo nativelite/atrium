@@ -3,7 +3,7 @@
 //! its passthrough output read back. Deadline-bounded throughout.
 
 use amux::bar::{bar_text, PaneInfo};
-use amux::input::{Action, PrefixScanner};
+use amux::input::{Action, Dir, PrefixScanner};
 use std::time::{Duration, Instant};
 
 // --- prefix scanner ---------------------------------------------------------
@@ -48,8 +48,51 @@ fn prefix_survives_chunk_boundaries() {
 
 #[test]
 fn unknown_command_swallows_prefix_and_byte() {
+    // `.` is not a bound command, so the prefix and it are both swallowed.
     let mut s = PrefixScanner::new();
-    assert_eq!(s.feed(b"a\x01zb"), vec![Action::Forward(b"ab".to_vec())]);
+    assert_eq!(s.feed(b"a\x01.b"), vec![Action::Forward(b"ab".to_vec())]);
+}
+
+#[test]
+fn tiling_commands_are_recognized() {
+    let mut s = PrefixScanner::new();
+    assert_eq!(s.feed(b"\x01\""), vec![Action::SplitH]);
+    assert_eq!(s.feed(b"\x01%"), vec![Action::SplitV]);
+    assert_eq!(s.feed(b"\x01z"), vec![Action::Zoom]);
+    assert_eq!(s.feed(b"\x01h"), vec![Action::MoveFocus(Dir::Left)]);
+    assert_eq!(s.feed(b"\x01j"), vec![Action::MoveFocus(Dir::Down)]);
+    assert_eq!(s.feed(b"\x01k"), vec![Action::MoveFocus(Dir::Up)]);
+    assert_eq!(s.feed(b"\x01l"), vec![Action::MoveFocus(Dir::Right)]);
+}
+
+#[test]
+fn prefixed_arrow_keys_move_focus() {
+    // Ctrl+A then ESC [ C  -> move focus right; the whole three-byte arrow
+    // sequence is consumed as one command, and nothing leaks to the pane.
+    let mut s = PrefixScanner::new();
+    assert_eq!(s.feed(b"\x01\x1b[C"), vec![Action::MoveFocus(Dir::Right)]);
+    assert_eq!(s.feed(b"\x01\x1b[A"), vec![Action::MoveFocus(Dir::Up)]);
+    assert_eq!(s.feed(b"\x01\x1b[B"), vec![Action::MoveFocus(Dir::Down)]);
+    assert_eq!(s.feed(b"\x01\x1b[D"), vec![Action::MoveFocus(Dir::Left)]);
+}
+
+#[test]
+fn prefixed_arrow_survives_chunk_boundaries() {
+    // The arrow's bytes arrive one per read; the state machine holds across.
+    let mut s = PrefixScanner::new();
+    assert_eq!(s.feed(b"\x01"), vec![]);
+    assert!(s.armed());
+    assert_eq!(s.feed(b"\x1b"), vec![]);
+    assert_eq!(s.feed(b"["), vec![]);
+    assert_eq!(s.feed(b"C"), vec![Action::MoveFocus(Dir::Right)]);
+    assert!(!s.armed());
+}
+
+#[test]
+fn bare_arrow_keys_still_forward_to_the_pane() {
+    // Without a prefix, arrows are ordinary bytes for the child (0.1 behavior).
+    let mut s = PrefixScanner::new();
+    assert_eq!(s.feed(b"\x1b[C"), vec![Action::Forward(b"\x1b[C".to_vec())]);
 }
 
 #[test]
@@ -293,6 +336,162 @@ fn new_pane_opens_and_switches() {
     assert!(
         contains(&out, b"amux-np-9"),
         "pane 1 dead after switching: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+// --- tiling (0.2): splits, focus, zoom, kill-retile -------------------------
+
+/// Spawn amux hosting an interactive shell in a pty, returning it once the bar
+/// has appeared (the shell is up). Shared setup for the tiling e2e tests.
+fn spawn_amux_shell(rows: u16, cols: u16) -> pty::Pty {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, rows, cols).unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    p
+}
+
+/// Ctrl+A % splits the focused pane into a second live tile, and *both* shells
+/// round-trip: a marker echoed in each appears in the composited output.
+#[test]
+fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
+    let mut p = spawn_amux_shell(24, 100);
+    // Echo a marker in the first pane, then split vertically and echo another
+    // marker in the new (focused) pane.
+    p.write(b"echo amux-tileA\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-tileA", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-tileA"),
+        "first pane silent: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01%").unwrap(); // split vertical -> focus the new pane
+    p.write(b"echo amux-tileB\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-tileB", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-tileB"),
+        "second tile silent after split: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// A 2x2 grid: split vertical, split the right column horizontally, focus the
+/// left column and split it horizontally — four live panes. Echo a unique
+/// marker in each and assert all four reach the composited frame.
+#[test]
+fn two_by_two_grid_has_four_live_panes() {
+    let mut p = spawn_amux_shell(30, 120);
+    // Pane 1 (top-left after the splits below) — mark it before splitting so the
+    // first shell is proven live.
+    p.write(b"echo amux-q1\r\n").unwrap();
+    read_until(&mut p, b"amux-q1", Duration::from_secs(15));
+    // Build the square: % (vertical) then " (horizontal on the right), then move
+    // focus back to the left column with h and " to split it.
+    p.write(b"\x01%").unwrap(); // now two columns, focus right
+    p.write(b"echo amux-q2\r\n").unwrap();
+    read_until(&mut p, b"amux-q2", Duration::from_secs(15));
+    p.write(b"\x01\"").unwrap(); // split right column -> focus bottom-right
+    p.write(b"echo amux-q3\r\n").unwrap();
+    read_until(&mut p, b"amux-q3", Duration::from_secs(15));
+    p.write(b"\x01h").unwrap(); // focus back to the left column
+    p.write(b"\x01\"").unwrap(); // split it -> focus bottom-left
+    p.write(b"echo amux-q4\r\n").unwrap();
+    // Collect everything for a few seconds and assert all four markers appeared.
+    let out = read_until(&mut p, b"amux-q4", Duration::from_secs(15));
+    for m in [
+        &b"amux-q1"[..],
+        &b"amux-q2"[..],
+        &b"amux-q3"[..],
+        &b"amux-q4"[..],
+    ] {
+        assert!(
+            contains(&out, m),
+            "missing {} in 2x2 frame: {:?}",
+            String::from_utf8_lossy(m),
+            String::from_utf8_lossy(&out)
+        );
+    }
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Focus movement changes which pane receives input: after a split, moving
+/// focus back to the original pane makes *it* echo the next command.
+#[test]
+fn focus_movement_routes_input_to_the_focused_pane() {
+    let mut p = spawn_amux_shell(24, 100);
+    p.write(b"\x01%").unwrap(); // split -> focus the new (right) pane
+    p.write(b"echo amux-right-pane\r\n").unwrap();
+    read_until(&mut p, b"amux-right-pane", Duration::from_secs(15));
+    // Move focus left (h) back to the original pane and run a distinct command.
+    p.write(b"\x01h").unwrap();
+    p.write(b"echo amux-left-again\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-left-again", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-left-again"),
+        "focus did not route back to the left pane: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Zoom toggles a tiled pane to full-screen passthrough and back; the shell
+/// keeps round-tripping across both toggles.
+#[test]
+fn zoom_toggles_and_pane_stays_live() {
+    let mut p = spawn_amux_shell(24, 100);
+    p.write(b"\x01%").unwrap(); // two tiles
+    p.write(b"echo amux-prezoom\r\n").unwrap();
+    read_until(&mut p, b"amux-prezoom", Duration::from_secs(15));
+    p.write(b"\x01z").unwrap(); // zoom the focused pane full-screen
+    p.write(b"echo amux-zoomed\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-zoomed", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-zoomed"),
+        "zoomed pane silent: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01z").unwrap(); // un-zoom back to tiled
+    p.write(b"echo amux-unzoomed\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-unzoomed", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-unzoomed"),
+        "pane dead after un-zoom: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Killing the focused pane in a split re-tiles down to the survivor, which is
+/// still live (and, being the sole pane, back in passthrough).
+#[test]
+fn kill_focused_pane_retiles_to_survivor() {
+    let mut p = spawn_amux_shell(24, 100);
+    p.write(b"echo amux-keepme\r\n").unwrap();
+    read_until(&mut p, b"amux-keepme", Duration::from_secs(15));
+    p.write(b"\x01%").unwrap(); // split -> focus new pane
+    p.write(b"echo amux-killme\r\n").unwrap();
+    read_until(&mut p, b"amux-killme", Duration::from_secs(15));
+    p.write(b"\x01x").unwrap(); // kill the focused (new) pane
+                                // The survivor takes over full-screen and still talks:
+    p.write(b"echo amux-survivor\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-survivor", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-survivor"),
+        "survivor dead after kill/re-tile: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01q").unwrap();
