@@ -24,7 +24,7 @@
 use amux::bar::{bar_paint, PaneInfo};
 use amux::input::{Action, Dir, PrefixScanner};
 use amux::layout::{self, Rect, Tree};
-use amux::tile::{compose, PaneView};
+use amux::tile::{compose, PaneState, PaneView};
 use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -455,8 +455,8 @@ fn to_move(d: Dir) -> layout::Move {
     }
 }
 
-/// Compose the active window's panes into a master screen (content + dividers +
-/// focus highlight); the caller diffs it to the terminal.
+/// Compose the active window's panes into a master screen (boxed borders +
+/// titles + liveness color + content); the caller diffs it to the terminal.
 fn render_tiled(w: &Window, rows: u16, cols: u16) -> ansi::Screen {
     let outer = tiled_outer(rows, cols);
     let rects = w.tree.rects(outer);
@@ -464,10 +464,27 @@ fn render_tiled(w: &Window, rows: u16, cols: u16) -> ansi::Screen {
     let views: Vec<PaneView> = rects
         .iter()
         .filter_map(|(id, rect)| {
-            w.pane(*id).map(|p| PaneView {
-                screen: p.term.screen(),
-                rect: *rect,
-                focused: *id == focus,
+            w.pane(*id).map(|p| {
+                // Liveness in priority order: focus, then a dead child, then
+                // recent background activity, then plain idle. `index` is the
+                // pane's 1-based position in the split's leaf order.
+                let state = if *id == focus {
+                    PaneState::Focused
+                } else if p.exited {
+                    PaneState::Exited
+                } else if p.activity {
+                    PaneState::Active
+                } else {
+                    PaneState::Idle
+                };
+                let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
+                PaneView {
+                    screen: p.term.screen(),
+                    rect: *rect,
+                    index,
+                    title: &p.title,
+                    state,
+                }
             })
         })
         .collect();
@@ -487,8 +504,12 @@ fn split_focused(
     flash: &mut Option<(String, Instant)>,
 ) {
     let new_id = w.next_id;
-    // Size the new pane roughly to a half; resize_window fixes it exactly after.
-    let (pr, pc) = (rows.saturating_sub(1).max(1) / 2, cols / 2);
+    // Size the new pane roughly to a half's *inner* area (minus the border);
+    // resize_window fixes it exactly right after the split.
+    let (pr, pc) = (
+        (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
+        (cols / 2).saturating_sub(2),
+    );
     match spawn_pane(command, pr.max(1), pc.max(1), new_id) {
         Ok(pane) => {
             w.panes.push(pane);
@@ -515,9 +536,13 @@ fn resize_window(w: &mut Window, rows: u16, cols: u16) {
         let outer = tiled_outer(rows, cols);
         let rects = w.tree.rects(outer);
         for (id, rect) in rects {
+            // Each pane wears a one-cell box border on every side, so its child
+            // and emulator see the *inner* content area, not the bordered rect.
+            let inner_rows = rect.rows.saturating_sub(2).max(1);
+            let inner_cols = rect.cols.saturating_sub(2).max(1);
             if let Some(p) = w.pane_mut(id) {
-                let _ = p.pty.resize(rect.rows as u16, rect.cols as u16);
-                p.term.resize(rect.rows, rect.cols);
+                let _ = p.pty.resize(inner_rows as u16, inner_cols as u16);
+                p.term.resize(inner_rows, inner_cols);
             }
         }
     } else {

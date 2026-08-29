@@ -5,8 +5,9 @@
 //! Leaves hold a pane id (an index into the app's pane vector); internal nodes
 //! are horizontal (stacked) or vertical (side-by-side) splits with two
 //! children. [`Tree::rects`] walks the tree over an outer rect and hands back
-//! `(pane_id, Rect)` for every leaf, reserving a 1-cell divider between the two
-//! children of each split (that gutter is where the compositor draws its rule).
+//! `(pane_id, Rect)` for every leaf. Panes tile **edge-to-edge** with no
+//! reserved gutter — each pane draws its own full box border (0.2.1), so
+//! adjacent borders simply abut and the split space is halved with no gap.
 //!
 //! MVP splits are **equal** — a split halves the focused pane — which is all
 //! the 2×2 "four agents in a square" case needs: split vertical, then split
@@ -31,8 +32,9 @@ impl Rect {
     }
 }
 
-/// Split orientation. `Horizontal` stacks its children (a divider *row*
-/// between them); `Vertical` places them side by side (a divider *column*).
+/// Split orientation. `Horizontal` stacks its children (top / bottom);
+/// `Vertical` places them side by side (left / right). Children abut with no
+/// reserved gutter — each pane's own box border is the visible seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Horizontal,
@@ -185,10 +187,11 @@ impl Tree {
     }
 
     /// Resolve the tree to `(pane_id, Rect)` for every pane, laid out inside
-    /// the outer rect. A split reserves one cell (a row for horizontal, a
-    /// column for vertical) as the divider between its halves; the remaining
-    /// space is halved. Panes that would be zero-sized are still emitted with
-    /// a 1×1 minimum so no pane silently vanishes.
+    /// the outer rect. A split halves the space edge-to-edge with **no**
+    /// reserved gutter — the first child gets the ceil half, the second the
+    /// floor half, and the second abuts the first with no gap (each pane's own
+    /// box border is the seam). Panes that would be zero-sized are still
+    /// emitted with a 1-cell minimum so no pane silently vanishes.
     pub fn rects(&self, outer: Rect) -> Vec<(usize, Rect)> {
         let mut out = Vec::new();
         Self::layout(&self.root, outer, &mut out);
@@ -200,10 +203,11 @@ impl Tree {
             Node::Leaf(id) => out.push((*id, r)),
             Node::Split { dir, first, second } => match dir {
                 Dir::Horizontal => {
-                    // Stacked: divider is a row between top and bottom.
-                    let avail = r.rows.saturating_sub(1).max(2);
-                    let top_rows = (avail / 2).max(1);
-                    let bot_rows = (avail - top_rows).max(1);
+                    // Stacked: top gets the ceil half, bottom the floor half,
+                    // abutting with no reserved divider row. (Manual ceil —
+                    // `div_ceil` is not stable on our 1.70 MSRV.)
+                    let top_rows = ((r.rows + 1) / 2).max(1);
+                    let bot_rows = r.rows.saturating_sub(top_rows).max(1);
                     let top = Rect {
                         row: r.row,
                         col: r.col,
@@ -211,7 +215,7 @@ impl Tree {
                         cols: r.cols,
                     };
                     let bottom = Rect {
-                        row: r.row + top_rows + 1,
+                        row: r.row + top_rows,
                         col: r.col,
                         rows: bot_rows,
                         cols: r.cols,
@@ -220,10 +224,11 @@ impl Tree {
                     Self::layout(second, bottom, out);
                 }
                 Dir::Vertical => {
-                    // Side by side: divider is a column between left and right.
-                    let avail = r.cols.saturating_sub(1).max(2);
-                    let left_cols = (avail / 2).max(1);
-                    let right_cols = (avail - left_cols).max(1);
+                    // Side by side: left gets the ceil half, right the floor
+                    // half, abutting with no reserved divider column. (Manual
+                    // ceil — `div_ceil` is not stable on our 1.70 MSRV.)
+                    let left_cols = ((r.cols + 1) / 2).max(1);
+                    let right_cols = r.cols.saturating_sub(left_cols).max(1);
                     let left = Rect {
                         row: r.row,
                         col: r.col,
@@ -232,7 +237,7 @@ impl Tree {
                     };
                     let right = Rect {
                         row: r.row,
-                        col: r.col + left_cols + 1,
+                        col: r.col + left_cols,
                         rows: r.rows,
                         cols: right_cols,
                     };
@@ -308,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn vertical_split_makes_two_side_by_side_with_a_divider_column() {
+    fn vertical_split_makes_two_side_by_side_edge_to_edge() {
         let mut t = Tree::new(0);
         t.split(Dir::Vertical, 1);
         assert!(!t.is_single());
@@ -319,16 +324,16 @@ mod tests {
         let (_, right) = rects[1];
         assert_eq!(left.row, 0);
         assert_eq!(left.rows, 24);
-        // 80 cols - 1 divider = 79, halved to 39 / 40.
-        assert_eq!(left.cols, 39);
-        assert_eq!(right.col, 40); // 39 + 1 divider
+        // 80 cols halved edge-to-edge: 40 / 40, no reserved gutter.
+        assert_eq!(left.cols, 40);
+        assert_eq!(right.col, 40); // abuts the left pane, no gap
         assert_eq!(right.cols, 40);
-        // The gap between them is exactly one column (the divider).
-        assert_eq!(right.col, left.col + left.cols + 1);
+        // The right pane begins exactly where the left ends (no divider cell).
+        assert_eq!(right.col, left.col + left.cols);
     }
 
     #[test]
-    fn horizontal_split_stacks_with_a_divider_row() {
+    fn horizontal_split_stacks_edge_to_edge() {
         let mut t = Tree::new(0);
         t.split(Dir::Horizontal, 1);
         let rects = t.rects(OUTER);
@@ -336,11 +341,11 @@ mod tests {
         let (_, bottom) = rects[1];
         assert_eq!(top.col, 0);
         assert_eq!(top.cols, 80);
-        // 24 rows - 1 divider = 23, halved to 11 / 12.
-        assert_eq!(top.rows, 11);
-        assert_eq!(bottom.row, 12); // 11 + 1 divider
+        // 24 rows halved edge-to-edge: 12 / 12, no reserved gutter.
+        assert_eq!(top.rows, 12);
+        assert_eq!(bottom.row, 12); // abuts the top pane, no gap
         assert_eq!(bottom.rows, 12);
-        assert_eq!(bottom.row, top.row + top.rows + 1);
+        assert_eq!(bottom.row, top.row + top.rows);
     }
 
     #[test]
