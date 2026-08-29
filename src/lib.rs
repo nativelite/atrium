@@ -16,8 +16,10 @@
 //! modifies, or credentials them.
 
 pub mod bar;
+pub mod bind;
 pub mod filter;
 pub mod input;
 pub mod layout;
 pub mod resolve;
 pub mod tile;
+pub mod uid;

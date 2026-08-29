@@ -65,20 +65,76 @@ impl PaneState {
     }
 }
 
+/// A bound agent's attention status, attached to a pane as a second, orthogonal
+/// axis to [`PaneState`] (§4.1 of the 0.3 design). Populated only for unfocused,
+/// bound agent panes; carries **status only** — never any transcript text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentMark {
+    pub status: agsess::Status,
+}
+
 /// One pane to composite: its emulated screen, its rect in master coords, its
-/// 1-based display index and title (both embedded in the top border), and its
-/// liveness [`PaneState`] (which tints the border).
+/// 1-based display index and title (both embedded in the top border), its
+/// liveness [`PaneState`] (which tints the border), and an optional bound-agent
+/// [`AgentMark`] (which can override the tint for an unfocused pane).
 pub struct PaneView<'a> {
     pub screen: &'a Screen,
     pub rect: Rect,
     pub index: usize,
     pub title: &'a str,
     pub state: PaneState,
+    /// The bound agent's status, if this is an unfocused agent pane amux bound.
+    /// `None` for shells, focused panes, and agents still awaiting their
+    /// transcript. Attention chrome (§4.2) reads only this.
+    pub agent: Option<AgentMark>,
 }
 
 impl PaneView<'_> {
     fn focused(&self) -> bool {
         self.state == PaneState::Focused
+    }
+
+    /// The border/title style, composing local liveness with agent attention.
+    ///
+    /// Precedence (§4.1): `Focused`/`Exited` always keep their local style — focus
+    /// must stay findable and a dead child is a hard fact that outranks an
+    /// inference. Otherwise a bound agent's attention style wins over
+    /// `Active`/`Idle`. Attention chrome applies to unfocused panes only, which
+    /// falls out for free (a focused pane never reaches the agent branch).
+    fn border_style(&self) -> Style {
+        match self.state {
+            PaneState::Focused | PaneState::Exited => self.state.style(),
+            _ => match self.agent.map(|a| a.status) {
+                // Bright yellow: an agent is blocked on the human.
+                Some(agsess::Status::WaitingApproval) => Style {
+                    fg: Color::Indexed(11),
+                    ..Style::default()
+                },
+                // Waiting for a prompt is an idle state — grey, same as Idle.
+                Some(agsess::Status::WaitingPrompt) => PaneState::Idle.style(),
+                // A working agent is unremarkable — default (same as Active).
+                Some(agsess::Status::Working) => Style::default(),
+                // No mark, or Idle: fall back to the local liveness style.
+                Some(agsess::Status::Idle) | None => self.state.style(),
+            },
+        }
+    }
+
+    /// The one-cell attention marker appended after the title (rung 2, §4.2):
+    /// ` ? ` waiting-approval, ` ~ ` working, nothing otherwise. Attention chrome
+    /// is for unfocused panes only, so a focused (or exited) pane never shows a
+    /// badge — the same precedence [`border_style`](PaneView::border_style) uses.
+    /// In practice the caller also leaves `agent: None` on the focused pane; this
+    /// gate keeps the rule self-consistent regardless.
+    fn title_badge(&self) -> &'static str {
+        if matches!(self.state, PaneState::Focused | PaneState::Exited) {
+            return "";
+        }
+        match self.agent.map(|a| a.status) {
+            Some(agsess::Status::WaitingApproval) => "? ",
+            Some(agsess::Status::Working) => "~ ",
+            _ => "",
+        }
     }
 }
 
@@ -138,7 +194,7 @@ fn blit_inner(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
 /// the pane's state style. A rect narrower/shorter than 2 cells still draws what
 /// fits — `set` clips out-of-bounds writes.
 fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
-    let style = p.state.style();
+    let style = p.border_style();
     let (r0, c0) = (p.rect.row, p.rect.col);
     let (rn, cn) = (p.rect.rows, p.rect.cols);
     if rn == 0 || cn == 0 {
@@ -171,9 +227,11 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
 
     // Title in the top edge: "┌ 2:claude ──…──┐". The label sits one cell in
     // from the top-left corner, framed by a space each side, and is truncated
-    // to leave room for the trailing corner.
+    // to leave room for the trailing corner. An unfocused bound agent appends a
+    // one-cell attention marker after the title (rung 2, §4.2) — status only,
+    // never any transcript text.
     if cn >= 5 {
-        let label = format!(" {}:{} ", p.index, p.title);
+        let label = format!(" {}:{} {}", p.index, p.title, p.title_badge());
         // Available label columns: everything between the two corners.
         let avail = cn.saturating_sub(2);
         let start = c0 + 1;
@@ -217,6 +275,26 @@ mod tests {
             index,
             title,
             state,
+            agent: None,
+        }
+    }
+
+    /// A pane view carrying a bound agent status (unfocused agent pane).
+    fn agent_view<'a>(
+        screen: &'a Screen,
+        rect: Rect,
+        index: usize,
+        title: &'a str,
+        state: PaneState,
+        status: agsess::Status,
+    ) -> PaneView<'a> {
+        PaneView {
+            screen,
+            rect,
+            index,
+            title,
+            state,
+            agent: Some(AgentMark { status }),
         }
     }
 
@@ -426,5 +504,145 @@ mod tests {
         assert_eq!(m.cell(0, 4).ch, '┐');
         let mid: String = (1..4).map(|c| m.cell(0, c).ch).collect();
         assert_eq!(mid, " 9:"); // " 9:verylongtitle " truncated to 3 cells
+    }
+
+    // --- agent-aware chrome (0.3) ------------------------------------------
+
+    #[test]
+    fn unfocused_waiting_approval_pane_is_yellow_with_a_badge() {
+        // A wide box so the badge fits: " 2:claude ? " needs room.
+        let inner = filled(3, 18, ' ');
+        let panes = vec![agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            2,
+            "claude",
+            PaneState::Idle, // unfocused, quiet — but its agent is blocked
+            agsess::Status::WaitingApproval,
+        )];
+        let m = compose(5, 20, &panes);
+        // Border tinted bright yellow (Indexed 11), overriding the local Idle grey.
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            Color::Indexed(11),
+            "waiting-approval border should be bright yellow"
+        );
+        // Title badge: " 2:claude ? " appears in the top edge.
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(top.starts_with(" 2:claude ? "), "top edge was {top:?}");
+    }
+
+    #[test]
+    fn focused_pane_with_waiting_agent_keeps_focus_style_no_escalation() {
+        // A blocked agent in the *focused* pane needs no escalation — you are
+        // already there. Focus style (bold bright cyan) wins; no yellow, no badge.
+        let inner = filled(3, 16, ' ');
+        let panes = vec![agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 18,
+            },
+            1,
+            "claude",
+            PaneState::Focused,
+            agsess::Status::WaitingApproval,
+        )];
+        let m = compose(5, 18, &panes);
+        let corner = m.cell(0, 0).style;
+        assert!(corner.bold, "focused border stays bold");
+        assert_eq!(
+            corner.fg,
+            Color::Indexed(14),
+            "focused border stays bright cyan, not yellow"
+        );
+        // No attention badge on a focused pane.
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(!top.contains('?'), "focused pane shows no badge: {top:?}");
+    }
+
+    #[test]
+    fn exited_pane_keeps_red_even_with_a_stale_agent_mark() {
+        // A dead child is a hard local fact that outranks a stale inference.
+        let inner = filled(3, 3, ' ');
+        let panes = vec![agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 12,
+            },
+            1,
+            "claude",
+            PaneState::Exited,
+            agsess::Status::WaitingApproval,
+        )];
+        let m = compose(5, 12, &panes);
+        assert_eq!(m.cell(0, 0).style.fg, Color::Indexed(1), "exited stays red");
+    }
+
+    #[test]
+    fn working_agent_pane_gets_default_border_and_tilde_badge() {
+        let inner = filled(3, 16, ' ');
+        let panes = vec![agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 18,
+            },
+            3,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::Working,
+        )];
+        let m = compose(5, 18, &panes);
+        // Working overrides Idle grey back to default (unremarkable).
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            Color::Default,
+            "working agent border is default"
+        );
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(top.starts_with(" 3:claude ~ "), "top edge was {top:?}");
+    }
+
+    #[test]
+    fn waiting_prompt_agent_pane_is_grey_with_no_badge() {
+        let inner = filled(3, 16, ' ');
+        let panes = vec![agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 18,
+            },
+            2,
+            "claude",
+            PaneState::Active, // recent output, but the turn ended cleanly
+            agsess::Status::WaitingPrompt,
+        )];
+        let m = compose(5, 18, &panes);
+        // WaitingPrompt reads as idle — grey — overriding the Active default.
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            Color::Indexed(8),
+            "waiting-prompt border is grey"
+        );
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(
+            !top.contains('?') && !top.contains('~'),
+            "no badge: {top:?}"
+        );
     }
 }

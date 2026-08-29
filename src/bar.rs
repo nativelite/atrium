@@ -12,6 +12,10 @@ pub struct PaneInfo {
     /// Output arrived while the pane was in the background.
     pub activity: bool,
     pub exited: bool,
+    /// A bound agent in this window is waiting on the human (`WaitingApproval`).
+    /// Rung 3 of the attention ladder (§4.2): drives the `?` marker and the
+    /// fleet `| N waiting` note. Status only — never any transcript text.
+    pub waiting: bool,
 }
 
 /// The visible bar text (no escapes), truncated/padded to `cols`. A
@@ -20,8 +24,14 @@ pub struct PaneInfo {
 pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
     let mut s = String::from(" amux ");
     for (i, p) in panes.iter().enumerate() {
+        // Marker priority (§4.2): a dead child, then a waiting agent (it needs
+        // you), then active, then background activity, then idle. `?` slots in
+        // between `!` and `*` so an unfocused window whose agent is blocked
+        // outranks mere activity but never masks an exit.
         let mark = if p.exited {
             "!"
+        } else if p.waiting {
+            "?"
         } else if p.active {
             "*"
         } else if p.activity {
@@ -30,6 +40,15 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
             "-"
         };
         s.push_str(&format!("| {}:{}{} ", i + 1, p.title, mark));
+    }
+    // Fleet note: when any *non-active* window has a waiting agent, count them
+    // so a blocked agent in a backgrounded window surfaces even off-screen.
+    let waiting = panes
+        .iter()
+        .filter(|p| p.waiting && !p.active && !p.exited)
+        .count();
+    if waiting > 0 {
+        s.push_str(&format!("| {waiting} waiting "));
     }
     if note.is_empty() {
         s.push_str("| ^A c:win \":% split hjkl:focus z:zoom x:kill q:quit");

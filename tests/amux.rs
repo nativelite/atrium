@@ -116,6 +116,18 @@ fn info(title: &str, active: bool, activity: bool, exited: bool) -> PaneInfo {
         active,
         activity,
         exited,
+        waiting: false,
+    }
+}
+
+/// A window whose bound agent is waiting on the human.
+fn waiting_info(title: &str, active: bool) -> PaneInfo {
+    PaneInfo {
+        title: title.into(),
+        active,
+        activity: false,
+        exited: false,
+        waiting: true,
     }
 }
 
@@ -150,6 +162,59 @@ fn bar_note_replaces_keys_help() {
     let text = bar_text(&panes, 120, "cannot start \"claude\": not found");
     assert!(text.contains("cannot start"), "{text}");
     assert!(!text.contains("c:new"), "{text}");
+}
+
+#[test]
+fn bar_waiting_agent_shows_question_marker() {
+    // A backgrounded window whose agent is blocked: `?` marker, not `-`/`+`.
+    let text = bar_text(
+        &[
+            info("cmd", true, false, false),
+            waiting_info("claude", false),
+        ],
+        120,
+        "",
+    );
+    assert!(text.contains("2:claude?"), "{text}");
+    assert!(text.contains("| 1 waiting"), "fleet note missing: {text}");
+}
+
+#[test]
+fn bar_exit_outranks_waiting_marker() {
+    // Priority: `!` (exited) beats `?` (waiting) beats `*`/`+`/`-`.
+    let mut p = waiting_info("claude", false);
+    p.exited = true;
+    let text = bar_text(&[p], 120, "");
+    assert!(text.contains("1:claude!"), "exit should win: {text}");
+    // An exited window is a dead child, not a live waiter: it neither shows `?`
+    // nor counts toward the fleet note.
+    assert!(!text.contains("waiting"), "exited is not a waiter: {text}");
+}
+
+#[test]
+fn bar_waiting_in_active_window_gets_no_fleet_note() {
+    // The fleet note surfaces waiters you are NOT looking at. A waiting agent
+    // in the *active* window needs no count — you are already there.
+    let text = bar_text(&[waiting_info("claude", true)], 120, "");
+    assert!(text.contains("1:claude?"), "{text}");
+    assert!(
+        !text.contains("waiting |") && !text.contains("| 1 waiting"),
+        "{text}"
+    );
+}
+
+#[test]
+fn bar_counts_multiple_backgrounded_waiters() {
+    let text = bar_text(
+        &[
+            info("cmd", true, false, false),
+            waiting_info("claude", false),
+            waiting_info("claude", false),
+        ],
+        160,
+        "",
+    );
+    assert!(text.contains("| 2 waiting"), "{text}");
 }
 
 // --- command resolution (the npm .cmd shim trap) -----------------------------

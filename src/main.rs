@@ -24,7 +24,7 @@
 use amux::bar::{bar_paint, PaneInfo};
 use amux::input::{Action, Dir, PrefixScanner};
 use amux::layout::{self, Rect, Tree};
-use amux::tile::{compose, PaneState, PaneView};
+use amux::tile::{compose, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -40,6 +40,10 @@ struct Pane {
     title: String,
     activity: bool,
     exited: bool,
+    /// The session id amux injected via `--session-id` when this pane is an
+    /// agent it launched (§3.3). `None` for shells and agents amux did not
+    /// bind. The binder maps this to the pane's live `agsess::Status`.
+    session_id: Option<String>,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -122,6 +126,19 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
     let mut last_size_check = Instant::now();
     let mut last_bar = String::new();
     let mut flash: Option<(String, Instant)> = None;
+
+    // Agent session state (§5): one read-only `agsess::World` over the Claude
+    // projects root, polled on the loop's existing `Instant`-throttle pattern —
+    // no threads. The *first* refresh uses `refresh_since(process_start_ms)` so
+    // the cold history scan (agtop measures ~1.4 s for ~60 MB) never freezes
+    // keystrokes; amux can never care about a session that stopped writing
+    // before it started. Thereafter: bound panes tail ~1 s, discovery ~5 s
+    // (accelerated to ~1 s while any agent pane is still unbound).
+    let mut world = agsess::World::new(agsess::default_root());
+    let process_start_ms = agsess::sessions::now_ms();
+    world.refresh_since(process_start_ms);
+    let mut last_agent_poll = Instant::now();
+    let mut last_agent_discover = Instant::now();
     // The previous composited master, kept per-frame so tiled mode diffs. Reset
     // to None (full repaint) on mode/layout/window changes.
     let mut prev_master: Option<ansi::Screen> = None;
@@ -365,10 +382,39 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
             }
         }
 
+        // 5b. agent state (§5). `refresh` tails only files that grew, so the
+        //     bound-pane tick is cheap; discovery is the full `read_dir`, run
+        //     rarely — but accelerated while any agent pane still lacks its
+        //     transcript so a fresh agent binds promptly.
+        let any_unbound = windows.iter().any(|w| {
+            w.panes.iter().any(|p| {
+                p.session_id
+                    .as_deref()
+                    .is_some_and(|id| !world.sessions.iter().any(|s| s.id == id))
+            })
+        });
+        let discover_every = if any_unbound {
+            Duration::from_millis(1000)
+        } else {
+            Duration::from_millis(5000)
+        };
+        if last_agent_discover.elapsed() >= discover_every {
+            // Discovery + tail: a full refresh picks up new transcripts and
+            // tails grown ones in one pass.
+            world.refresh();
+            last_agent_discover = Instant::now();
+            last_agent_poll = Instant::now();
+        } else if last_agent_poll.elapsed() >= Duration::from_millis(1000) {
+            // Bound-pane tick: refresh tails only files whose length grew, so
+            // this is ~a handful of stats for a small grid.
+            world.refresh();
+            last_agent_poll = Instant::now();
+        }
+
         // 6. render the active window (tiled compose+diff, else passthrough is
         //    already written above) then paint the bar.
         if windows[active].tiled() {
-            let master = render_tiled(&windows[active], rows, cols);
+            let master = render_tiled(&windows[active], rows, cols, &world.sessions);
             let bytes = match &prev_master {
                 Some(prev) => prev.diff(&master),
                 None => master.render_full(),
@@ -393,6 +439,14 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                 active: i == active,
                 activity: w.panes.iter().any(|p| p.activity),
                 exited: w.panes.iter().all(|p| p.exited),
+                // A window is "waiting" when a bound agent pane in it is blocked
+                // on the human (§4.2 rung 3). Status only.
+                waiting: w.panes.iter().any(|p| {
+                    matches!(
+                        amux::bind::status_for(p.session_id.as_deref(), &world.sessions),
+                        Some(agsess::Status::WaitingApproval)
+                    )
+                }),
             })
             .collect();
         if flash
@@ -457,7 +511,12 @@ fn to_move(d: Dir) -> layout::Move {
 
 /// Compose the active window's panes into a master screen (boxed borders +
 /// titles + liveness color + content); the caller diffs it to the terminal.
-fn render_tiled(w: &Window, rows: u16, cols: u16) -> ansi::Screen {
+fn render_tiled(
+    w: &Window,
+    rows: u16,
+    cols: u16,
+    sessions: &[agsess::AgentSession],
+) -> ansi::Screen {
     let outer = tiled_outer(rows, cols);
     let rects = w.tree.rects(outer);
     let focus = w.tree.focus();
@@ -477,6 +536,16 @@ fn render_tiled(w: &Window, rows: u16, cols: u16) -> ansi::Screen {
                 } else {
                     PaneState::Idle
                 };
+                // Agent mark only for *unfocused* bound agent panes (§4.1): a
+                // blocked agent in the focused pane needs no escalation. The
+                // binder maps the pane's injected id to its live status; carries
+                // status only — never any transcript text.
+                let agent = if *id == focus {
+                    None
+                } else {
+                    amux::bind::status_for(p.session_id.as_deref(), sessions)
+                        .map(|status| AgentMark { status })
+                };
                 let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
                 PaneView {
                     screen: p.term.screen(),
@@ -484,6 +553,7 @@ fn render_tiled(w: &Window, rows: u16, cols: u16) -> ansi::Screen {
                     index,
                     title: &p.title,
                     state,
+                    agent,
                 }
             })
         })
@@ -608,7 +678,21 @@ fn spawn_pane(command: &[String], rows: u16, cols: u16, id: usize) -> std::io::R
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
-    let effective = effective_command(command);
+    // Agent-aware bind (§3.3): if this is an agent pane amux is launching and the
+    // user did not already pick a session, mint a uuid and append
+    // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
+    // wrapping, so the flag reaches claude, not the shim host). Remember the id.
+    let session_id = amux::bind::session_id_for(command);
+    let user_cmd: Vec<String> = match &session_id {
+        Some(uuid) => {
+            let mut v = command.to_vec();
+            v.push("--session-id".to_string());
+            v.push(uuid.clone());
+            v
+        }
+        None => command.to_vec(),
+    };
+    let effective = effective_command(&user_cmd);
     let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
     let r = rows.max(1);
     let c = cols.max(1);
@@ -621,6 +705,7 @@ fn spawn_pane(command: &[String], rows: u16, cols: u16, id: usize) -> std::io::R
         title,
         activity: false,
         exited: false,
+        session_id,
     })
 }
 
