@@ -18,4 +18,6 @@
 pub mod bar;
 pub mod filter;
 pub mod input;
+pub mod layout;
 pub mod resolve;
+pub mod tile;
