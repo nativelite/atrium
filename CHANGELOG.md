@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-29
+
+### Added
+- **Agent-aware pane borders.** When amux launches an agent pane (`claude`) it
+  mints a fresh session id and passes `claude --session-id <uuid>` (unless the
+  user already supplied `--session-id`/`--resume`/`--continue`), so the pane's
+  transcript path is known exactly. The [`agsess`](https://github.com/nativelite/agsess)
+  crate derives that session's attention `Status` from the transcript files
+  (read-only, status only), and the binder maps pane → status by id.
+- Attention chrome on **unfocused** bound agent panes: bright-yellow border +
+  `?` title badge when the agent is **waiting on your approval**; grey when
+  waiting for a prompt / idle; default with a `~` badge while working. The
+  focused pane is never escalated; a dead child (red) and focus (cyan) still
+  outrank an agent mark.
+- Status bar: a `?` marker on any window whose bound agent is waiting, plus a
+  `| N waiting` fleet note so a blocked agent in a backgrounded window surfaces
+  off-screen. Border and bar render **status only** — never any transcript text.
+- Tiered agent-state poll on the loop's existing `Instant`-throttle (no
+  threads): bound transcripts tail ~1 s, discovery ~5 s (accelerated to ~1 s
+  while any agent pane is still unbound). The first refresh uses
+  `agsess::World::refresh_since(process_start_ms)` so the cold history scan can't
+  freeze keystrokes at startup.
+
+Agents launched *inside* a shell pane (`$ claude`) are not bound — a documented
+v1 limitation. New dependency: the org crate `agsess`. Third-party dependencies
+remain zero. M5 of the amux 0.3 agent-aware feature.
+
+## [0.2.1] - 2026-08-28
+
+### Added
+- **Boxed pane borders + liveness color.** Every tiled pane is drawn as a full
+  four-sided box with its `index:title` embedded in the top edge, and the border
+  is tinted by the pane's liveness: focused = bold bright cyan, exited = red,
+  idle = grey, background-active = default. Checked in strict priority order.
+
+## [0.2.0] - 2026-08-28
+
+### Added
+- **Tiled splits.** `Ctrl+A "` (stacked) and `Ctrl+A %` (side-by-side) split the
+  focused pane; `h`/`j`/`k`/`l` or the arrow keys move focus between tiles;
+  `Ctrl+A z` zooms the focused pane to full-screen passthrough and back. A window
+  with one pane (or a zoomed pane) stays in the 0.1 passthrough path; a window
+  with two or more visible panes renders tiled — each pane driving a `vterm`
+  emulator, all composited into one master screen written by diff. Windows
+  (`Ctrl+A c`, `1`-`9`, `n`/`p`) and splits coexist.
+
 ## [0.1.0] - 2026-08-28
 
 ### Added
@@ -33,5 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/amux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/nativelite/amux/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nativelite/amux/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/nativelite/amux/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/nativelite/amux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/nativelite/amux/releases/tag/v0.1.0
