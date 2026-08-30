@@ -10,6 +10,8 @@ amux claude        # every pane runs `claude`
 amux               # every pane runs your shell (COMSPEC / $SHELL)
 amux claude --continue        # any command + args
 amux --identity work claude   # run the agent under the `work` credential
+amux -n 4 claude              # open four agent panes at once (a 2x2 grid)
+amux --grid 2x3 claude        # open a 2x3 grid (six panes)
 ```
 
 ```
@@ -19,6 +21,12 @@ amux --identity work claude   # run the agent under the `work` credential
 └───────────────────────────┘└───────────────────────────┘
  amux | 1:claude* | 2:claude? | 3:cmd- | 1 waiting | ^A c:win …
 ```
+
+**Start flags** (amux's own, before the command): `--identity <name>` /
+`-I <name>` runs the agent under a credential identity; `-n <N>` opens **N agent
+panes at once** (N a positive multiple of 2) in a balanced grid, and
+`--grid <R>x<C>` sets the grid shape explicitly. Both must come *before* the
+hosted command, so a later `-n`/`-I` the hosted program takes is never eaten.
 
 **Keys** — `Ctrl+A`, then: `c` new window · `1`-`9` switch window · `n`/`p`
 cycle · `"` split stacked · `%` split side-by-side · `h`/`j`/`k`/`l` (or arrows)
@@ -126,8 +134,10 @@ never touches amux's siblings, and amux makes no network calls.
   (`2:claude ·work`) and next to the window's entry in the bar. A `wif:` identity
   reads apart from a static key at a glance (`·wif:prod` vs `·work`), which makes
   the credential-precedence footgun — a leftover static key shadowing a WIF
-  profile — visible. The tag has a per-identity color, but the text is always
-  drawn (never color-only).
+  profile — visible. The tag renders as **colored text** (the identity color as
+  the name's foreground, matching the pane border) in both the border and the
+  reverse-video bar — never a filled color chip — and the text is always drawn
+  (color is a redundant a11y channel, never color-only).
 - **Names only, never secrets — a hard guarantee.** The resolved environment is
   re-fetched on every spawn, handed straight to the child, and dropped; it is
   never cached on the pane, never logged, never persisted, and never appears in
@@ -141,6 +151,33 @@ never touches amux's siblings, and amux makes no network calls.
 Non-agent panes (shells, editors) and no-identity spawns are unaffected — they
 use the plain spawn path and carry no tag. New dependency: the org crate `akey`.
 Third-party dependencies remain zero.
+
+## Mass-spawn (0.5)
+
+`-n <N>` / `--grid <R>x<C>` open a whole grid of agent panes in **one** window,
+instead of splitting N times by hand:
+
+```bash
+amux -n 4 claude       # 2x2 — four agents in a square
+amux -n 6 claude       # 2x3
+amux -n 8 claude       # 2x4
+amux --grid 2x3 claude # the same 2x3, shape given explicitly
+amux --identity work -n 4 claude   # four panes, all under the `work` identity
+```
+
+- `-n <N>` takes a **positive multiple of 2** (2, 4, 6, 8, …); an odd or zero N
+  is a clear startup error (`-n must be a positive multiple of 2`), never a silent
+  fall back to one pane. The shape is balanced automatically — rows = the factor
+  of N closest to `sqrt(N)`, cols = `N / rows` — so the grid is never taller than
+  it is wide.
+- `--grid <R>x<C>` sets the dimensions yourself (product ≥ 2).
+- **Every tile runs the same command, each its own session** — each agent pane
+  still gets its own `--session-id`, so the agent-aware chrome binds each one
+  independently — and **all under the same `--identity`** if one was given.
+- Everything after spawn is the ordinary tiled window: `hjkl`/arrows move focus,
+  `z` zooms, `x` kills and re-tiles, the status/identity chrome and `q` quit all
+  work exactly as for a hand-split grid. (Saved rosters / `amux fleet up` are a
+  later increment; this is mass-spawn only.)
 
 ## The architecture (why it's small and faithful)
 

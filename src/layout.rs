@@ -78,6 +78,46 @@ impl Tree {
         }
     }
 
+    /// A balanced `rows × cols` grid of panes, ids `0..rows*cols` in row-major
+    /// order (top-left is 0), focused on pane 0. This is the mass-spawn layout
+    /// ([`crate::spawn`]): a window of N agent tiles built in one shot instead of
+    /// N interactive splits. The tree is C-wide columns nested inside R-tall
+    /// rows, so [`rects`](Tree::rects), focus movement, and close all behave
+    /// exactly as they would for the same shape built by hand with `split`.
+    ///
+    /// `rows` and `cols` are clamped to at least 1, so the worst case is a
+    /// single-leaf tree (never a panic or an empty tree).
+    pub fn grid(rows: usize, cols: usize) -> Self {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        // Row-major id assignment: row r, col c -> id r*cols + c.
+        let row_node = |r: usize| -> Node {
+            Self::balanced_line(Dir::Vertical, cols, |c| Node::Leaf(r * cols + c))
+        };
+        let root = Self::balanced_line(Dir::Horizontal, rows, row_node);
+        Tree { root, focus: 0 }
+    }
+
+    /// Build a balanced left-leaning line of `n` children joined by `dir`
+    /// splits, each child produced by `leaf(i)` for `i in 0..n`. `n >= 1`.
+    /// A single child is just that child (no split); otherwise the first child
+    /// is `leaf(0)` and the rest recurse, so ids stay in ascending order across
+    /// the resulting leaves — matching how a person would split left-to-right.
+    fn balanced_line(dir: Dir, n: usize, mut leaf: impl FnMut(usize) -> Node) -> Node {
+        Self::line_from(dir, 0, n, &mut leaf)
+    }
+
+    fn line_from(dir: Dir, start: usize, n: usize, leaf: &mut impl FnMut(usize) -> Node) -> Node {
+        if start + 1 >= n {
+            return leaf(start);
+        }
+        Node::Split {
+            dir,
+            first: Box::new(leaf(start)),
+            second: Box::new(Self::line_from(dir, start + 1, n, leaf)),
+        }
+    }
+
     /// The focused pane id.
     pub fn focus(&self) -> usize {
         self.focus
@@ -455,5 +495,67 @@ mod tests {
         t.focus = 0;
         t.split(Dir::Horizontal, 3);
         t
+    }
+
+    // --- grid builder (mass-spawn, 0.5) ------------------------------------
+
+    #[test]
+    fn grid_has_the_expected_leaf_count_and_ids() {
+        // 2x3 -> six leaves, ids 0..6, focus on 0.
+        let t = Tree::grid(2, 3);
+        assert_eq!(t.len(), 6);
+        assert_eq!(t.focus(), 0);
+        let mut ids = t.ids();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn grid_leaves_tile_without_overlap() {
+        // Every grid shape mass-spawn can produce must tile the outer rect with
+        // no two panes overlapping (same discipline as the 2x2 split test).
+        for &(r, c) in &[(1, 2), (2, 2), (2, 3), (2, 4), (3, 4)] {
+            let t = Tree::grid(r, c);
+            let rects = t.rects(OUTER);
+            assert_eq!(rects.len(), r * c, "{r}x{c} leaf count");
+            for i in 0..rects.len() {
+                for j in (i + 1)..rects.len() {
+                    assert!(
+                        !overlaps(rects[i].1, rects[j].1),
+                        "{r}x{c}: {:?} vs {:?}",
+                        rects[i],
+                        rects[j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grid_focus_moves_geometrically() {
+        // A 2x2 grid built by `grid` behaves like one built by hand: focus on
+        // the top-left pane, right+down+left+up returns to it.
+        let mut t = Tree::grid(2, 2);
+        let rects = t.rects(OUTER);
+        let top_left = rects
+            .iter()
+            .min_by_key(|(_, r)| (r.row, r.col))
+            .map(|(id, _)| *id)
+            .unwrap();
+        t.focus = top_left;
+        let r = t.move_focus(Move::Right, OUTER);
+        assert_ne!(r, top_left);
+        t.move_focus(Move::Down, OUTER);
+        t.move_focus(Move::Left, OUTER);
+        let back = t.move_focus(Move::Up, OUTER);
+        assert_eq!(back, top_left);
+    }
+
+    #[test]
+    fn grid_degenerate_dims_never_panic() {
+        // 0 dims clamp to 1: a single-leaf tree, not a panic or empty tree.
+        let t = Tree::grid(0, 0);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.ids(), vec![0]);
     }
 }

@@ -138,12 +138,16 @@ pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> Strin
             continue;
         }
         match &seg.tag {
-            // An identity tag: switch to its per-identity color, emit the text,
-            // then restore the bar's reverse-video base so the color can't bleed
-            // into the following segments.
+            // An identity tag: render it as colored *text*, matching the tiled
+            // border tag. The bar's base line is reverse-video, so setting a
+            // foreground on a still-reversed cell would swap to a filled color
+            // block (a chip). Dropping `reverse` for the tag makes the identity
+            // color the *foreground* on the bar's normal background — legible
+            // colored text, the same SGR the border uses (`fg`, no reverse).
+            // The base reverse-video style is restored right after so the color
+            // (and the reverse drop) can't bleed into the following segments.
             Some(name) => {
                 let tag_style = Style {
-                    reverse: true,
                     fg: Color::Indexed(identity::palette_index(name)),
                     ..Style::default()
                 };

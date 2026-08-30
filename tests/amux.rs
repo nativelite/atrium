@@ -241,24 +241,33 @@ fn bar_wif_identity_reads_apart_from_static() {
 }
 
 #[test]
-fn bar_paint_colors_the_identity_tag_and_keeps_the_text() {
-    // The `·<name>` tag must carry the same per-identity palette color the
-    // tiled border uses, wrapped so the color does not bleed into the rest of
-    // the reverse-video bar, and the text must stay intact (a11y).
+fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
+    // The `·<name>` tag must read as colored *text* — the identity color as the
+    // foreground on the bar's normal background, exactly the SGR the tiled
+    // border uses — NOT a filled color block. The bar line is reverse-video, so
+    // a foreground set while still reversed would swap to a background chip; the
+    // fix drops `reverse` for the tag so the color lands on the text. The text
+    // must stay intact regardless of color (a11y).
     let mut p = info("claude", true, false, false);
     p.identity = Some("work".into());
     let painted = bar_paint(&[p], 25, 120, "");
 
-    // The tag's foreground SGR: palette color for "work" -> ansi index. The
-    // blue/magenta palette (12/13) is in the 8..=15 bright range, which `sgr()`
-    // maps to a `90 + (n-8)` fg param (12 -> 94, 13 -> 95), after the base
-    // `0;7` (reset + reverse).
+    // The tag's SGR is `reset + fg` with NO reverse (`7`) attribute — colored
+    // text, not a reverse-video chip. Palette color for "work" maps via `sgr()`
+    // to a `90 + (n-8)` fg param (12 -> 94, 13 -> 95).
     let idx = amux::identity::palette_index("work");
     let fg_param = 90 + (idx - 8) as u16;
-    let tag_sgr = format!("\x1b[0;7;{fg_param}m");
+    let tag_sgr = format!("\x1b[0;{fg_param}m");
     assert!(
         painted.contains(&tag_sgr),
-        "tag should switch to its palette fg color; sgr {tag_sgr:?} not in {painted:?}"
+        "tag should be colored text (reset+fg, no reverse); sgr {tag_sgr:?} not in {painted:?}"
+    );
+    // It must NOT be the old reverse-video chip form (`0;7;<fg>`), which
+    // rendered as a filled background block.
+    let chip_sgr = format!("\x1b[0;7;{fg_param}m");
+    assert!(
+        !painted.contains(&chip_sgr),
+        "tag must not be a reverse-video chip; found {chip_sgr:?} in {painted:?}"
     );
 
     // The colored run is immediately followed by the `·work` text.
@@ -269,7 +278,8 @@ fn bar_paint_colors_the_identity_tag_and_keeps_the_text() {
     );
 
     // Right after the tag text, the bar restores its reverse-video base
-    // (`\x1b[0;7m`) so the color cannot bleed into the following segment.
+    // (`\x1b[0;7m`) so neither the color nor the dropped `reverse` bleeds into
+    // the following segment.
     let restore = format!("·work{}", "\x1b[0;7m");
     assert!(
         painted.contains(&restore),
@@ -663,6 +673,74 @@ fn kill_focused_pane_retiles_to_survivor() {
     );
     p.write(b"\x01q").unwrap();
     assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+// --- mass-spawn (0.5): -n / --grid open N panes at once ----------------------
+
+/// `amux -n 4 <shell>` opens ONE window of four tiled panes in a 2x2 grid. The
+/// composited frame shows all four pane labels (` 1:… ` .. ` 4:… ` in their top
+/// borders), and each pane round-trips: a marker echoed in each — reached by
+/// moving focus around the grid — appears in the output.
+#[test]
+fn mass_spawn_n_four_opens_four_live_panes() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec!["-n", "4", shell];
+    argv.extend(args);
+    // A big terminal so all four boxed tiles (and their labels) fit.
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 40, 160).unwrap();
+    let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
+
+    // Four pane labels appear in the tiled frame: " 1:<stem> " .. " 4:<stem> ".
+    // Collect output until the fourth label shows (the grid is fully drawn).
+    let mut label4 = b" 4:".to_vec();
+    label4.extend_from_slice(stem);
+    let out = read_until(&mut p, &label4, Duration::from_secs(20));
+    for i in 1..=4u8 {
+        let mut label = vec![b' ', b'0' + i, b':'];
+        label.extend_from_slice(stem);
+        assert!(
+            contains(&out, &label),
+            "pane {i} label missing from grid: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // The focused (pane 1, top-left) shell round-trips.
+    p.write(b"echo amux-grid-p1\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-grid-p1", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-grid-p1"),
+        "focused grid pane silent: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Move focus right to another tile and prove IT is live too — a different
+    // pane receiving input confirms four independent sessions, not one echoed
+    // four times.
+    p.write(b"\x01l").unwrap();
+    p.write(b"echo amux-grid-p2\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-grid-p2", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-grid-p2"),
+        "second grid pane silent after focus move: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// An odd `-n` is a clean startup error, not a silent single pane: amux prints
+/// the reason and exits non-zero.
+#[test]
+fn mass_spawn_rejects_odd_n() {
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["-n", "3", "cmd"], 24, 80).unwrap();
+    // It must exit non-zero (bad argument), and not sit there hosting a shell.
+    let code = wait_exit(&mut p, 15);
+    assert_ne!(code, 0, "odd -n should be a startup error");
 }
 
 /// A literal Ctrl+A goes through with the doubled prefix.

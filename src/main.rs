@@ -94,13 +94,23 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [command [args...]]   (Ctrl+A ? in the bar shows keys)"
+            "usage: amux [--identity <name>] [-n <N> | --grid <R>x<C>] [command [args...]]   (Ctrl+A ? in the bar shows keys)"
         );
         return ExitCode::SUCCESS;
     }
     if rest.first().map(String::as_str) == Some("--stdin-probe") {
         return stdin_probe();
     }
+    // amux's own mass-spawn flags (`-n <N>` / `--grid <R>x<C>`) are stripped off
+    // the front, after `--identity`, before the hosted command. A bad value is a
+    // startup error, surfaced on stderr — never a silent fallback to one pane.
+    let (grid, rest) = match amux::spawn::parse(&rest) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("amux: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let command: Vec<String> = if rest.is_empty() {
         vec![default_shell()]
     } else {
@@ -113,10 +123,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run(&mut term, &command, identity.as_deref())
+    run(&mut term, &command, identity.as_deref(), grid)
 }
 
-fn run(term: &mut rawterm::Terminal, command: &[String], identity: Option<&str>) -> ExitCode {
+fn run(
+    term: &mut rawterm::Terminal,
+    command: &[String],
+    identity: Option<&str>,
+    grid: Option<amux::spawn::Grid>,
+) -> ExitCode {
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
@@ -131,13 +146,25 @@ fn run(term: &mut rawterm::Terminal, command: &[String], identity: Option<&str>)
     // bar and the pane spawns *without* the credential — never silently, and
     // never unauthenticated-without-saying-so (§7).
     let mut flash: Option<(String, Instant)> = None;
-    match spawn_window(command, rows, cols, 0, identity, &mut flash) {
+    // Mass-spawn: one window of N tiles in a balanced grid; otherwise the 0.1
+    // single-pane path, untouched. Both share the same spawn machinery (each
+    // pane its own session, all under the same identity).
+    let initial = match grid {
+        Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
+        None => spawn_window(command, rows, cols, 0, identity, &mut flash),
+    };
+    match initial {
         Ok(w) => windows.push(w),
         Err(e) => {
             cleanup_screen(&mut out);
             eprintln!("amux: cannot start {:?}: {e}", command[0]);
             return ExitCode::FAILURE;
         }
+    }
+    // A grid window is born tiled: resize so every pane's pty/emulator gets its
+    // true inner rect (spawn used rough sizes).
+    if grid.is_some() {
+        resize_window(&mut windows[0], rows, cols);
     }
     let mut active = 0usize; // active window index
     let mut scanner = PrefixScanner::new();
@@ -714,6 +741,52 @@ fn spawn_window(
         tree: Tree::new(0),
         zoomed: false,
         next_id: 1,
+    })
+}
+
+/// Mass-spawn a single window of N tiles laid out as a balanced `grid`. The
+/// split tree is built with [`layout::Tree::grid`] (ids `0..N`, focus 0) so
+/// focus/rects/close all keep working exactly as for a hand-split grid. Each
+/// tile runs the SAME command, each its own session (a fresh `--session-id` per
+/// pane via the existing `bind` path inside `spawn_pane`), all under the same
+/// `identity` if one was given. Panes are spawned at a rough grid-cell size; the
+/// caller resizes the window right after so each pty/emulator gets its exact
+/// inner rect. If any pane fails to spawn, the whole window is abandoned and the
+/// already-spawned panes are killed (nothing to host half a grid).
+fn spawn_window_grid(
+    command: &[String],
+    rows: u16,
+    cols: u16,
+    grid: amux::spawn::Grid,
+    identity: Option<&str>,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Window> {
+    let tree = Tree::grid(grid.rows, grid.cols);
+    let n = grid.total();
+    // Rough per-cell inner size (minus the one-cell border on each side); the
+    // caller's resize_window fixes it exactly right after.
+    let cell_rows = ((rows.saturating_sub(1).max(1) as usize / grid.rows.max(1)).saturating_sub(2))
+        .max(1) as u16;
+    let cell_cols = ((cols as usize / grid.cols.max(1)).saturating_sub(2)).max(1) as u16;
+    let mut panes: Vec<Pane> = Vec::with_capacity(n);
+    for id in 0..n {
+        match spawn_pane(command, cell_rows, cell_cols, id, identity, flash) {
+            Ok(pane) => panes.push(pane),
+            Err(e) => {
+                // Tear down whatever we already started — a partial grid is not
+                // a coherent window.
+                for p in panes.iter_mut() {
+                    let _ = p.pty.kill();
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(Window {
+        panes,
+        tree,
+        zoomed: false,
+        next_id: n,
     })
 }
 

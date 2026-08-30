@@ -22,5 +22,6 @@ pub mod identity;
 pub mod input;
 pub mod layout;
 pub mod resolve;
+pub mod spawn;
 pub mod tile;
 pub mod uid;

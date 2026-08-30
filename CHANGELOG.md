@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-29
+
+### Added
+- **Mass-spawn — open N agent panes at once (`-n <N>` / `--grid <R>x<C>`).** One
+  command now opens a whole balanced grid of agent tiles in a single window
+  instead of N interactive splits: `amux -n 4 claude` gives a 2×2 square,
+  `amux -n 6 claude` a 2×3, `amux -n 8 claude` a 2×4. `-n <N>` takes a positive
+  **multiple of 2** (an odd or zero N is a clear startup error:
+  `-n must be a positive multiple of 2`); `--grid <R>x<C>` sets the shape
+  explicitly (`--grid 2x3`, product ≥ 2). The flags are amux's own, stripped off
+  the front after `--identity`, before the hosted command — a later `-n` that
+  belongs to the hosted program is never eaten. Every tile runs the same command,
+  **each its own session** (its own `--session-id` via the existing bind path),
+  all under the same `--identity` if one was given. The grid is built with
+  `layout::Tree::grid`, so focus (`hjkl`/arrows), zoom, kill-retile, and all the
+  agent/identity chrome behave exactly as for a hand-split grid.
+
+### Fixed
+- **Identity `·<name>` tag now reads as colored *text*, not a filled chip.** The
+  status bar is reverse-video, so setting a foreground color on the still-reversed
+  tag cell swapped to a filled background block (an accidental color chip). The
+  tag now drops `reverse` so its identity color lands on the *text* — the same SGR
+  the tiled border already uses — on the bar's normal background, then restores the
+  base reverse-video style so nothing bleeds. The `·<name>` **text is always
+  present** (color is a redundant a11y channel).
+
 ## [0.4.1] - 2026-08-29
 
 ### Fixed
