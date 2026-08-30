@@ -215,25 +215,36 @@ pub fn extra_allow_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Pull amux's own ctl meta-flags off the front of the (already identity-
+/// Pull amux's own launch meta-flags off the front of the (already identity-
 /// stripped) argument vector, before the hosted command begins — exactly the way
 /// [`crate::spawn::parse`] pulls `-n`/`--grid`. Returns `(allow_ctl, max_depth,
-/// rest)`, where `rest` is the untouched remainder (grid flags + hosted command).
+/// yolo, rest)`, where `rest` is the untouched remainder (grid flags + hosted
+/// command).
 ///
 /// * `--allow-ctl` — opt in to the control channel (off by default).
 /// * `--max-depth <N>` — the recursion guard ceiling (default
 ///   [`DEFAULT_MAX_DEPTH`]); `0` means unlimited (the guard is removed).
+/// * `--yolo` — launch every agent pane amux spawns with claude's
+///   `--dangerously-skip-permissions`, so a spawned worker comes up **trusted
+///   and in auto mode** (no workspace-trust dialog, no per-action prompts). This
+///   is what lets an agent-driven fleet run hands-off; it is also genuinely
+///   dangerous (agents run tools unsupervised), hence opt-in and loudly named.
 ///
-/// Parsing stops at the first non-flag token, so a `--max-depth` the hosted
-/// program takes is never eaten. A bad `--max-depth` value is a clear error.
-pub fn parse_flags(args: &[String]) -> Result<(bool, usize, Vec<String>), String> {
+/// Parsing stops at the first non-flag token, so a flag the hosted program takes
+/// is never eaten. A bad `--max-depth` value is a clear error.
+pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), String> {
     let mut allow = false;
     let mut max_depth = DEFAULT_MAX_DEPTH;
+    let mut yolo = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--allow-ctl" => {
                 allow = true;
+                i += 1;
+            }
+            "--yolo" => {
+                yolo = true;
                 i += 1;
             }
             "--max-depth" => {
@@ -247,11 +258,15 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, Vec<String>), String
                 max_depth = parse_depth(&s["--max-depth=".len()..])?;
                 i += 1;
             }
-            _ => return Ok((allow, effective_depth(max_depth), args[i..].to_vec())),
+            _ => return Ok((allow, effective_depth(max_depth), yolo, args[i..].to_vec())),
         }
     }
-    Ok((allow, effective_depth(max_depth), Vec::new()))
+    Ok((allow, effective_depth(max_depth), yolo, Vec::new()))
 }
+
+/// The claude flag `--yolo` injects into every agent pane: skips the workspace
+/// trust dialog and all permission prompts.
+pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
@@ -709,15 +724,16 @@ mod tests {
 
     #[test]
     fn flags_default_off_and_pass_command_through() {
-        let (allow, depth, rest) = parse_flags(&v(&["claude", "--continue"])).unwrap();
+        let (allow, depth, yolo, rest) = parse_flags(&v(&["claude", "--continue"])).unwrap();
         assert!(!allow);
+        assert!(!yolo);
         assert_eq!(depth, DEFAULT_MAX_DEPTH);
         assert_eq!(rest, v(&["claude", "--continue"]));
     }
 
     #[test]
     fn flags_allow_ctl_and_max_depth() {
-        let (allow, depth, rest) =
+        let (allow, depth, _yolo, rest) =
             parse_flags(&v(&["--allow-ctl", "--max-depth", "3", "claude"])).unwrap();
         assert!(allow);
         assert_eq!(depth, 3);
@@ -725,8 +741,17 @@ mod tests {
     }
 
     #[test]
+    fn flags_yolo_is_parsed() {
+        let (allow, _depth, yolo, rest) =
+            parse_flags(&v(&["--allow-ctl", "--yolo", "claude"])).unwrap();
+        assert!(allow);
+        assert!(yolo);
+        assert_eq!(rest, v(&["claude"]));
+    }
+
+    #[test]
     fn flags_max_depth_zero_is_unlimited() {
-        let (_, depth, _) =
+        let (_, depth, _, _) =
             parse_flags(&v(&["--allow-ctl", "--max-depth", "0", "claude"])).unwrap();
         assert_eq!(depth, usize::MAX);
     }
@@ -734,7 +759,7 @@ mod tests {
     #[test]
     fn flags_stop_at_command_so_child_keeps_its_flags() {
         // A `--max-depth` after the command belongs to the child, untouched.
-        let (allow, _, rest) =
+        let (allow, _, _, rest) =
             parse_flags(&v(&["--allow-ctl", "claude", "--max-depth", "9"])).unwrap();
         assert!(allow);
         assert_eq!(rest, v(&["claude", "--max-depth", "9"]));

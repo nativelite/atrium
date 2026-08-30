@@ -27,7 +27,7 @@ use amux::layout::{self, Rect, Tree};
 use amux::tile::{compose, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,12 @@ static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
 /// agent inside can drive `amux ctl`. `None` (unset) ⇒ ctl is off and every
 /// spawn is byte-identical to pre-ctl amux.
 static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
+
+/// Set once at startup iff `--yolo` was given: every agent pane amux spawns gets
+/// claude's `--dangerously-skip-permissions` appended, so a spawned worker comes
+/// up trusted and in auto mode. Off ⇒ agents prompt for trust/permissions as
+/// usual. Read by the spawn path (`spawn_pane_full`).
+static AGENT_YOLO: AtomicBool = AtomicBool::new(false);
 
 fn next_agent_id() -> usize {
     NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
@@ -207,20 +213,22 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--yolo] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      --yolo: launch agents with --dangerously-skip-permissions (trusted + auto mode; agents run tools unsupervised)\n\
              \x20      amux ctl spawn [--role R] [--here] -- <cmd...> | list | send <target> <text> | status [target]\n\
-             \x20      (Ctrl+A ? in the bar shows keys)"
+             \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
         );
         return ExitCode::SUCCESS;
     }
     if rest.first().map(String::as_str) == Some("--stdin-probe") {
         return stdin_probe();
     }
-    // amux's own ctl meta-flags (`--allow-ctl` / `--max-depth <N>`) are stripped
-    // next — after `--identity`, before mass-spawn flags and the hosted command.
-    // A bad `--max-depth` is a startup error, never a silent fallback.
-    let (allow_ctl, max_depth, rest) = match amux::ctl::parse_flags(&rest) {
-        Ok(triple) => triple,
+    // amux's own launch meta-flags (`--allow-ctl` / `--max-depth <N>` / `--yolo`)
+    // are stripped next — after `--identity`, before mass-spawn flags and the
+    // hosted command. A bad `--max-depth` is a startup error, never a silent
+    // fallback.
+    let (allow_ctl, max_depth, yolo, rest) = match amux::ctl::parse_flags(&rest) {
+        Ok(quad) => quad,
         Err(msg) => {
             eprintln!("amux: {msg}");
             return ExitCode::FAILURE;
@@ -256,9 +264,13 @@ fn main() -> ExitCode {
         None,
         allow_ctl,
         max_depth,
+        yolo,
     )
 }
 
+// The run loop threads several independent, well-named launch parameters; a
+// bag struct would obscure more than it helps here.
+#[allow(clippy::too_many_arguments)]
 fn run(
     term: &mut rawterm::Terminal,
     command: &[String],
@@ -276,7 +288,14 @@ fn run(
     // recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
     allow_ctl: bool,
     max_depth: usize,
+    // `--yolo`: launch every agent pane with `--dangerously-skip-permissions`
+    // (trusted + auto mode). Published to the spawn path via `AGENT_YOLO` before
+    // the first spawn.
+    yolo: bool,
 ) -> ExitCode {
+    // Publish the yolo policy before any pane is spawned so even the initial
+    // agent picks it up.
+    AGENT_YOLO.store(yolo, Ordering::Relaxed);
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
@@ -1155,6 +1174,7 @@ fn fleet_up(name: &str) -> ExitCode {
         Some(window),
         false,
         amux::ctl::DEFAULT_MAX_DEPTH,
+        false,
     )
 }
 
@@ -1635,20 +1655,27 @@ fn spawn_pane_full(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
+    // `--yolo`: for an agent pane, append claude's `--dangerously-skip-permissions`
+    // so it comes up trusted and in auto mode (no trust dialog / no prompts).
+    // Only for agent commands — a shell pane is never given the flag.
+    let base: Vec<String> =
+        if amux::bind::is_agent_stem(&title) && AGENT_YOLO.load(Ordering::Relaxed) {
+            let mut v = command.to_vec();
+            v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+            v
+        } else {
+            command.to_vec()
+        };
     // Agent-aware bind (§3.3): if this is an agent pane amux is launching and the
     // user did not already pick a session, mint a uuid and append
     // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
     // wrapping, so the flag reaches claude, not the shim host). Remember the id.
-    let session_id = amux::bind::session_id_for(command);
-    let user_cmd: Vec<String> = match &session_id {
-        Some(uuid) => {
-            let mut v = command.to_vec();
-            v.push("--session-id".to_string());
-            v.push(uuid.clone());
-            v
-        }
-        None => command.to_vec(),
-    };
+    let session_id = amux::bind::session_id_for(&base);
+    let mut user_cmd: Vec<String> = base;
+    if let Some(uuid) = &session_id {
+        user_cmd.push("--session-id".to_string());
+        user_cmd.push(uuid.clone());
+    }
     let effective = effective_command(&user_cmd);
     let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
     let r = rows.max(1);
