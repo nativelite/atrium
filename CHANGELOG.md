@@ -10,14 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.10.0] - 2026-08-30
 
 ### Added
-- **`--yolo` — hands-off agent fleets.** `amux --yolo …` launches every agent
+- **`--trust` — hands-off agent fleets.** `amux --trust …` launches every agent
   pane amux spawns (the initial one, splits, grid tiles, and **ctl-spawned
   workers**) with claude's `--dangerously-skip-permissions`, so a spawned worker
   comes up **trusted and in auto mode** — no workspace-trust dialog, no
   per-action prompts. This is what makes an agent-driven hierarchy (a lead
   `ctl spawn`-ing and tasking workers) run without a human clicking through a
-  trust prompt for every new agent. Opt-in and loudly named: with it on, agents
-  run tools unsupervised. Only agent panes get the flag; a shell pane never does.
+  trust prompt for every new agent. Opt-in: with it on, agents run tools
+  unsupervised. Only agent panes get the flag; a shell pane never does.
 
 ## [0.9.0] - 2026-08-30
 

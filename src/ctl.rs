@@ -218,24 +218,24 @@ pub fn extra_allow_from_env() -> Vec<String> {
 /// Pull amux's own launch meta-flags off the front of the (already identity-
 /// stripped) argument vector, before the hosted command begins — exactly the way
 /// [`crate::spawn::parse`] pulls `-n`/`--grid`. Returns `(allow_ctl, max_depth,
-/// yolo, rest)`, where `rest` is the untouched remainder (grid flags + hosted
+/// trust, rest)`, where `rest` is the untouched remainder (grid flags + hosted
 /// command).
 ///
 /// * `--allow-ctl` — opt in to the control channel (off by default).
 /// * `--max-depth <N>` — the recursion guard ceiling (default
 ///   [`DEFAULT_MAX_DEPTH`]); `0` means unlimited (the guard is removed).
-/// * `--yolo` — launch every agent pane amux spawns with claude's
+/// * `--trust` — launch every agent pane amux spawns with claude's
 ///   `--dangerously-skip-permissions`, so a spawned worker comes up **trusted
 ///   and in auto mode** (no workspace-trust dialog, no per-action prompts). This
 ///   is what lets an agent-driven fleet run hands-off; it is also genuinely
-///   dangerous (agents run tools unsupervised), hence opt-in and loudly named.
+///   powerful (agents run tools unsupervised), hence opt-in.
 ///
 /// Parsing stops at the first non-flag token, so a flag the hosted program takes
 /// is never eaten. A bad `--max-depth` value is a clear error.
 pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), String> {
     let mut allow = false;
     let mut max_depth = DEFAULT_MAX_DEPTH;
-    let mut yolo = false;
+    let mut trust = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -243,8 +243,8 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), 
                 allow = true;
                 i += 1;
             }
-            "--yolo" => {
-                yolo = true;
+            "--trust" => {
+                trust = true;
                 i += 1;
             }
             "--max-depth" => {
@@ -258,13 +258,13 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), 
                 max_depth = parse_depth(&s["--max-depth=".len()..])?;
                 i += 1;
             }
-            _ => return Ok((allow, effective_depth(max_depth), yolo, args[i..].to_vec())),
+            _ => return Ok((allow, effective_depth(max_depth), trust, args[i..].to_vec())),
         }
     }
-    Ok((allow, effective_depth(max_depth), yolo, Vec::new()))
+    Ok((allow, effective_depth(max_depth), trust, Vec::new()))
 }
 
-/// The claude flag `--yolo` injects into every agent pane: skips the workspace
+/// The claude flag `--trust` injects into every agent pane: skips the workspace
 /// trust dialog and all permission prompts.
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
@@ -741,11 +741,11 @@ mod tests {
     }
 
     #[test]
-    fn flags_yolo_is_parsed() {
-        let (allow, _depth, yolo, rest) =
-            parse_flags(&v(&["--allow-ctl", "--yolo", "claude"])).unwrap();
+    fn flags_trust_is_parsed() {
+        let (allow, _depth, trust, rest) =
+            parse_flags(&v(&["--allow-ctl", "--trust", "claude"])).unwrap();
         assert!(allow);
-        assert!(yolo);
+        assert!(trust);
         assert_eq!(rest, v(&["claude"]));
     }
 
