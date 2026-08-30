@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-30
+
+### Added
+- **Mouse mode — `Ctrl+A m` — click a pane to focus it.** Off by default (so the
+  terminal's native drag-to-select / copy keeps working); toggle it on and a
+  left-click focuses the tiled pane under the cursor. The bar hint shows `m:mouse`
+  and a note reports the mode when toggled. While on, hold **Shift** and drag to
+  select text (the terminal's override). The scanner parses SGR mouse reports
+  (`ESC [ < Cb ; Cx ; Cy M`) only while mouse mode is on — a lone ESC keypress is
+  never intercepted or delayed for a TUI in the pane when it's off, and non-mouse
+  escapes (arrow keys) always pass through to the pane. Wheel and drag events are
+  ignored (only a plain left click focuses). Built on `rawterm::Terminal::set_mouse`.
+
 ## [0.8.2] - 2026-08-30
 
 ### Fixed

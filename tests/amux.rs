@@ -108,6 +108,60 @@ fn commands_split_surrounding_forwards_in_order() {
     );
 }
 
+// --- mouse mode (Ctrl+A m + SGR click parsing) ------------------------------
+
+#[test]
+fn ctrl_a_m_toggles_mouse() {
+    let mut s = PrefixScanner::new();
+    assert_eq!(s.feed(b"\x01m"), vec![Action::ToggleMouse]);
+}
+
+#[test]
+fn mouse_off_forwards_sgr_sequences_untouched() {
+    // Default (mouse off): a bare SGR-looking sequence is just forwarded to the
+    // pane, and a lone ESC is never intercepted/delayed.
+    let mut s = PrefixScanner::new();
+    assert_eq!(
+        s.feed(b"\x1b[<0;5;9M"),
+        vec![Action::Forward(b"\x1b[<0;5;9M".to_vec())]
+    );
+}
+
+#[test]
+fn mouse_on_left_press_becomes_a_click() {
+    let mut s = PrefixScanner::new();
+    s.set_mouse(true);
+    assert_eq!(
+        s.feed(b"\x1b[<0;12;7M"),
+        vec![Action::MouseClick { col: 12, row: 7 }]
+    );
+}
+
+#[test]
+fn mouse_on_release_and_wheel_and_drag_are_not_clicks() {
+    let mut s = PrefixScanner::new();
+    s.set_mouse(true);
+    assert_eq!(s.feed(b"\x1b[<0;12;7m"), vec![]); // release
+    assert_eq!(s.feed(b"\x1b[<64;1;1M"), vec![]); // wheel-up
+    assert_eq!(s.feed(b"\x1b[<32;1;1M"), vec![]); // motion/drag
+}
+
+#[test]
+fn mouse_on_still_forwards_a_real_arrow_key() {
+    // With mouse on, a non-mouse escape (arrow key ESC [ C) still reaches the pane.
+    let mut s = PrefixScanner::new();
+    s.set_mouse(true);
+    assert_eq!(s.feed(b"\x1b[C"), vec![Action::Forward(b"\x1b[C".to_vec())]);
+}
+
+#[test]
+fn mouse_click_survives_chunk_boundaries() {
+    let mut s = PrefixScanner::new();
+    s.set_mouse(true);
+    assert_eq!(s.feed(b"\x1b[<0;3"), vec![]);
+    assert_eq!(s.feed(b";4M"), vec![Action::MouseClick { col: 3, row: 4 }]);
+}
+
 // --- bar --------------------------------------------------------------------
 
 fn info(title: &str, active: bool, activity: bool, exited: bool) -> PaneInfo {

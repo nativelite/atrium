@@ -87,7 +87,7 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
     }
     if note.is_empty() {
         segs.push(plain(String::from(
-            "| ^A c:win \":% split hjkl:focus z:zoom x:kill q:quit",
+            "| ^A c:win \":% split hjkl:focus z:zoom m:mouse x:kill q:quit",
         )));
     } else {
         segs.push(plain(format!("| {note}")));

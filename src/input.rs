@@ -43,11 +43,22 @@ pub enum Action {
     MoveFocus(Dir),
     /// Toggle the focused pane to/from full-screen passthrough — `Ctrl+A z`.
     Zoom,
+    /// Toggle mouse mode — `Ctrl+A m`. When on, clicks focus panes (and the
+    /// host captures the mouse); when off, the terminal's native drag-to-select
+    /// / copy is restored.
+    ToggleMouse,
+    /// A left-button press at 1-based terminal cell (`col`, `row`) — only
+    /// emitted while mouse mode is on. Used to focus the pane under the cursor.
+    MouseClick {
+        col: u16,
+        row: u16,
+    },
     Quit,
 }
 
-/// The scanner's arming state: idle, prefix seen (command pending), or an
-/// arrow escape mid-parse after a prefixed `ESC`.
+/// The scanner's arming state: idle, prefix seen (command pending), an arrow
+/// escape mid-parse after a prefixed `ESC`, or an SGR-mouse escape mid-parse
+/// (only reached while mouse mode is on).
 #[derive(Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
@@ -57,11 +68,26 @@ enum State {
     ArrowEsc,
     /// Prefix + `ESC [` seen; expecting the final letter `A`/`B`/`C`/`D`.
     ArrowCsi,
+    /// Bare `ESC` seen with mouse mode on; expecting `[` to continue a possible
+    /// SGR mouse sequence (anything else is forwarded verbatim).
+    MouseEsc,
+    /// Bare `ESC [` seen with mouse mode on; expecting `<` (SGR mouse) — else
+    /// forward verbatim.
+    MouseCsi,
+    /// Inside an SGR mouse sequence (`ESC [ <` seen); accumulating
+    /// `Cb;Cx;Cy` until the terminating `M` (press) or `m` (release).
+    MouseParams,
 }
 
 #[derive(Debug, Default)]
 pub struct PrefixScanner {
     state: State,
+    /// Whether mouse mode is on. Only when on does a *bare* `ESC` begin SGR
+    /// mouse detection; off, bare escapes forward immediately (0.1 behavior), so
+    /// a lone ESC keypress is never delayed for a TUI in the pane.
+    mouse: bool,
+    /// Accumulates the `Cb;Cx;Cy` digits of an in-progress SGR mouse sequence.
+    mouse_buf: Vec<u8>,
 }
 
 impl PrefixScanner {
@@ -72,6 +98,13 @@ impl PrefixScanner {
     /// True when a prefix has been seen and a command (or arrow) is pending.
     pub fn armed(&self) -> bool {
         self.state != State::Idle
+    }
+
+    /// Turn mouse-sequence interception on or off. Kept in sync with the host's
+    /// actual mouse capture (`rawterm::Terminal::set_mouse`) so the scanner only
+    /// intercepts `ESC [ <` sequences when the terminal is really sending them.
+    pub fn set_mouse(&mut self, on: bool) {
+        self.mouse = on;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
@@ -142,6 +175,10 @@ impl PrefixScanner {
                             flush(&mut run, &mut actions);
                             actions.push(Action::Zoom);
                         }
+                        b'm' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::ToggleMouse);
+                        }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
                         b'k' => push_move(Dir::Up, &mut run, &mut actions, &mut flush),
@@ -153,9 +190,66 @@ impl PrefixScanner {
                         _ => {} // unknown command: swallow prefix and byte
                     }
                 }
+                State::MouseEsc => {
+                    // Bare `ESC` (mouse mode): only `[` continues toward an SGR
+                    // mouse sequence; anything else is a normal escape — forward
+                    // the `ESC` and re-handle this byte as an idle byte.
+                    if b == b'[' {
+                        self.state = State::MouseCsi;
+                    } else {
+                        run.push(0x1b);
+                        self.state = State::Idle;
+                        if b == PREFIX {
+                            self.state = State::Armed;
+                        } else {
+                            run.push(b);
+                        }
+                    }
+                    continue;
+                }
+                State::MouseCsi => {
+                    // `ESC [` (mouse mode): `<` confirms SGR mouse; else forward
+                    // `ESC [` and re-handle this byte.
+                    if b == b'<' {
+                        self.mouse_buf.clear();
+                        self.state = State::MouseParams;
+                    } else {
+                        run.push(0x1b);
+                        run.push(b'[');
+                        self.state = State::Idle;
+                        if b == PREFIX {
+                            self.state = State::Armed;
+                        } else {
+                            run.push(b);
+                        }
+                    }
+                    continue;
+                }
+                State::MouseParams => {
+                    // Accumulate `Cb;Cx;Cy` until the terminator: `M` = press,
+                    // `m` = release. We act on a left-button press only.
+                    if b == b'M' || b == b'm' {
+                        if b == b'M' {
+                            if let Some((cb, col, row)) = parse_sgr_mouse(&self.mouse_buf) {
+                                if is_left_press(cb) {
+                                    flush(&mut run, &mut actions);
+                                    actions.push(Action::MouseClick { col, row });
+                                }
+                            }
+                        }
+                        self.mouse_buf.clear();
+                        self.state = State::Idle;
+                    } else if self.mouse_buf.len() < 32 {
+                        // Bound the buffer so a malformed stream can't grow it.
+                        self.mouse_buf.push(b);
+                    }
+                    continue;
+                }
                 State::Idle => {
                     if b == PREFIX {
                         self.state = State::Armed;
+                    } else if self.mouse && b == 0x1b {
+                        self.state = State::MouseEsc;
                     } else {
                         run.push(b);
                     }
@@ -165,6 +259,27 @@ impl PrefixScanner {
         flush(&mut run, &mut actions);
         actions
     }
+}
+
+/// Parse an SGR mouse body `Cb;Cx;Cy` into `(button_flags, col, row)`. Columns
+/// and rows are 1-based terminal cells. Returns `None` on a malformed body.
+fn parse_sgr_mouse(buf: &[u8]) -> Option<(u32, u16, u16)> {
+    let s = std::str::from_utf8(buf).ok()?;
+    let mut parts = s.split(';');
+    let cb: u32 = parts.next()?.parse().ok()?;
+    let col: u16 = parts.next()?.parse().ok()?;
+    let row: u16 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None; // extra fields → not a well-formed mouse report
+    }
+    Some((cb, col, row))
+}
+
+/// True when an SGR button code is a plain **left-button** event (button bits
+/// `00`) that is neither pointer **motion** (bit 5, `0x20`) nor a **wheel**
+/// event (bit 6, `0x40`) — i.e. a real left click, not a drag or scroll.
+fn is_left_press(cb: u32) -> bool {
+    cb & 0b0110_0011 == 0
 }
 
 /// Emit a focus-move action, flushing any pending forward run first.

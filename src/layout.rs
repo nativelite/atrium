@@ -171,6 +171,18 @@ impl Tree {
         self.focus = new_id;
     }
 
+    /// Move focus directly to pane `id` (a no-op returning `false` if `id` is not
+    /// in the tree). This is what lets a mouse click focus the pane under the
+    /// cursor.
+    pub fn focus_pane(&mut self, id: usize) -> bool {
+        if self.ids().contains(&id) {
+            self.focus = id;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Split a *specific* pane `target` in `dir` (not necessarily the focused
     /// one), giving the new half pane id `new_id`, and move focus to the new
     /// pane. Returns `false` (a no-op) if `target` is not in the tree. This is

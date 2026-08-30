@@ -344,6 +344,10 @@ fn run(
     }
     let mut active = 0usize; // active window index
     let mut scanner = PrefixScanner::new();
+    // Mouse mode is off by default (native drag-to-select / copy works); `Ctrl+A m`
+    // toggles it on to click-focus panes. Kept in sync between the terminal (which
+    // actually captures the mouse) and the scanner (which parses the clicks).
+    let mut mouse_on = false;
     let mut buf = [0u8; 8192];
     let mut force_repaint = true;
     let mut last_bar_paint = Instant::now();
@@ -466,6 +470,51 @@ fn run(
                         resize_window(w, rows, cols);
                         prev_master = None;
                         force_repaint = true;
+                    }
+                }
+                Action::ToggleMouse => {
+                    mouse_on = !mouse_on;
+                    // Keep the terminal's capture and the scanner's parsing in
+                    // lockstep — set both, and don't leave one on if the other
+                    // fails.
+                    if term.set_mouse(mouse_on).is_ok() {
+                        scanner.set_mouse(mouse_on);
+                        flash = Some((
+                            if mouse_on {
+                                "mouse: ON — click a pane to focus (Shift-drag to select text)"
+                                    .to_string()
+                            } else {
+                                "mouse: OFF — drag to select / copy".to_string()
+                            },
+                            Instant::now(),
+                        ));
+                    } else {
+                        mouse_on = !mouse_on; // revert on failure
+                        flash = Some(("mouse mode unavailable here".to_string(), Instant::now()));
+                    }
+                    force_repaint = true;
+                }
+                Action::MouseClick { col, row } => {
+                    // Focus the pane under the cursor. Only meaningful in a tiled
+                    // window (a single/zoomed pane already has focus).
+                    let w = &mut windows[active];
+                    if w.tiled() {
+                        let outer = tiled_outer(rows, cols);
+                        let mx = col.saturating_sub(1) as usize;
+                        let my = row.saturating_sub(1) as usize;
+                        for (id, rect) in w.tree.rects(outer) {
+                            let inside = my >= rect.row
+                                && my < rect.row + rect.rows
+                                && mx >= rect.col
+                                && mx < rect.col + rect.cols;
+                            if inside {
+                                if w.tree.focus_pane(id) {
+                                    prev_master = None;
+                                    force_repaint = true;
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
                 Action::KillPane => {
