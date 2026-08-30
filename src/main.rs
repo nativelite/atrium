@@ -1350,6 +1350,11 @@ fn spawn_worker_window(
             let agent_id = pane.agent_id;
             let session = pane.session_id.clone();
             windows.push(w);
+            // Size the new window's pane to its true rect now, so the agent
+            // paints full-height immediately instead of at the rough spawn size
+            // (which otherwise needs a manual terminal resize to correct).
+            let last = windows.len() - 1;
+            resize_window(&mut windows[last], rows, cols);
             amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
         }
         Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
@@ -1404,6 +1409,11 @@ fn spawn_worker_here(
             w.tree
                 .split_pane(caller_pane_id, layout::Dir::Vertical, new_id);
             w.zoomed = false;
+            // Resize the whole window so both the caller and the fresh worker get
+            // their exact inner rects — without this the worker keeps its rough
+            // half-size and paints short (blank below), fixed only by a manual
+            // terminal resize. Mirrors what the interactive split handlers do.
+            resize_window(&mut windows[wi], rows, cols);
             amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
         }
         Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),

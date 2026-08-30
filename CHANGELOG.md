@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-30
+
+### Fixed
+- **A `ctl`-spawned worker now paints full-size immediately.** A `ctl spawn`
+  (new window) and `ctl spawn --here` (split) sized the worker's pty to a rough
+  spawn estimate but never resized the window to its true rects, so the agent
+  rendered short — content bunched at the top with a blank area below — until a
+  manual terminal resize forced a recompute. Both paths now call `resize_window`
+  right after spawning (as the interactive split handlers already did), so the
+  worker fills its pane at once.
+
 ## [0.8.0] - 2026-08-30
 
 ### Added
