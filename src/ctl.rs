@@ -9,8 +9,10 @@
 //!   *pure* guard — allowlist + depth cap — so the safety rules are unit-tested
 //!   without a pty or a running amux.
 //!
-//! C1 surface: `spawn` (open a visible worker pane) and `list` (the org chart).
-//! `send` / `status` / `kill` arrive in C2–C3.
+//! Surface: `spawn` (open a visible worker — new window or `--here` split),
+//! `list` (the org chart), `send` (queue-until-idle task delivery), and
+//! `status` (agsess-backed). `send`/`status` with a target are subtree-scoped.
+//! `kill` + identity delegation arrive in C3.
 
 use std::process::ExitCode;
 
@@ -38,13 +40,34 @@ pub struct Request {
     pub cmd: Cmd,
 }
 
-/// The C1 command set.
+/// The command set (C1: spawn/list; C2 adds send/status).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     /// Open a new worker pane running `argv`, tagged `role`.
     Spawn(SpawnReq),
     /// Report the spawn tree.
     List,
+    /// Feed `text` to a target pane's agent as a submitted prompt (queued until
+    /// the target is idle).
+    Send(SendReq),
+    /// Report status: one target, or (no target) the caller's visible subtree.
+    Status(StatusReq),
+}
+
+/// A `send` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SendReq {
+    /// Pane id (numeric) or role label to deliver to.
+    pub target: String,
+    /// The task/prompt text to submit.
+    pub text: String,
+}
+
+/// A `status` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusReq {
+    /// A specific pane id/role, or `None` for the caller's subtree roll-up.
+    pub target: Option<String>,
 }
 
 /// A `spawn` request's payload.
@@ -54,7 +77,8 @@ pub struct SpawnReq {
     /// The command to host, e.g. `["claude"]`. Must be non-empty and on the
     /// agent allowlist (checked by [`evaluate_spawn`]).
     pub argv: Vec<String>,
-    /// Open in a new window (true, the C1 default) vs. split the caller (later).
+    /// Open in a new window (true, the default) vs. `--here` split beside the
+    /// caller (false).
     pub new_window: bool,
 }
 
@@ -115,6 +139,60 @@ pub fn evaluate_spawn(
         });
     }
     Ok(attempted)
+}
+
+/// Resolve a `send`/`status` target string to a pane's agent id. A numeric
+/// target matches by agent id; otherwise it matches by role label. `candidates`
+/// is `(agent_id, role)` for every live pane. Returns a clear error when the
+/// target is unknown or a role is ambiguous (matches more than one pane). Pure.
+pub fn resolve_target(
+    target: &str,
+    candidates: &[(usize, Option<String>)],
+) -> Result<usize, String> {
+    if let Ok(id) = target.parse::<usize>() {
+        if candidates.iter().any(|(cid, _)| *cid == id) {
+            return Ok(id);
+        }
+        return Err(format!("no pane with id {id}"));
+    }
+    let hits: Vec<usize> = candidates
+        .iter()
+        .filter(|(_, role)| role.as_deref() == Some(target))
+        .map(|(cid, _)| *cid)
+        .collect();
+    match hits.as_slice() {
+        [] => Err(format!("no pane with id or role {target:?}")),
+        [one] => Ok(*one),
+        many => Err(format!(
+            "role {target:?} is ambiguous ({} panes: {}); use a pane id",
+            many.len(),
+            many.iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Is `target` inside the subtree rooted at `root` (i.e. `root` itself or a
+/// descendant of it)? `parents` maps each `agent_id` to its parent. This is the
+/// **subtree-scoping guard** (Decision 3): a non-privileged caller may only
+/// `send`/`status` panes in its own subtree. Pure; cycle-guarded.
+pub fn in_subtree(target: usize, root: usize, parents: &[(usize, Option<usize>)]) -> bool {
+    if target == root {
+        return true;
+    }
+    let parent_of = |id: usize| parents.iter().find(|(i, _)| *i == id).and_then(|(_, p)| *p);
+    let mut cur = target;
+    // The tree is shallow (depth-capped) but guard against a malformed cycle.
+    for _ in 0..4096 {
+        match parent_of(cur) {
+            Some(p) if p == root => return true,
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Environment knob (comma-separated) that extends the ctl agent allowlist
@@ -213,6 +291,23 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             })
         }
         Some("list") => Cmd::List,
+        Some("send") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "send needs a target".to_string())?
+                .to_string();
+            let text = v
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "send needs text".to_string())?
+                .to_string();
+            Cmd::Send(SendReq { target, text })
+        }
+        Some("status") => {
+            let target = v.get("target").and_then(Value::as_str).map(str::to_string);
+            Cmd::Status(StatusReq { target })
+        }
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
     };
@@ -245,6 +340,28 @@ pub fn reply_spawned(pane: usize, role: Option<&str>, session: Option<&str>) -> 
         ("pane", i(pane)),
         ("role", role.map(s).unwrap_or(Value::Null)),
         ("session", session.map(s).unwrap_or(Value::Null)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"target":<id>,"queued":<bool>}` — a `send` was accepted. `queued`
+/// is true when the target was busy (delivery waits for it to go idle), false
+/// when it will go out immediately. Delivery itself is asynchronous.
+pub fn reply_sent(target: usize, queued: bool) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("target", i(target)),
+        ("queued", Value::Bool(queued)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"pane":<id>,"status":"<label>"}` — a single target's status.
+pub fn reply_status_one(pane: usize, status: Option<&str>) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("pane", i(pane)),
+        ("status", status.map(s).unwrap_or(Value::Null)),
     ])
     .to_string()
 }
@@ -378,8 +495,27 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
         Some("list") => {
             pairs.push(("cmd", s("list")));
         }
+        Some("send") => {
+            pairs.push(("cmd", s("send")));
+            let target = args
+                .get(1)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "send needs a target (pane id or role)".to_string())?;
+            let text = args[2..].join(" ");
+            if text.trim().is_empty() {
+                return Err("send needs text after the target".to_string());
+            }
+            pairs.push(("target", Value::String(target.clone())));
+            pairs.push(("text", Value::String(text)));
+        }
+        Some("status") => {
+            pairs.push(("cmd", s("status")));
+            if let Some(target) = args.get(1).filter(|t| !t.starts_with('-')) {
+                pairs.push(("target", Value::String(target.clone())));
+            }
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
-        None => return Err("needs a subcommand: spawn | list".to_string()),
+        None => return Err("needs a subcommand: spawn | list | send | status".to_string()),
     }
     Ok(obj(pairs).to_string())
 }
@@ -472,6 +608,83 @@ mod tests {
             Cmd::Spawn(sp) => assert!(!sp.new_window),
             _ => panic!("expected spawn"),
         }
+    }
+
+    #[test]
+    fn build_and_parse_send_request() {
+        let line = build_request(&v(&["send", "dev_1", "implement", "X", "TDD"]), Some(0)).unwrap();
+        let req = parse_request(&line).unwrap();
+        assert_eq!(req.caller, Some(0));
+        match req.cmd {
+            Cmd::Send(sr) => {
+                assert_eq!(sr.target, "dev_1");
+                assert_eq!(sr.text, "implement X TDD");
+            }
+            _ => panic!("expected send"),
+        }
+    }
+
+    #[test]
+    fn send_without_text_is_an_error() {
+        let err = build_request(&v(&["send", "dev_1"]), None).unwrap_err();
+        assert!(err.contains("text"), "{err}");
+    }
+
+    #[test]
+    fn build_and_parse_status_request_with_and_without_target() {
+        let one = parse_request(&build_request(&v(&["status", "3"]), None).unwrap()).unwrap();
+        assert_eq!(
+            one.cmd,
+            Cmd::Status(StatusReq {
+                target: Some("3".into())
+            })
+        );
+        let all = parse_request(&build_request(&v(&["status"]), None).unwrap()).unwrap();
+        assert_eq!(all.cmd, Cmd::Status(StatusReq { target: None }));
+    }
+
+    #[test]
+    fn resolve_target_by_id_and_role() {
+        let panes = [
+            (0usize, Some("ceo".to_string())),
+            (1, Some("dev_1".to_string())),
+            (2, None),
+        ];
+        assert_eq!(resolve_target("1", &panes), Ok(1));
+        assert_eq!(resolve_target("dev_1", &panes), Ok(1));
+        assert!(resolve_target("9", &panes).unwrap_err().contains("no pane"));
+        assert!(resolve_target("ghost", &panes)
+            .unwrap_err()
+            .contains("no pane"));
+    }
+
+    #[test]
+    fn resolve_target_flags_ambiguous_roles() {
+        let panes = [
+            (1usize, Some("dev".to_string())),
+            (2, Some("dev".to_string())),
+        ];
+        assert!(resolve_target("dev", &panes)
+            .unwrap_err()
+            .contains("ambiguous"));
+    }
+
+    #[test]
+    fn in_subtree_walks_the_parent_chain() {
+        // 0 (root) → 1 (lead) → 2, 3 (ICs); 4 is a sibling lead's IC.
+        let parents = [
+            (0usize, None),
+            (1, Some(0)),
+            (2, Some(1)),
+            (3, Some(1)),
+            (4, Some(5)),
+            (5, Some(0)),
+        ];
+        assert!(in_subtree(2, 1, &parents)); // IC is in its lead's subtree
+        assert!(in_subtree(1, 1, &parents)); // a pane is in its own subtree
+        assert!(!in_subtree(4, 1, &parents)); // a cousin is not
+        assert!(in_subtree(4, 0, &parents)); // everything is under the root
+        assert!(!in_subtree(1, 2, &parents)); // a parent is not under its child
     }
 
     #[test]
