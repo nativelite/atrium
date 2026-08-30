@@ -36,6 +36,14 @@ impl Grid {
         self.rows * self.cols
     }
 
+    /// Parse a `"RxC"` grid spec (rows x cols, `x` or `X`) into a [`Grid`],
+    /// requiring both dimensions >= 1 and a product >= 2. Shared by the
+    /// `--grid` flag ([`parse`]) and the fleet loader's `"grid"` field, so both
+    /// accept exactly the same spec. Returns a clear error string on a bad spec.
+    pub fn parse_spec(val: &str) -> Result<Grid, String> {
+        parse_grid(val)
+    }
+
     /// A balanced `R×C` shape for a plain count `n`: rows = the divisor of `n`
     /// closest to `sqrt(n)`, cols = `n / rows`. For the even counts mass-spawn
     /// accepts this yields the intuitive squares/rectangles: `4→2×2`, `6→2×3`,

@@ -85,6 +85,12 @@ impl Window {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `amux fleet …` is its own command family (a saved roster of agents), not a
+    // hosted program — dispatch it before any of amux's flag parsing so `fleet`
+    // and its subcommands are never mistaken for a command to host.
+    if args.first().map(String::as_str) == Some("fleet") {
+        return fleet_cmd(&args[1..]);
+    }
     // amux's own `--identity <name>` / `-I <name>` is stripped off the front,
     // before the hosted command begins; it tags the initial agent pane and is
     // inherited by every split/new pane (stored, re-resolved per spawn). Only
@@ -123,7 +129,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run(&mut term, &command, identity.as_deref(), grid)
+    run(&mut term, &command, identity.as_deref(), grid, None)
 }
 
 fn run(
@@ -131,6 +137,12 @@ fn run(
     command: &[String],
     identity: Option<&str>,
     grid: Option<amux::spawn::Grid>,
+    // A pre-built initial window (the fleet loader spawns its own panes, one per
+    // agent, each with its own identity/cwd). When `Some`, it is used verbatim
+    // as the first window and `command`/`grid` are ignored for it — but they
+    // still drive later `Ctrl+A c` new panes and splits (which host `command`
+    // under `identity`), so a fleet's new panes open a shell as a scratch pane.
+    initial_window: Option<Window>,
 ) -> ExitCode {
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
@@ -146,12 +158,16 @@ fn run(
     // bar and the pane spawns *without* the credential — never silently, and
     // never unauthenticated-without-saying-so (§7).
     let mut flash: Option<(String, Instant)> = None;
-    // Mass-spawn: one window of N tiles in a balanced grid; otherwise the 0.1
-    // single-pane path, untouched. Both share the same spawn machinery (each
-    // pane its own session, all under the same identity).
-    let initial = match grid {
-        Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
-        None => spawn_window(command, rows, cols, 0, identity, &mut flash),
+    // A pre-built window (fleet) is used as-is; otherwise mass-spawn opens one
+    // window of N tiles in a balanced grid, or the 0.1 single-pane path. All
+    // share the same spawn machinery (each pane its own session).
+    let prebuilt = initial_window.is_some();
+    let initial = match initial_window {
+        Some(w) => Ok(w),
+        None => match grid {
+            Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
+            None => spawn_window(command, rows, cols, 0, identity, &mut flash),
+        },
     };
     match initial {
         Ok(w) => windows.push(w),
@@ -161,9 +177,9 @@ fn run(
             return ExitCode::FAILURE;
         }
     }
-    // A grid window is born tiled: resize so every pane's pty/emulator gets its
-    // true inner rect (spawn used rough sizes).
-    if grid.is_some() {
+    // A grid or pre-built (fleet) window is born tiled: resize so every pane's
+    // pty/emulator gets its true inner rect (spawn used rough sizes).
+    if grid.is_some() || prebuilt {
         resize_window(&mut windows[0], rows, cols);
     }
     let mut active = 0usize; // active window index
@@ -720,6 +736,234 @@ fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
     }
 }
 
+/// The `amux fleet …` command family. `fleet up <name>` brings up a saved
+/// roster; `fleet ls` lists the fleet names; anything else prints usage. Kept
+/// separate from the hosted-program path — a fleet is amux's own command, not a
+/// child to run.
+fn fleet_cmd(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("up") => match args.get(1) {
+            Some(name) => fleet_up(name),
+            None => {
+                eprintln!("amux fleet up <name>: needs a fleet name (try `amux fleet ls`)");
+                ExitCode::FAILURE
+            }
+        },
+        Some("ls") => fleet_ls(),
+        _ => {
+            eprintln!("usage: amux fleet up <name> | amux fleet ls");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// List the fleet names in the discovered fleet file, in file order. A missing
+/// file or a malformed one is a clear error on stderr (non-zero exit).
+fn fleet_ls() -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let located = match amux::fleet::discover(&cwd) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("amux fleet: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = match std::fs::read_to_string(&located.path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("amux fleet: cannot read {}: {e}", located.path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let fleets = match amux::fleet::parse(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("amux fleet: {}: {e}", located.path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let names = fleets.names();
+    if names.is_empty() {
+        println!("(no fleets defined in {})", located.path.display());
+    } else {
+        for name in names {
+            println!("{name}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `amux fleet up <name>` — read the fleet file, build one tiled window with a
+/// pane per agent (each in its `cwd`, under its identity, with its extra args),
+/// and hand it to the run loop. Any error before spawning (no file, bad JSON,
+/// unknown name, empty fleet, a bad grid, a missing `cwd`) is reported and
+/// **nothing is spawned** — never a partial fleet.
+fn fleet_up(name: &str) -> ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let located = match amux::fleet::discover(&cwd) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("amux fleet: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let text = match std::fs::read_to_string(&located.path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("amux fleet: cannot read {}: {e}", located.path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let fleets = match amux::fleet::parse(&text) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("amux fleet: {}: {e}", located.path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let fleet = match fleets.get(name) {
+        Some(f) => f.clone(),
+        None => {
+            let available = fleets.names().join(", ");
+            eprintln!("amux fleet: no fleet named {name:?} (available: {available})");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Grid: explicit `RxC` (must fit the agent count) or an auto balanced grid.
+    let n = fleet.agents.len();
+    let grid = match &fleet.grid {
+        Some(spec) => match amux::spawn::Grid::parse_spec(spec) {
+            Ok(g) if g.total() >= n => g,
+            Ok(g) => {
+                eprintln!(
+                    "amux fleet: grid {spec:?} has {} cells but fleet {name:?} has {n} agents",
+                    g.total()
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("amux fleet: fleet {name:?}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => amux::spawn::Grid::balanced(n.max(2)),
+    };
+
+    // Validate every agent's cwd *before* spawning anything, so a bad path never
+    // leaves a half-open fleet.
+    for a in &fleet.agents {
+        if let Some(dir) = &a.cwd {
+            let resolved = amux::fleet::resolve_dir(&located.dir, dir);
+            if !resolved.is_dir() {
+                eprintln!(
+                    "amux fleet: agent {:?}: cwd {} does not exist",
+                    a.name,
+                    resolved.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    let mut term = match rawterm::Terminal::raw() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("amux: stdin/stdout must be a terminal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (rows, cols) = term.size().unwrap_or((24, 80));
+
+    let mut flash: Option<(String, Instant)> = None;
+    let window = match spawn_fleet_window(&fleet, &located.dir, grid, rows, cols, &mut flash) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("amux fleet: cannot start fleet {name:?}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // New panes / splits opened later host a shell under the fleet's default
+    // identity — a scratch pane in-role, not another copy of an agent.
+    let scratch = vec![default_shell()];
+    run(
+        &mut term,
+        &scratch,
+        fleet.identity.as_deref(),
+        None,
+        Some(window),
+    )
+}
+
+/// Build the fleet's tiled window: one pane per agent, laid out on `grid`
+/// (agents fill leaf ids `0..n` row-major). Each pane runs the agent's `cmd`
+/// plus its fleet args (`--add-dir`/`--append-system-prompt`/`--model`/
+/// `--effort`), under its identity (per-agent, else the fleet default), in its
+/// resolved `cwd`. If any agent fails to spawn, the panes already started are
+/// killed and the whole window is abandoned — never a partial fleet.
+fn spawn_fleet_window(
+    fleet: &amux::fleet::Fleet,
+    base_dir: &std::path::Path,
+    grid: amux::spawn::Grid,
+    rows: u16,
+    cols: u16,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Window> {
+    let tree = Tree::grid(grid.rows, grid.cols);
+    // Rough per-cell inner size (minus the one-cell border on each side); the
+    // caller's resize_window fixes it exactly right after.
+    let cell_rows = ((rows.saturating_sub(1).max(1) as usize / grid.rows.max(1)).saturating_sub(2))
+        .max(1) as u16;
+    let cell_cols = ((cols as usize / grid.cols.max(1)).saturating_sub(2)).max(1) as u16;
+
+    let mut panes: Vec<Pane> = Vec::with_capacity(fleet.agents.len());
+    for (id, agent) in fleet.agents.iter().enumerate() {
+        // Resolve add_dirs against the fleet file's directory (absolute as-is).
+        let resolved_dirs: Vec<String> = agent
+            .add_dirs
+            .iter()
+            .map(|d| {
+                amux::fleet::resolve_dir(base_dir, d)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        let command = agent.args(&resolved_dirs);
+        // Per-agent identity else the fleet default.
+        let identity = agent.identity.as_deref().or(fleet.identity.as_deref());
+        // cwd resolved against the fleet dir (validated to exist by the caller).
+        let cwd = agent.cwd.as_ref().map(|d| {
+            amux::fleet::resolve_dir(base_dir, d)
+                .to_string_lossy()
+                .into_owned()
+        });
+        match spawn_pane_full(
+            &command,
+            cell_rows,
+            cell_cols,
+            id,
+            identity,
+            cwd.as_deref(),
+            flash,
+        ) {
+            Ok(pane) => panes.push(pane),
+            Err(e) => {
+                for p in panes.iter_mut() {
+                    let _ = p.pty.kill();
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(Window {
+        panes,
+        tree,
+        zoomed: false,
+        next_id: fleet.agents.len(),
+    })
+}
+
 fn spawn_window(
     command: &[String],
     rows: u16,
@@ -798,6 +1042,32 @@ fn spawn_pane(
     identity: Option<&str>,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
+    // The single-pane / split / grid path: no per-pane working directory (the
+    // child inherits amux's cwd, today's behavior). The fleet loader is the only
+    // caller that supplies a `cwd`; everyone else routes through here with `None`.
+    spawn_pane_full(command, rows, cols, id, identity, None, flash)
+}
+
+/// The shared spawn core: build the agent's launch (session-id inject, Windows
+/// shim wrapping, identity env resolution), then spawn it on a pty of the given
+/// size in the given working directory. Every pane amux hosts — the initial one,
+/// a split, a grid tile, and each fleet agent — is born here, so the identity /
+/// `--session-id` / effective-command discipline is written once and shared.
+///
+/// `command` is the *base* user command with any extra agent args already
+/// appended (e.g. the fleet loader's `--add-dir` / `--append-system-prompt` /
+/// `--model` / `--effort`); this function then appends `--session-id` when the
+/// pane is a bindable agent, exactly as before. `cwd` is `Some(dir)` for a fleet
+/// agent (so its `CLAUDE.md` auto-loads) and `None` everywhere else.
+fn spawn_pane_full(
+    command: &[String],
+    rows: u16,
+    cols: u16,
+    id: usize,
+    identity: Option<&str>,
+    cwd: Option<&str>,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Pane> {
     let title = std::path::Path::new(&command[0])
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -832,15 +1102,15 @@ fn spawn_pane(
     // never logged, never printed. The pane stores only the identity *name*.
     //
     // Resolve failure (no such target, vault locked) is surfaced in the bar and
-    // the pane spawns with plain `spawn` (ambient creds) — visible, not silent,
-    // and never unauthenticated-without-saying-so (§7).
+    // the pane spawns with plain env (ambient creds) but still in `cwd` — visible,
+    // not silent, and never unauthenticated-without-saying-so (§7).
     let pty = if inject {
         let name = identity.expect("wants_env implies Some");
         match akey::resolve(name) {
             Ok(env) => {
                 // `env` holds secret values; used for this one spawn only, then
                 // dropped. Deliberately never formatted, logged, or stored.
-                pty::Pty::spawn_with_env(&effective[0], &argrefs, r, c, &env)?
+                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &env, cwd)?
             }
             Err(e) => {
                 // Name only in the message — `e` is akey's own error text
@@ -850,11 +1120,11 @@ fn spawn_pane(
                     format!("identity {name:?} unresolved: {e} — running without it"),
                     Instant::now(),
                 ));
-                pty::Pty::spawn(&effective[0], &argrefs, r, c)?
+                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &[], cwd)?
             }
         }
     } else {
-        pty::Pty::spawn(&effective[0], &argrefs, r, c)?
+        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &[], cwd)?
     };
     Ok(Pane {
         id,

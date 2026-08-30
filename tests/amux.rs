@@ -743,6 +743,106 @@ fn mass_spawn_rejects_odd_n() {
     assert_ne!(code, 0, "odd -n should be a startup error");
 }
 
+// --- fleet (0.6): `amux fleet up <name>` brings up a saved roster ------------
+
+/// `amux fleet up test` reads a temp `amux.fleet.json` with two shell agents and
+/// brings up ONE tiled window with two panes. Both pane labels appear in the
+/// composited frame and each round-trips a marker — proving two live sessions,
+/// laid out by the loader. Hermetic: the agents run the shell, not claude.
+#[test]
+fn fleet_up_opens_a_two_agent_window() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    // A fleet file in a fresh temp dir; run amux with that dir as cwd so the
+    // loader's cwd-first discovery finds it.
+    let td = std::env::temp_dir().join(format!("amux-fleet-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    let cmd_json = {
+        let mut parts = vec![format!("{shell:?}")];
+        parts.extend(args.iter().map(|a| format!("{a:?}")));
+        parts.join(", ")
+    };
+    let fleet_json = format!(
+        r#"{{ "fleets": {{ "test": {{ "grid": "1x2", "agents": [
+          {{ "name": "one", "cmd": [{cmd_json}] }},
+          {{ "name": "two", "cmd": [{cmd_json}] }}
+        ] }} }} }}"#
+    );
+    std::fs::write(td.join("amux.fleet.json"), fleet_json).unwrap();
+
+    // Launch amux via its own binary, spawned with the temp dir as its working
+    // directory so `fleet up` discovers the local file. pty::spawn_full sets cwd.
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_amux"),
+        &["fleet", "up", "test"],
+        30,
+        120,
+        &[],
+        Some(&td.to_string_lossy()),
+    )
+    .unwrap();
+
+    let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
+    // Two pane labels appear in the tiled frame: " 1:<stem> " and " 2:<stem> ".
+    let mut label2 = b" 2:".to_vec();
+    label2.extend_from_slice(stem);
+    let out = read_until(&mut p, &label2, Duration::from_secs(20));
+    for i in 1..=2u8 {
+        let mut label = vec![b' ', b'0' + i, b':'];
+        label.extend_from_slice(stem);
+        assert!(
+            contains(&out, &label),
+            "fleet pane {i} label missing: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    // The focused (pane 1) shell round-trips.
+    p.write(b"echo amux-fleet-p1\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-fleet-p1", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-fleet-p1"),
+        "fleet pane 1 silent: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Move focus to the second pane and prove it is live too.
+    p.write(b"\x01l").unwrap();
+    p.write(b"echo amux-fleet-p2\r\n").unwrap();
+    let out = read_until(&mut p, b"amux-fleet-p2", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"amux-fleet-p2"),
+        "fleet pane 2 silent after focus move: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// `amux fleet up nope` with no fleet file is a clean error, not a hung window.
+#[test]
+fn fleet_up_unknown_file_is_a_startup_error() {
+    let td = std::env::temp_dir().join(format!("amux-fleet-nofile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_amux"),
+        &["fleet", "up", "nope"],
+        24,
+        80,
+        &[],
+        Some(&td.to_string_lossy()),
+    )
+    .unwrap();
+    assert_ne!(wait_exit(&mut p, 15), 0, "missing fleet file should error");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// A literal Ctrl+A goes through with the doubled prefix.
 #[test]
 fn double_prefix_reaches_the_child() {

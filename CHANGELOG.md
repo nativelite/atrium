@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-29
+
+### Added
+- **Saved rosters — `amux fleet up <name>`.** Bring up a whole squad of agents
+  already in-role — identity, working directory, context dirs, and instructions —
+  from one command. A fleet is defined in a project-local **`amux.fleet.json`**
+  (checked into the repo so a team shares it), with a user-global fallback
+  (`%APPDATA%\amux\fleet.json` on Windows / `~/.config/amux/fleet.json`
+  elsewhere). `amux fleet up review-crew` reads the file (read-only), builds one
+  tiled window with a pane per agent — laid out by the fleet's `"grid"` or an
+  auto balanced grid — and spawns each agent's `cmd` in its `cwd` (so its
+  `CLAUDE.md` auto-loads), under its identity (per-agent, else a fleet default,
+  resolved via `akey` and injected per-pane), with `--add-dir` (`add_dirs`),
+  `--append-system-prompt` (`prompt`), `--model`, and `--effort` when set, plus
+  the usual `--session-id` so status binding works per pane. Each pane wears its
+  identity `·<name>` tag exactly as `--identity` panes do — the **name** only,
+  never a secret. `amux fleet ls` lists the fleet names. Any error before
+  spawning — no file (the message names both locations), malformed JSON, unknown
+  fleet, a fleet with zero agents, a grid that does not fit the agent count, or a
+  `cwd` that does not exist — is reported and **nothing is spawned** (never a
+  partial fleet). Unknown JSON fields are ignored, so the schema can grow without
+  breaking older files. Reuses the existing per-pane spawn machinery (identity /
+  `--session-id` / effective-command / cwd), so amux adds no secret handling.
+  Depends on the `json` crate (org, zero-dep) and pty 0.3.0's `spawn_full` (cwd).
+
 ## [0.5.0] - 2026-08-29
 
 ### Added

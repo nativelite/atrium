@@ -176,8 +176,69 @@ amux --identity work -n 4 claude   # four panes, all under the `work` identity
   independently — and **all under the same `--identity`** if one was given.
 - Everything after spawn is the ordinary tiled window: `hjkl`/arrows move focus,
   `z` zooms, `x` kills and re-tiles, the status/identity chrome and `q` quit all
-  work exactly as for a hand-split grid. (Saved rosters / `amux fleet up` are a
-  later increment; this is mass-spawn only.)
+  work exactly as for a hand-split grid. For a **saved roster** — named agents
+  each with their own identity, working dir, and instructions — see
+  `amux fleet up` below.
+
+## Saved rosters — `amux fleet up` (0.6)
+
+Mass-spawn opens N copies of *one* command; a **fleet** brings up a squad of
+*different, named* agents, each already in-role — its own identity, working
+directory, extra context dirs, and instructions — from one command:
+
+```bash
+amux fleet up review-crew   # bring up the whole squad, each on its identity
+amux fleet ls               # list the fleet names in the file
+```
+
+A fleet lives in **`amux.fleet.json`**, looked for in the current directory first
+(check it into the repo so a team shares the fleet), then a user-global fallback
+(`%APPDATA%\amux\fleet.json` on Windows, `~/.config/amux/fleet.json` elsewhere).
+The file is read **read-only** — amux never writes it.
+
+```json
+{
+  "fleets": {
+    "review-crew": {
+      "grid": "2x2",
+      "identity": "work",
+      "agents": [
+        {
+          "name": "reviewer",
+          "cmd": ["claude"],
+          "identity": "wif:prod",
+          "cwd": "./review",
+          "add_dirs": ["../shared", "./specs"],
+          "prompt": "You review PRs for safety.",
+          "model": "opus",
+          "effort": "high"
+        },
+        { "name": "builder", "cmd": ["claude"], "cwd": "./app" }
+      ]
+    }
+  }
+}
+```
+
+- **`grid`** (optional) — an `RxC` layout that must fit the agent count; omit it
+  and the window auto-grids from the number of agents.
+- **`identity`** (optional) — a default `akey` identity for every agent; a
+  per-agent `identity` overrides it. Resolved via `akey` and injected per pane
+  exactly as `--identity` does — the pane shows the `·<name>` tag (the **name**
+  only, never a secret), and a resolve failure is flashed and the pane runs
+  without it, never silently unauthenticated.
+- Each agent needs a **`name`** and a **`cmd`** (command + args). Optional:
+  **`cwd`** (spawned there, so its `CLAUDE.md` auto-loads — resolved relative to
+  the fleet file's directory, absolute paths as-is), **`add_dirs`**
+  (→ `claude --add-dir …`, so it can read other trees), **`prompt`**
+  (→ `--append-system-prompt`), **`model`** (→ `--model`), **`effort`**
+  (→ `--effort`). Each agent still gets its own `--session-id`, so the
+  agent-aware chrome binds each pane independently.
+- **Errors spawn nothing.** No file (the message names both locations), malformed
+  JSON, an unknown fleet name, a fleet with zero agents, a grid that does not fit,
+  or a `cwd` that does not exist — each is a clear startup error, never a partial
+  fleet. Unknown fields are ignored, so the format can grow without breaking
+  older files.
 
 ## The architecture (why it's small and faithful)
 

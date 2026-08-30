@@ -1,6 +1,6 @@
 [package]
 name = "amux"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
@@ -17,6 +17,7 @@ rawterm = { git = "https://github.com/nativelite/rawterm-rs", branch = "main" }
 ansi = { git = "https://github.com/nativelite/ansi-rs", branch = "main" }
 vterm = { git = "https://github.com/nativelite/vterm-rs", branch = "main" }
 agsess = { git = "https://github.com/nativelite/agsess", branch = "main" }
+json = { git = "https://github.com/nativelite/json-rs", branch = "main" }
 
 [lib]
 name = "amux"
