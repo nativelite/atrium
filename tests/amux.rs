@@ -2,7 +2,7 @@
 //! thing — amux itself spawned inside a `pty`, driven with keystrokes,
 //! its passthrough output read back. Deadline-bounded throughout.
 
-use amux::bar::{bar_text, PaneInfo};
+use amux::bar::{bar_paint, bar_text, PaneInfo};
 use amux::input::{Action, Dir, PrefixScanner};
 use std::time::{Duration, Instant};
 
@@ -240,6 +240,43 @@ fn bar_wif_identity_reads_apart_from_static() {
     assert!(text.contains("·wif:prod"), "wif tag missing: {text}");
 }
 
+#[test]
+fn bar_paint_colors_the_identity_tag_and_keeps_the_text() {
+    // The `·<name>` tag must carry the same per-identity palette color the
+    // tiled border uses, wrapped so the color does not bleed into the rest of
+    // the reverse-video bar, and the text must stay intact (a11y).
+    let mut p = info("claude", true, false, false);
+    p.identity = Some("work".into());
+    let painted = bar_paint(&[p], 25, 120, "");
+
+    // The tag's foreground SGR: palette color for "work" -> ansi index. The
+    // blue/magenta palette (12/13) is in the 8..=15 bright range, which `sgr()`
+    // maps to a `90 + (n-8)` fg param (12 -> 94, 13 -> 95), after the base
+    // `0;7` (reset + reverse).
+    let idx = amux::identity::palette_index("work");
+    let fg_param = 90 + (idx - 8) as u16;
+    let tag_sgr = format!("\x1b[0;7;{fg_param}m");
+    assert!(
+        painted.contains(&tag_sgr),
+        "tag should switch to its palette fg color; sgr {tag_sgr:?} not in {painted:?}"
+    );
+
+    // The colored run is immediately followed by the `·work` text.
+    let with_text = format!("{tag_sgr}·work");
+    assert!(
+        painted.contains(&with_text),
+        "colored tag text missing: {painted:?}"
+    );
+
+    // Right after the tag text, the bar restores its reverse-video base
+    // (`\x1b[0;7m`) so the color cannot bleed into the following segment.
+    let restore = format!("·work{}", "\x1b[0;7m");
+    assert!(
+        painted.contains(&restore),
+        "base reverse-video style not restored after tag: {painted:?}"
+    );
+}
+
 // --- command resolution (the npm .cmd shim trap) -----------------------------
 
 #[test]
@@ -293,6 +330,48 @@ fn filter_survives_splits_at_every_boundary() {
         out.extend(f.feed(&input[cut..]));
         // trailing partial candidate is held, everything else is clean
         assert_eq!(out, b"premidpost".to_vec(), "cut at {cut}");
+    }
+}
+
+#[test]
+fn filter_strips_alt_screen_toggles() {
+    // amux owns the alt screen: a pane's alt-buffer enter/leave — the modern
+    // ?1049 and the legacy ?1047 / ?47 — must never reach the real terminal.
+    use amux::filter::Passthrough;
+    let mut f = Passthrough::new();
+    assert_eq!(
+        f.feed(b"a\x1b[?1049hb\x1b[?1049lc\x1b[?1047hd\x1b[?1047le\x1b[?47hf\x1b[?47lg"),
+        b"abcdefg".to_vec()
+    );
+}
+
+#[test]
+fn filter_strips_alt_screen_across_every_split() {
+    // Each alt-screen sequence must survive a cut at any byte boundary; the
+    // shorter ?47 has to co-exist with the longer ?1047/?1049 in the matcher.
+    use amux::filter::Passthrough;
+    let input = b"pre\x1b[?1049hmid\x1b[?47lpost\x1b[?1047hend\x1b[?104";
+    for cut in 0..=input.len() {
+        let mut f = Passthrough::new();
+        let mut out = f.feed(&input[..cut]);
+        out.extend(f.feed(&input[cut..]));
+        // The trailing "\x1b[?104" is an unresolved prefix, held back.
+        assert_eq!(out, b"premidpostend".to_vec(), "cut at {cut}");
+    }
+}
+
+#[test]
+fn filter_does_not_eat_a_prefix_that_resolves_to_a_non_strip_sequence() {
+    // "\x1b[?104" is a prefix of "\x1b[?1049h" but "\x1b[?104x" is not any
+    // strip sequence — it must pass through intact once resolved, even across
+    // a split at the ambiguous boundary.
+    use amux::filter::Passthrough;
+    let input = b"\x1b[?104x";
+    for cut in 0..=input.len() {
+        let mut f = Passthrough::new();
+        let mut out = f.feed(&input[..cut]);
+        out.extend(f.feed(&input[cut..]));
+        assert_eq!(out, input.to_vec(), "cut at {cut}");
     }
 }
 

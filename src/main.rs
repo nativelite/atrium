@@ -800,9 +800,22 @@ fn spawn_pane(
     })
 }
 
+/// Sanitize the terminal on exit and leave the alt screen. amux owns the alt
+/// buffer (§ the run loop's `\x1b[?1049h` at start), but a hosted app may have
+/// left modes on — mouse reporting, bracketed paste, a hidden cursor, an
+/// altered scroll region, a non-default SGR. Leaving the alt screen alone does
+/// not undo those, so we reset them first, in a sensible order, before the
+/// `?1049l` swap so the user's original shell comes back clean. Called on
+/// **every** exit path in `run` (normal quit, last-pane-exit, read error, and
+/// the initial-spawn failure).
 fn cleanup_screen(out: &mut impl Write) {
-    // Reset the scroll region, leave the alt screen.
-    let _ = write!(out, "\x1b[r\x1b[?1049l");
+    let _ = write!(
+        out,
+        // Reset SGR; disable mouse reporting (1000/1002/1003/1006); disable
+        // bracketed paste (2004); show the cursor (25); reset the scroll region;
+        // then leave the alt screen (1049) last so the swap-back is the final act.
+        "\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[r\x1b[?1049l"
+    );
     let _ = out.flush();
 }
 

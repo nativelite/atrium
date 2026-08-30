@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-29
+
+### Fixed
+- **Terminal restored cleanly on exit (amux owns the alt screen).** A hosted app
+  that toggles the **alternate screen buffer** (`ESC[?1049h/l`, or the legacy
+  `?1047`/`?47`) in passthrough was fighting amux's own alt screen, so on quit the
+  agent's last frame (e.g. Claude's "custom API key detected" prompt) stayed on
+  screen instead of the user's pre-amux shell. amux now **owns** the alt screen
+  tmux-style: the passthrough filter strips a pane's alt-screen enter/leave
+  (alongside the win32-input-mode toggles it already stripped), so panes render
+  into amux's buffer and never touch the real terminal's. `cleanup_screen` is now
+  a full sanitize — reset SGR, disable mouse reporting and bracketed paste, show
+  the cursor, reset the scroll region, then leave the alt screen — run on every
+  exit path so a hosted app that left modes on can't corrupt the terminal.
+- **Identity `·<name>` tag is now colored in the status bar.** The per-identity
+  palette color (the same one the tiled border uses) was only applied on the
+  tiled border, so a single-pane (passthrough) user never saw it. The bar now
+  colors just the `·<name>` tag segment and restores its reverse-video style
+  afterward so the color doesn't bleed into the rest of the line. The `·<name>`
+  **text is always present** (color is a redundant a11y channel).
+
 ## [0.4.0] - 2026-08-29
 
 ### Added
