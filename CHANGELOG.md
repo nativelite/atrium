@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-30
+
+### Added
+- **`ctl` control plane (C2): task and observe the hierarchy.** Building on C1's
+  channel + `spawn`/`list`:
+  - `amux ctl send <target> <text>` — deliver a task to a worker as a submitted
+    prompt. **Queue-until-idle** (agsess-gated): if the target is mid-turn the
+    text waits and is delivered (text, then Enter) once it goes idle, so a send
+    never lands in the middle of a turn. `<target>` is a pane id or role label.
+  - `amux ctl status [<target>]` — a target's live `agsess` status, or (no
+    target) the caller's subtree roll-up.
+  - `amux ctl spawn --here` — tile the worker *beside* the pane that spawned it
+    (same window), so a lead and its ICs sit in one view; default `spawn` still
+    opens a new window.
+- **Subtree-scoped control (Decision 3).** `send`/`status` on a specific target
+  are scoped to the caller's own subtree; a **root/operator** pane controls
+  everything. A worker cannot steer a sibling's team — refused with a clear JSON
+  error. (Pure `in_subtree` guard, unit-tested.)
+
 ## [0.7.0] - 2026-08-30
 
 ### Added

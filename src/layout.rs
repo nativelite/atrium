@@ -171,6 +171,19 @@ impl Tree {
         self.focus = new_id;
     }
 
+    /// Split a *specific* pane `target` in `dir` (not necessarily the focused
+    /// one), giving the new half pane id `new_id`, and move focus to the new
+    /// pane. Returns `false` (a no-op) if `target` is not in the tree. This is
+    /// what lets `ctl spawn --here` tile a worker beside the pane that requested
+    /// it, even when that pane is not the window's current focus.
+    pub fn split_pane(&mut self, target: usize, dir: Dir, new_id: usize) -> bool {
+        let ok = Self::split_at(&mut self.root, target, dir, new_id);
+        if ok {
+            self.focus = new_id;
+        }
+        ok
+    }
+
     fn split_at(node: &mut Node, target: usize, dir: Dir, new_id: usize) -> bool {
         match node {
             Node::Leaf(id) if *id == target => {
@@ -466,6 +479,23 @@ mod tests {
         t.move_focus(Move::Left, OUTER);
         let back = t.move_focus(Move::Up, OUTER);
         assert_eq!(back, top_left, "up+left should return to the top-left pane");
+    }
+
+    #[test]
+    fn split_pane_targets_a_specific_pane_not_just_focus() {
+        // Build [0 | 1] with focus on 1, then split pane 0 (the *unfocused* one).
+        let mut t = Tree::new(0);
+        t.split(Dir::Vertical, 1);
+        assert_eq!(t.focus(), 1);
+        assert!(t.split_pane(0, Dir::Vertical, 2));
+        // 0 became a split into {0, 2}; the tree now holds 0, 1, 2 and focus
+        // moved to the new pane.
+        let mut ids = t.ids();
+        ids.sort();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(t.focus(), 2);
+        // Splitting a pane that isn't there is a no-op.
+        assert!(!t.split_pane(99, Dir::Vertical, 3));
     }
 
     #[test]

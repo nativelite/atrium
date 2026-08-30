@@ -46,6 +46,76 @@ fn next_agent_id() -> usize {
     NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// A `ctl send` awaiting delivery. The design queues a task until the target is
+/// **idle** (agsess-gated) rather than injecting into a live turn (Decision 4).
+/// Once the target is ready we write the text, then — after a short beat so the
+/// agent's TUI registers the line before the submit — write the Enter. The beat
+/// mirrors the C0 spike, which split the text and `\r` with a delay.
+struct PendingSend {
+    /// Target pane's global agent id (already resolved + scope-checked).
+    target: usize,
+    text: String,
+    /// When the send was accepted — a fallback so a target that never yields a
+    /// derivable status (a shell, a not-yet-bound agent) still gets it.
+    queued_at: Instant,
+    /// `Some(t)` once the text has been written; `t` gates the follow-up Enter.
+    text_written_at: Option<Instant>,
+}
+
+/// How long after writing the task text we send the Enter that submits it.
+const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
+/// If a target never yields a derivable agsess status (non-agent / unbound),
+/// deliver anyway once the send has waited this long, so a queue never wedges.
+const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
+
+/// Find a hosted pane by its global agent id (immutable / mutable).
+fn pane_by_agent(windows: &[Window], id: usize) -> Option<&Pane> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .find(|p| p.agent_id == id)
+}
+fn pane_by_agent_mut(windows: &mut [Window], id: usize) -> Option<&mut Pane> {
+    windows
+        .iter_mut()
+        .flat_map(|w| w.panes.iter_mut())
+        .find(|p| p.agent_id == id)
+}
+
+/// `(agent_id, role)` for every live pane — the candidate set for target
+/// resolution.
+fn ctl_candidates(windows: &[Window]) -> Vec<(usize, Option<String>)> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .map(|p| (p.agent_id, p.role.clone()))
+        .collect()
+}
+
+/// `(agent_id, parent)` for every live pane — the spawn-tree edges the subtree
+/// guard walks.
+fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .map(|p| (p.agent_id, p.parent))
+        .collect()
+}
+
+/// The **human** controls everything (Decision 3). A caller is human-privileged
+/// when it has no attributed pane, or when its pane is a *root* (one amux opened,
+/// `parent == None`, depth 0) — i.e. where the operator sits. A spawned worker
+/// (depth > 0) is scoped to its own subtree.
+fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
+    match caller {
+        None => true,
+        Some(id) => match pane_by_agent(windows, id) {
+            Some(p) => p.parent.is_none(),
+            None => true, // unknown caller (e.g. run from outside a pane) = operator
+        },
+    }
+}
+
 /// One hosted terminal: a pty, its emulator (for tiled compositing), its
 /// passthrough filter (for the passthrough / zoom path), and bar metadata. Each
 /// pane has a stable `id` the window's split tree refers to.
@@ -138,7 +208,7 @@ fn main() -> ExitCode {
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
             "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
-             \x20      amux ctl spawn [--role R] [-- <cmd...>] | amux ctl list   (inside a --allow-ctl session)\n\
+             \x20      amux ctl spawn [--role R] [--here] -- <cmd...> | list | send <target> <text> | status [target]\n\
              \x20      (Ctrl+A ? in the bar shows keys)"
         );
         return ExitCode::SUCCESS;
@@ -227,6 +297,8 @@ fn run(
     // environment. A bind failure is non-fatal: amux still runs, just without
     // ctl, and says so in the bar (never silently unavailable).
     let mut ctl_listener: Option<amux::ipc::Listener> = None;
+    // Queue-until-idle deliveries for `ctl send` (flushed each tick).
+    let mut pending_sends: Vec<PendingSend> = Vec::new();
     // Operator-approved extra allowlist stems (AMUX_CTL_ALLOW); empty ⇒ the
     // built-in agents-only guard. Read once at startup.
     let ctl_extra_allow = if allow_ctl {
@@ -443,6 +515,7 @@ fn run(
                             cols,
                             max_depth,
                             &ctl_extra_allow,
+                            &mut pending_sends,
                             &world,
                         );
                         let _ = listener.respond(&reply);
@@ -453,6 +526,11 @@ fn run(
                     Err(_) => break,
                 }
             }
+        }
+
+        // 1c. flush any queued `ctl send`s whose target is now idle (Decision 4).
+        if flush_sends(&mut pending_sends, &mut windows, &world) {
+            force_repaint = true;
         }
 
         // 2. drain every pane in the active window (all panes are live in
@@ -1111,9 +1189,13 @@ fn status_label(s: agsess::Status) -> &'static str {
 }
 
 /// Apply one ctl request against the live window set and return the JSON reply
-/// line. This is the server side of the control channel: `list` serializes the
-/// spawn tree (agsess statuses folded in), `spawn` creates a visible worker pane
-/// after the pure [`amux::ctl::evaluate_spawn`] guard (allowlist + depth) passes.
+/// line. The server side of the control channel: `list`/`status` serialize the
+/// spawn tree (agsess statuses folded in), `spawn` creates a visible worker
+/// (new window or `--here` split) after the pure [`amux::ctl::evaluate_spawn`]
+/// guard, and `send` enqueues a queue-until-idle delivery. `send`/`status` with
+/// a target are **subtree-scoped**: a non-root (non-human) caller may only reach
+/// its own subtree.
+#[allow(clippy::too_many_arguments)]
 fn apply_ctl(
     line: &str,
     windows: &mut Vec<Window>,
@@ -1121,6 +1203,7 @@ fn apply_ctl(
     cols: u16,
     max_depth: usize,
     extra_allow: &[String],
+    pending: &mut Vec<PendingSend>,
     world: &agsess::World,
 ) -> String {
     use amux::ctl::{self, Cmd};
@@ -1129,66 +1212,260 @@ fn apply_ctl(
         Ok(r) => r,
         Err(e) => return ctl::reply_err(&e),
     };
+    let privileged = caller_privileged(windows, req.caller);
 
     match req.cmd {
-        Cmd::List => {
-            let mut panes: Vec<&Pane> = windows.iter().flat_map(|w| w.panes.iter()).collect();
-            panes.sort_by_key(|p| p.agent_id);
-            let nodes: Vec<ctl::TreeNode> = panes
-                .iter()
-                .map(|p| ctl::TreeNode {
-                    id: p.agent_id,
-                    parent: p.parent,
-                    role: p.role.as_deref(),
-                    title: &p.title,
-                    depth: p.depth,
-                    status: amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
-                        .map(status_label),
-                })
-                .collect();
-            ctl::reply_list(&nodes)
+        Cmd::List => reply_tree(windows, world, None),
+        Cmd::Status(sr) => match sr.target {
+            None => {
+                // No target: the caller's subtree (whole tree for the operator).
+                let root = if privileged { None } else { req.caller };
+                reply_tree(windows, world, root)
+            }
+            Some(t) => {
+                let candidates = ctl_candidates(windows);
+                let id = match ctl::resolve_target(&t, &candidates) {
+                    Ok(id) => id,
+                    Err(e) => return ctl::reply_err(&e),
+                };
+                if let Some(deny) = scope_denied(windows, req.caller, privileged, id) {
+                    return deny;
+                }
+                let status = pane_by_agent(windows, id).and_then(|p| {
+                    amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
+                        .map(status_label)
+                });
+                ctl::reply_status_one(id, status)
+            }
+        },
+        Cmd::Send(sr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&sr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, req.caller, privileged, id) {
+                return deny;
+            }
+            // Queued iff the target is mid-turn now; either way delivery is async
+            // and happens when the target is idle.
+            let busy = matches!(
+                pane_by_agent(windows, id)
+                    .and_then(|p| amux::bind::status_for(p.session_id.as_deref(), &world.sessions)),
+                Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
+            );
+            pending.push(PendingSend {
+                target: id,
+                text: sr.text,
+                queued_at: Instant::now(),
+                text_written_at: None,
+            });
+            ctl::reply_sent(id, busy)
         }
         Cmd::Spawn(sp) => {
-            if !sp.new_window {
-                return ctl::reply_err(
-                    "`--here` (split the caller) lands in C2; C1 opens a new window — rerun without --here",
-                );
-            }
-            // The caller's depth (0 if the caller is unknown — e.g. a human pane
-            // amux did not spawn): the worker will sit one below it.
             let caller_depth = req
                 .caller
-                .and_then(|cid| {
-                    windows
-                        .iter()
-                        .flat_map(|w| w.panes.iter())
-                        .find(|p| p.agent_id == cid)
-                })
+                .and_then(|cid| pane_by_agent(windows, cid))
                 .map(|p| p.depth)
                 .unwrap_or(0);
-            match ctl::evaluate_spawn(&sp.argv, caller_depth, max_depth, extra_allow) {
-                Err(denied) => ctl::reply_err(&denied.message()),
-                Ok(new_depth) => {
-                    let mut flash = None;
-                    match spawn_window(&sp.argv, rows, cols, windows.len(), None, &mut flash) {
-                        Ok(mut w) => {
-                            // A new window from ctl spawn is a single pane; stamp
-                            // its spawn-tree fields before it joins the set.
-                            let pane = &mut w.panes[0];
-                            pane.role = sp.role.clone();
-                            pane.parent = req.caller;
-                            pane.depth = new_depth;
-                            let agent_id = pane.agent_id;
-                            let session = pane.session_id.clone();
-                            windows.push(w);
-                            ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
-                        }
-                        Err(e) => ctl::reply_err(&format!("spawn failed: {e}")),
-                    }
-                }
+            let new_depth =
+                match ctl::evaluate_spawn(&sp.argv, caller_depth, max_depth, extra_allow) {
+                    Ok(d) => d,
+                    Err(denied) => return ctl::reply_err(&denied.message()),
+                };
+            if sp.new_window {
+                spawn_worker_window(windows, &sp, req.caller, new_depth, rows, cols)
+            } else {
+                spawn_worker_here(windows, &sp, req.caller, new_depth, rows, cols)
             }
         }
     }
+}
+
+/// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
+/// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
+fn reply_tree(windows: &[Window], world: &agsess::World, root: Option<usize>) -> String {
+    let parents = ctl_parents(windows);
+    let mut panes: Vec<&Pane> = windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .filter(|p| match root {
+            None => true,
+            Some(r) => amux::ctl::in_subtree(p.agent_id, r, &parents),
+        })
+        .collect();
+    panes.sort_by_key(|p| p.agent_id);
+    let nodes: Vec<amux::ctl::TreeNode> = panes
+        .iter()
+        .map(|p| amux::ctl::TreeNode {
+            id: p.agent_id,
+            parent: p.parent,
+            role: p.role.as_deref(),
+            title: &p.title,
+            depth: p.depth,
+            status: amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
+                .map(status_label),
+        })
+        .collect();
+    amux::ctl::reply_list(&nodes)
+}
+
+/// Subtree-scope guard: `None` if the caller may act on `target`, else a ready
+/// JSON refusal. The operator (privileged) may act on anything.
+fn scope_denied(
+    windows: &[Window],
+    caller: Option<usize>,
+    privileged: bool,
+    target: usize,
+) -> Option<String> {
+    if privileged {
+        return None;
+    }
+    let root = caller?; // non-privileged implies a known caller pane
+    if amux::ctl::in_subtree(target, root, &ctl_parents(windows)) {
+        None
+    } else {
+        Some(amux::ctl::reply_err(&format!(
+            "pane {target} is outside your subtree; a worker may only steer what it spawned"
+        )))
+    }
+}
+
+/// `ctl spawn` (default): a visible worker in a brand-new window.
+fn spawn_worker_window(
+    windows: &mut Vec<Window>,
+    sp: &amux::ctl::SpawnReq,
+    caller: Option<usize>,
+    new_depth: usize,
+    rows: u16,
+    cols: u16,
+) -> String {
+    let mut flash = None;
+    match spawn_window(&sp.argv, rows, cols, windows.len(), None, &mut flash) {
+        Ok(mut w) => {
+            let pane = &mut w.panes[0];
+            pane.role = sp.role.clone();
+            pane.parent = caller;
+            pane.depth = new_depth;
+            let agent_id = pane.agent_id;
+            let session = pane.session_id.clone();
+            windows.push(w);
+            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
+        }
+        Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
+    }
+}
+
+/// `ctl spawn --here`: tile the worker *beside* the caller, in the caller's own
+/// window, so a lead and its ICs sit in one view. Falls back to an error if the
+/// caller's pane can't be located (nothing to sit beside).
+fn spawn_worker_here(
+    windows: &mut [Window],
+    sp: &amux::ctl::SpawnReq,
+    caller: Option<usize>,
+    new_depth: usize,
+    rows: u16,
+    cols: u16,
+) -> String {
+    let Some(caller_id) = caller else {
+        return amux::ctl::reply_err(
+            "`--here` needs a caller pane; run it from inside an amux pane",
+        );
+    };
+    // Locate the window holding the caller and that caller's per-window pane id.
+    let Some((wi, caller_pane_id)) = windows.iter().enumerate().find_map(|(i, w)| {
+        w.panes
+            .iter()
+            .find(|p| p.agent_id == caller_id)
+            .map(|p| (i, p.id))
+    }) else {
+        return amux::ctl::reply_err("`--here`: caller pane not found (rerun without --here)");
+    };
+
+    let w = &mut windows[wi];
+    let new_id = w.next_id;
+    // Rough half-cell inner size; the caller resizes the window right after.
+    let (pr, pc) = (
+        (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
+        (cols / 2).saturating_sub(2),
+    );
+    let mut flash = None;
+    match spawn_pane(&sp.argv, pr.max(1), pc.max(1), new_id, None, &mut flash) {
+        Ok(mut pane) => {
+            pane.role = sp.role.clone();
+            pane.parent = caller;
+            pane.depth = new_depth;
+            let agent_id = pane.agent_id;
+            let session = pane.session_id.clone();
+            w.panes.push(pane);
+            w.next_id += 1;
+            // Split beside the caller specifically (side-by-side), not just the
+            // window's current focus.
+            w.tree
+                .split_pane(caller_pane_id, layout::Dir::Vertical, new_id);
+            w.zoomed = false;
+            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
+        }
+        Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
+    }
+}
+
+/// Flush queued `ctl send`s (Decision 4: queue until the target is idle). For
+/// each pending send: once the target reports a ready status (or the unbound
+/// fallback elapses), write the text; a beat later write the Enter and drop it.
+/// A vanished target is dropped. Returns whether anything was written (so the
+/// caller can request a repaint).
+fn flush_sends(
+    pending: &mut Vec<PendingSend>,
+    windows: &mut [Window],
+    world: &agsess::World,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut wrote = false;
+    pending.retain_mut(|ps| {
+        match ps.text_written_at {
+            None => {
+                // Decide readiness from the target's live status.
+                let ready = match pane_by_agent(windows, ps.target) {
+                    None => return false, // target gone — drop the send
+                    Some(p) => {
+                        match amux::bind::status_for(p.session_id.as_deref(), &world.sessions) {
+                            Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) => {
+                                true
+                            }
+                            Some(_) => false, // Working / WaitingApproval — keep waiting
+                            None => now.duration_since(ps.queued_at) >= SEND_UNBOUND_FALLBACK,
+                        }
+                    }
+                };
+                if ready {
+                    if let Some(p) = pane_by_agent_mut(windows, ps.target) {
+                        let _ = p.pty.write(ps.text.as_bytes());
+                        ps.text_written_at = Some(now);
+                        wrote = true;
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+            Some(t) => {
+                if now.duration_since(t) >= SEND_ENTER_DELAY {
+                    if let Some(p) = pane_by_agent_mut(windows, ps.target) {
+                        let _ = p.pty.write(b"\r");
+                        wrote = true;
+                    }
+                    false // delivered — drop
+                } else {
+                    true
+                }
+            }
+        }
+    });
+    wrote
 }
 
 fn spawn_window(

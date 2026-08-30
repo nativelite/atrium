@@ -952,3 +952,66 @@ fn ctl_spawn_off_the_allowlist_is_refused() {
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+/// `amux ctl status <id>` returns a target's status as JSON. Pane 0 is always
+/// the initial pane (agent ids are process-global from 0), so this is stable.
+#[test]
+fn ctl_status_reports_a_pane() {
+    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    p.write(format!("\"{amux}\" ctl status 0\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"pane\":0", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"pane\":0"),
+        "no status reply: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// `amux ctl send <role> <text>` delivers the text to the worker as input. We
+/// spawn the worker in a *new* window, task it from the caller window, then
+/// switch to the worker window to observe: the marker appears there only if the
+/// send actually reached the worker's pty (the caller's command echo lives in a
+/// different window, so it can't produce a false positive).
+#[test]
+fn ctl_send_delivers_a_task_to_a_worker() {
+    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20)); // worker window opened
+    p.write(format!("\"{amux}\" ctl send dev_1 echo WORKERMARK7\r\n").as_bytes())
+        .unwrap();
+    p.write(b"\x012").unwrap(); // Ctrl+A 2 -> watch the worker window
+    let out = read_until(&mut p, b"WORKERMARK7", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"WORKERMARK7"),
+        "worker never received the send: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// `amux ctl spawn --here` succeeds over the channel (tiles the worker beside its
+/// caller): the reply carries the worker's role, proving the split-placement path
+/// ran end to end.
+#[test]
+fn ctl_spawn_here_succeeds() {
+    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    p.write(format!("\"{amux}\" ctl spawn --here --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"dev_1\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"role\":\"dev_1\""),
+        "no --here spawn reply: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
