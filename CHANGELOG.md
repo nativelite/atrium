@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
+### Added
+- **Per-pane agent identity — `--identity <name>` (short `-I <name>`).** amux
+  now launches an agent pane under a chosen credential identity: it resolves the
+  target's environment via [`akey`](https://github.com/nativelite/akey)
+  (`akey::resolve` — a key name → `ANTHROPIC_API_KEY`; `wif:<name>` → the five
+  federation vars) and injects it into that one child via the new
+  `pty::Pty::spawn_with_env`. This is path B of the amux ⨯ akey design (native
+  flag, not the wrapper). Usage: `amux --identity work claude`.
+- **Inherit-on-split.** The identity applies to the initial agent pane and is
+  inherited by every split / new pane. It is re-resolved on **each** spawn; only
+  the identity **name** is stored on the pane — never the resolved secret.
+- **Identity tag in the chrome (name only).** A `·<name>` tag renders after the
+  `index:title` in a pane's top border (e.g. `2:claude ·work`, `2:claude
+  ·wif:prod`) and next to the window's entry in the status bar. A `wif:` identity
+  reads apart from a static key at a glance. The tag carries a deterministic
+  per-identity color from a small, tunable palette (blue/magenta) chosen to avoid
+  the status hues; the `·<name>` **text is always rendered** (never color-only).
+- **Visible resolve failure.** If `akey::resolve` errors (no such target, vault
+  locked) the reason is surfaced in the pane bar and the agent spawns *without*
+  the credential — never silently, never unauthenticated-without-saying-so.
+
+amux renders identity **names** only: no key, no token, ever. The resolved env
+lives only for the spawn call and is never logged, printed, or persisted (the
+`AMUX_DEBUG` traces never include it). New dependency: the org crate `akey`;
+`pty` bumped to 0.2.0 for `spawn_with_env`. Third-party dependencies remain zero.
+
 ## [0.3.0] - 2026-08-29
 
 ### Added

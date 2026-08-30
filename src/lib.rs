@@ -18,6 +18,7 @@
 pub mod bar;
 pub mod bind;
 pub mod filter;
+pub mod identity;
 pub mod input;
 pub mod layout;
 pub mod resolve;

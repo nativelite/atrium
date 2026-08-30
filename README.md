@@ -8,7 +8,8 @@ down.
 ```bash
 amux claude        # every pane runs `claude`
 amux               # every pane runs your shell (COMSPEC / $SHELL)
-amux claude --continue   # any command + args
+amux claude --continue        # any command + args
+amux --identity work claude   # run the agent under the `work` credential
 ```
 
 ```
@@ -99,6 +100,47 @@ loud yellow border correctly stays quiet — auto mode doesn't block on the huma
 so there's nothing to surface; the yellow is reserved for the sessions where an
 agent is genuinely blocked. (A future opt-in hook can replace the inference with
 a certainty; it is not part of this release.)
+
+## Agent identity (0.4)
+
+`--identity <name>` (short `-I <name>`) launches an agent pane under a chosen
+credential identity:
+
+```bash
+amux --identity work claude      # a static key stored in your OS vault
+amux --identity wif:prod claude  # a Workload Identity Federation profile
+```
+
+amux resolves the target's environment through
+[`akey`](https://github.com/nativelite/akey) — a key name becomes
+`ANTHROPIC_API_KEY`, a `wif:<name>` profile becomes the five documented
+federation variables — and injects it into **that one child** via the pty
+(`pty::Pty::spawn_with_env`). The credential is set for that agent alone; it
+never touches amux's siblings, and amux makes no network calls.
+
+- **The identity applies to the initial agent pane and is inherited by every
+  split / new pane.** Identity is fixed for a pane's lifetime (a running
+  process's env can't change), so to re-identify you respawn the pane — an
+  explicit, visible action.
+- **Only the *name* is shown.** A `·<name>` tag rides in the pane's top border
+  (`2:claude ·work`) and next to the window's entry in the bar. A `wif:` identity
+  reads apart from a static key at a glance (`·wif:prod` vs `·work`), which makes
+  the credential-precedence footgun — a leftover static key shadowing a WIF
+  profile — visible. The tag has a per-identity color, but the text is always
+  drawn (never color-only).
+- **Names only, never secrets — a hard guarantee.** The resolved environment is
+  re-fetched on every spawn, handed straight to the child, and dropped; it is
+  never cached on the pane, never logged, never persisted, and never appears in
+  `AMUX_DEBUG` traces. A screen-shared grid leaks no key and no token — only the
+  labels you typed.
+- **Resolve failure is visible, not silent.** If the identity can't be resolved
+  (no such target, vault locked) the reason lands in the bar and the agent spawns
+  *without* the credential — you are told, rather than running unauthenticated by
+  surprise.
+
+Non-agent panes (shells, editors) and no-identity spawns are unaffected — they
+use the plain spawn path and carry no tag. New dependency: the org crate `akey`.
+Third-party dependencies remain zero.
 
 ## The architecture (why it's small and faithful)
 

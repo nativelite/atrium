@@ -87,6 +87,11 @@ pub struct PaneView<'a> {
     /// `None` for shells, focused panes, and agents still awaiting their
     /// transcript. Attention chrome (§4.2) reads only this.
     pub agent: Option<AgentMark>,
+    /// The credential identity **name** this pane runs under, if any — the
+    /// name the user typed (`work`, `wif:prod`), never the secret. Rendered as
+    /// a colored `·<name>` tag after the `index:title` in the top border. The
+    /// color is a redundant channel; the text is always drawn (a11y).
+    pub identity: Option<&'a str>,
 }
 
 impl PaneView<'_> {
@@ -225,18 +230,47 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
     put(master, last_row, c0, BOTTOM_LEFT);
     put(master, last_row, last_col, BOTTOM_RIGHT);
 
-    // Title in the top edge: "┌ 2:claude ──…──┐". The label sits one cell in
-    // from the top-left corner, framed by a space each side, and is truncated
+    // Title in the top edge: "┌ 2:claude ·work ──…──┐". The label sits one cell
+    // in from the top-left corner, framed by a space each side, and is truncated
     // to leave room for the trailing corner. An unfocused bound agent appends a
     // one-cell attention marker after the title (rung 2, §4.2) — status only,
-    // never any transcript text.
+    // never any transcript text. When the pane carries a credential identity, a
+    // `·<name>` tag follows in its own (per-identity) color — the **name** only,
+    // never the secret, and the text is always drawn so the signal survives
+    // without color (a11y).
     if cn >= 5 {
         let label = format!(" {}:{} {}", p.index, p.title, p.title_badge());
         // Available label columns: everything between the two corners.
         let avail = cn.saturating_sub(2);
         let start = c0 + 1;
-        for (i, ch) in label.chars().take(avail).enumerate() {
-            put(master, r0, start + i, ch);
+        let mut col = 0usize; // columns consumed within `avail`
+        for ch in label.chars().take(avail) {
+            put(master, r0, start + col, ch);
+            col += 1;
+        }
+        // The identity tag, in its own color, using whatever columns remain.
+        if let Some(name) = p.identity {
+            let tag = format!("·{name} ");
+            let tag_style = Style {
+                fg: Color::Indexed(crate::identity::palette_index(name)),
+                ..Style::default()
+            };
+            for ch in tag.chars() {
+                if col >= avail {
+                    break;
+                }
+                if r0 < rows && start + col < cols {
+                    master.set(
+                        r0,
+                        start + col,
+                        Cell {
+                            ch,
+                            style: tag_style,
+                        },
+                    );
+                }
+                col += 1;
+            }
         }
     }
 }
@@ -276,6 +310,7 @@ mod tests {
             title,
             state,
             agent: None,
+            identity: None,
         }
     }
 
@@ -295,6 +330,27 @@ mod tests {
             title,
             state,
             agent: Some(AgentMark { status }),
+            identity: None,
+        }
+    }
+
+    /// A pane view carrying a credential identity name-tag.
+    fn identity_view<'a>(
+        screen: &'a Screen,
+        rect: Rect,
+        index: usize,
+        title: &'a str,
+        state: PaneState,
+        identity: &'a str,
+    ) -> PaneView<'a> {
+        PaneView {
+            screen,
+            rect,
+            index,
+            title,
+            state,
+            agent: None,
+            identity: Some(identity),
         }
     }
 
@@ -644,5 +700,115 @@ mod tests {
             !top.contains('?') && !top.contains('~'),
             "no badge: {top:?}"
         );
+    }
+
+    // --- identity name-tag (0.4) -------------------------------------------
+
+    #[test]
+    fn identity_pane_renders_a_dot_name_tag_in_the_border() {
+        // A wide box so " 2:claude ·work " all fits.
+        let inner = filled(3, 20, ' ');
+        let panes = vec![identity_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 22,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+            "work",
+        )];
+        let m = compose(5, 22, &panes);
+        // The top edge carries "index:title" then the "·work" identity tag.
+        let top: String = (1..18).map(|c| m.cell(0, c).ch).collect();
+        assert!(top.starts_with(" 2:claude ·work"), "top edge was {top:?}");
+    }
+
+    #[test]
+    fn identity_tag_uses_the_tunable_palette_color_and_always_has_text() {
+        let inner = filled(3, 20, ' ');
+        let panes = vec![identity_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 22,
+            },
+            1,
+            "claude",
+            PaneState::Idle,
+            "work",
+        )];
+        let m = compose(5, 22, &panes);
+        // Find the "·" cell; it and the name must carry a palette color, never a
+        // status hue, and the TEXT must be present regardless of color (a11y).
+        let top: Vec<char> = (1..18).map(|c| m.cell(0, c).ch).collect();
+        let dot = top.iter().position(|&c| c == '·').expect("· tag present");
+        let dot_col = 1 + dot;
+        let style = m.cell(0, dot_col).style;
+        let expected = Color::Indexed(crate::identity::palette_index("work"));
+        assert_eq!(
+            style.fg, expected,
+            "tag wears its per-identity palette color"
+        );
+        // The palette avoids the status hues.
+        assert!(
+            crate::identity::IDENTITY_PALETTE.contains(&12)
+                || crate::identity::IDENTITY_PALETTE.contains(&13),
+            "palette is the tunable blue/magenta family"
+        );
+        // Text survives even if a reader ignores color: "·work" is spelled out.
+        let rendered: String = top.iter().collect();
+        assert!(
+            rendered.contains("·work"),
+            "identity text present: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_wif_identity_reads_differently_from_a_static_one() {
+        // A `wif:` identity surfaces its prefix so federated panes read apart
+        // from static-key panes at a glance — the name, still never a secret.
+        let inner = filled(3, 22, ' ');
+        let panes = vec![identity_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 24,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+            "wif:prod",
+        )];
+        let m = compose(5, 24, &panes);
+        let top: String = (1..20).map(|c| m.cell(0, c).ch).collect();
+        assert!(top.contains("·wif:prod"), "wif tag present: {top:?}");
+    }
+
+    #[test]
+    fn no_identity_pane_has_no_tag() {
+        let inner = filled(3, 18, ' ');
+        let panes = vec![view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+        )];
+        let m = compose(5, 20, &panes);
+        let top: String = (1..18).map(|c| m.cell(0, c).ch).collect();
+        assert!(!top.contains('·'), "no identity, no tag: {top:?}");
     }
 }

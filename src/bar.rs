@@ -16,6 +16,11 @@ pub struct PaneInfo {
     /// Rung 3 of the attention ladder (§4.2): drives the `?` marker and the
     /// fleet `| N waiting` note. Status only — never any transcript text.
     pub waiting: bool,
+    /// The credential identity **name** the window's agent runs under, if any —
+    /// the name the user typed (`work`, `wif:prod`), never the secret. Shown as
+    /// a `·<name>` tag next to the window entry (name-only, a11y text always
+    /// present; see `identity::IDENTITY_PALETTE` for the tunable color).
+    pub identity: Option<String>,
 }
 
 /// The visible bar text (no escapes), truncated/padded to `cols`. A
@@ -39,7 +44,15 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
         } else {
             "-"
         };
-        s.push_str(&format!("| {}:{}{} ", i + 1, p.title, mark));
+        // The identity name-tag rides next to the window entry — the name only,
+        // never the secret. Text is always present so the signal survives
+        // without color (the tag's per-identity palette color is applied when
+        // the bar paints, but the `·<name>` text is the load-bearing channel).
+        let tag = match &p.identity {
+            Some(name) => format!("·{name}"),
+            None => String::new(),
+        };
+        s.push_str(&format!("| {}:{}{}{} ", i + 1, p.title, mark, tag));
     }
     // Fleet note: when any *non-active* window has a waiting agent, count them
     // so a blocked agent in a backgrounded window surfaces even off-screen.

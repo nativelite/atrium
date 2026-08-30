@@ -117,6 +117,7 @@ fn info(title: &str, active: bool, activity: bool, exited: bool) -> PaneInfo {
         activity,
         exited,
         waiting: false,
+        identity: None,
     }
 }
 
@@ -128,6 +129,7 @@ fn waiting_info(title: &str, active: bool) -> PaneInfo {
         activity: false,
         exited: false,
         waiting: true,
+        identity: None,
     }
 }
 
@@ -215,6 +217,27 @@ fn bar_counts_multiple_backgrounded_waiters() {
         "",
     );
     assert!(text.contains("| 2 waiting"), "{text}");
+}
+
+#[test]
+fn bar_shows_identity_name_tag_next_to_the_window_entry() {
+    // A window whose agent runs under the `work` identity shows `·work` next to
+    // its entry — the name only, never a secret, and the text is always present.
+    let mut p = info("claude", true, false, false);
+    p.identity = Some("work".into());
+    let text = bar_text(&[p], 120, "");
+    assert!(
+        text.contains("1:claude*·work"),
+        "identity tag missing: {text}"
+    );
+}
+
+#[test]
+fn bar_wif_identity_reads_apart_from_static() {
+    let mut p = info("claude", true, false, false);
+    p.identity = Some("wif:prod".into());
+    let text = bar_text(&[p], 120, "");
+    assert!(text.contains("·wif:prod"), "wif tag missing: {text}");
 }
 
 // --- command resolution (the npm .cmd shim trap) -----------------------------

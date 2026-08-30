@@ -44,6 +44,12 @@ struct Pane {
     /// agent it launched (§3.3). `None` for shells and agents amux did not
     /// bind. The binder maps this to the pane's live `agsess::Status`.
     session_id: Option<String>,
+    /// The credential identity **name** this pane's agent runs under, if any
+    /// (path B). Only the name is stored — never the resolved secret. On every
+    /// spawn amux re-resolves the env via `akey` and injects it for that child
+    /// alone; the resolved values live only for the spawn call and are dropped
+    /// immediately. Surfaced in the chrome as a `·<name>` tag.
+    identity: Option<String>,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -79,17 +85,26 @@ impl Window {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("--help") {
-        eprintln!("usage: amux [command [args...]]   (Ctrl+A ? in the bar shows keys)");
+    // amux's own `--identity <name>` / `-I <name>` is stripped off the front,
+    // before the hosted command begins; it tags the initial agent pane and is
+    // inherited by every split/new pane (stored, re-resolved per spawn). Only
+    // the NAME is threaded through — never the resolved secret. We parse it
+    // *first* so amux's own meta-flags (`--help`, `--stdin-probe`) are still
+    // recognized when they follow an identity (`amux --identity work --help`).
+    let (identity, rest) = amux::identity::parse(&args);
+    if rest.first().map(String::as_str) == Some("--help") {
+        eprintln!(
+            "usage: amux [--identity <name>] [command [args...]]   (Ctrl+A ? in the bar shows keys)"
+        );
         return ExitCode::SUCCESS;
     }
-    if args.first().map(String::as_str) == Some("--stdin-probe") {
+    if rest.first().map(String::as_str) == Some("--stdin-probe") {
         return stdin_probe();
     }
-    let command: Vec<String> = if args.is_empty() {
+    let command: Vec<String> = if rest.is_empty() {
         vec![default_shell()]
     } else {
-        args
+        rest
     };
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
@@ -98,10 +113,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run(&mut term, &command)
+    run(&mut term, &command, identity.as_deref())
 }
 
-fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
+fn run(term: &mut rawterm::Terminal, command: &[String], identity: Option<&str>) -> ExitCode {
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
@@ -110,7 +125,13 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
     let _ = out.flush();
 
     let mut windows: Vec<Window> = Vec::new();
-    match spawn_window(command, rows, cols, 0) {
+    // The initial pane can fail to spawn (command missing) *or* fail to resolve
+    // its identity (no such target, vault locked). A spawn failure aborts amux
+    // (there is nothing to host); an identity-resolve failure is surfaced in the
+    // bar and the pane spawns *without* the credential — never silently, and
+    // never unauthenticated-without-saying-so (§7).
+    let mut flash: Option<(String, Instant)> = None;
+    match spawn_window(command, rows, cols, 0, identity, &mut flash) {
         Ok(w) => windows.push(w),
         Err(e) => {
             cleanup_screen(&mut out);
@@ -125,7 +146,6 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
     let mut last_bar_paint = Instant::now();
     let mut last_size_check = Instant::now();
     let mut last_bar = String::new();
-    let mut flash: Option<(String, Instant)> = None;
 
     // Agent session state (§5): one read-only `agsess::World` over the Claude
     // projects root, polled on the loop's existing `Instant`-throttle pattern —
@@ -183,22 +203,24 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                         force_repaint = true;
                     }
                 }
-                Action::NewPane => match spawn_window(command, rows, cols, windows.len()) {
-                    Ok(w) => {
-                        windows.push(w);
-                        let last = windows.len() - 1;
-                        switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
-                        prev_master = None;
-                        force_repaint = true;
+                Action::NewPane => {
+                    match spawn_window(command, rows, cols, windows.len(), identity, &mut flash) {
+                        Ok(w) => {
+                            windows.push(w);
+                            let last = windows.len() - 1;
+                            switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
+                            prev_master = None;
+                            force_repaint = true;
+                        }
+                        Err(e) => {
+                            flash = Some((
+                                format!("cannot start {:?}: {e}", command[0]),
+                                Instant::now(),
+                            ));
+                            force_repaint = true;
+                        }
                     }
-                    Err(e) => {
-                        flash = Some((
-                            format!("cannot start {:?}: {e}", command[0]),
-                            Instant::now(),
-                        ));
-                        force_repaint = true;
-                    }
-                },
+                }
                 Action::SplitH => {
                     split_focused(
                         &mut windows[active],
@@ -206,6 +228,7 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                         command,
                         rows,
                         cols,
+                        identity,
                         &mut flash,
                     );
                     resize_window(&mut windows[active], rows, cols);
@@ -219,6 +242,7 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                         command,
                         rows,
                         cols,
+                        identity,
                         &mut flash,
                     );
                     resize_window(&mut windows[active], rows, cols);
@@ -447,6 +471,9 @@ fn run(term: &mut rawterm::Terminal, command: &[String]) -> ExitCode {
                         Some(agsess::Status::WaitingApproval)
                     )
                 }),
+                // The window's identity tag: the first pane's identity name (all
+                // panes in a window inherit the same identity in v1). Name only.
+                identity: w.panes.first().and_then(|p| p.identity.clone()),
             })
             .collect();
         if flash
@@ -554,6 +581,7 @@ fn render_tiled(
                     title: &p.title,
                     state,
                     agent,
+                    identity: p.identity.as_deref(),
                 }
             })
         })
@@ -571,6 +599,7 @@ fn split_focused(
     command: &[String],
     rows: u16,
     cols: u16,
+    identity: Option<&str>,
     flash: &mut Option<(String, Instant)>,
 ) {
     let new_id = w.next_id;
@@ -580,7 +609,8 @@ fn split_focused(
         (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
         (cols / 2).saturating_sub(2),
     );
-    match spawn_pane(command, pr.max(1), pc.max(1), new_id) {
+    // Splits inherit the active identity (§4). resolve failure lands in `flash`.
+    match spawn_pane(command, pr.max(1), pc.max(1), new_id, identity, flash) {
         Ok(pane) => {
             w.panes.push(pane);
             w.next_id += 1;
@@ -663,8 +693,22 @@ fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
     }
 }
 
-fn spawn_window(command: &[String], rows: u16, cols: u16, _idx: usize) -> std::io::Result<Window> {
-    let pane = spawn_pane(command, rows.saturating_sub(1).max(1), cols, 0)?;
+fn spawn_window(
+    command: &[String],
+    rows: u16,
+    cols: u16,
+    _idx: usize,
+    identity: Option<&str>,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Window> {
+    let pane = spawn_pane(
+        command,
+        rows.saturating_sub(1).max(1),
+        cols,
+        0,
+        identity,
+        flash,
+    )?;
     Ok(Window {
         panes: vec![pane],
         tree: Tree::new(0),
@@ -673,7 +717,14 @@ fn spawn_window(command: &[String], rows: u16, cols: u16, _idx: usize) -> std::i
     })
 }
 
-fn spawn_pane(command: &[String], rows: u16, cols: u16, id: usize) -> std::io::Result<Pane> {
+fn spawn_pane(
+    command: &[String],
+    rows: u16,
+    cols: u16,
+    id: usize,
+    identity: Option<&str>,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Pane> {
     let title = std::path::Path::new(&command[0])
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -696,7 +747,42 @@ fn spawn_pane(command: &[String], rows: u16, cols: u16, id: usize) -> std::io::R
     let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
     let r = rows.max(1);
     let c = cols.max(1);
-    let pty = pty::Pty::spawn(&effective[0], &argrefs, r, c)?;
+
+    // Identity injection (path B): only for an agent pane with an identity set.
+    // Decide ONCE so the spawn path and the pane's stored tag can never diverge
+    // — a pane tagged with an identity is exactly a pane spawned with its env.
+    let inject = amux::identity::wants_env(command, identity);
+
+    // We RE-RESOLVE on every spawn — the resolved env (which contains secret
+    // material) lives only in this local, is handed straight to the pty, and is
+    // dropped at the end of this function. It is never cached on the pane,
+    // never logged, never printed. The pane stores only the identity *name*.
+    //
+    // Resolve failure (no such target, vault locked) is surfaced in the bar and
+    // the pane spawns with plain `spawn` (ambient creds) — visible, not silent,
+    // and never unauthenticated-without-saying-so (§7).
+    let pty = if inject {
+        let name = identity.expect("wants_env implies Some");
+        match akey::resolve(name) {
+            Ok(env) => {
+                // `env` holds secret values; used for this one spawn only, then
+                // dropped. Deliberately never formatted, logged, or stored.
+                pty::Pty::spawn_with_env(&effective[0], &argrefs, r, c, &env)?
+            }
+            Err(e) => {
+                // Name only in the message — `e` is akey's own error text
+                // ("no key or WIF profile named …"), which carries the name the
+                // user typed, never any secret value.
+                *flash = Some((
+                    format!("identity {name:?} unresolved: {e} — running without it"),
+                    Instant::now(),
+                ));
+                pty::Pty::spawn(&effective[0], &argrefs, r, c)?
+            }
+        }
+    } else {
+        pty::Pty::spawn(&effective[0], &argrefs, r, c)?
+    };
     Ok(Pane {
         id,
         pty,
@@ -706,6 +792,11 @@ fn spawn_pane(command: &[String], rows: u16, cols: u16, id: usize) -> std::io::R
         activity: false,
         exited: false,
         session_id,
+        // Store the identity NAME only, and only for panes that would actually
+        // run under it (agent panes) — a shell keeps `None`, so no misleading
+        // tag on a pane that was never credentialed. `inject` is the same
+        // decision the spawn used, so tag and env can never disagree.
+        identity: identity.filter(|_| inject).map(str::to_string),
     })
 }
 

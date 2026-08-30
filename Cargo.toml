@@ -1,6 +1,6 @@
 [package]
 name = "amux"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
@@ -12,6 +12,7 @@ categories = ["command-line-utilities"]
 # nativelite app rule: zero THIRD-PARTY dependencies; org crates only.
 [dependencies]
 pty = { git = "https://github.com/nativelite/pty-rs", branch = "main" }
+akey = { git = "https://github.com/nativelite/akey", branch = "main" }
 rawterm = { git = "https://github.com/nativelite/rawterm-rs", branch = "main" }
 ansi = { git = "https://github.com/nativelite/ansi-rs", branch = "main" }
 vterm = { git = "https://github.com/nativelite/vterm-rs", branch = "main" }
