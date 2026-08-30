@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-08-30
+
+### Fixed
+- **You can select and copy text again.** amux (via `rawterm`) was capturing the
+  mouse and clearing the console's quick-edit mode, which disabled native
+  drag-to-select — so copying out of a pane didn't work. amux now leaves the
+  mouse alone by default (picks up `rawterm` 0.2.1), so text selection/copy works
+  in every mode. (Click-to-focus a pane will return as an explicit, opt-in mouse
+  mode.)
+
 ## [0.8.1] - 2026-08-30
 
 ### Fixed
