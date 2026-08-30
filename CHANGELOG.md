@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-30
+
+### Added
+- **ctl C3 — `kill`, credential delegation, and an audit log.** The control
+  plane gains the last milestone (design §5), so a hosted agent hierarchy is
+  fully steerable *and* governed:
+  - **`amux ctl kill <target>`** tears down a worker **and its whole subtree**
+    (a lead's `kill` reaps its ICs too). Subtree-scoped like `send`/`status`: a
+    worker may only kill inside its own subtree; the operator kills anything.
+    The reply lists the torn-down pane ids. Teardown reuses the interactive-kill
+    reap path (collapse split tree, drop panes, remove any emptied window).
+  - **`amux ctl spawn --identity X`** delegates a credential identity to the
+    worker — **scoped**: a worker may only pass down an identity it itself holds
+    (its own, or the session/fleet default amux launched with), so an IC can't
+    mint `wif:prod` its lead was never granted. The operator (human root) is the
+    trust root and may delegate any vault identity. Only the identity *name* is
+    ever handled here; resolved secrets are re-resolved per spawn and never
+    stored or logged (unchanged from identity path B).
+  - **Audit log** — every ctl request is recorded (caller, action, a secret-free
+    detail, outcome) to an in-memory ring, readable live via **`amux ctl audit
+    [N]`** (subtree-scoped: a worker sees only its own subtree's entries).
+    Opt-in on-disk JSONL mirror via `AMUX_CTL_AUDIT=<file>`. `send` logs the
+    text *length*, never the body; identity *names* only, never secrets.
+
+### Fixed
+- **Synchronized-output fidelity (via vterm 0.2.0).** Tiled panes hosting Claude
+  Code no longer show stray leftover / overlapping text: vterm now honors DEC
+  private mode 2026 (`?2026h`/`?2026l`), double-buffering across a synchronized
+  update, so amux's compositor never samples a pane mid-redraw. No amux code
+  change — the compositor already reads `term.screen()` each tick; this bumps
+  the vterm git dependency to the fix.
+
 ## [0.10.0] - 2026-08-30
 
 ### Added

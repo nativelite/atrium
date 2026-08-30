@@ -1069,3 +1069,52 @@ fn ctl_spawn_here_succeeds() {
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+// --- end to end: the ctl control channel (C3) -------------------------------
+
+/// `amux ctl kill <role>` tears down the worker over the live channel: spawn a
+/// worker in a new window, then kill it by role — the reply carries the
+/// `killed` set (the torn-down subtree), proving `kill` ran end to end and the
+/// reap path took the worker's window down.
+#[test]
+fn ctl_kill_tears_down_a_worker() {
+    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20)); // worker window opened
+    p.write(format!("\"{amux}\" ctl kill dev_1\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"killed\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"killed\""),
+        "no ctl kill reply with a torn-down set: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// `amux ctl audit` returns the recorded control-request log. After a spawn the
+/// log holds a `spawn` entry; the operator (the initial root pane) sees it —
+/// proving requests are recorded and the log is readable live over the channel.
+#[test]
+fn ctl_audit_records_requests() {
+    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20)); // spawn recorded
+    p.write(format!("\"{amux}\" ctl audit\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"audit\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"action\":\"spawn\""),
+        "audit log missing the spawn entry: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}

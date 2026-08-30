@@ -215,7 +215,8 @@ fn main() -> ExitCode {
         eprintln!(
             "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
              \x20      --trust: launch agents with --dangerously-skip-permissions (trusted + auto mode; agents run tools unsupervised)\n\
-             \x20      amux ctl spawn [--role R] [--here] -- <cmd...> | list | send <target> <text> | status [target]\n\
+             \x20      amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
+             \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
         );
         return ExitCode::SUCCESS;
@@ -337,6 +338,23 @@ fn run(
             }
         }
     }
+    // ctl audit log (design §5): in-memory always when ctl is on, mirrored to a
+    // JSONL file when the operator opts in via `AMUX_CTL_AUDIT`. A file that
+    // can't be opened is surfaced once in the bar; the in-memory log runs on.
+    let mut ctl_audit = if allow_ctl {
+        let path = std::env::var(amux::ctl::ENV_AUDIT)
+            .ok()
+            .filter(|p| !p.is_empty());
+        let mut a = amux::audit::Audit::new(amux::audit::DEFAULT_CAP, path.as_deref());
+        if let Some(err) = a.take_error() {
+            if flash.is_none() {
+                flash = Some((format!("ctl audit: {err}"), Instant::now()));
+            }
+        }
+        a
+    } else {
+        amux::audit::Audit::in_memory()
+    };
     // A pre-built window (fleet) is used as-is; otherwise mass-spawn opens one
     // window of N tiles in a balanced grid, or the 0.1 single-pane path. All
     // share the same spawn machinery (each pane its own session).
@@ -585,6 +603,8 @@ fn run(
                             &ctl_extra_allow,
                             &mut pending_sends,
                             &world,
+                            identity,
+                            &mut ctl_audit,
                         );
                         let _ = listener.respond(&reply);
                         prev_master = None;
@@ -1258,12 +1278,11 @@ fn status_label(s: agsess::Status) -> &'static str {
 }
 
 /// Apply one ctl request against the live window set and return the JSON reply
-/// line. The server side of the control channel: `list`/`status` serialize the
-/// spawn tree (agsess statuses folded in), `spawn` creates a visible worker
-/// (new window or `--here` split) after the pure [`amux::ctl::evaluate_spawn`]
-/// guard, and `send` enqueues a queue-until-idle delivery. `send`/`status` with
-/// a target are **subtree-scoped**: a non-root (non-human) caller may only reach
-/// its own subtree.
+/// line, **recording it to the audit log** (design §5). Thin wrapper: parse,
+/// serve `audit` reads directly (they need the log and are not self-recorded),
+/// else [`dispatch_ctl`] the request and record its outcome. `spawn`/`send`/
+/// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
+/// delegation-scoped.
 #[allow(clippy::too_many_arguments)]
 fn apply_ctl(
     line: &str,
@@ -1274,21 +1293,76 @@ fn apply_ctl(
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
     world: &agsess::World,
+    session_identity: Option<&str>,
+    audit: &mut amux::audit::Audit,
 ) -> String {
     use amux::ctl::{self, Cmd};
 
     let req = match ctl::parse_request(line) {
         Ok(r) => r,
-        Err(e) => return ctl::reply_err(&e),
+        Err(e) => {
+            let reply = ctl::reply_err(&e);
+            audit.record(None, "bad-request", &truncate(line, 80), false, &e);
+            return reply;
+        }
     };
-    let privileged = caller_privileged(windows, req.caller);
+    let caller = req.caller;
+    let privileged = caller_privileged(windows, caller);
+
+    // `audit` is served here (it reads the log) and is not itself recorded — a
+    // query of the log shouldn't pollute the log. It is subtree-scoped like any
+    // read: a worker sees only its own subtree's entries.
+    if let Cmd::Audit(ar) = &req.cmd {
+        return audit_reply(audit, windows, caller, privileged, ar.tail);
+    }
+
+    let (action, detail) = audit_label(&req);
+    let reply = dispatch_ctl(
+        req,
+        windows,
+        rows,
+        cols,
+        max_depth,
+        extra_allow,
+        pending,
+        world,
+        session_identity,
+        privileged,
+    );
+    let (ok, note) = audit_outcome(&reply);
+    audit.record(caller, action, &detail, ok, &note);
+    reply
+}
+
+/// The server side of the control channel: turn one parsed [`amux::ctl::Request`]
+/// into its JSON reply. `list`/`status` serialize the spawn tree (agsess status
+/// folded in); `spawn` opens a visible worker after the pure allowlist/depth
+/// guard ([`amux::ctl::evaluate_spawn`]) and the credential-delegation guard
+/// ([`amux::ctl::delegation_allowed`]); `send` enqueues a queue-until-idle
+/// delivery; `kill` tears down the target's subtree (the reap step reaps them).
+/// `send`/`status`/`kill` with a target are subtree-scoped.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_ctl(
+    req: amux::ctl::Request,
+    windows: &mut Vec<Window>,
+    rows: u16,
+    cols: u16,
+    max_depth: usize,
+    extra_allow: &[String],
+    pending: &mut Vec<PendingSend>,
+    world: &agsess::World,
+    session_identity: Option<&str>,
+    privileged: bool,
+) -> String {
+    use amux::ctl::{self, Cmd};
+    let caller = req.caller;
 
     match req.cmd {
         Cmd::List => reply_tree(windows, world, None),
         Cmd::Status(sr) => match sr.target {
             None => {
                 // No target: the caller's subtree (whole tree for the operator).
-                let root = if privileged { None } else { req.caller };
+                let root = if privileged { None } else { caller };
                 reply_tree(windows, world, root)
             }
             Some(t) => {
@@ -1297,7 +1371,7 @@ fn apply_ctl(
                     Ok(id) => id,
                     Err(e) => return ctl::reply_err(&e),
                 };
-                if let Some(deny) = scope_denied(windows, req.caller, privileged, id) {
+                if let Some(deny) = scope_denied(windows, caller, privileged, id) {
                     return deny;
                 }
                 let status = pane_by_agent(windows, id).and_then(|p| {
@@ -1313,7 +1387,7 @@ fn apply_ctl(
                 Ok(id) => id,
                 Err(e) => return ctl::reply_err(&e),
             };
-            if let Some(deny) = scope_denied(windows, req.caller, privileged, id) {
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
                 return deny;
             }
             // Queued iff the target is mid-turn now; either way delivery is async
@@ -1332,8 +1406,7 @@ fn apply_ctl(
             ctl::reply_sent(id, busy)
         }
         Cmd::Spawn(sp) => {
-            let caller_depth = req
-                .caller
+            let caller_depth = caller
                 .and_then(|cid| pane_by_agent(windows, cid))
                 .map(|p| p.depth)
                 .unwrap_or(0);
@@ -1342,13 +1415,168 @@ fn apply_ctl(
                     Ok(d) => d,
                     Err(denied) => return ctl::reply_err(&denied.message()),
                 };
+            // Credential-delegation guard (§5): a worker may only pass down an
+            // identity it itself holds (its own or the session default); the
+            // operator delegates anything.
+            let caller_identity = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .and_then(|p| p.identity.clone());
+            if let Err(msg) = ctl::delegation_allowed(
+                sp.identity.as_deref(),
+                caller_identity.as_deref(),
+                session_identity,
+                privileged,
+            ) {
+                return ctl::reply_err(&msg);
+            }
             if sp.new_window {
-                spawn_worker_window(windows, &sp, req.caller, new_depth, rows, cols)
+                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols)
             } else {
-                spawn_worker_here(windows, &sp, req.caller, new_depth, rows, cols)
+                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols)
             }
         }
+        Cmd::Kill(kr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&kr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            // Tear down the target and every descendant. We only mark the panes
+            // dead (kill the pty, set `exited`); the run loop's reap step (§4)
+            // then collapses the split trees, drops the panes, and removes any
+            // window left empty — the same proven path an interactive `x` uses.
+            let parents = ctl_parents(windows);
+            let mut killed: Vec<usize> = Vec::new();
+            for w in windows.iter_mut() {
+                for p in w.panes.iter_mut() {
+                    if amux::ctl::in_subtree(p.agent_id, id, &parents) {
+                        let _ = p.pty.kill();
+                        p.exited = true;
+                        killed.push(p.agent_id);
+                    }
+                }
+            }
+            killed.sort_unstable();
+            ctl::reply_killed(&killed)
+        }
+        // `audit` is handled in `apply_ctl` (it needs the log); never reaches here.
+        Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
     }
+}
+
+/// Truncate a string to `n` chars (char-safe), appending `…` when cut. Keeps a
+/// bad-request line short in the audit log.
+fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+/// The audit `(action, detail)` for a request: a stable verb plus a compact,
+/// **secret-free** description (identity *names* only; `send` logs the text
+/// *length*, never the body).
+fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
+    use amux::ctl::Cmd;
+    match &req.cmd {
+        Cmd::List => ("list", String::new()),
+        Cmd::Status(sr) => (
+            "status",
+            match &sr.target {
+                Some(t) => format!("target={t}"),
+                None => "scope=subtree".to_string(),
+            },
+        ),
+        Cmd::Send(sr) => (
+            "send",
+            format!("target={} len={}", sr.target, sr.text.chars().count()),
+        ),
+        Cmd::Spawn(sp) => {
+            let stem = sp
+                .argv
+                .first()
+                .map(|a| {
+                    std::path::Path::new(a)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| a.clone())
+                })
+                .unwrap_or_default();
+            (
+                "spawn",
+                format!(
+                    "role={} argv={} identity={}",
+                    sp.role.as_deref().unwrap_or("-"),
+                    stem,
+                    sp.identity.as_deref().unwrap_or("-")
+                ),
+            )
+        }
+        Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
+        Cmd::Audit(_) => ("audit", String::new()),
+    }
+}
+
+/// Read `(ok, note)` back out of a reply line for the audit record: the error on
+/// failure, or a compact success tag naming the salient id(s).
+fn audit_outcome(reply: &str) -> (bool, String) {
+    let v = match json::parse(reply) {
+        Ok(v) => v,
+        Err(_) => return (false, "unparseable reply".to_string()),
+    };
+    let ok = v.get("ok").and_then(json::Value::as_bool).unwrap_or(false);
+    if !ok {
+        return (
+            false,
+            v.get("err")
+                .and_then(json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        );
+    }
+    let note = if let Some(p) = v.get("pane").and_then(json::Value::as_i64) {
+        format!("pane={p}")
+    } else if let Some(k) = v.get("killed").and_then(json::Value::as_array) {
+        let ids: Vec<String> = k
+            .iter()
+            .filter_map(json::Value::as_i64)
+            .map(|n| n.to_string())
+            .collect();
+        format!("killed={}", ids.join(","))
+    } else if let Some(t) = v.get("target").and_then(json::Value::as_i64) {
+        format!("target={t}")
+    } else {
+        String::new()
+    };
+    (true, note)
+}
+
+/// Serve a `ctl audit` read: the in-memory log, subtree-scoped. The operator
+/// sees everything; a worker sees only entries issued from within its own
+/// subtree (operator/`None`-caller entries are hidden from it).
+fn audit_reply(
+    audit: &amux::audit::Audit,
+    windows: &[Window],
+    caller: Option<usize>,
+    privileged: bool,
+    tail: Option<usize>,
+) -> String {
+    let entries = if privileged {
+        audit.view(tail, |_| true)
+    } else if let Some(root) = caller {
+        let parents = ctl_parents(windows);
+        audit.view(tail, |e| match e.caller {
+            Some(c) => amux::ctl::in_subtree(c, root, &parents),
+            None => false, // operator actions are hidden from a worker
+        })
+    } else {
+        audit.view(tail, |_| true)
+    };
+    amux::ctl::reply_audit(entries)
 }
 
 /// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
@@ -1410,7 +1638,14 @@ fn spawn_worker_window(
     cols: u16,
 ) -> String {
     let mut flash = None;
-    match spawn_window(&sp.argv, rows, cols, windows.len(), None, &mut flash) {
+    match spawn_window(
+        &sp.argv,
+        rows,
+        cols,
+        windows.len(),
+        sp.identity.as_deref(),
+        &mut flash,
+    ) {
         Ok(mut w) => {
             let pane = &mut w.panes[0];
             pane.role = sp.role.clone();
@@ -1464,7 +1699,14 @@ fn spawn_worker_here(
         (cols / 2).saturating_sub(2),
     );
     let mut flash = None;
-    match spawn_pane(&sp.argv, pr.max(1), pc.max(1), new_id, None, &mut flash) {
+    match spawn_pane(
+        &sp.argv,
+        pr.max(1),
+        pc.max(1),
+        new_id,
+        sp.identity.as_deref(),
+        &mut flash,
+    ) {
         Ok(mut pane) => {
             pane.role = sp.role.clone();
             pane.parent = caller;

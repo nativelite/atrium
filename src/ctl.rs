@@ -9,10 +9,12 @@
 //!   *pure* guard — allowlist + depth cap — so the safety rules are unit-tested
 //!   without a pty or a running amux.
 //!
-//! Surface: `spawn` (open a visible worker — new window or `--here` split),
-//! `list` (the org chart), `send` (queue-until-idle task delivery), and
-//! `status` (agsess-backed). `send`/`status` with a target are subtree-scoped.
-//! `kill` + identity delegation arrive in C3.
+//! Surface: `spawn` (open a visible worker — new window or `--here` split, under
+//! an optionally-delegated `--identity`), `list` (the org chart), `send`
+//! (queue-until-idle task delivery), `status` (agsess-backed), `kill` (subtree
+//! teardown), and `audit` (the ctl request log). `send`/`status`/`kill`/`audit`
+//! with a target are subtree-scoped; credential delegation is scoped by
+//! [`delegation_allowed`] (C3).
 
 use std::process::ExitCode;
 
@@ -40,7 +42,7 @@ pub struct Request {
     pub cmd: Cmd,
 }
 
-/// The command set (C1: spawn/list; C2 adds send/status).
+/// The command set (C1: spawn/list; C2: send/status; C3: kill/audit).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cmd {
     /// Open a new worker pane running `argv`, tagged `role`.
@@ -52,6 +54,26 @@ pub enum Cmd {
     Send(SendReq),
     /// Report status: one target, or (no target) the caller's visible subtree.
     Status(StatusReq),
+    /// Terminate a target pane **and its whole subtree** (design §5: a kill
+    /// tears down descendants, so a lead's `kill` reaps its ICs too).
+    Kill(KillReq),
+    /// Report the ctl request log (subtree-scoped for a worker), most recent
+    /// `tail` entries or all of the in-memory ring.
+    Audit(AuditReq),
+}
+
+/// A `kill` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KillReq {
+    /// Pane id (numeric) or role label at the root of the subtree to tear down.
+    pub target: String,
+}
+
+/// An `audit` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditReq {
+    /// Show only the most recent `n` entries; `None` = the whole in-memory ring.
+    pub tail: Option<usize>,
 }
 
 /// A `send` request's payload.
@@ -80,6 +102,11 @@ pub struct SpawnReq {
     /// Open in a new window (true, the default) vs. `--here` split beside the
     /// caller (false).
     pub new_window: bool,
+    /// The credential identity **name** to run the worker under (`--identity X`),
+    /// if any. Subject to delegation scoping ([`delegation_allowed`]): a worker
+    /// may only pass down an identity it itself holds. `None` = no identity
+    /// (ambient env), the default.
+    pub identity: Option<String>,
 }
 
 /// Why a spawn was refused. Each maps to a clear reply the caller can act on.
@@ -195,6 +222,41 @@ pub fn in_subtree(target: usize, root: usize, parents: &[(usize, Option<usize>)]
     false
 }
 
+/// The **credential-delegation guard** (design §5): which identity may a
+/// `ctl spawn` run its worker under? A spawned worker (non-privileged caller)
+/// may only delegate an identity it itself holds — its **own** identity, or the
+/// **session/fleet default** amux launched with — so an IC can't mint itself
+/// `wif:prod` that its lead was never granted. The **operator** (human root,
+/// `privileged`) is the trust root and may delegate any identity in the vault.
+/// Requesting `None` (no identity) is always allowed. Pure; unit-tested.
+///
+/// * `requested` — the `--identity` name the spawn asked for (or `None`).
+/// * `caller_identity` — the requesting pane's own identity name.
+/// * `session_default` — the identity amux itself was launched under.
+pub fn delegation_allowed(
+    requested: Option<&str>,
+    caller_identity: Option<&str>,
+    session_default: Option<&str>,
+    privileged: bool,
+) -> Result<(), String> {
+    let Some(req) = requested else {
+        return Ok(()); // no identity delegated — nothing to escalate
+    };
+    if privileged || Some(req) == caller_identity || Some(req) == session_default {
+        return Ok(());
+    }
+    Err(format!(
+        "identity {req:?} is not yours to delegate; a worker may only pass down \
+         its own identity or the session default"
+    ))
+}
+
+/// Environment knob naming a file to append the ctl audit log to as JSONL, one
+/// object per request (opt-in, on top of `--allow-ctl`; design §5 "optionally
+/// on-disk"). Unset ⇒ the log is kept in memory only, readable via `ctl audit`.
+/// Only identity **names** are ever written — never resolved secret values.
+pub const ENV_AUDIT: &str = "AMUX_CTL_AUDIT";
+
 /// Environment knob (comma-separated) that extends the ctl agent allowlist
 /// beyond [`bind::AGENT_STEMS`]. Opt-in on top of `--allow-ctl` and set by the
 /// human who launches amux, so it never weakens the confused-agent guard for a
@@ -299,10 +361,12 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             };
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
+            let identity = v.get("identity").and_then(Value::as_str).map(str::to_string);
             Cmd::Spawn(SpawnReq {
                 role,
                 argv,
                 new_window,
+                identity,
             })
         }
         Some("list") => Cmd::List,
@@ -322,6 +386,21 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
         Some("status") => {
             let target = v.get("target").and_then(Value::as_str).map(str::to_string);
             Cmd::Status(StatusReq { target })
+        }
+        Some("kill") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "kill needs a target".to_string())?
+                .to_string();
+            Cmd::Kill(KillReq { target })
+        }
+        Some("audit") => {
+            let tail = v
+                .get("tail")
+                .and_then(Value::as_i64)
+                .map(|n| n.max(0) as usize);
+            Cmd::Audit(AuditReq { tail })
         }
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
@@ -367,6 +446,25 @@ pub fn reply_sent(target: usize, queued: bool) -> String {
         ("ok", Value::Bool(true)),
         ("target", i(target)),
         ("queued", Value::Bool(queued)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"killed":[<id>,…]}` — the set of panes torn down by a `kill`
+/// (the target plus every descendant), sorted. Empty only if the target
+/// vanished between resolve and teardown.
+pub fn reply_killed(killed: &[usize]) -> String {
+    let arr = killed.iter().map(|id| i(*id)).collect();
+    obj(vec![("ok", Value::Bool(true)), ("killed", Value::Array(arr))]).to_string()
+}
+
+/// `{"ok":true,"audit":[<entry>,…]}` — the (already-serialized, already-scoped)
+/// audit entries, oldest-first. The caller builds each entry `Value` from its
+/// own log so this crate stays free of the log's storage type.
+pub fn reply_audit(entries: Vec<Value>) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("audit", Value::Array(entries)),
     ])
     .to_string()
 }
@@ -429,7 +527,10 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("amux ctl: {msg}");
-            eprintln!("usage: amux ctl spawn [--role R] [-- <cmd...>] | amux ctl list");
+            eprintln!(
+                "usage: amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...>\n\
+                 \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -467,6 +568,7 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
         Some("spawn") => {
             pairs.push(("cmd", s("spawn")));
             let mut role: Option<String> = None;
+            let mut identity: Option<String> = None;
             let mut new_window = true;
             let mut argv: Vec<String> = Vec::new();
             let mut i = 1;
@@ -477,6 +579,14 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                             args.get(i + 1)
                                 .cloned()
                                 .ok_or_else(|| "--role needs a value".to_string())?,
+                        );
+                        i += 2;
+                    }
+                    "--identity" => {
+                        identity = Some(
+                            args.get(i + 1)
+                                .cloned()
+                                .ok_or_else(|| "--identity needs a value".to_string())?,
                         );
                         i += 2;
                     }
@@ -500,6 +610,9 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             }
             if let Some(r) = role {
                 pairs.push(("role", Value::String(r)));
+            }
+            if let Some(x) = identity {
+                pairs.push(("identity", Value::String(x)));
             }
             pairs.push(("window", Value::Bool(new_window)));
             pairs.push((
@@ -529,8 +642,29 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                 pairs.push(("target", Value::String(target.clone())));
             }
         }
+        Some("kill") => {
+            pairs.push(("cmd", s("kill")));
+            let target = args
+                .get(1)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "kill needs a target (pane id or role)".to_string())?;
+            pairs.push(("target", Value::String(target.clone())));
+        }
+        Some("audit") => {
+            pairs.push(("cmd", s("audit")));
+            if let Some(tok) = args.get(1).filter(|t| !t.starts_with('-')) {
+                let n = tok
+                    .parse::<usize>()
+                    .map_err(|_| format!("audit tail must be a number, got {tok:?}"))?;
+                pairs.push(("tail", Value::Number(Number::Int(n as i64))));
+            }
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
-        None => return Err("needs a subcommand: spawn | list | send | status".to_string()),
+        None => {
+            return Err(
+                "needs a subcommand: spawn | list | send | status | kill | audit".to_string(),
+            )
+        }
     }
     Ok(obj(pairs).to_string())
 }
@@ -769,6 +903,102 @@ mod tests {
     fn flags_bad_max_depth_errors() {
         let err = parse_flags(&v(&["--max-depth", "lots"])).unwrap_err();
         assert!(err.contains("--max-depth"), "{err}");
+    }
+
+    #[test]
+    fn build_spawn_with_identity_roundtrips() {
+        let line = build_request(
+            &v(&["spawn", "--role", "dev_1", "--identity", "work", "--", "claude"]),
+            Some(0),
+        )
+        .unwrap();
+        let req = parse_request(&line).unwrap();
+        match req.cmd {
+            Cmd::Spawn(sp) => {
+                assert_eq!(sp.role.as_deref(), Some("dev_1"));
+                assert_eq!(sp.identity.as_deref(), Some("work"));
+                assert_eq!(sp.argv, v(&["claude"]));
+            }
+            _ => panic!("expected spawn"),
+        }
+    }
+
+    #[test]
+    fn spawn_without_identity_leaves_it_none() {
+        let line = build_request(&v(&["spawn", "--", "claude"]), None).unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Spawn(sp) => assert_eq!(sp.identity, None),
+            _ => panic!("expected spawn"),
+        }
+    }
+
+    #[test]
+    fn build_and_parse_kill_request() {
+        let req = parse_request(&build_request(&v(&["kill", "dev_1"]), Some(1)).unwrap()).unwrap();
+        assert_eq!(req.caller, Some(1));
+        assert_eq!(
+            req.cmd,
+            Cmd::Kill(KillReq {
+                target: "dev_1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn kill_without_target_is_an_error() {
+        let err = build_request(&v(&["kill"]), None).unwrap_err();
+        assert!(err.contains("target"), "{err}");
+    }
+
+    #[test]
+    fn build_and_parse_audit_with_and_without_tail() {
+        let tailed = parse_request(&build_request(&v(&["audit", "20"]), None).unwrap()).unwrap();
+        assert_eq!(tailed.cmd, Cmd::Audit(AuditReq { tail: Some(20) }));
+        let all = parse_request(&build_request(&v(&["audit"]), None).unwrap()).unwrap();
+        assert_eq!(all.cmd, Cmd::Audit(AuditReq { tail: None }));
+    }
+
+    #[test]
+    fn audit_non_numeric_tail_is_an_error() {
+        let err = build_request(&v(&["audit", "lots"]), None).unwrap_err();
+        assert!(err.contains("number"), "{err}");
+    }
+
+    #[test]
+    fn delegation_none_is_always_allowed() {
+        assert!(delegation_allowed(None, None, None, false).is_ok());
+        assert!(delegation_allowed(None, Some("work"), Some("prod"), false).is_ok());
+    }
+
+    #[test]
+    fn delegation_worker_may_pass_its_own_or_the_session_default() {
+        // Caller holds "work"; session default is "team".
+        assert!(delegation_allowed(Some("work"), Some("work"), Some("team"), false).is_ok());
+        assert!(delegation_allowed(Some("team"), Some("work"), Some("team"), false).is_ok());
+    }
+
+    #[test]
+    fn delegation_worker_cannot_mint_an_unheld_identity() {
+        let err = delegation_allowed(Some("prod"), Some("work"), Some("team"), false).unwrap_err();
+        assert!(err.contains("prod"), "{err}");
+        assert!(err.contains("delegate"), "{err}");
+    }
+
+    #[test]
+    fn delegation_operator_may_delegate_anything() {
+        // privileged == the human root: any vault identity is theirs to grant.
+        assert!(delegation_allowed(Some("prod"), None, Some("work"), true).is_ok());
+    }
+
+    #[test]
+    fn reply_killed_lists_the_torn_down_panes() {
+        let r = reply_killed(&[1, 2, 3]);
+        let v = json::parse(&r).unwrap();
+        assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            v.get("killed").and_then(Value::as_array).map(<[_]>::len),
+            Some(3)
+        );
     }
 
     #[test]
