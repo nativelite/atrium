@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-30
+
+### Added
+- **`ctl` control plane (C1) — opt-in.** amux can now host a *controllable*
+  hierarchy of agents. Launch with `amux --allow-ctl [--max-depth <N>] …` and
+  amux binds a per-process control channel (a Windows **named pipe** / unix
+  **socket**, zero third-party deps), injecting its address (`AMUX_CTL`) and each
+  pane's id (`AMUX_PANE`) into every pane it spawns. From inside a pane:
+  - `amux ctl spawn [--role R] -- <cmd>` opens a **visible** new worker pane
+    (returns its agent id + session id as JSON);
+  - `amux ctl list` returns the spawn tree (id, parent, role, depth, live
+    `agsess` status) as JSON.
+  The channel is drained non-blocking from the run loop (no thread). **Off by
+  default:** without `--allow-ctl` there is no pipe, `amux ctl` refuses, and
+  behavior is identical to before.
+- **Spawn-tree safety guards.** `ctl spawn` accepts only commands on the agent
+  allowlist (`{claude}`, extensible per-session via `AMUX_CTL_ALLOW`), and a
+  `--max-depth` ceiling (default 6, `0` = unlimited) bounds *recursion* — never
+  fleet width — as a fork-bomb circuit-breaker. Every worker is a normal pane:
+  visible in the bar, killable, in the org chart.
+
+_Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
+(they arrive in C2–C3)._
+
 ## [0.6.1] - 2026-08-29
 
 ### Fixed

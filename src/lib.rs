@@ -17,10 +17,12 @@
 
 pub mod bar;
 pub mod bind;
+pub mod ctl;
 pub mod filter;
 pub mod fleet;
 pub mod identity;
 pub mod input;
+pub mod ipc;
 pub mod layout;
 pub mod resolve;
 pub mod spawn;

@@ -27,7 +27,24 @@ use amux::layout::{self, Rect, Tree};
 use amux::tile::{compose, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// A process-global, monotonic **agent id** stamped on every pane amux hosts —
+/// the stable key of the ctl spawn tree (`Pane.id` is only unique within a
+/// window; this is unique across the whole run). Incremented once per spawn.
+static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
+
+/// The ctl channel address, set once at startup iff `--allow-ctl` was given.
+/// The spawn path reads it to inject `AMUX_CTL`/`AMUX_PANE` into each pane so an
+/// agent inside can drive `amux ctl`. `None` (unset) ⇒ ctl is off and every
+/// spawn is byte-identical to pre-ctl amux.
+static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
+
+fn next_agent_id() -> usize {
+    NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// One hosted terminal: a pty, its emulator (for tiled compositing), its
 /// passthrough filter (for the passthrough / zoom path), and bar metadata. Each
@@ -50,6 +67,20 @@ struct Pane {
     /// alone; the resolved values live only for the spawn call and are dropped
     /// immediately. Surfaced in the chrome as a `·<name>` tag.
     identity: Option<String>,
+    /// Process-global agent id (see [`NEXT_AGENT`]): the ctl spawn-tree key,
+    /// stable across windows. Injected into the pane as `AMUX_PANE` so an agent
+    /// inside can attribute its own `ctl spawn` calls.
+    agent_id: usize,
+    /// The ctl role label this pane was spawned under (`dev_1`), if any. `None`
+    /// for the human's own panes and shells.
+    role: Option<String>,
+    /// The agent id of the pane whose `ctl spawn` created this one. `None` for a
+    /// root pane the human opened.
+    parent: Option<usize>,
+    /// Depth in the spawn tree: 0 for a root/human pane, parent.depth + 1 for a
+    /// ctl-spawned worker. The `--max-depth` recursion guard is checked against
+    /// this.
+    depth: usize,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -91,6 +122,12 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("fleet") {
         return fleet_cmd(&args[1..]);
     }
+    // `amux ctl …` is the control-channel client: it connects to the running
+    // amux's `AMUX_CTL` endpoint, so it is a command family, not a hosted
+    // program — dispatch it before flag parsing too.
+    if args.first().map(String::as_str) == Some("ctl") {
+        return amux::ctl::ctl_cmd(&args[1..]);
+    }
     // amux's own `--identity <name>` / `-I <name>` is stripped off the front,
     // before the hosted command begins; it tags the initial agent pane and is
     // inherited by every split/new pane (stored, re-resolved per spawn). Only
@@ -100,13 +137,25 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [-n <N> | --grid <R>x<C>] [command [args...]]   (Ctrl+A ? in the bar shows keys)"
+            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      amux ctl spawn [--role R] [-- <cmd...>] | amux ctl list   (inside a --allow-ctl session)\n\
+             \x20      (Ctrl+A ? in the bar shows keys)"
         );
         return ExitCode::SUCCESS;
     }
     if rest.first().map(String::as_str) == Some("--stdin-probe") {
         return stdin_probe();
     }
+    // amux's own ctl meta-flags (`--allow-ctl` / `--max-depth <N>`) are stripped
+    // next — after `--identity`, before mass-spawn flags and the hosted command.
+    // A bad `--max-depth` is a startup error, never a silent fallback.
+    let (allow_ctl, max_depth, rest) = match amux::ctl::parse_flags(&rest) {
+        Ok(triple) => triple,
+        Err(msg) => {
+            eprintln!("amux: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     // amux's own mass-spawn flags (`-n <N>` / `--grid <R>x<C>`) are stripped off
     // the front, after `--identity`, before the hosted command. A bad value is a
     // startup error, surfaced on stderr — never a silent fallback to one pane.
@@ -129,7 +178,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run(&mut term, &command, identity.as_deref(), grid, None)
+    run(
+        &mut term,
+        &command,
+        identity.as_deref(),
+        grid,
+        None,
+        allow_ctl,
+        max_depth,
+    )
 }
 
 fn run(
@@ -143,6 +200,12 @@ fn run(
     // still drive later `Ctrl+A c` new panes and splits (which host `command`
     // under `identity`), so a fleet's new panes open a shell as a scratch pane.
     initial_window: Option<Window>,
+    // ctl control plane (§ amux-ctl-control-plane): when `allow_ctl`, amux binds
+    // a per-process control endpoint and injects its address into every pane, so
+    // an agent inside a pane can `amux ctl spawn/list`. `max_depth` is the
+    // recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
+    allow_ctl: bool,
+    max_depth: usize,
 ) -> ExitCode {
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
@@ -158,6 +221,31 @@ fn run(
     // bar and the pane spawns *without* the credential — never silently, and
     // never unauthenticated-without-saying-so (§7).
     let mut flash: Option<(String, Instant)> = None;
+    // ctl control channel (opt-in). Bind the endpoint and publish its address to
+    // the spawn path *before* the first pane is spawned, so every pane — the
+    // initial one included — is born with `AMUX_CTL`/`AMUX_PANE` in its
+    // environment. A bind failure is non-fatal: amux still runs, just without
+    // ctl, and says so in the bar (never silently unavailable).
+    let mut ctl_listener: Option<amux::ipc::Listener> = None;
+    // Operator-approved extra allowlist stems (AMUX_CTL_ALLOW); empty ⇒ the
+    // built-in agents-only guard. Read once at startup.
+    let ctl_extra_allow = if allow_ctl {
+        amux::ctl::extra_allow_from_env()
+    } else {
+        Vec::new()
+    };
+    if allow_ctl {
+        let addr = amux::ipc::default_address();
+        match amux::ipc::Listener::bind(&addr) {
+            Ok(l) => {
+                let _ = CTL_ADDRESS.set(addr);
+                ctl_listener = Some(l);
+            }
+            Err(e) => {
+                flash = Some((format!("ctl channel disabled: {e}"), Instant::now()));
+            }
+        }
+    }
     // A pre-built window (fleet) is used as-is; otherwise mass-spawn opens one
     // window of N tiles in a balanced grid, or the 0.1 single-pane path. All
     // share the same spawn machinery (each pane its own session).
@@ -336,6 +424,33 @@ fn run(
                         eprint!("[amux-dbg quit-received]\r\n");
                     }
                     break 'outer;
+                }
+            }
+        }
+
+        // 1b. ctl control channel: drain up to a few requests this tick
+        //     (non-blocking; usually zero). Each request is applied as a pane
+        //     operation and answered on the same connection. A spawn appends a
+        //     visible new window, so we force a repaint after any request.
+        if let Some(listener) = ctl_listener.as_mut() {
+            for _ in 0..8 {
+                match listener.poll() {
+                    Ok(Some(line)) => {
+                        let reply = apply_ctl(
+                            &line,
+                            &mut windows,
+                            rows,
+                            cols,
+                            max_depth,
+                            &ctl_extra_allow,
+                            &world,
+                        );
+                        let _ = listener.respond(&reply);
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
         }
@@ -903,12 +1018,16 @@ fn fleet_up(name: &str) -> ExitCode {
     // New panes / splits opened later host a shell under the fleet's default
     // identity — a scratch pane in-role, not another copy of an agent.
     let scratch = vec![default_shell()];
+    // ctl is opt-in via the `amux --allow-ctl` path; the fleet path runs without
+    // it in C1 (a fleet + live ctl-spawn combination lands later).
     run(
         &mut term,
         &scratch,
         fleet.identity.as_deref(),
         None,
         Some(window),
+        false,
+        amux::ctl::DEFAULT_MAX_DEPTH,
     )
 }
 
@@ -978,6 +1097,98 @@ fn spawn_fleet_window(
         zoomed: false,
         next_id: fleet.agents.len(),
     })
+}
+
+/// The agsess status label the ctl protocol reports (stable strings the calling
+/// agent can match on).
+fn status_label(s: agsess::Status) -> &'static str {
+    match s {
+        agsess::Status::Working => "working",
+        agsess::Status::WaitingApproval => "waiting-approval",
+        agsess::Status::WaitingPrompt => "waiting-prompt",
+        agsess::Status::Idle => "idle",
+    }
+}
+
+/// Apply one ctl request against the live window set and return the JSON reply
+/// line. This is the server side of the control channel: `list` serializes the
+/// spawn tree (agsess statuses folded in), `spawn` creates a visible worker pane
+/// after the pure [`amux::ctl::evaluate_spawn`] guard (allowlist + depth) passes.
+fn apply_ctl(
+    line: &str,
+    windows: &mut Vec<Window>,
+    rows: u16,
+    cols: u16,
+    max_depth: usize,
+    extra_allow: &[String],
+    world: &agsess::World,
+) -> String {
+    use amux::ctl::{self, Cmd};
+
+    let req = match ctl::parse_request(line) {
+        Ok(r) => r,
+        Err(e) => return ctl::reply_err(&e),
+    };
+
+    match req.cmd {
+        Cmd::List => {
+            let mut panes: Vec<&Pane> = windows.iter().flat_map(|w| w.panes.iter()).collect();
+            panes.sort_by_key(|p| p.agent_id);
+            let nodes: Vec<ctl::TreeNode> = panes
+                .iter()
+                .map(|p| ctl::TreeNode {
+                    id: p.agent_id,
+                    parent: p.parent,
+                    role: p.role.as_deref(),
+                    title: &p.title,
+                    depth: p.depth,
+                    status: amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
+                        .map(status_label),
+                })
+                .collect();
+            ctl::reply_list(&nodes)
+        }
+        Cmd::Spawn(sp) => {
+            if !sp.new_window {
+                return ctl::reply_err(
+                    "`--here` (split the caller) lands in C2; C1 opens a new window — rerun without --here",
+                );
+            }
+            // The caller's depth (0 if the caller is unknown — e.g. a human pane
+            // amux did not spawn): the worker will sit one below it.
+            let caller_depth = req
+                .caller
+                .and_then(|cid| {
+                    windows
+                        .iter()
+                        .flat_map(|w| w.panes.iter())
+                        .find(|p| p.agent_id == cid)
+                })
+                .map(|p| p.depth)
+                .unwrap_or(0);
+            match ctl::evaluate_spawn(&sp.argv, caller_depth, max_depth, extra_allow) {
+                Err(denied) => ctl::reply_err(&denied.message()),
+                Ok(new_depth) => {
+                    let mut flash = None;
+                    match spawn_window(&sp.argv, rows, cols, windows.len(), None, &mut flash) {
+                        Ok(mut w) => {
+                            // A new window from ctl spawn is a single pane; stamp
+                            // its spawn-tree fields before it joins the set.
+                            let pane = &mut w.panes[0];
+                            pane.role = sp.role.clone();
+                            pane.parent = req.caller;
+                            pane.depth = new_depth;
+                            let agent_id = pane.agent_id;
+                            let session = pane.session_id.clone();
+                            windows.push(w);
+                            ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
+                        }
+                        Err(e) => ctl::reply_err(&format!("spawn failed: {e}")),
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn spawn_window(
@@ -1107,6 +1318,20 @@ fn spawn_pane_full(
     let r = rows.max(1);
     let c = cols.max(1);
 
+    // Stamp the process-global agent id now — it is both the pane's spawn-tree
+    // key and the `AMUX_PANE` value injected below, so an agent inside can
+    // attribute its own `ctl spawn` calls back to this pane.
+    let agent_id = next_agent_id();
+
+    // ctl env (non-secret): when the control channel is on, every pane learns
+    // the endpoint (`AMUX_CTL`) and its own id (`AMUX_PANE`). This is the base
+    // env; identity secrets (if any) are merged on top for this one spawn.
+    let mut base_env: Vec<(String, String)> = Vec::new();
+    if let Some(addr) = CTL_ADDRESS.get() {
+        base_env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.clone()));
+        base_env.push((amux::ctl::ENV_PANE.to_string(), agent_id.to_string()));
+    }
+
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge
     // — a pane tagged with an identity is exactly a pane spawned with its env.
@@ -1124,9 +1349,12 @@ fn spawn_pane_full(
         let name = identity.expect("wants_env implies Some");
         match akey::resolve(name) {
             Ok(env) => {
-                // `env` holds secret values; used for this one spawn only, then
-                // dropped. Deliberately never formatted, logged, or stored.
-                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &env, cwd)?
+                // `env` holds secret values; merged with the (non-secret) ctl
+                // base env for this one spawn, then dropped. Deliberately never
+                // formatted, logged, or stored.
+                let mut merged = base_env.clone();
+                merged.extend(env);
+                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &merged, cwd)?
             }
             Err(e) => {
                 // Name only in the message — `e` is akey's own error text
@@ -1136,11 +1364,11 @@ fn spawn_pane_full(
                     format!("identity {name:?} unresolved: {e} — running without it"),
                     Instant::now(),
                 ));
-                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &[], cwd)?
+                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
             }
         }
     } else {
-        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &[], cwd)?
+        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
     };
     Ok(Pane {
         id,
@@ -1156,6 +1384,12 @@ fn spawn_pane_full(
         // tag on a pane that was never credentialed. `inject` is the same
         // decision the spawn used, so tag and env can never disagree.
         identity: identity.filter(|_| inject).map(str::to_string),
+        agent_id,
+        // Spawn-tree fields default to "root pane the human opened"; the ctl
+        // spawn handler overrides role/parent/depth for a ctl-created worker.
+        role: None,
+        parent: None,
+        depth: 0,
     })
 }
 

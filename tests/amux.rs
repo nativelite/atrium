@@ -868,3 +868,87 @@ fn double_prefix_reaches_the_child() {
     p.write(b"\x01q").unwrap();
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
+
+// --- end to end: the ctl control channel (C1) -------------------------------
+
+/// Spawn `amux --allow-ctl <shell>` in a pty, with `AMUX_CTL_ALLOW` set so the
+/// harmless shell counts as a spawnable worker, and return the pty once the bar
+/// (pane 1) is up. The hosted shell inherits `AMUX_CTL`/`AMUX_PANE`, so a client
+/// typed into it drives the real channel — exactly as an agent-in-a-pane would.
+fn spawn_amux_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
+    let (shell, flag): (&str, &str) = if cfg!(windows) {
+        ("cmd", "/Q")
+    } else {
+        ("sh", "-i")
+    };
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_amux"),
+        &["--allow-ctl", shell, flag],
+        24,
+        100,
+        &[("AMUX_CTL_ALLOW".to_string(), shell.to_string())],
+        None,
+    )
+    .unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    (p, shell, flag)
+}
+
+/// `amux ctl list`, run inside a live `--allow-ctl` amux pane, connects over the
+/// real channel and returns the org chart as JSON — proving the whole loop:
+/// bind → inject env → client connect → non-blocking server drain → reply.
+#[test]
+fn ctl_list_roundtrips_through_a_live_amux() {
+    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    p.write(format!("\"{amux}\" ctl list\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"tree\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"tree\""),
+        "no ctl list reply in: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// `amux ctl spawn -- <shell>` opens a *visible* new worker window: after the
+/// call the bar gains a second pane entry. This is the C1 "an in-pane
+/// `ctl spawn` opens a visible worker" done-criterion, end to end.
+#[test]
+fn ctl_spawn_opens_a_visible_worker_window() {
+    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    let out = read_until(&mut p, two, Duration::from_secs(20));
+    assert!(
+        contains(&out, two),
+        "no second (worker) pane in the bar after ctl spawn: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// A spawn of a command that is *not* on the allowlist is refused cleanly over
+/// the channel — the guard reaches the client as a JSON error, no worker opens.
+#[test]
+fn ctl_spawn_off_the_allowlist_is_refused() {
+    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
+    let amux = env!("CARGO_BIN_EXE_amux");
+    // `whoami` is a real binary on both platforms but not an agent/allowlisted.
+    p.write(format!("\"{amux}\" ctl spawn -- whoami\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"allowlist", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"allowlist"),
+        "expected an allowlist refusal, got: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
