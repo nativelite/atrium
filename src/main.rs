@@ -439,10 +439,26 @@ fn run(
                 if (r, c) != (rows, cols) && r >= 3 {
                     rows = r;
                     cols = c;
-                    let _ = write!(out, "\x1b[1;{}r", rows - 1);
+                    // Reset the scroll region for the new height, then wipe the
+                    // whole screen. The wipe is what fixes the tiled-resize
+                    // garble: when the terminal shrinks, cells from the previous,
+                    // larger frame lie outside the new master and would otherwise
+                    // linger; and a tiled recompose diffs against `prev_master`,
+                    // so without this clear + `prev_master = None` the first frame
+                    // at the new size can paint over stale geometry. This mirrors
+                    // the clear `switch_window`/`repaint_focused` already emit.
+                    let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows - 1);
+                    // Resize every window's panes (pty + emulator) to their new
+                    // inner rects at the new size — tiled windows recompute the
+                    // grid, passthrough windows refit the sole/focused pane.
+                    // `resize_window` is the single helper both initial layout
+                    // and resize share, so their inner-rect math cannot drift.
                     for w in windows.iter_mut() {
                         resize_window(w, rows, cols);
                     }
+                    // Force a full recompose at the new size: tiled repaints via
+                    // `render_full` (which re-clears + paints every cell),
+                    // passthrough nudges the focused pty to redraw.
                     prev_master = None;
                     force_repaint = true;
                 }

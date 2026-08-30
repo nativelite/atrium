@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-29
+
+### Fixed
+- **Non-power-of-2 grids now tile evenly.** The layout engine split every node
+  50/50 by space, but an N-wide row is a left-leaning binary tree
+  (`split(a, split(b, c))`), so a 3-column line came out **50% / 25% / 25%**
+  (`-n 6`, `8`, `12` were all lopsided; only powers of two happened to halve
+  evenly). Each split now divides its span **proportionally to the leaf count**
+  of its two children, so `split(a, split(b, c))` gives `a` one-third and its
+  two-leaf sibling two-thirds → even thirds. Concretely, an 80-column 3-wide row
+  was `40 / 20 / 20` and is now `26 / 27 / 27`. A plain two-pane split is 1 leaf
+  vs 1 leaf, so it stays 50/50 — manual splits are unchanged.
+- **Tiled view no longer garbles on terminal resize.** On a size change the run
+  loop now clears the screen (`\x1b[2J\x1b[H`, matching the window-switch and
+  passthrough-repaint paths) before recomputing the grid and resizing each pane's
+  emulator and pty to its new inner rect, then forces a full recompose. Without
+  the clear, cells from the previous (larger) frame lingered outside the new,
+  smaller master. Passthrough (single-pane / zoomed) resize is unchanged.
+
 ## [0.6.0] - 2026-08-29
 
 ### Added

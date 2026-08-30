@@ -241,51 +241,71 @@ impl Tree {
     fn layout(node: &Node, r: Rect, out: &mut Vec<(usize, Rect)>) {
         match node {
             Node::Leaf(id) => out.push((*id, r)),
-            Node::Split { dir, first, second } => match dir {
-                Dir::Horizontal => {
-                    // Stacked: top gets the ceil half, bottom the floor half,
-                    // abutting with no reserved divider row. (Manual ceil —
-                    // `div_ceil` is not stable on our 1.70 MSRV.)
-                    let top_rows = ((r.rows + 1) / 2).max(1);
-                    let bot_rows = r.rows.saturating_sub(top_rows).max(1);
-                    let top = Rect {
-                        row: r.row,
-                        col: r.col,
-                        rows: top_rows,
-                        cols: r.cols,
-                    };
-                    let bottom = Rect {
-                        row: r.row + top_rows,
-                        col: r.col,
-                        rows: bot_rows,
-                        cols: r.cols,
-                    };
-                    Self::layout(first, top, out);
-                    Self::layout(second, bottom, out);
+            Node::Split { dir, first, second } => {
+                // Divide the span *proportionally to each child's leaf count*,
+                // not 50/50. A plain two-pane split is 1 leaf vs 1 leaf → 50/50
+                // (manual splits unchanged), but a left-leaning line like
+                // `split(a, split(b, c))` is 1 vs 2 → the first child gets 1/3
+                // and its two-leaf sibling gets 2/3, so a 3-, 6-, or 12-way grid
+                // tiles in even thirds/sixths instead of the old 50/25/25.
+                // (`split_span` clamps both sides to >= 1 and keeps them abutting
+                // with no reserved gutter — each pane draws its own box border.)
+                let a = Self::count(first);
+                let b = Self::count(second);
+                match dir {
+                    Dir::Horizontal => {
+                        // Stacked: top gets its leaf-count share, bottom the rest.
+                        let (top_rows, bot_rows) = Self::split_span(r.rows, a, b);
+                        let top = Rect {
+                            row: r.row,
+                            col: r.col,
+                            rows: top_rows,
+                            cols: r.cols,
+                        };
+                        let bottom = Rect {
+                            row: r.row + top_rows,
+                            col: r.col,
+                            rows: bot_rows,
+                            cols: r.cols,
+                        };
+                        Self::layout(first, top, out);
+                        Self::layout(second, bottom, out);
+                    }
+                    Dir::Vertical => {
+                        // Side by side: left gets its leaf-count share, right the rest.
+                        let (left_cols, right_cols) = Self::split_span(r.cols, a, b);
+                        let left = Rect {
+                            row: r.row,
+                            col: r.col,
+                            rows: r.rows,
+                            cols: left_cols,
+                        };
+                        let right = Rect {
+                            row: r.row,
+                            col: r.col + left_cols,
+                            rows: r.rows,
+                            cols: right_cols,
+                        };
+                        Self::layout(first, left, out);
+                        Self::layout(second, right, out);
+                    }
                 }
-                Dir::Vertical => {
-                    // Side by side: left gets the ceil half, right the floor
-                    // half, abutting with no reserved divider column. (Manual
-                    // ceil — `div_ceil` is not stable on our 1.70 MSRV.)
-                    let left_cols = ((r.cols + 1) / 2).max(1);
-                    let right_cols = r.cols.saturating_sub(left_cols).max(1);
-                    let left = Rect {
-                        row: r.row,
-                        col: r.col,
-                        rows: r.rows,
-                        cols: left_cols,
-                    };
-                    let right = Rect {
-                        row: r.row,
-                        col: r.col + left_cols,
-                        rows: r.rows,
-                        cols: right_cols,
-                    };
-                    Self::layout(first, left, out);
-                    Self::layout(second, right, out);
-                }
-            },
+            }
         }
+    }
+
+    /// Split `total` cells between two children holding `a` and `b` leaves,
+    /// proportionally to their leaf counts and abutting with no gap. The first
+    /// child gets `round(total * a / (a+b))` (floor, matching the old ceil-half
+    /// behavior for the balanced 1-vs-1 case only where it lands on an integer),
+    /// the second gets the remainder; both are clamped to at least 1 cell so no
+    /// pane silently vanishes. Returns `(first, second)`, `first + second == total`
+    /// whenever `total >= 2`.
+    fn split_span(total: usize, a: usize, b: usize) -> (usize, usize) {
+        let denom = (a + b).max(1);
+        let first = (total * a / denom).max(1);
+        let second = total.saturating_sub(first).max(1);
+        (first, second)
     }
 
     /// Move focus to the nearest pane in direction `m`, measured from the
@@ -529,6 +549,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn grid_columns_and_rows_are_evenly_balanced() {
+        // The leaf-count-proportional split makes a 3-wide line tile in even
+        // thirds (26/27/27 of 80), not the old binary-halving 40/20/20. Assert
+        // every column is within 1 cell of outer_cols/cols and every row within
+        // 1 of outer_rows/rows, for both a 2x3 and a 3x2 grid, and that the
+        // panes still perfectly tile the outer rect (columns/rows sum exactly,
+        // no overlap, full coverage).
+        for &(gr, gc) in &[(2usize, 3usize), (3, 2)] {
+            let t = Tree::grid(gr, gc);
+            let rects = t.rects(OUTER);
+            assert_eq!(rects.len(), gr * gc);
+
+            // Distinct column x-origins and their widths (top row is enough:
+            // columns share widths across rows in a balanced grid).
+            let want_col = OUTER.cols / gc;
+            let want_row = OUTER.rows / gr;
+            for (_, r) in &rects {
+                assert!(
+                    r.cols.abs_diff(want_col) <= 1,
+                    "{gr}x{gc}: col width {} not within 1 of {want_col} ({r:?})",
+                    r.cols
+                );
+                assert!(
+                    r.rows.abs_diff(want_row) <= 1,
+                    "{gr}x{gc}: row height {} not within 1 of {want_row} ({r:?})",
+                    r.rows
+                );
+            }
+
+            // No overlap.
+            for i in 0..rects.len() {
+                for j in (i + 1)..rects.len() {
+                    assert!(
+                        !overlaps(rects[i].1, rects[j].1),
+                        "{gr}x{gc}: {:?} vs {:?}",
+                        rects[i],
+                        rects[j]
+                    );
+                }
+            }
+
+            // Full coverage: the union of all rects equals the outer rect area,
+            // which (given no overlap) proves the panes tile it edge-to-edge.
+            let area: usize = rects.iter().map(|(_, r)| r.rows * r.cols).sum();
+            assert_eq!(
+                area,
+                OUTER.rows * OUTER.cols,
+                "{gr}x{gc}: rects must cover the whole outer rect with no gap"
+            );
+        }
+    }
+
+    #[test]
+    fn a_three_column_line_tiles_in_even_thirds() {
+        // Regression for the -n 6 "50/25/25" bug: a single 3-wide row must be
+        // 26/27/27 across 80 cols, i.e. proportional to leaf count, not the old
+        // 40/20/20 from binary 50/50 halving.
+        let t = Tree::grid(1, 3);
+        let mut cols: Vec<usize> = t.rects(OUTER).iter().map(|(_, r)| r.cols).collect();
+        cols.sort_unstable();
+        assert_eq!(cols, vec![26, 27, 27], "80 cols split three ways evenly");
+        // And the widths sum to the full outer width (edge-to-edge, no gutter).
+        assert_eq!(cols.iter().sum::<usize>(), OUTER.cols);
+    }
+
+    #[test]
+    fn a_plain_two_pane_split_stays_fifty_fifty() {
+        // The proportional rule is 1-vs-1 for a manual split, so it must not
+        // shift the existing even-halving behavior manual splits depend on.
+        let mut t = Tree::new(0);
+        t.split(Dir::Vertical, 1);
+        let rects = t.rects(OUTER);
+        assert_eq!(rects[0].1.cols, 40);
+        assert_eq!(rects[1].1.cols, 40);
     }
 
     #[test]
