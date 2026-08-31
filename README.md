@@ -412,8 +412,9 @@ the hard way):
 - **Agents launched *inside* a shell pane.** amux's agent chrome tracks panes
   amux itself launched as agents (see "What amux can and cannot see"). Running
   `$ claude` inside a shell pane is a documented v1 limitation, not a silent bug.
-- **Unix polish.** The loop is portable and CI runs the e2e suite on Linux, but
-  passthrough pane-switch repaint relies on the app redrawing on SIGWINCH
+- **Unix polish.** The loop is portable and the e2e suite passes on Linux (run
+  it locally), but passthrough pane-switch repaint relies on the app redrawing
+  on SIGWINCH
   (full-screen TUIs do; bare shells won't repaint their prompt). Windows —
   where ConPTY guarantees repaints — is the reference platform today.
 
@@ -439,8 +440,9 @@ cleanly, and literal-prefix delivery.
 ## Development
 
 ```bash
-python dev.py check   # dependency guard + cargo test (what CI runs)
+python dev.py check   # dependency guard + cargo test (the pre-push gate)
 ```
 
-CI note: needs the `ORG_READ_TOKEN` secret while the nativelite crates are
-private.
+No CI runs right now (GitHub Actions are off, 2026-08-30); the local `dev.py
+check` is the gate. A lean CI may return once the nativelite crates are public —
+it would need an org-read token to fetch the private git deps.
