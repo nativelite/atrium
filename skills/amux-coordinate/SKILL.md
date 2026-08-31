@@ -11,6 +11,14 @@ agents — each a real `claude` in its own visible amux pane — through the
 verification; the **parts themselves go to teammates**. Do not sit and implement
 each part yourself — even if you could — that defeats the point of coordinating.
 
+**Delegate through `amux ctl` — NOT your built-in tools.** Create every teammate
+by running the `amux ctl spawn` shell command (below). Do **not** use your Task
+tool, "subagents", or "background agents" — those run **invisibly** and defeat
+the entire purpose, which is that every teammate is a visible amux pane the human
+can watch, zoom into, and steer. If you catch yourself about to launch a
+background agent or Task, stop and run `amux ctl spawn` instead. A teammate that
+is not an `amux ctl` pane is the wrong thing.
+
 ## Your loop
 
 1. **Split** the work into independent parts — ideally parts that can proceed in

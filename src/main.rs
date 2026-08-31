@@ -72,6 +72,15 @@ fn next_agent_id() -> usize {
     NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// DEC synchronized-output (private mode 2026). amux wraps each composited frame
+/// it emits to the *real* terminal in these markers, so the outer terminal paints
+/// the whole frame (all tiled panes + the bar) atomically instead of showing it
+/// half-drawn — that half-drawn frame is the tiled "shutter". This is the emit
+/// side of the same mode `vterm` honors on the way in; a terminal that doesn't
+/// support 2026 ignores the markers, so it degrades cleanly.
+const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
+const SYNC_END: &[u8] = b"\x1b[?2026l";
+
 /// A `ctl send` awaiting delivery. The design queues a task until the target is
 /// **idle** (agsess-gated) rather than injecting into a live turn (Decision 4).
 /// Once the target is ready we write the text, then — after a short beat so the
@@ -834,17 +843,18 @@ fn run(
         }
 
         // 6. render the active window (tiled compose+diff, else passthrough is
-        //    already written above) then paint the bar.
+        //    already written above) then paint the bar. The tiled composite and
+        //    the bar are accumulated into one `frame` and emitted wrapped in
+        //    synchronized output (§`SYNC_BEGIN`), so the outer terminal paints
+        //    panes+bar atomically — no mid-frame tearing. An empty frame (idle
+        //    tick) emits nothing, so the markers never spam.
+        let mut frame: Vec<u8> = Vec::new();
         if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions);
-            let bytes = match &prev_master {
-                Some(prev) => prev.diff(&master),
-                None => master.render_full(),
+            match &prev_master {
+                Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
+                None => frame.extend_from_slice(&master.render_full()),
             };
-            if !bytes.is_empty() {
-                let _ = out.write_all(&bytes);
-                let _ = out.flush();
-            }
             prev_master = Some(master);
         } else if force_repaint {
             // Passthrough (single pane or zoomed): nudge the focused pane's pty
@@ -887,10 +897,18 @@ fn run(
             || painted != last_bar
             || last_bar_paint.elapsed() >= Duration::from_millis(500)
         {
-            let _ = out.write_all(painted.as_bytes());
-            let _ = out.flush();
+            frame.extend_from_slice(painted.as_bytes());
             last_bar = painted;
             last_bar_paint = Instant::now();
+        }
+        // Emit the tick's composite+bar as ONE synchronized frame, so the outer
+        // terminal never shows it half-drawn (the tiled "shutter"). Nothing to
+        // draw ⇒ no write, no markers.
+        if !frame.is_empty() {
+            let _ = out.write_all(SYNC_BEGIN);
+            let _ = out.write_all(&frame);
+            let _ = out.write_all(SYNC_END);
+            let _ = out.flush();
         }
         force_repaint = false;
     }
@@ -1962,8 +1980,9 @@ fn spawn_pane_full(
     //   Skip (`--skip-permissions`) → `--dangerously-skip-permissions` (full
     //                                bypass; the human confirmed it at launch).
     let mode = trust_mode();
-    let trusted_launch = amux::bind::is_agent_stem(&title) && mode != amux::ctl::TrustMode::Off;
-    let base: Vec<String> = if trusted_launch {
+    let is_agent = amux::bind::is_agent_stem(&title);
+    let trusted_launch = is_agent && mode != amux::ctl::TrustMode::Off;
+    let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
         match mode {
             amux::ctl::TrustMode::Edits => {
@@ -1978,6 +1997,17 @@ fn spawn_pane_full(
     } else {
         command.to_vec()
     };
+    // When the ctl channel is live, teach every agent pane — the initial one and
+    // ctl-spawned workers alike — to delegate through `amux ctl` (visible panes)
+    // instead of its own invisible Task/background-agents tool. This is the
+    // dependable layer: it is always in the agent's context (via
+    // `--append-system-prompt`), so reliable delegation no longer hinges on a
+    // skill happening to surface. Appended after any trust flags so it terminates
+    // the `--allowedTools` list cleanly rather than being read as one of its values.
+    if is_agent && CTL_ADDRESS.get().is_some() {
+        base.push("--append-system-prompt".to_string());
+        base.push(amux::ctl::AGENT_CTL_DIRECTIVE.to_string());
+    }
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
     // per-dir in ~/.claude.json). Without this a trusted launch in an untrusted

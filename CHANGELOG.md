@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-31
+
+### Fixed
+- **Buttery tiled rendering — synchronized output on emit.** amux now wraps each
+  composited frame it writes to the real terminal in DEC mode 2026
+  (`?2026h … ?2026l`) and coalesces the tiled composite + the bar into a single
+  write per tick, so the outer terminal paints each frame atomically instead of
+  showing it half-drawn. This is the emit side of the same mode `vterm` already
+  honors on input; it removes the tiled "shutter" when several agent panes
+  animate at once. Terminals without mode 2026 ignore the markers (degrades
+  cleanly), and an idle tick (empty frame) emits nothing.
+
+### Added
+- **Reliable ctl delegation — amux teaches its agents about `ctl`.** When the
+  control channel is live (`--allow-ctl`), amux appends a short directive to
+  every agent pane it launches (via `--append-system-prompt`): delegate through
+  `amux ctl spawn`/`send`/`status`/`kill` (visible panes), **not** the agent's
+  own invisible Task/background-agents tool. This is always in the agent's
+  context, so reliable coordination no longer depends on a skill happening to
+  auto-surface. The `amux-coordinate` / `amux-delegate` skills are hardened with
+  the same "use `amux ctl`, never background agents" rule.
+
 ## [0.13.0] - 2026-08-31
 
 ### Changed

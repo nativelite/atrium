@@ -9,6 +9,12 @@ You are running inside amux, which lets you spawn teammate agents — each a rea
 `claude` in its own visible pane — through the `amux ctl` command. You MAY hand
 an independent part of your work to a teammate.
 
+**Delegate through `amux ctl` — NOT your built-in tools.** If you delegate, do it
+by running the `amux ctl spawn` shell command (below), never with your Task tool,
+"subagents", or "background agents" — those run invisibly, whereas an `amux ctl`
+teammate is a visible pane the human can watch and steer. That visibility is the
+whole point.
+
 ## Delegate only when it pays
 
 Delegate a part when it is **genuinely independent** and **substantial enough**

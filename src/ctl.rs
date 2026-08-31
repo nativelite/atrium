@@ -361,6 +361,24 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
 /// workspace trust dialog and **all** permission prompts (full bypass).
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
+/// System-prompt directive amux appends (via `--append-system-prompt`) to every
+/// **agent** pane it launches **when the ctl channel is live** — so a hosted
+/// agent reliably knows to delegate through `ctl` (visible panes) instead of its
+/// own invisible Task/background-agents tool. This is the dependable layer: it is
+/// always in the agent's context for a ctl session, so it doesn't rely on a skill
+/// happening to surface. The agent applies it against whatever the human types —
+/// delegate on "coordinate a team", stay solo otherwise.
+pub const AGENT_CTL_DIRECTIVE: &str = "You are running inside amux, a terminal \
+multiplexer with a live control plane (endpoint in the AMUX_CTL env var). When a \
+task calls for delegating to teammates or coordinating a team, delegate by \
+running the shell commands `amux ctl spawn --role <name> -- claude`, then \
+`amux ctl send <name> \"<self-contained subtask>\"`, and track them with \
+`amux ctl status` / reap with `amux ctl kill`. Each teammate is a VISIBLE amux \
+pane the human can watch, steer, and take over. Do NOT use your Task tool or \
+background agents to delegate — those run invisibly and defeat amux's purpose. \
+Run `amux ctl` with no arguments for the full command surface, or use the \
+amux-coordinate / amux-delegate skills for the full workflow.";
+
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
         .map_err(|_| "--max-depth must be a non-negative integer (0 = unlimited)".to_string())
