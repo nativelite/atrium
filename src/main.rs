@@ -122,9 +122,11 @@ fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, fram
     let bcol = (cols.saturating_sub(brand.chars().count()) / 2) + 1;
     let scol = (cols.saturating_sub(sub.chars().count()) / 2) + 1;
     // One atomic frame: clear, bright-cyan bold wordmark, dim-cyan subline, reset.
+    // `?25l` hides the cursor so it doesn't blink next to the spinner; the agent
+    // restores it when it takes over (§ the handoff in the drain).
     let _ = write!(
         out,
-        "\x1b[?2026h\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
+        "\x1b[?2026h\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
          \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m\x1b[?2026l",
         mid + 1
     );
@@ -783,12 +785,13 @@ fn run(
                         }
                         if !tiled && pane.id == focus {
                             if first_paint {
-                                // Hand off from the splash: wipe it, then paint the
-                                // agent's current screen straight from the emulator
-                                // (which already reflects everything fed so far),
+                                // Hand off from the splash: restore the cursor the
+                                // splash hid, then paint the agent's current screen
+                                // straight from the emulator (its `render_full`
+                                // already clears + reflects everything fed so far),
                                 // and resume live passthrough from here.
                                 let full = pane.term.screen().render_full();
-                                let _ = out.write_all(b"\x1b[2J\x1b[H");
+                                let _ = out.write_all(b"\x1b[?25h");
                                 let _ = out.write_all(&full);
                             } else if pane.painted {
                                 let cleaned = pane.filter.feed(&buf[..n]);

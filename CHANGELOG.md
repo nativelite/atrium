@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-08-31
+
+### Fixed
+- **Startup splash: hide the cursor.** The cursor blinked next to the spinner and
+  flashed at handoff. The splash now hides the cursor (`?25l`) while it is up and
+  restores it (`?25h`) when the agent takes over — clean spinner, no stray cursor.
+
 ## [0.16.1] - 2026-08-31
 
 ### Fixed
