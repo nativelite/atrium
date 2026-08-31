@@ -81,6 +81,12 @@ fn next_agent_id() -> usize {
 const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 
+/// Max reads per active pane per tick (each up to the 8 KiB `buf`). High enough
+/// to drain a whole frame from a big burst before compositing (~0.5 MiB), so we
+/// never composite a half-drawn pane; the drain still breaks early the instant
+/// the pane has no more data, so this cap only matters on a genuine flood.
+const DRAIN_READS_PER_TICK: usize = 64;
+
 /// A `ctl send` awaiting delivery. The design queues a task until the target is
 /// **idle** (agsess-gated) rather than injecting into a live turn (Decision 4).
 /// Once the target is ready we write the text, then — after a short beat so the
@@ -694,7 +700,13 @@ fn run(
         let tiled = windows[active].tiled();
         let focus = windows[active].tree.focus();
         for pane in windows[active].panes.iter_mut() {
-            for i in 0..8 {
+            // Drain each active pane *fully* before we composite, so a big data
+            // burst (a large `ctl send`, a wall of tool output) is a whole frame
+            // rather than a truncated one — a partial drain that straddles a
+            // `?2026` block stalls the outer terminal (the "shutter"). The loop
+            // still breaks the instant there is no more data, so the high cap only
+            // bites on a genuinely huge burst; it never adds latency when idle.
+            for i in 0..DRAIN_READS_PER_TICK {
                 let wait = if i == 0 {
                     Duration::from_millis(5)
                 } else {

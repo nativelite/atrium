@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.3] - 2026-08-31
+
+### Fixed
+- **Shudder during heavy data bursts.** The active window's panes were drained
+  with an 8-read cap per tick (~64 KiB), so a big burst — a large `ctl send`, a
+  wall of tool output — was composited half-drained; if it straddled a `?2026`
+  block, the outer terminal stalled (the shudder). Active panes now drain fully
+  before compositing (they already break the instant there is no more data, so
+  the higher cap only bites on a genuine flood and never adds idle latency),
+  matching what background panes already did.
+
 ## [0.14.2] - 2026-08-31
 
 ### Added
