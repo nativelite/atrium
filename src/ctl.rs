@@ -168,6 +168,52 @@ pub fn evaluate_spawn(
     Ok(attempted)
 }
 
+/// Permission-posture flags that **amux** owns, not the spawning agent. A hosted
+/// agent running `amux ctl spawn -- claude …` must not be able to hand its
+/// teammates a stronger posture than the human chose at launch — e.g. appending
+/// `--dangerously-skip-permissions` (full bypass) or `--allowedTools "Bash(*)"`
+/// (auto-allow everything) when the operator launched in safe `--trust` mode.
+/// amux applies the launch posture itself (see `spawn_pane_full`), so these are
+/// stripped from agent-supplied argv.
+const GOVERNED_FLAGS: [&str; 3] = [
+    "--dangerously-skip-permissions",
+    "--permission-mode",
+    "--allowedTools",
+];
+
+/// Strip amux-governed permission flags (and their values) from a ctl-spawn
+/// argv, returning `(cleaned, stripped)` where `stripped` names the flags removed
+/// (surfaced in the spawn reply's `note` — never silent, per the guardrails).
+/// `--dangerously-skip-permissions` is a bare switch; `--permission-mode` and
+/// `--allowedTools` each consume the following token as their value. Both
+/// `--flag value` and `--flag=value` spellings are handled. Pure.
+pub fn sanitize_spawn_argv(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let takes_value = |f: &str| f == "--permission-mode" || f == "--allowedTools";
+    let mut cleaned = Vec::with_capacity(argv.len());
+    let mut stripped: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        // Match either `--flag` or the `--flag=value` form.
+        let head = a.split('=').next().unwrap_or(a);
+        if let Some(&flag) = GOVERNED_FLAGS.iter().find(|&&g| g == head) {
+            if !stripped.iter().any(|s| s == flag) {
+                stripped.push(flag.to_string());
+            }
+            // Drop a *separate* value token only for `--flag value` (not
+            // `--flag=value`, whose value rides along in this same arg).
+            if takes_value(flag) && !a.contains('=') && i + 1 < argv.len() {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        cleaned.push(a.clone());
+        i += 1;
+    }
+    (cleaned, stripped)
+}
+
 /// Resolve a `send`/`status` target string to a pane's agent id. A numeric
 /// target matches by agent id; otherwise it matches by role label. `candidates`
 /// is `(agent_id, role)` for every live pane. Returns a clear error when the
@@ -382,7 +428,10 @@ coordinating a team, delegate by running the shell command amux ctl spawn \
 subtask, and track them with amux ctl status and reap them with amux ctl kill. \
 Placement: add --here to a spawn to tile the teammate beside you in one shared \
 view, or --window for a separate window, and follow the human preference on \
-layout. Each teammate is a VISIBLE amux pane the human can watch, steer, and \
+layout. Spawn each teammate as plain claude with NO permission flags: amux \
+already applies the human chosen trust mode to every pane it launches, so never \
+add --dangerously-skip-permissions or --permission-mode yourself. \
+Each teammate is a VISIBLE amux pane the human can watch, steer, and \
 take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
 invisibly and defeat the purpose of amux. Run amux ctl with no arguments for the \
@@ -486,13 +535,21 @@ pub fn reply_err(msg: &str) -> String {
     obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]).to_string()
 }
 
-/// `{"ok":true,"pane":<id>,"role":<role|null>,"session":<sid|null>}`
-pub fn reply_spawned(pane: usize, role: Option<&str>, session: Option<&str>) -> String {
+/// `{"ok":true,"pane":<id>,"role":<role|null>,"session":<sid|null>,"note":<note|null>}`.
+/// `note` carries a non-fatal advisory (e.g. permission flags amux stripped from
+/// the spawn argv) so the caller sees it instead of it happening silently.
+pub fn reply_spawned(
+    pane: usize,
+    role: Option<&str>,
+    session: Option<&str>,
+    note: Option<&str>,
+) -> String {
     obj(vec![
         ("ok", Value::Bool(true)),
         ("pane", i(pane)),
         ("role", role.map(s).unwrap_or(Value::Null)),
         ("session", session.map(s).unwrap_or(Value::Null)),
+        ("note", note.map(s).unwrap_or(Value::Null)),
     ])
     .to_string()
 }
@@ -734,6 +791,37 @@ mod tests {
 
     fn v(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn sanitize_strips_dangerous_bypass_flag() {
+        let (clean, stripped) = sanitize_spawn_argv(&v(&["claude", "--dangerously-skip-permissions"]));
+        assert_eq!(clean, v(&["claude"]));
+        assert_eq!(stripped, v(&["--dangerously-skip-permissions"]));
+    }
+
+    #[test]
+    fn sanitize_strips_permission_mode_and_its_value() {
+        // `--flag value` form: both the flag and its value token go.
+        let (clean, stripped) =
+            sanitize_spawn_argv(&v(&["claude", "--permission-mode", "bypassPermissions", "-r"]));
+        assert_eq!(clean, v(&["claude", "-r"]));
+        assert_eq!(stripped, v(&["--permission-mode"]));
+    }
+
+    #[test]
+    fn sanitize_strips_allowedtools_including_eq_form() {
+        // `--flag=value` form: the value rides in the same arg, no extra token.
+        let (clean, stripped) = sanitize_spawn_argv(&v(&["claude", "--allowedTools=Bash(*)"]));
+        assert_eq!(clean, v(&["claude"]));
+        assert_eq!(stripped, v(&["--allowedTools"]));
+    }
+
+    #[test]
+    fn sanitize_leaves_benign_argv_untouched() {
+        let (clean, stripped) = sanitize_spawn_argv(&v(&["claude", "--continue", "--model", "opus"]));
+        assert_eq!(clean, v(&["claude", "--continue", "--model", "opus"]));
+        assert!(stripped.is_empty());
     }
 
     #[test]
@@ -1080,10 +1168,19 @@ mod tests {
 
     #[test]
     fn reply_builders_are_valid_json() {
-        let spawned = reply_spawned(3, Some("dev_1"), Some("abc-123"));
+        let spawned = reply_spawned(3, Some("dev_1"), Some("abc-123"), None);
         let v = json::parse(&spawned).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(v.get("pane").and_then(Value::as_i64), Some(3));
+        assert!(matches!(v.get("note"), Some(Value::Null)));
+
+        // With a note, it rides along as a string field.
+        let noted = reply_spawned(3, None, None, Some("stripped --dangerously-skip-permissions"));
+        let nv = json::parse(&noted).unwrap();
+        assert_eq!(
+            nv.get("note").and_then(Value::as_str),
+            Some("stripped --dangerously-skip-permissions")
+        );
 
         let nodes = [TreeNode {
             id: 0,

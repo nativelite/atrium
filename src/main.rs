@@ -1613,7 +1613,24 @@ fn dispatch_ctl(
             });
             ctl::reply_sent(id, busy)
         }
-        Cmd::Spawn(sp) => {
+        Cmd::Spawn(mut sp) => {
+            // amux owns the permission posture: the human's `--trust`/`--skip`
+            // choice at launch governs every pane, and a hosted agent must not be
+            // able to escalate its teammates past it (e.g. slipping
+            // `--dangerously-skip-permissions` into the spawn argv). Strip any such
+            // flags the agent added and surface a note in the reply — visible, not
+            // silent — so amux's launch posture is the single source of truth.
+            let (cleaned_argv, stripped) = ctl::sanitize_spawn_argv(&sp.argv);
+            sp.argv = cleaned_argv;
+            let note = if stripped.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "amux governs agent permissions; ignored {} (the human's launch trust mode applies)",
+                    stripped.join(", ")
+                ))
+            };
+            let note = note.as_deref();
             let caller_depth = caller
                 .and_then(|cid| pane_by_agent(windows, cid))
                 .map(|p| p.depth)
@@ -1638,9 +1655,9 @@ fn dispatch_ctl(
                 return ctl::reply_err(&msg);
             }
             if sp.new_window {
-                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols)
+                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols, note)
             } else {
-                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols)
+                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols, note)
             }
         }
         Cmd::Kill(kr) => {
@@ -1844,6 +1861,7 @@ fn spawn_worker_window(
     new_depth: usize,
     rows: u16,
     cols: u16,
+    note: Option<&str>,
 ) -> String {
     let mut flash = None;
     match spawn_window(
@@ -1867,7 +1885,7 @@ fn spawn_worker_window(
             // (which otherwise needs a manual terminal resize to correct).
             let last = windows.len() - 1;
             resize_window(&mut windows[last], rows, cols);
-            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
+            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
         }
         Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
     }
@@ -1883,6 +1901,7 @@ fn spawn_worker_here(
     new_depth: usize,
     rows: u16,
     cols: u16,
+    note: Option<&str>,
 ) -> String {
     let Some(caller_id) = caller else {
         return amux::ctl::reply_err(
@@ -1923,17 +1942,23 @@ fn spawn_worker_here(
             let session = pane.session_id.clone();
             w.panes.push(pane);
             w.next_id += 1;
-            // Split beside the caller specifically (side-by-side), not just the
-            // window's current focus.
-            w.tree
-                .split_pane(caller_pane_id, layout::Dir::Vertical, new_id);
+            // Re-tile the WHOLE window into a balanced near-square grid over all
+            // its panes (keeping their stable ids), rather than just splitting the
+            // caller side-by-side. A plain `split_pane` each time stacks every
+            // `--here` worker into one column, so N of them degrade to an
+            // unusable `1×N` strip; re-gridding keeps 2→1×2, 4→2×2, 6→2×3,
+            // 12→3×4, … balanced. Focus lands on the fresh worker.
+            let _ = caller_pane_id; // (kept for the error message above)
+            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
+            w.tree = Tree::grid_from_ids(&ids);
+            w.tree.focus_pane(new_id);
             w.zoomed = false;
             // Resize the whole window so both the caller and the fresh worker get
             // their exact inner rects — without this the worker keeps its rough
             // half-size and paints short (blank below), fixed only by a manual
             // terminal resize. Mirrors what the interactive split handlers do.
             resize_window(&mut windows[wi], rows, cols);
-            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref())
+            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
         }
         Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
     }

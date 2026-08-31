@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-31
+
+### Fixed
+- **`ctl spawn --here` now re-tiles into a balanced grid.** Each `--here` worker
+  used to split the caller pane side-by-side, so N of them stacked into a
+  degenerate `1×N` strip (12 tiles → twelve unusably-thin columns). The window is
+  now re-gridded over all its panes on every `--here` spawn into a near-square
+  layout (`cols = ceil(√n)`), so 2→1×2, 4→2×2, 6→2×3, 12→3×4, … stay balanced.
+  Existing panes keep their ids; focus lands on the fresh worker. New
+  `layout::Tree::grid_from_ids`.
+
+### Security
+- **amux governs agent permissions — a spawned agent can no longer escalate its
+  teammates.** A hosted agent could append `--dangerously-skip-permissions` (or
+  `--permission-mode` / `--allowedTools "Bash(*)"`) to its `ctl spawn -- claude …`
+  and hand teammates full bypass even when the human launched in safe `--trust`
+  mode. `ctl spawn` now strips those amux-governed permission flags from
+  agent-supplied argv and reports what it removed in the spawn reply's `note`
+  (visible, never silent); amux's launch trust mode is the single source of
+  truth. The injected delegation directive also now tells agents to spawn plain
+  `claude` with no permission flags. New `ctl::sanitize_spawn_argv`.
+
 ## [0.16.3] - 2026-08-31
 
 ### Fixed

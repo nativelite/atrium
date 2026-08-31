@@ -98,6 +98,53 @@ impl Tree {
         Tree { root, focus: 0 }
     }
 
+    /// Build a balanced near-square grid over an explicit, ordered list of
+    /// **existing** pane ids (unlike [`grid`](Tree::grid), which mints fresh
+    /// `0..n` ids). This re-tiles a window into a clean grid after
+    /// `ctl spawn --here` grows it, so N `--here` workers sit in a ~square
+    /// arrangement instead of the degenerate `1×N` line a naïve "split beside the
+    /// caller every time" produces.
+    ///
+    /// Columns = `ceil(sqrt(n))`, rows = `ceil(n / cols)`; ids fill row-major, so
+    /// a non-rectangular count leaves the last row short (its cells then a touch
+    /// taller, per the leaf-count-proportional split — cosmetic only; perfect
+    /// counts like 4/6/9/12 tile evenly). Focus is set to `ids[0]`; callers move
+    /// it as needed. An empty slice falls back to a single leaf so this never
+    /// panics.
+    pub fn grid_from_ids(ids: &[usize]) -> Self {
+        if ids.is_empty() {
+            return Tree::new(0);
+        }
+        let n = ids.len();
+        // Integer ceil(sqrt(n)) — no float rounding surprises.
+        let mut cols = 1;
+        while cols * cols < n {
+            cols += 1;
+        }
+        let row_nodes: Vec<Node> = ids
+            .chunks(cols)
+            .map(|row| Self::join(Dir::Vertical, row.iter().map(|&id| Node::Leaf(id)).collect()))
+            .collect();
+        let root = Self::join(Dir::Horizontal, row_nodes);
+        Tree { root, focus: ids[0] }
+    }
+
+    /// Fold `nodes` (non-empty) into a single left-leaning line of `dir` splits —
+    /// `[n0 | [n1 | [… | nk]]]` — matching [`line_from`](Tree::line_from)'s shape
+    /// so `rects`, focus movement, and close behave identically to a hand-built
+    /// line.
+    fn join(dir: Dir, mut nodes: Vec<Node>) -> Node {
+        let mut acc = nodes.pop().expect("join: nodes must be non-empty");
+        while let Some(n) = nodes.pop() {
+            acc = Node::Split {
+                dir,
+                first: Box::new(n),
+                second: Box::new(acc),
+            };
+        }
+        acc
+    }
+
     /// Build a balanced left-leaning line of `n` children joined by `dir`
     /// splits, each child produced by `leaf(i)` for `i in 0..n`. `n >= 1`.
     /// A single child is just that child (no split); otherwise the first child
@@ -696,5 +743,63 @@ mod tests {
         let t = Tree::grid(0, 0);
         assert_eq!(t.len(), 1);
         assert_eq!(t.ids(), vec![0]);
+    }
+
+    #[test]
+    fn grid_from_ids_balances_arbitrary_ids_into_a_near_square() {
+        // 12 existing panes with non-0..n ids must tile as a balanced 3×4 grid
+        // (not the old 1×12 strip): every id preserved, no overlap, even cells.
+        let ids: Vec<usize> = vec![0, 5, 9, 2, 7, 11, 3, 8, 1, 6, 10, 4];
+        let t = Tree::grid_from_ids(&ids);
+        assert_eq!(t.len(), 12);
+        assert_eq!(t.focus(), ids[0]);
+        let mut got = t.ids();
+        got.sort_unstable();
+        let mut want = ids.clone();
+        want.sort_unstable();
+        assert_eq!(got, want, "all ids preserved");
+        let rects = t.rects(OUTER);
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(
+                    !overlaps(rects[i].1, rects[j].1),
+                    "{:?} vs {:?}",
+                    rects[i],
+                    rects[j]
+                );
+            }
+        }
+        // Edge-to-edge coverage of the whole outer rect (no gaps).
+        let area: usize = rects.iter().map(|(_, r)| r.rows * r.cols).sum();
+        assert_eq!(area, OUTER.rows * OUTER.cols);
+        // Every pane is ~ a 4-col × 3-row cell: width ~20 (80/4), height ~8 (24/3).
+        for (_, r) in &rects {
+            assert!(r.cols.abs_diff(80 / 4) <= 1, "col {} not ~20 ({r:?})", r.cols);
+            assert!(r.rows.abs_diff(24 / 3) <= 1, "row {} not ~8 ({r:?})", r.rows);
+        }
+    }
+
+    #[test]
+    fn grid_from_ids_handles_a_partial_last_row() {
+        // 5 ids → cols=3, rows=2, last row holds 2. Still tiles with no overlap
+        // and full coverage; every id preserved (partial last row allowed).
+        let ids = vec![7, 3, 9, 1, 5];
+        let t = Tree::grid_from_ids(&ids);
+        assert_eq!(t.len(), 5);
+        let rects = t.rects(OUTER);
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(!overlaps(rects[i].1, rects[j].1));
+            }
+        }
+        let area: usize = rects.iter().map(|(_, r)| r.rows * r.cols).sum();
+        assert_eq!(area, OUTER.rows * OUTER.cols);
+    }
+
+    #[test]
+    fn grid_from_ids_empty_is_a_single_leaf() {
+        let t = Tree::grid_from_ids(&[]);
+        assert_eq!(t.len(), 1);
+        assert!(t.is_single());
     }
 }
