@@ -240,6 +240,136 @@ The file is read **read-only** — amux never writes it.
   fleet. Unknown fields are ignored, so the format can grow without breaking
   older files.
 
+## The ctl control plane (0.8–0.11)
+
+A fleet is a *saved* org chart; **`ctl`** builds one **live**, and lets an agent
+(or you) *drive* it. It turns amux from a viewer of agents into a **runtime** for
+them: a pane can **spawn**, **send** to, **observe**, and **kill** other agent
+panes — and because every one is a visible, killable pane with a status border,
+the whole hierarchy stays **legible and controllable**, which opaque subagents
+are not.
+
+The shape it's built for — one human, a couple of coordinators, a wide bench of
+workers:
+
+```
+  you (a shell/agent pane)
+   └─ hand an initiative to →
+      lead_a, lead_b          (coordinators)
+        └─ each splits it across →
+           dev_1, dev_2, …    (workers, each its own pane)
+```
+
+**Turn it on (opt-in, off by default):**
+
+```bash
+amux --allow-ctl claude                 # bind the control channel
+amux --allow-ctl --trust claude         # …and launch every agent trusted + hands-off
+amux --allow-ctl --max-depth 3 claude   # cap spawn recursion (default 6; 0 = unlimited)
+```
+
+Without `--allow-ctl` the channel isn't bound and `amux ctl` refuses — today's
+amux is unchanged for anyone who doesn't ask for this. When it's on, amux opens a
+per-instance control channel (a **named pipe** on Windows, a **unix socket**
+elsewhere — zero-dep, non-blocking-drained in the run loop) and injects two env
+vars into **every** pane it spawns:
+
+- **`AMUX_CTL`** — the channel endpoint. `amux ctl` connects here.
+- **`AMUX_PANE`** — the caller pane's agent id, so the server attributes each
+  request to its place in the spawn tree.
+
+Any process in a pane — a shell command, or an agent via a tool/hook — issues
+control by running **`amux ctl <cmd>`**, which speaks one JSON request per line
+and prints the one-line JSON reply.
+
+**The command surface.** Targets are a pane **id** (its numeric agent id) or a
+**role** label (`dev_1`); an ambiguous role is a clear error.
+
+| Command | Does | Reply |
+| --- | --- | --- |
+| `amux ctl spawn [--role R] [--identity X] [--here\|--window] -- <cmd…>` | Open a visible worker running `<cmd>` (a new window, or `--here` tiled beside the caller), tagged `R`, optionally under credential identity `X`. | `{"ok":true,"pane":3,"role":"dev_1","session":"…"}` |
+| `amux ctl list` | The live org chart: every pane with parent, role, depth, and `agsess` status. | `{"ok":true,"tree":[{"id":0,"parent":null,"role":null,"title":"claude","depth":0,"status":"idle"},…]}` |
+| `amux ctl send <target> <text…>` | Deliver `<text>` to a pane's agent as a submitted prompt. **Queued until the target is idle** (agsess-gated), so it never lands mid-turn. | `{"ok":true,"target":3,"queued":true}` |
+| `amux ctl status [<target>]` | One target's status, or (no target) a roll-up of the caller's subtree. Backed by `agsess` — `working` / `waiting-approval` / `waiting-prompt` / `idle` (or `null` if unbound). | `{"ok":true,"pane":3,"status":"working"}` |
+| `amux ctl kill <target>` | Terminate a worker **and its whole subtree** (a lead's kill reaps its ICs). The dead panes' windows re-tile / close on the next tick. | `{"ok":true,"killed":[3,4,5]}` |
+| `amux ctl audit [N]` | The control-request log (most recent `N`, or all), for reconstructing a run. | `{"ok":true,"audit":[{"seq":1,"caller":0,"action":"spawn","detail":"role=dev_1 argv=claude identity=-","ok":true,"note":"pane=1"},…]}` |
+
+### The security model — the part that must be right
+
+Giving a hosted agent the power to spawn processes is a real capability. The
+safety rests on **everything being a visible pane you can kill**, plus hard
+limits — each one unit-tested as a pure function:
+
+1. **Opt-in.** No `--allow-ctl`, no channel; `amux ctl` refuses (`AMUX_CTL`
+   unset). Nothing changes for a session that didn't ask.
+2. **Agents, not arbitrary shell.** `ctl spawn` accepts only commands on an
+   **agent allowlist** (default `{claude}`), so a confused agent can't
+   `ctl spawn -- rm -rf`. Extend it per-session — set by the human who launches
+   amux — with **`AMUX_CTL_ALLOW`** (comma-separated stems, e.g. for another
+   agent CLI). It never weakens a session that didn't set it.
+3. **No count cap; a depth guard.** A fleet designed for 32 runs 32 — width is
+   unlimited. Only *recursion* is bounded, by **`--max-depth`** (default 6,
+   `0` removes it): a spawn past the ceiling is refused, so a self-spawning agent
+   can't fork-bomb the machine. You always see the live count and can kill any
+   subtree.
+4. **Subtree-scoped control.** By default an agent may `send` / `status` / `kill`
+   / `audit` only panes **in its own subtree**; a lead steers its own team, never
+   a sibling's. **You control everything** — a root pane (the one amux opened, or
+   any `ctl` run from outside a pane) is the operator and reaches every pane.
+5. **Scoped credential delegation.** `ctl spawn --identity X` may only pass down
+   an identity the caller **itself holds** — its own identity, or the session /
+   fleet default amux launched with — so a worker can't mint `wif:prod` its lead
+   was never granted. You (the human root) are the trust root and may delegate
+   any vault identity. Only the identity **name** is ever handled here; the secret
+   is re-resolved per spawn and never stored or logged (the same discipline as
+   `--identity`).
+6. **Audit.** Every request is recorded — caller, action, a **secret-free**
+   detail (`send` logs the text *length*, never the body; identities by name
+   only), and outcome — to an in-memory ring, readable live via `ctl audit`
+   (subtree-scoped like any read). Opt in to a persistent JSONL mirror with
+   **`AMUX_CTL_AUDIT=<file>`**; a file it can't open is flashed once, and the log
+   keeps running in memory.
+7. **Visibility is the safety story.** Nothing a `ctl`-spawned agent does is
+   hidden: it's a pane with a status border, in the org chart, killable. That is
+   the whole reason to do this in amux instead of as opaque subagents.
+
+### A run: initiative → leads → ICs
+
+```bash
+# You launch the control plane, trusted so the fleet runs hands-off. With
+# --trust, every ctl-spawned agent also comes up trusted (no per-action prompts),
+# so a lead can drive its ICs without you clicking through dialogs.
+amux --allow-ctl --trust claude
+
+# From your pane, hand the initiative to two coordinators:
+amux ctl spawn --role lead_a -- claude
+amux ctl spawn --role lead_b -- claude
+amux ctl send lead_a "Own the parser rewrite. Split it across two ICs, TDD."
+amux ctl send lead_b "Own the docs refresh. One IC is enough."
+
+# lead_a, from its own pane, builds its team beside it (--here) and tasks them:
+amux ctl spawn --here --role dev_1 -- claude
+amux ctl spawn --here --role dev_2 -- claude
+amux ctl send dev_1 "Rewrite the tokenizer, tests first."
+amux ctl send dev_2 "Rewrite the AST builder, tests first."
+
+# lead_a coordinates by status, not by scraping terminals:
+amux ctl status            # roll-up of lead_a's own subtree
+amux ctl status dev_1      # one IC (lead_b's team is out of scope — refused)
+
+# When an IC is done, its lead reaps it (and anything under it):
+amux ctl kill dev_1
+
+# You see all of it, any time — the org chart and the full trail:
+amux ctl list
+amux ctl audit
+```
+
+The multiplier: many workers, coordinated by a few of them, driven by one human —
+and every level is a pane you can watch, redirect, zoom into (`Ctrl+A z`), or
+kill. `ctl` is the small verb layer; the panes, tiling, identity injection, and
+`agsess` status it stands on already existed.
+
 ## The architecture (why it's small and faithful)
 
 amux is a **passthrough** first, an emulator only when it must tile. In
