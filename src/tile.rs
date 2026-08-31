@@ -152,11 +152,18 @@ impl PaneView<'_> {
 ///
 /// Returns the master screen with its `cursor` set to the focused pane's
 /// cursor, translated into the focused pane's *inner* (bordered) coordinates.
-pub fn compose(rows: usize, cols: usize, panes: &[PaneView]) -> Screen {
+pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Screen {
     let mut master = Screen::new(rows, cols);
 
     for p in panes {
-        blit_inner(&mut master, p, rows, cols);
+        // A pane that has not painted anything yet (freshly spawned agent still
+        // booting) shows an animated "starting…" spinner instead of a dead blank
+        // rect — so an initializing pane reads as *loading*, not *broken*.
+        if screen_is_blank(p.screen) {
+            draw_loading(&mut master, p, rows, cols, frame);
+        } else {
+            blit_inner(&mut master, p, rows, cols);
+        }
         draw_border(&mut master, p, rows, cols);
     }
 
@@ -173,6 +180,50 @@ pub fn compose(rows: usize, cols: usize, panes: &[PaneView]) -> Screen {
     }
 
     master
+}
+
+/// Braille spinner frames for the per-pane loading state (advances ~8/sec).
+const SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+
+/// True if the pane's emulator has produced no visible content yet — its screen
+/// is entirely default cells. Short-circuits on the first non-blank cell, so a
+/// pane that has painted (the common case) is cheap; the full scan only runs
+/// while a pane is still blank (its brief loading phase).
+fn screen_is_blank(s: &Screen) -> bool {
+    let blank = Cell::default();
+    for r in 0..s.rows() {
+        for c in 0..s.cols() {
+            if s.cell(r, c) != blank {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Draw an animated "⣾ starting <title>…" centered in the pane's inner area,
+/// tinted with the pane's state style. `frame` advances the spinner. Clipped to
+/// the inner box so a narrow pane never bleeds onto the border or neighbors.
+fn draw_loading(master: &mut Screen, p: &PaneView, rows: usize, cols: usize, frame: usize) {
+    let inner_row = p.rect.row + 1;
+    let inner_col = p.rect.col + 1;
+    let inner_rows = p.rect.rows.saturating_sub(2);
+    let inner_cols = p.rect.cols.saturating_sub(2);
+    if inner_rows == 0 || inner_cols == 0 {
+        return;
+    }
+    let spin = SPINNER[frame % SPINNER.len()];
+    let label = format!("{spin} starting {}…", p.title);
+    let style = p.border_style();
+    let mid_r = inner_row + inner_rows / 2;
+    let llen = label.chars().count();
+    let start_c = inner_col + inner_cols.saturating_sub(llen) / 2;
+    for (i, ch) in label.chars().enumerate() {
+        let c = start_c + i;
+        if c < inner_col + inner_cols && mid_r < rows && c < cols {
+            master.set(mid_r, c, Cell { ch, style });
+        }
+    }
 }
 
 /// Blit a pane's screen into its inner area, inset one cell from the rect on
@@ -370,7 +421,7 @@ mod tests {
             "claude",
             PaneState::Idle,
         )];
-        let m = compose(5, 12, &panes);
+        let m = compose(5, 12, &panes, 0);
         // Corners.
         assert_eq!(m.cell(0, 0).ch, '┌');
         assert_eq!(m.cell(0, 11).ch, '┐');
@@ -396,7 +447,7 @@ mod tests {
             "sh",
             PaneState::Idle,
         )];
-        let m = compose(5, 5, &panes);
+        let m = compose(5, 5, &panes, 0);
         // Border, not 'X', at the rect's top-left corner.
         assert_eq!(m.cell(0, 0).ch, '┌');
         assert_ne!(m.cell(0, 0).ch, 'X');
@@ -420,7 +471,7 @@ mod tests {
             "sh",
             PaneState::Focused,
         )];
-        let m = compose(5, 5, &panes);
+        let m = compose(5, 5, &panes, 0);
         let corner = m.cell(0, 0).style;
         assert!(corner.bold, "focused border should be bold");
         assert_eq!(corner.fg, Color::Indexed(14), "focused border bright cyan");
@@ -443,7 +494,7 @@ mod tests {
             "sh",
             PaneState::Exited,
         )];
-        let m = compose(5, 5, &panes);
+        let m = compose(5, 5, &panes, 0);
         assert_eq!(
             m.cell(0, 0).style.fg,
             Color::Indexed(1),
@@ -466,7 +517,7 @@ mod tests {
             "sh",
             PaneState::Idle,
         )];
-        let m = compose(5, 5, &panes);
+        let m = compose(5, 5, &panes, 0);
         assert_eq!(m.cell(0, 0).style.fg, Color::Indexed(8), "idle border grey");
     }
 
@@ -501,7 +552,7 @@ mod tests {
                 PaneState::Focused,
             ),
         ];
-        let m = compose(6, 12, &panes);
+        let m = compose(6, 12, &panes, 0);
         // Focused rect origin (0,6), inner origin (1,7), cursor (1,2) -> (2,9).
         assert_eq!(m.cursor, (2, 9));
     }
@@ -525,7 +576,7 @@ mod tests {
             view(&c, rect(5, 0), 3, "c", PaneState::Idle),
             view(&d, rect(5, 6), 4, "d", PaneState::Focused),
         ];
-        let m = compose(10, 12, &panes);
+        let m = compose(10, 12, &panes, 0);
         // Each quadrant shows its own content at its inset origin.
         assert_eq!(m.cell(1, 1).ch, 'A');
         assert_eq!(m.cell(1, 7).ch, 'B');
@@ -554,7 +605,7 @@ mod tests {
             "verylongtitle",
             PaneState::Idle,
         )];
-        let m = compose(5, 5, &panes);
+        let m = compose(5, 5, &panes, 0);
         // Corners intact; title clipped to the 3 cells between them.
         assert_eq!(m.cell(0, 0).ch, '┌');
         assert_eq!(m.cell(0, 4).ch, '┐');
@@ -581,7 +632,7 @@ mod tests {
             PaneState::Idle, // unfocused, quiet — but its agent is blocked
             agsess::Status::WaitingApproval,
         )];
-        let m = compose(5, 20, &panes);
+        let m = compose(5, 20, &panes, 0);
         // Border tinted bright yellow (Indexed 11), overriding the local Idle grey.
         assert_eq!(
             m.cell(0, 0).style.fg,
@@ -611,7 +662,7 @@ mod tests {
             PaneState::Focused,
             agsess::Status::WaitingApproval,
         )];
-        let m = compose(5, 18, &panes);
+        let m = compose(5, 18, &panes, 0);
         let corner = m.cell(0, 0).style;
         assert!(corner.bold, "focused border stays bold");
         assert_eq!(
@@ -641,7 +692,7 @@ mod tests {
             PaneState::Exited,
             agsess::Status::WaitingApproval,
         )];
-        let m = compose(5, 12, &panes);
+        let m = compose(5, 12, &panes, 0);
         assert_eq!(m.cell(0, 0).style.fg, Color::Indexed(1), "exited stays red");
     }
 
@@ -661,7 +712,7 @@ mod tests {
             PaneState::Idle,
             agsess::Status::Working,
         )];
-        let m = compose(5, 18, &panes);
+        let m = compose(5, 18, &panes, 0);
         // Working overrides Idle grey back to default (unremarkable).
         assert_eq!(
             m.cell(0, 0).style.fg,
@@ -688,7 +739,7 @@ mod tests {
             PaneState::Active, // recent output, but the turn ended cleanly
             agsess::Status::WaitingPrompt,
         )];
-        let m = compose(5, 18, &panes);
+        let m = compose(5, 18, &panes, 0);
         // WaitingPrompt reads as idle — grey — overriding the Active default.
         assert_eq!(
             m.cell(0, 0).style.fg,
@@ -721,7 +772,7 @@ mod tests {
             PaneState::Idle,
             "work",
         )];
-        let m = compose(5, 22, &panes);
+        let m = compose(5, 22, &panes, 0);
         // The top edge carries "index:title" then the "·work" identity tag.
         let top: String = (1..18).map(|c| m.cell(0, c).ch).collect();
         assert!(top.starts_with(" 2:claude ·work"), "top edge was {top:?}");
@@ -743,7 +794,7 @@ mod tests {
             PaneState::Idle,
             "work",
         )];
-        let m = compose(5, 22, &panes);
+        let m = compose(5, 22, &panes, 0);
         // Find the "·" cell; it and the name must carry a palette color, never a
         // status hue, and the TEXT must be present regardless of color (a11y).
         let top: Vec<char> = (1..18).map(|c| m.cell(0, c).ch).collect();
@@ -787,7 +838,7 @@ mod tests {
             PaneState::Idle,
             "wif:prod",
         )];
-        let m = compose(5, 24, &panes);
+        let m = compose(5, 24, &panes, 0);
         let top: String = (1..20).map(|c| m.cell(0, c).ch).collect();
         assert!(top.contains("·wif:prod"), "wif tag present: {top:?}");
     }
@@ -807,8 +858,67 @@ mod tests {
             "claude",
             PaneState::Idle,
         )];
-        let m = compose(5, 20, &panes);
+        let m = compose(5, 20, &panes, 0);
         let top: String = (1..18).map(|c| m.cell(0, c).ch).collect();
         assert!(!top.contains('·'), "no identity, no tag: {top:?}");
+    }
+
+    #[test]
+    fn a_blank_pane_shows_an_animated_loading_spinner() {
+        // A freshly-spawned pane whose emulator has painted nothing yet (an
+        // all-default screen) shows "⣾ starting <title>…" centered, not a dead
+        // blank rect — so it reads as loading, not broken.
+        let blank = Screen::new(3, 10); // never painted
+        let panes = vec![view(
+            &blank,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+        )];
+        let m0 = compose(5, 20, &panes, 0);
+        let whole: String = (0..5)
+            .flat_map(|r| (0..20).map(move |c| (r, c)))
+            .map(|(r, c)| m0.cell(r, c).ch)
+            .collect();
+        assert!(whole.contains("starting claude"), "no loading label:\n{whole}");
+        assert!(whole.contains('⣾'), "frame 0 spinner missing");
+        // The spinner advances with the frame counter (animation).
+        let m1 = compose(5, 20, &panes, 1);
+        let whole1: String = (0..5)
+            .flat_map(|r| (0..20).map(move |c| (r, c)))
+            .map(|(r, c)| m1.cell(r, c).ch)
+            .collect();
+        assert!(whole1.contains('⣽'), "frame 1 spinner should differ");
+    }
+
+    #[test]
+    fn a_painted_pane_shows_its_content_not_the_spinner() {
+        // Once a pane has any content, it blits normally — no loading spinner.
+        let inner = filled(3, 18, 'Z');
+        let panes = vec![view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            1,
+            "claude",
+            PaneState::Focused,
+        )];
+        let m = compose(5, 20, &panes, 3);
+        assert_eq!(m.cell(1, 1).ch, 'Z'); // content, not a spinner
+        let whole: String = (0..5)
+            .flat_map(|r| (0..20).map(move |c| (r, c)))
+            .map(|(r, c)| m.cell(r, c).ch)
+            .collect();
+        assert!(!whole.contains("starting"), "painted pane must not load");
     }
 }

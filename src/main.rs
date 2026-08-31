@@ -462,6 +462,11 @@ fn run(
     let mut force_repaint = true;
     let mut last_bar_paint = Instant::now();
     let mut last_size_check = Instant::now();
+    // Animation clock for the per-pane loading spinner (advances ~8 frames/sec).
+    // A blank (still-booting) pane's spinner changes with this, so the tiled diff
+    // repaints just those cells; once every pane has painted, the frame no longer
+    // affects the master, so it stops driving repaints.
+    let anim_start = Instant::now();
     let mut last_bar = String::new();
 
     // Agent session state (§5): one read-only `agsess::World` over the Claude
@@ -862,7 +867,8 @@ fn run(
         //    tick) emits nothing, so the markers never spam.
         let mut frame: Vec<u8> = Vec::new();
         if windows[active].tiled() {
-            let master = render_tiled(&windows[active], rows, cols, &world.sessions);
+            let spin_frame = (anim_start.elapsed().as_millis() / 120) as usize;
+            let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
             match &prev_master {
                 Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
                 None => frame.extend_from_slice(&master.render_full()),
@@ -971,6 +977,7 @@ fn render_tiled(
     rows: u16,
     cols: u16,
     sessions: &[agsess::AgentSession],
+    frame: usize,
 ) -> ansi::Screen {
     let outer = tiled_outer(rows, cols);
     let rects = w.tree.rects(outer);
@@ -1016,7 +1023,7 @@ fn render_tiled(
         .collect();
     // Compose over the full terminal (rows), leaving the bar row untouched; the
     // bar is painted separately after the diff, exactly as in passthrough.
-    compose(rows as usize, cols as usize, &views)
+    compose(rows as usize, cols as usize, &views, frame)
 }
 
 /// Split the focused pane, spawning a new pane sized to what its half will be.

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-31
+
+### Added
+- **Per-pane loading animation.** A tiled pane whose agent has not painted
+  anything yet (a freshly-spawned teammate still booting) now shows an animated
+  `⣾ starting <title>…` spinner centered in its box, instead of a dead blank
+  rect — so an initializing pane reads as *loading*, not *broken*. The spinner
+  advances ~8 fps while blank and stops driving repaints the moment the pane
+  paints; the blank-check short-circuits, so a painted pane costs nothing.
+  (Tiled mode only; a single passthrough pane shows claude's own startup.)
+
 ## [0.14.3] - 2026-08-31
 
 ### Fixed
