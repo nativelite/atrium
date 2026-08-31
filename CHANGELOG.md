@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-31
+
+### Added
+- **Teammate placement guidance.** The injected ctl directive and the
+  `amux-coordinate` skill now tell the agent about `--here` (tile the teammate
+  beside you as a pane, for a one-view org chart) vs `--window` (a separate
+  window/tab, the default — better for many teammates), and to follow the
+  human's stated layout preference. Both were always available on `ctl spawn`;
+  now the agent knows to use them, so you can just say "tile them" or "give each
+  its own window". Also pulls vterm 0.3.0 (ECH + SU/SD scroll fidelity).
+
 ## [0.14.1] - 2026-08-31
 
 ### Fixed

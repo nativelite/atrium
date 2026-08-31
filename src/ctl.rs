@@ -380,7 +380,10 @@ environment variable. When a task calls for delegating to teammates or \
 coordinating a team, delegate by running the shell command amux ctl spawn \
 --role NAME -- claude, then amux ctl send NAME followed by a self-contained \
 subtask, and track them with amux ctl status and reap them with amux ctl kill. \
-Each teammate is a VISIBLE amux pane the human can watch, steer, and take over. \
+Placement: add --here to a spawn to tile the teammate beside you in one shared \
+view, or --window for a separate window, and follow the human preference on \
+layout. Each teammate is a VISIBLE amux pane the human can watch, steer, and \
+take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
 invisibly and defeat the purpose of amux. Run amux ctl with no arguments for the \
 full command surface, or use the amux-coordinate or amux-delegate skills for the \

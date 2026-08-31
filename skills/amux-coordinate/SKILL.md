@@ -33,8 +33,14 @@ is not an `amux ctl` pane is the wrong thing.
 
 ## How to delegate
 
-    amux ctl spawn --role <short-name> -- claude
+    amux ctl spawn --here --role <short-name> -- claude     # tile beside you
     amux ctl send <short-name> "<the subtask>"
+
+**Placement.** `--here` tiles the teammate beside you as a pane, so you and your
+team sit in one org-chart view — prefer this for a handful of teammates. Use
+`--window` (the default if you omit both) to give each teammate its own window
+instead — better when there are many teammates or each needs a full screen.
+Follow the human's stated preference ("tile them" vs "separate windows").
 
 A teammate starts **blank** — a fresh agent that cannot see this conversation,
 your plan, or your work in progress. Every `send` must be fully self-contained:
