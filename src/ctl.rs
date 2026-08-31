@@ -107,6 +107,12 @@ pub struct SpawnReq {
     /// may only pass down an identity it itself holds. `None` = no identity
     /// (ambient env), the default.
     pub identity: Option<String>,
+    /// The permission mode this spawn requested (`--mode plan|accept|automode`),
+    /// if any. `None` ⇒ inherit the session policy (the launch `--trust`). When
+    /// set, amux honors it for the operator (root pane) and, for a non-operator
+    /// worker, caps it at the session policy — a worker may match or de-escalate
+    /// but never elevate ([`TrustMode::rank`]).
+    pub mode: Option<TrustMode>,
 }
 
 /// Why a spawn was refused. Each maps to a clear reply the caller can act on.
@@ -329,18 +335,65 @@ pub fn extra_allow_from_env() -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustMode {
     /// Default: no relaxation. claude decides per its own settings; amux does not
-    /// touch the folder-trust dialog or the permission mode.
+    /// touch the folder-trust dialog or the permission mode. Policy keyword
+    /// `default`.
     Off,
-    /// `--trust`: **auto-accept edits + a safe dev-command allowlist.** Agents
-    /// edit and run the build/test loop hands-off, but a command outside the
-    /// allowlist (e.g. `curl`, `git push`, `rm` outside the workdir) still
-    /// surfaces as a **visible approval prompt** in its pane. Also pre-accepts
-    /// the folder-trust dialog. The safe hands-off default.
+    /// `plan`: claude's **plan mode** (`--permission-mode plan`) — read-only
+    /// analysis, no edits or commands. Also pre-accepts the folder-trust dialog so
+    /// the agent can read the tree hands-off. The safest hands-off posture.
+    Plan,
+    /// `accept` (bare `--trust`): **auto-accept edits + a safe dev-command
+    /// allowlist.** Agents edit and run the build/test loop hands-off, but a
+    /// command outside the allowlist (e.g. `curl`, `git push`, `rm` outside the
+    /// workdir) still surfaces as a **visible approval prompt** in its pane. Also
+    /// pre-accepts the folder-trust dialog. The safe hands-off default.
     Edits,
-    /// `--skip-permissions`: **full bypass** (`--dangerously-skip-permissions`).
-    /// Every command runs with no gate at all. Genuinely dangerous — amux
-    /// requires an explicit launch confirmation before using it.
+    /// `automode` (`--skip-permissions`): **full bypass**
+    /// (`--dangerously-skip-permissions`). Every command runs with no gate at all.
+    /// Genuinely dangerous — amux requires an explicit launch confirmation before
+    /// using it.
     Skip,
+}
+
+impl TrustMode {
+    /// Autonomous-power rank, low→high: `Off` < `Plan` < `Edits` < `Skip`. The
+    /// **session policy** (the launch `--trust <policy>`) is the ceiling: a
+    /// non-operator worker may request a mode of equal or lower rank (match or
+    /// de-escalate) but never a higher one (no self-elevation). The operator (the
+    /// human's root pane) is exempt and may request any mode.
+    pub fn rank(self) -> u8 {
+        match self {
+            TrustMode::Off => 0,
+            TrustMode::Plan => 1,
+            TrustMode::Edits => 2,
+            TrustMode::Skip => 3,
+        }
+    }
+
+    /// Parse a policy keyword (`plan` / `accept` / `automode` / `default`, with a
+    /// couple of intuitive aliases) into a mode. `None` for anything else — the
+    /// caller reports a clear error or treats the token as the hosted command.
+    pub fn from_policy_keyword(k: &str) -> Option<TrustMode> {
+        match k {
+            "plan" => Some(TrustMode::Plan),
+            "accept" | "acceptedits" | "edits" => Some(TrustMode::Edits),
+            "automode" | "auto" | "skip" | "bypass" => Some(TrustMode::Skip),
+            "default" | "off" | "ask" => Some(TrustMode::Off),
+            _ => None,
+        }
+    }
+
+    /// The canonical policy keyword for this mode (round-trips with
+    /// [`from_policy_keyword`](TrustMode::from_policy_keyword)); used for the ctl
+    /// wire form and human-facing notes.
+    pub fn policy_label(self) -> &'static str {
+        match self {
+            TrustMode::Off => "default",
+            TrustMode::Plan => "plan",
+            TrustMode::Edits => "accept",
+            TrustMode::Skip => "automode",
+        }
+    }
 }
 
 /// Pull amux's own launch meta-flags off the front of the (already identity-
@@ -364,7 +417,9 @@ pub enum TrustMode {
 pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<String>), String> {
     let mut allow = false;
     let mut max_depth = DEFAULT_MAX_DEPTH;
-    let mut trust = TrustMode::Off;
+    // `None` until a trust flag is seen; a second, different one is a conflict.
+    let mut trust: Option<TrustMode> = None;
+    let dup = || "set the session trust policy once (--trust <policy> or --skip-permissions)".to_string();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -373,17 +428,38 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
                 i += 1;
             }
             "--trust" => {
-                if trust == TrustMode::Skip {
-                    return Err("use --trust or --skip-permissions, not both".to_string());
+                if trust.is_some() {
+                    return Err(dup());
                 }
-                trust = TrustMode::Edits;
+                // Optional policy keyword: `--trust automode|accept|plan`. If the
+                // next token is a known policy it is consumed; otherwise `--trust`
+                // is bare (= accept) and the token is the hosted command.
+                match args.get(i + 1).and_then(|n| TrustMode::from_policy_keyword(n)) {
+                    Some(m) => {
+                        trust = Some(m);
+                        i += 2;
+                    }
+                    None => {
+                        trust = Some(TrustMode::Edits);
+                        i += 1;
+                    }
+                }
+            }
+            s if s.starts_with("--trust=") => {
+                if trust.is_some() {
+                    return Err(dup());
+                }
+                let k = &s["--trust=".len()..];
+                trust = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
+                    format!("--trust: unknown policy {k:?} (use plan, accept, or automode)")
+                })?);
                 i += 1;
             }
             "--skip-permissions" => {
-                if trust == TrustMode::Edits {
-                    return Err("use --trust or --skip-permissions, not both".to_string());
+                if trust.is_some() {
+                    return Err(dup());
                 }
-                trust = TrustMode::Skip;
+                trust = Some(TrustMode::Skip);
                 i += 1;
             }
             "--max-depth" => {
@@ -397,10 +473,22 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
                 max_depth = parse_depth(&s["--max-depth=".len()..])?;
                 i += 1;
             }
-            _ => return Ok((allow, effective_depth(max_depth), trust, args[i..].to_vec())),
+            _ => {
+                return Ok((
+                    allow,
+                    effective_depth(max_depth),
+                    trust.unwrap_or(TrustMode::Off),
+                    args[i..].to_vec(),
+                ))
+            }
         }
     }
-    Ok((allow, effective_depth(max_depth), trust, Vec::new()))
+    Ok((
+        allow,
+        effective_depth(max_depth),
+        trust.unwrap_or(TrustMode::Off),
+        Vec::new(),
+    ))
 }
 
 /// The claude flag `--skip-permissions` injects into every agent pane: skips the
@@ -428,9 +516,12 @@ coordinating a team, delegate by running the shell command amux ctl spawn \
 subtask, and track them with amux ctl status and reap them with amux ctl kill. \
 Placement: add --here to a spawn to tile the teammate beside you in one shared \
 view, or --window for a separate window, and follow the human preference on \
-layout. Spawn each teammate as plain claude with NO permission flags: amux \
-already applies the human chosen trust mode to every pane it launches, so never \
-add --dangerously-skip-permissions or --permission-mode yourself. \
+layout. Spawn each teammate as plain claude with NO raw permission flags: amux \
+applies the session trust policy to every pane it launches, so never add \
+--dangerously-skip-permissions or --permission-mode yourself. To request a \
+specific mode for a teammate, add --mode plan or --mode accept or --mode \
+automode to the spawn; amux honors it when the human operator asks and otherwise \
+caps it at the session policy (a worker cannot elevate itself). \
 Each teammate is a VISIBLE amux pane the human can watch, steer, and \
 take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
@@ -470,11 +561,16 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
             let identity = v.get("identity").and_then(Value::as_str).map(str::to_string);
+            let mode = v
+                .get("mode")
+                .and_then(Value::as_str)
+                .and_then(TrustMode::from_policy_keyword);
             Cmd::Spawn(SpawnReq {
                 role,
                 argv,
                 new_window,
                 identity,
+                mode,
             })
         }
         Some("list") => Cmd::List,
@@ -644,7 +740,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         Err(msg) => {
             eprintln!("amux ctl: {msg}");
             eprintln!(
-                "usage: amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...>\n\
+                "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode] -- <cmd...>\n\
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]"
             );
             return ExitCode::FAILURE;
@@ -686,10 +782,20 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             let mut role: Option<String> = None;
             let mut identity: Option<String> = None;
             let mut new_window = true;
+            let mut mode: Option<TrustMode> = None;
             let mut argv: Vec<String> = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--mode" => {
+                        let k = args
+                            .get(i + 1)
+                            .ok_or_else(|| "--mode needs a value (plan, accept, or automode)".to_string())?;
+                        mode = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
+                            format!("--mode: unknown {k:?} (use plan, accept, or automode)")
+                        })?);
+                        i += 2;
+                    }
                     "--role" => {
                         role = Some(
                             args.get(i + 1)
@@ -729,6 +835,9 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             }
             if let Some(x) = identity {
                 pairs.push(("identity", Value::String(x)));
+            }
+            if let Some(m) = mode {
+                pairs.push(("mode", Value::String(m.policy_label().to_string())));
             }
             pairs.push(("window", Value::Bool(new_window)));
             pairs.push((
@@ -1039,13 +1148,78 @@ mod tests {
     }
 
     #[test]
+    fn flags_trust_takes_a_policy_keyword() {
+        // `--trust automode|plan|accept` sets the session policy; the keyword is
+        // consumed and the command (`claude`) is left in `rest`.
+        for (policy, want) in [
+            ("automode", TrustMode::Skip),
+            ("plan", TrustMode::Plan),
+            ("accept", TrustMode::Edits),
+        ] {
+            let (_a, _d, trust, rest) =
+                parse_flags(&v(&["--allow-ctl", "--trust", policy, "claude"])).unwrap();
+            assert_eq!(trust, want, "--trust {policy}");
+            assert_eq!(rest, v(&["claude"]), "--trust {policy} leaves the command");
+        }
+        // `--trust=plan` spelling.
+        let (_a, _d, trust, rest) = parse_flags(&v(&["--trust=plan", "claude"])).unwrap();
+        assert_eq!(trust, TrustMode::Plan);
+        assert_eq!(rest, v(&["claude"]));
+    }
+
+    #[test]
+    fn flags_bare_trust_is_accept_and_keeps_the_command() {
+        // A bare `--trust` followed by a non-policy token = accept, and the token
+        // is the hosted command (not eaten as a policy).
+        let (_a, _d, trust, rest) = parse_flags(&v(&["--trust", "claude"])).unwrap();
+        assert_eq!(trust, TrustMode::Edits);
+        assert_eq!(rest, v(&["claude"]));
+    }
+
+    #[test]
     fn flags_trust_and_skip_permissions_conflict() {
         assert!(parse_flags(&v(&["--trust", "--skip-permissions", "claude"]))
             .unwrap_err()
-            .contains("not both"));
+            .contains("once"));
         assert!(parse_flags(&v(&["--skip-permissions", "--trust", "claude"]))
             .unwrap_err()
-            .contains("not both"));
+            .contains("once"));
+        // Two policy spellings at once is also a conflict.
+        assert!(parse_flags(&v(&["--trust", "plan", "--trust", "automode", "claude"]))
+            .unwrap_err()
+            .contains("once"));
+    }
+
+    #[test]
+    fn trust_mode_rank_orders_by_autonomous_power() {
+        assert!(TrustMode::Off.rank() < TrustMode::Plan.rank());
+        assert!(TrustMode::Plan.rank() < TrustMode::Edits.rank());
+        assert!(TrustMode::Edits.rank() < TrustMode::Skip.rank());
+        // Keyword ↔ label round-trip for every mode.
+        for m in [TrustMode::Off, TrustMode::Plan, TrustMode::Edits, TrustMode::Skip] {
+            assert_eq!(TrustMode::from_policy_keyword(m.policy_label()), Some(m));
+        }
+    }
+
+    #[test]
+    fn build_spawn_mode_roundtrips_through_parse() {
+        // `ctl spawn --mode automode` reaches the server as SpawnReq.mode = Skip.
+        let line =
+            build_request(&v(&["spawn", "--mode", "automode", "--", "claude"]), Some(0)).unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Spawn(sp) => assert_eq!(sp.mode, Some(TrustMode::Skip)),
+            _ => panic!("expected spawn"),
+        }
+        // No --mode ⇒ None (inherit the session policy).
+        let plain = build_request(&v(&["spawn", "--", "claude"]), None).unwrap();
+        match parse_request(&plain).unwrap().cmd {
+            Cmd::Spawn(sp) => assert_eq!(sp.mode, None),
+            _ => panic!("expected spawn"),
+        }
+        // An unknown --mode is a clear client error.
+        assert!(build_request(&v(&["spawn", "--mode", "yolo", "--", "claude"]), None)
+            .unwrap_err()
+            .contains("--mode"));
     }
 
     #[test]

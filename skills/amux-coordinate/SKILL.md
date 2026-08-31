@@ -73,13 +73,19 @@ shows one of yours, kill it.
 
 ## Full surface & discovery
 
-    amux ctl spawn [--role R] [--identity X] [--here | --window] -- <cmd...>
+    amux ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode] -- <cmd...>
     amux ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
 
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles
-it beside you (vs a new window). Targets are a role name or a pane id; you can
-only reach your own subtree; the human sees and controls everything. Run
-`amux ctl` with no arguments (or `amux --help`) for the authoritative surface.
+it beside you (vs a new window). `--mode` picks a teammate's permission mode
+(`plan` = read-only, `accept` = auto-accept edits, `automode` = full bypass);
+omit it to inherit the session policy the human launched with. amux honors your
+`--mode` when the human operator is directing, and caps a sub-worker at the policy
+(a worker cannot elevate itself) — never add raw claude permission flags like
+`--dangerously-skip-permissions` yourself; use `--mode`. Targets are a role name
+or a pane id; you can only reach your own subtree; the human sees and controls
+everything. Run `amux ctl` with no arguments (or `amux --help`) for the
+authoritative surface.
 
 ## Depth & visibility
 

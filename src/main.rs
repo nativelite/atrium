@@ -54,6 +54,7 @@ fn trust_mode() -> amux::ctl::TrustMode {
     match AGENT_TRUST.load(Ordering::Relaxed) {
         1 => amux::ctl::TrustMode::Edits,
         2 => amux::ctl::TrustMode::Skip,
+        3 => amux::ctl::TrustMode::Plan,
         _ => amux::ctl::TrustMode::Off,
     }
 }
@@ -64,6 +65,7 @@ fn set_trust_mode(m: amux::ctl::TrustMode) {
         amux::ctl::TrustMode::Off => 0,
         amux::ctl::TrustMode::Edits => 1,
         amux::ctl::TrustMode::Skip => 2,
+        amux::ctl::TrustMode::Plan => 3,
     };
     AGENT_TRUST.store(code, Ordering::Relaxed);
 }
@@ -303,14 +305,17 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
-             \x20      --trust: safe hands-off — agents auto-accept edits + a safe dev-command allowlist\n\
-             \x20               (build/test/run); anything else (curl, git push, rm outside the dir) still\n\
-             \x20               prompts, visibly, in its pane. Also pre-accepts claude's folder-trust dialog.\n\
-             \x20               Extend the allowlist with AMUX_TRUST_ALLOW=\"cmd one,cmd two\".\n\
-             \x20      --skip-permissions: FULL bypass (--dangerously-skip-permissions) — every command runs\n\
-             \x20               with no gate. Dangerous; amux asks you to confirm at launch.\n\
-             \x20      amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
+            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
+             \x20               ceiling they are capped at. `accept` (bare --trust): auto-accept edits + a safe\n\
+             \x20               dev-command allowlist (build/test/run); anything else (curl, git push, rm outside\n\
+             \x20               the dir) still prompts, visibly. `plan`: read-only plan mode. `automode`: FULL\n\
+             \x20               bypass (--dangerously-skip-permissions, no gate; amux confirms it at launch).\n\
+             \x20               All pre-accept claude's folder-trust dialog. Extend the accept allowlist with\n\
+             \x20               AMUX_TRUST_ALLOW=\"cmd one,cmd two\". You (the root pane) can elevate a teammate\n\
+             \x20               above the policy per-spawn with `ctl spawn --mode …`; a worker cannot.\n\
+             \x20      --skip-permissions: alias for --trust automode.\n\
+             \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
         );
@@ -491,7 +496,7 @@ fn run(
         Some(w) => Ok(w),
         None => match grid {
             Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
-            None => spawn_window(command, rows, cols, 0, identity, &mut flash),
+            None => spawn_window(command, rows, cols, 0, identity, trust_mode(), &mut flash),
         },
     };
     match initial {
@@ -584,7 +589,7 @@ fn run(
                     }
                 }
                 Action::NewPane => {
-                    match spawn_window(command, rows, cols, windows.len(), identity, &mut flash) {
+                    match spawn_window(command, rows, cols, windows.len(), identity, trust_mode(), &mut flash) {
                         Ok(w) => {
                             windows.push(w);
                             let last = windows.len() - 1;
@@ -1158,7 +1163,7 @@ fn split_focused(
         (cols / 2).saturating_sub(2),
     );
     // Splits inherit the active identity (§4). resolve failure lands in `flash`.
-    match spawn_pane(command, pr.max(1), pc.max(1), new_id, identity, flash) {
+    match spawn_pane(command, pr.max(1), pc.max(1), new_id, identity, trust_mode(), flash) {
         Ok(pane) => {
             w.panes.push(pane);
             w.next_id += 1;
@@ -1455,6 +1460,7 @@ fn spawn_fleet_window(
             id,
             identity,
             cwd.as_deref(),
+            trust_mode(),
             flash,
         ) {
             Ok(pane) => panes.push(pane),
@@ -1614,21 +1620,45 @@ fn dispatch_ctl(
             ctl::reply_sent(id, busy)
         }
         Cmd::Spawn(mut sp) => {
-            // amux owns the permission posture: the human's `--trust`/`--skip`
-            // choice at launch governs every pane, and a hosted agent must not be
-            // able to escalate its teammates past it (e.g. slipping
-            // `--dangerously-skip-permissions` into the spawn argv). Strip any such
-            // flags the agent added and surface a note in the reply — visible, not
-            // silent — so amux's launch posture is the single source of truth.
+            // amux owns the permission posture. Two layers, both surfaced (never
+            // silent) in the reply `note`:
+            //
+            //  1. Strip RAW claude permission flags the agent slipped into the argv
+            //     (`--dangerously-skip-permissions`, `--permission-mode`, …). Agents
+            //     request a mode through `--mode`, not raw flags, so amux stays the
+            //     single source of truth.
+            //  2. Resolve the effective mode from the per-spawn `--mode` under the
+            //     session policy: the **operator** (the human's root pane) may set
+            //     ANY mode (elevation is the human directing); a non-operator
+            //     **worker** is capped at the policy — it may match or de-escalate
+            //     but never elevate itself. No `--mode` ⇒ inherit the policy.
             let (cleaned_argv, stripped) = ctl::sanitize_spawn_argv(&sp.argv);
             sp.argv = cleaned_argv;
-            let note = if stripped.is_empty() {
+            let mut notes: Vec<String> = Vec::new();
+            if !stripped.is_empty() {
+                notes.push(format!(
+                    "ignored raw {} — request a mode with --mode instead",
+                    stripped.join(", ")
+                ));
+            }
+            let policy = trust_mode();
+            let effective = match sp.mode {
+                None => policy,
+                Some(req) if privileged => req,
+                Some(req) if req.rank() <= policy.rank() => req,
+                Some(req) => {
+                    notes.push(format!(
+                        "capped teammate to {} (session policy); a worker cannot elevate itself to {}",
+                        policy.policy_label(),
+                        req.policy_label()
+                    ));
+                    policy
+                }
+            };
+            let note = if notes.is_empty() {
                 None
             } else {
-                Some(format!(
-                    "amux governs agent permissions; ignored {} (the human's launch trust mode applies)",
-                    stripped.join(", ")
-                ))
+                Some(notes.join("; "))
             };
             let note = note.as_deref();
             let caller_depth = caller
@@ -1655,9 +1685,9 @@ fn dispatch_ctl(
                 return ctl::reply_err(&msg);
             }
             if sp.new_window {
-                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols, note)
+                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols, effective, note)
             } else {
-                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols, note)
+                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols, effective, note)
             }
         }
         Cmd::Kill(kr) => {
@@ -1854,6 +1884,7 @@ fn scope_denied(
 }
 
 /// `ctl spawn` (default): a visible worker in a brand-new window.
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker_window(
     windows: &mut Vec<Window>,
     sp: &amux::ctl::SpawnReq,
@@ -1861,6 +1892,7 @@ fn spawn_worker_window(
     new_depth: usize,
     rows: u16,
     cols: u16,
+    mode: amux::ctl::TrustMode,
     note: Option<&str>,
 ) -> String {
     let mut flash = None;
@@ -1870,6 +1902,7 @@ fn spawn_worker_window(
         cols,
         windows.len(),
         sp.identity.as_deref(),
+        mode,
         &mut flash,
     ) {
         Ok(mut w) => {
@@ -1894,6 +1927,7 @@ fn spawn_worker_window(
 /// `ctl spawn --here`: tile the worker *beside* the caller, in the caller's own
 /// window, so a lead and its ICs sit in one view. Falls back to an error if the
 /// caller's pane can't be located (nothing to sit beside).
+#[allow(clippy::too_many_arguments)]
 fn spawn_worker_here(
     windows: &mut [Window],
     sp: &amux::ctl::SpawnReq,
@@ -1901,6 +1935,7 @@ fn spawn_worker_here(
     new_depth: usize,
     rows: u16,
     cols: u16,
+    mode: amux::ctl::TrustMode,
     note: Option<&str>,
 ) -> String {
     let Some(caller_id) = caller else {
@@ -1932,6 +1967,7 @@ fn spawn_worker_here(
         pc.max(1),
         new_id,
         sp.identity.as_deref(),
+        mode,
         &mut flash,
     ) {
         Ok(mut pane) => {
@@ -2028,6 +2064,7 @@ fn spawn_window(
     cols: u16,
     _idx: usize,
     identity: Option<&str>,
+    mode: amux::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
     let pane = spawn_pane(
@@ -2036,6 +2073,7 @@ fn spawn_window(
         cols,
         0,
         identity,
+        mode,
         flash,
     )?;
     Ok(Window {
@@ -2072,7 +2110,7 @@ fn spawn_window_grid(
     let cell_cols = ((cols as usize / grid.cols.max(1)).saturating_sub(2)).max(1) as u16;
     let mut panes: Vec<Pane> = Vec::with_capacity(n);
     for id in 0..n {
-        match spawn_pane(command, cell_rows, cell_cols, id, identity, flash) {
+        match spawn_pane(command, cell_rows, cell_cols, id, identity, trust_mode(), flash) {
             Ok(pane) => panes.push(pane),
             Err(e) => {
                 // Tear down whatever we already started — a partial grid is not
@@ -2098,12 +2136,13 @@ fn spawn_pane(
     cols: u16,
     id: usize,
     identity: Option<&str>,
+    mode: amux::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
     // The single-pane / split / grid path: no per-pane working directory (the
     // child inherits amux's cwd, today's behavior). The fleet loader is the only
     // caller that supplies a `cwd`; everyone else routes through here with `None`.
-    spawn_pane_full(command, rows, cols, id, identity, None, flash)
+    spawn_pane_full(command, rows, cols, id, identity, None, mode, flash)
 }
 
 /// The shared spawn core: build the agent's launch (session-id inject, Windows
@@ -2117,6 +2156,7 @@ fn spawn_pane(
 /// `--model` / `--effort`); this function then appends `--session-id` when the
 /// pane is a bindable agent, exactly as before. `cwd` is `Some(dir)` for a fleet
 /// agent (so its `CLAUDE.md` auto-loads) and `None` everywhere else.
+#[allow(clippy::too_many_arguments)]
 fn spawn_pane_full(
     command: &[String],
     rows: u16,
@@ -2124,6 +2164,7 @@ fn spawn_pane_full(
     id: usize,
     identity: Option<&str>,
     cwd: Option<&str>,
+    mode: amux::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
     let title = std::path::Path::new(&command[0])
@@ -2134,9 +2175,12 @@ fn spawn_pane_full(
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands
     //                                still prompt, visibly, in the pane.
-    //   Skip (`--skip-permissions`) → `--dangerously-skip-permissions` (full
+    //   Skip (`automode`)          → `--dangerously-skip-permissions` (full
     //                                bypass; the human confirmed it at launch).
-    let mode = trust_mode();
+    //   Plan (`plan`)              → `--permission-mode plan` (read-only).
+    // `mode` is the *effective* mode for this pane: the session policy for the
+    // panes amux opens itself, or — for a ctl spawn — the per-spawn `--mode` after
+    // the operator-elevate / worker-cap governance in `apply_ctl`.
     let is_agent = amux::bind::is_agent_stem(&title);
     let trusted_launch = is_agent && mode != amux::ctl::TrustMode::Off;
     let mut base: Vec<String> = if trusted_launch {
@@ -2147,6 +2191,10 @@ fn spawn_pane_full(
             }
             amux::ctl::TrustMode::Skip => {
                 v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+            }
+            amux::ctl::TrustMode::Plan => {
+                v.push("--permission-mode".to_string());
+                v.push("plan".to_string());
             }
             amux::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
         }

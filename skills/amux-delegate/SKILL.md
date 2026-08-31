@@ -47,13 +47,16 @@ reap it — don't leave a finished teammate running.
 
 ## Full surface & discovery
 
-    amux ctl spawn [--role R] [--identity X] [--here | --window] -- <cmd...>
+    amux ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode] -- <cmd...>
     amux ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
 
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles
-it beside you (vs a new window); `audit` prints your delegation ledger. Targets
-are a role name or a pane id; you can only reach your own subtree. Run `amux ctl`
-with no arguments (or `amux --help`) for the authoritative, current surface.
+it beside you (vs a new window); `--mode` picks a teammate's permission mode
+(`plan`/`accept`/`automode`), else it inherits the session policy — amux caps you
+at that policy unless the human operator is directing, so use `--mode` rather than
+raw claude permission flags; `audit` prints your delegation ledger. Targets are a
+role name or a pane id; you can only reach your own subtree. Run `amux ctl` with
+no arguments (or `amux --help`) for the authoritative, current surface.
 
 ## Depth & visibility
 

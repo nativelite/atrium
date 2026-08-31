@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-31
+
+### Added
+- **Session trust policy + per-teammate modes.** `--trust` now takes a policy
+  argument — **`--trust plan|accept|automode`** — that sets the mode spawned agents
+  run in *and* the ceiling they're capped at. Bare `--trust` = `accept` (today's
+  behavior); `--skip-permissions` is an alias for `--trust automode`; new **`plan`**
+  = claude's read-only plan mode (`--permission-mode plan`).
+- **`ctl spawn --mode plan|accept|automode`** picks a teammate's mode instead of
+  inheriting the policy. Governance: **the operator (root pane) may set any mode**
+  (elevating a teammate is the human directing the session); **a spawned worker is
+  capped at the policy** — it may match or de-escalate but never elevate itself.
+  Anything capped or stripped is reported in the spawn reply's `note`, never
+  silently. This resolves the tension from 0.17.0's flat "strip everything": the
+  human can now say "spin these up in automode / plan" and have it take effect,
+  while a rogue sub-agent still can't escalate on its own. New `TrustMode::Plan`,
+  `TrustMode::rank`, `TrustMode::from_policy_keyword` / `policy_label`.
+
 ## [0.17.1] - 2026-08-31
 
 ### Fixed
