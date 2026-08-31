@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-08-31
+
+### Fixed
+- **`--here` grid: no thin stub row for non-rectangular counts.** 0.17.0 filled
+  rows to `ceil(√n)`, leaving the remainder as a short last row (13 → 4/4/4/**1**,
+  a ~1-tall sliver). The grid now uses `rows = floor(√n)` and spreads panes
+  **evenly** across those rows (sizes differ by at most one), so every count tiles
+  as a real grid with comparable row heights: 13 → three rows of 5/4/4, 3 → a
+  single 1×3 row, 7 → 4/3. Perfect counts are unchanged (12 → 3×4, 9 → 3×3).
+
 ## [0.17.0] - 2026-08-31
 
 ### Fixed

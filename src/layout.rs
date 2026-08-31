@@ -105,26 +105,40 @@ impl Tree {
     /// arrangement instead of the degenerate `1×N` line a naïve "split beside the
     /// caller every time" produces.
     ///
-    /// Columns = `ceil(sqrt(n))`, rows = `ceil(n / cols)`; ids fill row-major, so
-    /// a non-rectangular count leaves the last row short (its cells then a touch
-    /// taller, per the leaf-count-proportional split — cosmetic only; perfect
-    /// counts like 4/6/9/12 tile evenly). Focus is set to `ids[0]`; callers move
-    /// it as needed. An empty slice falls back to a single leaf so this never
-    /// panics.
+    /// `rows = floor(sqrt(n))` (biased toward wider grids — reads better in a
+    /// terminal and suits side-by-side `--here` tiling), then the panes are spread
+    /// **evenly** across those rows: the first `n % rows` rows take one extra, the
+    /// rest the base share, so row sizes differ by at most one. Because the layout
+    /// splits space proportionally to leaf count, near-equal row sizes give
+    /// near-equal row heights — so there is **no thin stub row** for
+    /// non-rectangular counts (13 → three rows of 5/4/4, all comparable height;
+    /// not 4/4/4/1 with a sliver). Perfect counts still tile exactly (12 → 3×4,
+    /// 9 → 3×3, 4 → 2×2). Focus is set to `ids[0]`; callers move it as needed. An
+    /// empty slice falls back to a single leaf so this never panics.
     pub fn grid_from_ids(ids: &[usize]) -> Self {
         if ids.is_empty() {
             return Tree::new(0);
         }
         let n = ids.len();
-        // Integer ceil(sqrt(n)) — no float rounding surprises.
-        let mut cols = 1;
-        while cols * cols < n {
-            cols += 1;
+        // rows = floor(sqrt(n)), computed without floats (no rounding surprises).
+        let mut rows = 1;
+        while (rows + 1) * (rows + 1) <= n {
+            rows += 1;
         }
-        let row_nodes: Vec<Node> = ids
-            .chunks(cols)
-            .map(|row| Self::join(Dir::Vertical, row.iter().map(|&id| Node::Leaf(id)).collect()))
-            .collect();
+        // Even spread: `rem` rows of `base + 1`, then `rows - rem` of `base`.
+        let base = n / rows;
+        let rem = n % rows;
+        let mut row_nodes = Vec::with_capacity(rows);
+        let mut start = 0;
+        for r in 0..rows {
+            let take = base + usize::from(r < rem);
+            let row = &ids[start..start + take];
+            row_nodes.push(Self::join(
+                Dir::Vertical,
+                row.iter().map(|&id| Node::Leaf(id)).collect(),
+            ));
+            start += take;
+        }
         let root = Self::join(Dir::Horizontal, row_nodes);
         Tree { root, focus: ids[0] }
     }
@@ -780,20 +794,48 @@ mod tests {
     }
 
     #[test]
-    fn grid_from_ids_handles_a_partial_last_row() {
-        // 5 ids → cols=3, rows=2, last row holds 2. Still tiles with no overlap
-        // and full coverage; every id preserved (partial last row allowed).
-        let ids = vec![7, 3, 9, 1, 5];
+    fn grid_from_ids_spreads_a_prime_count_with_no_stub_row() {
+        // 13 (prime) must tile as a real grid — three rows of 5/4/4 — with NO
+        // thin sliver row (the old ceil-cols approach made 4/4/4/1, a ~1-tall
+        // stub). Assert every pane is a healthy fraction of the height, all ids
+        // present, no overlap, full coverage.
+        let ids: Vec<usize> = (100..113).collect(); // 13 non-0..n ids
         let t = Tree::grid_from_ids(&ids);
-        assert_eq!(t.len(), 5);
+        assert_eq!(t.len(), 13);
+        let mut got = t.ids();
+        got.sort_unstable();
+        assert_eq!(got, ids, "all 13 ids preserved");
         let rects = t.rects(OUTER);
+        // No pane collapses to a stub: OUTER is 24 rows over 3 grid rows ⇒ ~8
+        // each; every pane must be at least 6 tall (would be ~1 for a 4/4/4/1
+        // stub row).
+        for (_, r) in &rects {
+            assert!(r.rows >= 6, "pane too short (stub row?): {r:?}");
+        }
         for i in 0..rects.len() {
             for j in (i + 1)..rects.len() {
-                assert!(!overlaps(rects[i].1, rects[j].1));
+                assert!(
+                    !overlaps(rects[i].1, rects[j].1),
+                    "{:?} vs {:?}",
+                    rects[i],
+                    rects[j]
+                );
             }
         }
         let area: usize = rects.iter().map(|(_, r)| r.rows * r.cols).sum();
         assert_eq!(area, OUTER.rows * OUTER.cols);
+    }
+
+    #[test]
+    fn grid_from_ids_three_panes_make_one_row() {
+        // floor(sqrt(3)) = 1 row ⇒ 3 side-by-side (a 1×3 line), the natural shape
+        // for three teammates rather than a 2-over-1 split.
+        let t = Tree::grid_from_ids(&[4, 8, 2]);
+        let rects = t.rects(OUTER);
+        assert_eq!(rects.len(), 3);
+        for (_, r) in &rects {
+            assert_eq!(r.rows, OUTER.rows, "all three share one full-height row");
+        }
     }
 
     #[test]
