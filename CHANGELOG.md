@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-08-31
+
+### Fixed
+- **Agent panes died on launch under `--allow-ctl` on Windows.** The ctl
+  directive added in 0.14.0 contained shell-special characters (`"`, `<`, `>`,
+  backticks) that broke the `cmd /C claude.cmd …` shim's argument quoting, so
+  `amux --allow-ctl --trust claude` opened and quit immediately (the pane's
+  claude got a garbled command line and exited, taking amux with it). The
+  directive is now plain prose with no shell-special characters, so it survives
+  the shim intact. (A loud comment on the constant guards against reintroducing
+  a special character.)
+
 ## [0.14.0] - 2026-08-31
 
 ### Fixed

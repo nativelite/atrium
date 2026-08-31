@@ -368,16 +368,23 @@ pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 /// always in the agent's context for a ctl session, so it doesn't rely on a skill
 /// happening to surface. The agent applies it against whatever the human types —
 /// delegate on "coordinate a team", stay solo otherwise.
+// IMPORTANT: this string is passed to claude via `--append-system-prompt` on the
+// command line, which on Windows goes through a `cmd /C claude.cmd ...` shim.
+// It must contain NO shell-special characters — no quotes, backticks, angle
+// brackets, parens, &, |, %, ^ — or the shim's quoting breaks and the agent pane
+// dies on launch. Keep it plain prose (letters, spaces, commas, periods, colons,
+// hyphens) so it survives the round-trip intact.
 pub const AGENT_CTL_DIRECTIVE: &str = "You are running inside amux, a terminal \
-multiplexer with a live control plane (endpoint in the AMUX_CTL env var). When a \
-task calls for delegating to teammates or coordinating a team, delegate by \
-running the shell commands `amux ctl spawn --role <name> -- claude`, then \
-`amux ctl send <name> \"<self-contained subtask>\"`, and track them with \
-`amux ctl status` / reap with `amux ctl kill`. Each teammate is a VISIBLE amux \
-pane the human can watch, steer, and take over. Do NOT use your Task tool or \
-background agents to delegate — those run invisibly and defeat amux's purpose. \
-Run `amux ctl` with no arguments for the full command surface, or use the \
-amux-coordinate / amux-delegate skills for the full workflow.";
+multiplexer with a live control plane whose endpoint is in the AMUX_CTL \
+environment variable. When a task calls for delegating to teammates or \
+coordinating a team, delegate by running the shell command amux ctl spawn \
+--role NAME -- claude, then amux ctl send NAME followed by a self-contained \
+subtask, and track them with amux ctl status and reap them with amux ctl kill. \
+Each teammate is a VISIBLE amux pane the human can watch, steer, and take over. \
+Do NOT use your Task tool or background agents to delegate, since those run \
+invisibly and defeat the purpose of amux. Run amux ctl with no arguments for the \
+full command surface, or use the amux-coordinate or amux-delegate skills for the \
+full workflow.";
 
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
