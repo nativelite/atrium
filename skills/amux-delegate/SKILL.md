@@ -1,0 +1,56 @@
+---
+name: amux-delegate
+description: Delegate an independent, substantial part of your work to a teammate agent (a claude in its own amux pane) via `amux ctl`, when it genuinely pays off. Use when running inside amux and part of the task is large and independent.
+---
+
+# Delegating to a teammate agent (amux ctl)
+
+You are running inside amux, which lets you spawn teammate agents — each a real
+`claude` in its own visible pane — through the `amux ctl` command. You MAY hand
+an independent part of your work to a teammate.
+
+## Delegate only when it pays
+
+Delegate a part when it is **genuinely independent** and **substantial enough**
+that running it in parallel beats doing it yourself. If you could finish the work
+about as fast as it takes to spawn, brief, monitor, and reap a teammate, just do
+it — delegation has real coordination overhead. Do NOT delegate parts that depend
+on each other, or small/quick work. (If you have been told to coordinate a team,
+use the amux-coordinate skill instead — there, delegating is the job.)
+
+## How to delegate
+
+    amux ctl spawn --role <short-name> -- claude
+    amux ctl send <short-name> "<the subtask>"
+
+A teammate starts **blank** — a fresh agent that cannot see this conversation,
+your goal, or your work in progress. Every `send` must be fully self-contained:
+the goal, the exact file paths, the constraints, and how it will know it is done.
+Write a short paragraph, not "do the auth part".
+
+## Collect results, then reap
+
+Teammates leave artifacts on the shared filesystem (files, edits, commits) — they
+do NOT return a value to you.
+
+    amux ctl status [<role>]   # which teammates are working vs idle
+    amux ctl kill <role>       # reap a teammate once you have collected its part
+
+When a teammate reports idle, read the files it changed to see its work, then
+reap it — don't leave a finished teammate running.
+
+## Full surface & discovery
+
+    amux ctl spawn [--role R] [--identity X] [--here | --window] -- <cmd...>
+    amux ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+
+`--identity X` runs a teammate under a credential you already hold; `--here` tiles
+it beside you (vs a new window); `audit` prints your delegation ledger. Targets
+are a role name or a pane id; you can only reach your own subtree. Run `amux ctl`
+with no arguments (or `amux --help`) for the authoritative, current surface.
+
+## Depth & visibility
+
+Keep the tree shallow — a teammate can delegate too, but there is a spawn-depth
+limit. Everything you spawn is a visible pane the human can watch, zoom into, or
+take over; nothing you delegate is hidden.

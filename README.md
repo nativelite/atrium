@@ -382,6 +382,34 @@ and every level is a pane you can watch, redirect, zoom into (`Ctrl+A z`), or
 kill. `ctl` is the small verb layer; the panes, tiling, identity injection, and
 `agsess` status it stands on already existed.
 
+### Delegation skills — `amux-delegate` and `amux-coordinate`
+
+`ctl` is the mechanism; two Claude Code skills (in [`skills/`](skills/)) are the
+instruction layer that makes an agent *use* it. Copy the directories into
+`~/.claude/skills/` and any amux-hosted claude picks them up. They exist because
+the trigger is **who decides to delegate**:
+
+- **`amux-delegate`** (ambient / discretionary) — the agent *may* hand off an
+  independent, substantial part when it genuinely pays, and does small or
+  dependent work inline. On its own a capable agent usually judges it can do the
+  work itself — which is correct — so this fires rarely by design. Its real value
+  is discoverability: without it, an agent doesn't know `amux ctl` exists at all.
+- **`amux-coordinate`** (directed) — for when you *want* fan-out. It casts the
+  agent as a coordinator that splits the work, delegates **every** part, monitors,
+  collects, and reaps — instead of implementing inline. This is the reliable
+  lever: on a task where the ambient skill chose inline every time, coordinate
+  mode fanned out every time.
+
+Drop a spawned lead straight into coordinate mode by telling it to coordinate:
+
+```bash
+amux ctl spawn --role lead -- claude
+amux ctl send lead "Coordinate this across a team, one teammate per part: <the initiative>"
+```
+
+or, from your own pane, just say "coordinate this across a team: …" and let the
+skill surface.
+
 ## The architecture (why it's small and faithful)
 
 amux is a **passthrough** first, an emulator only when it must tile. In
