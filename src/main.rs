@@ -87,6 +87,33 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// the pane has no more data, so this cap only matters on a genuine flood.
 const DRAIN_READS_PER_TICK: usize = 64;
 
+/// Draw the animated startup splash for a passthrough pane that has not painted
+/// yet — a centered `a m u x` wordmark and a spinner, so the agent's boot reads
+/// as *loading*, not a hang. Written straight to the terminal and wrapped in
+/// synchronized output so each frame is atomic (no flicker from the per-frame
+/// clear); the drain wipes it on the pane's first real bytes.
+fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
+    const SPIN: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
+    let (rows, cols) = (rows as usize, cols as usize);
+    if rows < 3 || cols < 10 {
+        return;
+    }
+    let spin = SPIN[frame % SPIN.len()];
+    let brand = "a m u x";
+    let sub = format!("{spin}  starting your agent…  {spin}");
+    let mid = (rows / 2).max(1);
+    let bcol = (cols.saturating_sub(brand.chars().count()) / 2) + 1;
+    let scol = (cols.saturating_sub(sub.chars().count()) / 2) + 1;
+    // One atomic frame: clear, bright-cyan bold wordmark, dim-cyan subline, reset.
+    let _ = write!(
+        out,
+        "\x1b[?2026h\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
+         \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m\x1b[?2026l",
+        mid + 1
+    );
+    let _ = out.flush();
+}
+
 /// A `ctl send` awaiting delivery. The design queues a task until the target is
 /// **idle** (agsess-gated) rather than injecting into a live turn (Decision 4).
 /// Once the target is ready we write the text, then — after a short beat so the
@@ -192,6 +219,11 @@ struct Pane {
     /// ctl-spawned worker. The `--max-depth` recursion guard is checked against
     /// this.
     depth: usize,
+    /// True once the pane's process has produced any output. Until then, a
+    /// *passthrough* (single/zoomed) pane shows the animated startup splash
+    /// instead of a blank screen (the tiled path uses a per-pane blank check in
+    /// the compositor). Set on the pane's first byte in the drain.
+    painted: bool,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -467,6 +499,9 @@ fn run(
     // repaints just those cells; once every pane has painted, the frame no longer
     // affects the master, so it stops driving repaints.
     let anim_start = Instant::now();
+    // The spinner frame last painted by the passthrough startup splash, so it
+    // redraws only when the frame advances (not every tick).
+    let mut last_splash_frame: usize = usize::MAX;
     let mut last_bar = String::new();
 
     // Agent session state (§5): one read-only `agsess::World` over the Claude
@@ -722,7 +757,14 @@ fn run(
                         // Always feed the emulator so a later switch/split/zoom
                         // renders the current screen without a repaint nudge.
                         pane.term.feed(&buf[..n]);
+                        let first_paint = !pane.painted;
+                        pane.painted = true;
                         if !tiled && pane.id == focus {
+                            // First real bytes after the startup splash: wipe it
+                            // so the agent paints onto a clean screen.
+                            if first_paint {
+                                let _ = out.write_all(b"\x1b[2J\x1b[H");
+                            }
                             let cleaned = pane.filter.feed(&buf[..n]);
                             let _ = out.write_all(&cleaned);
                         } else if pane.id != focus {
@@ -865,19 +907,32 @@ fn run(
         //    synchronized output (§`SYNC_BEGIN`), so the outer terminal paints
         //    panes+bar atomically — no mid-frame tearing. An empty frame (idle
         //    tick) emits nothing, so the markers never spam.
+        let spin_frame = (anim_start.elapsed().as_millis() / 120) as usize;
         let mut frame: Vec<u8> = Vec::new();
         if windows[active].tiled() {
-            let spin_frame = (anim_start.elapsed().as_millis() / 120) as usize;
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
             match &prev_master {
                 Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
                 None => frame.extend_from_slice(&master.render_full()),
             };
             prev_master = Some(master);
-        } else if force_repaint {
-            // Passthrough (single pane or zoomed): nudge the focused pane's pty
-            // so it repaints in full, the same trick 0.1 uses on window switch.
-            repaint_focused(&mut windows[active], rows, cols, &mut out);
+        } else {
+            // Passthrough (single pane or zoomed). While the focused pane has not
+            // painted yet, animate the startup splash so the ~seconds of agent
+            // boot don't look like a hang; the drain wipes it and takes over on
+            // the pane's first bytes. Throttled to the spinner's ~8 fps.
+            let fp = windows[active].tree.focus();
+            let unpainted = windows[active].pane(fp).map(|p| !p.painted).unwrap_or(false);
+            if unpainted {
+                if spin_frame != last_splash_frame {
+                    draw_startup_splash(&mut out, rows, cols, spin_frame);
+                    last_splash_frame = spin_frame;
+                }
+            } else if force_repaint {
+                // Nudge the focused pane's pty to repaint in full, the same trick
+                // 0.1 uses on window switch.
+                repaint_focused(&mut windows[active], rows, cols, &mut out);
+            }
         }
 
         // 7. the bar (windows, with the active one starred)
@@ -2053,6 +2108,17 @@ fn spawn_pane_full(
         user_cmd.push(uuid.clone());
     }
     let effective = effective_command(&user_cmd);
+    // Opt-in spawn diagnostic: `AMUX_SPAWN_LOG=<file>` appends the exact command
+    // (post trust-flags, post shim) amux launches for each pane, so a "why isn't
+    // this pane in the mode I expected" question is answered by data, not guesses.
+    if let Ok(path) = std::env::var("AMUX_SPAWN_LOG") {
+        if !path.is_empty() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "[{title}] {}", effective.join(" "));
+            }
+        }
+    }
     let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
     let r = rows.max(1);
     let c = cols.max(1);
@@ -2129,6 +2195,7 @@ fn spawn_pane_full(
         role: None,
         parent: None,
         depth: 0,
+        painted: false,
     })
 }
 

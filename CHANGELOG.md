@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-31
+
+### Added
+- **Animated startup splash for the initial (passthrough) load.** A single/zoomed
+  pane that has not painted yet now shows a centered `a m u x` wordmark + spinner
+  instead of a ~3-second blank screen while the agent boots — so the initial load
+  reads as *loading*, not broken. It wipes itself the instant the agent produces
+  output. (Complements the tiled per-pane loading spinner from 0.15.0.)
+- **`AMUX_SPAWN_LOG=<file>`** — opt-in diagnostic: appends the exact command amux
+  launches for each pane (post trust-flags, post shim), so "why isn't this pane
+  in the mode I expected" is answered by data. Confirmed with it that `--trust`'s
+  `acceptEdits` + allowlist reach ctl-spawned teammates identically to the
+  initial pane.
+
 ## [0.15.0] - 2026-08-31
 
 ### Added
