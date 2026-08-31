@@ -278,6 +278,18 @@ vars into **every** pane it spawns:
 - **`AMUX_PANE`** — the caller pane's agent id, so the server attributes each
   request to its place in the spawn tree.
 
+**`--trust` (hands-off).** For an agent-driven fleet to run without you at the
+keyboard, `--trust` makes every agent pane amux launches come up fully trusted:
+it appends claude's `--dangerously-skip-permissions` (no per-action prompts)
+**and** pre-accepts claude's separate *folder-trust* dialog for that pane's
+working directory — the "Do you trust the files in this folder?" gate, which
+`--dangerously-skip-permissions` does *not* cover (it's stored per-directory in
+`~/.claude.json`). amux writes only that trust bit, only for the pane's own
+directory, only under `--trust`, atomically; a config it can't parse is left
+untouched and the pane still launches. This is the one place amux writes another
+tool's config — deliberate, opt-in, and genuinely powerful (agents then run
+tools unsupervised), so it stays off by default.
+
 Any process in a pane — a shell command, or an agent via a tool/hook — issues
 control by running **`amux ctl <cmd>`**, which speaks one JSON request per line
 and prints the one-line JSON reply.

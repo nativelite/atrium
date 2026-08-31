@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-30
+
+### Fixed
+- **`--trust` is now actually hands-off.** It appended claude's
+  `--dangerously-skip-permissions` (no per-action prompts) but claude still
+  blocked on its separate *"Do you trust the files in this folder?"* dialog —
+  a per-directory gate stored in `~/.claude.json`, which that flag does **not**
+  cover. `--trust` now also pre-accepts folder trust for each agent pane's
+  working directory, so a fleet launched in a fresh folder no longer stops for a
+  human to click through the dialog.
+
+### Added
+- **`amux::trust`** — pre-accepts claude's folder-trust dialog by setting
+  `projects["<dir>"].hasTrustDialogAccepted = true` in `~/.claude.json` (the same
+  state claude writes when you accept). Only under `--trust`, only the trust bit,
+  only for the pane's own directory; an atomic temp-then-rename write that
+  preserves the rest of the file byte-for-byte, and **leaves a config it can't
+  parse untouched** (never clobbers what it didn't understand). Honors
+  `CLAUDE_CONFIG_DIR`. This is the one place amux writes another tool's config —
+  deliberate and opt-in; see the `--trust` note in the README.
+
 ## [0.11.0] - 2026-08-30
 
 ### Added

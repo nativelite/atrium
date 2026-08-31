@@ -28,4 +28,5 @@ pub mod layout;
 pub mod resolve;
 pub mod spawn;
 pub mod tile;
+pub mod trust;
 pub mod uid;

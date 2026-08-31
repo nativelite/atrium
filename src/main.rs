@@ -214,7 +214,8 @@ fn main() -> ExitCode {
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
             "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
-             \x20      --trust: launch agents with --dangerously-skip-permissions (trusted + auto mode; agents run tools unsupervised)\n\
+             \x20      --trust: launch agents with --dangerously-skip-permissions AND pre-accept claude's folder-trust\n\
+             \x20               dialog for each pane's dir in ~/.claude.json (fully hands-off; agents run tools unsupervised)\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
@@ -1898,16 +1899,31 @@ fn spawn_pane_full(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
     // `--trust`: for an agent pane, append claude's `--dangerously-skip-permissions`
-    // so it comes up trusted and in auto mode (no trust dialog / no prompts).
-    // Only for agent commands — a shell pane is never given the flag.
-    let base: Vec<String> =
-        if amux::bind::is_agent_stem(&title) && AGENT_TRUST.load(Ordering::Relaxed) {
-            let mut v = command.to_vec();
-            v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
-            v
-        } else {
-            command.to_vec()
-        };
+    // so it comes up in auto mode (no per-action permission prompts). Only for
+    // agent commands — a shell pane is never given the flag.
+    let trusted_launch = amux::bind::is_agent_stem(&title) && AGENT_TRUST.load(Ordering::Relaxed);
+    let base: Vec<String> = if trusted_launch {
+        let mut v = command.to_vec();
+        v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+        v
+    } else {
+        command.to_vec()
+    };
+    // …and pre-accept claude's *folder-trust* dialog for this pane's working
+    // directory — a separate gate `--dangerously-skip-permissions` does NOT
+    // cover (it's stored per-dir in ~/.claude.json). Without this a --trust
+    // launch in an untrusted folder still blocks on "trust this folder?". Only
+    // under --trust, only the trust bit, only this pane's cwd; a parse/IO
+    // problem is flashed and the pane spawns anyway (worst case: the dialog).
+    if trusted_launch {
+        let dir = cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        if let Err(e) = amux::trust::ensure_trusted(&dir) {
+            *flash = Some((format!("folder-trust: {e}"), Instant::now()));
+        }
+    }
     // Agent-aware bind (§3.3): if this is an agent pane amux is launching and the
     // user did not already pick a session, mint a uuid and append
     // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
