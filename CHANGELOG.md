@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.3] - 2026-08-31
+
+### Fixed
+- **Startup splash: no more white-bar flash, no spinner pause.** Two initial-load
+  glitches, same root cause — the splash was on a *separate* write path from the
+  status bar. (1) The splash `2J`-cleared the whole screen ~8×/sec on its own
+  atomic frame, wiping the bar a beat before the bar's separate frame repainted
+  it, which read as the white bar flashing. The splash is now composited **into
+  the tick's single synchronized frame** with the bar, so the whole screen
+  repaints atomically and the bar never disappears. (2) At ~1 s in, the agent pane
+  is still unbound, so agsess discovery (a full `read_dir` over the projects root)
+  fired and blocked the loop for the better part of a second, freezing the
+  spinner. Discovery is now **deferred while the sole pane is on the splash** —
+  nothing is bound yet, so there is nothing to show — and resumes the moment the
+  agent paints.
+
 ## [0.16.2] - 2026-08-31
 
 ### Fixed

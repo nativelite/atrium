@@ -121,16 +121,20 @@ fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, fram
     let mid = (rows / 2).max(1);
     let bcol = (cols.saturating_sub(brand.chars().count()) / 2) + 1;
     let scol = (cols.saturating_sub(sub.chars().count()) / 2) + 1;
-    // One atomic frame: clear, bright-cyan bold wordmark, dim-cyan subline, reset.
-    // `?25l` hides the cursor so it doesn't blink next to the spinner; the agent
-    // restores it when it takes over (§ the handoff in the drain).
+    // Appended into the tick's single synchronized frame (with the bar), NOT a
+    // frame of its own — so the whole screen (wordmark *and* bar) repaints
+    // atomically. Drawing the splash on its own write path used to `2J`-clear the
+    // bar a beat before the bar's separate frame repainted it, which read as the
+    // white bar flashing on startup. No `?2026`/flush here: the caller wraps the
+    // composite in `SYNC_BEGIN`/`SYNC_END` and flushes once. `?25l` hides the
+    // cursor so it doesn't blink next to the spinner; the agent restores it
+    // (`?25h`) at the handoff in the drain.
     let _ = write!(
         out,
-        "\x1b[?2026h\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
-         \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m\x1b[?2026l",
+        "\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
+         \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m",
         mid + 1
     );
-    let _ = out.flush();
 }
 
 /// A `ctl send` awaiting delivery. The design queues a task until the target is
@@ -924,7 +928,20 @@ fn run(
         } else {
             Duration::from_millis(5000)
         };
-        if last_agent_discover.elapsed() >= discover_every {
+        // While the sole pane is still on the startup splash, skip the refresh
+        // entirely: nothing is bound yet (so the bar has nothing to show), and the
+        // discovery pass is a full `read_dir` over the projects root that can block
+        // the loop for the better part of a second — which froze the splash spinner
+        // for a beat right at ~1 s in. Once the agent paints, polling resumes and
+        // it binds on the next tick.
+        let booting_splash = !windows[active].tiled()
+            && windows[active]
+                .pane(windows[active].tree.focus())
+                .map(|p| !p.painted)
+                .unwrap_or(false);
+        if booting_splash {
+            // hold off — resumes as soon as the pane paints
+        } else if last_agent_discover.elapsed() >= discover_every {
             // Discovery + tail: a full refresh picks up new transcripts and
             // tails grown ones in one pass.
             world.refresh();
@@ -945,6 +962,9 @@ fn run(
         //    tick) emits nothing, so the markers never spam.
         let spin_frame = (anim_start.elapsed().as_millis() / 120) as usize;
         let mut frame: Vec<u8> = Vec::new();
+        // Set when this tick composited the startup splash into `frame`; its `2J`
+        // wipes the bar, so the bar is force-appended below to keep the frame whole.
+        let mut splash_drawn = false;
         if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
             match &prev_master {
@@ -961,8 +981,9 @@ fn run(
             let unpainted = windows[active].pane(fp).map(|p| !p.painted).unwrap_or(false);
             if unpainted {
                 if spin_frame != last_splash_frame {
-                    draw_startup_splash(&mut out, rows, cols, spin_frame);
+                    draw_startup_splash(&mut frame, rows, cols, spin_frame);
                     last_splash_frame = spin_frame;
+                    splash_drawn = true;
                 }
             } else if force_repaint {
                 // Nudge the focused pane's pty to repaint in full, the same trick
@@ -1003,6 +1024,7 @@ fn run(
         let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
         let painted = bar_paint(&infos, rows, cols as usize, note);
         if force_repaint
+            || splash_drawn
             || painted != last_bar
             || last_bar_paint.elapsed() >= Duration::from_millis(500)
         {
