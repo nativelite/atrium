@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-08-31
+
+### Fixed
+- **Startup splash never actually showed.** 0.16.0 marked a pane "painted" on its
+  first byte, but an agent emits terminal-setup bytes within milliseconds (before
+  any visible content), so the splash was wiped instantly. "Painted" now means the
+  emulator has *visible* content; while still blank, the agent's pre-frame bytes
+  are suppressed so they don't scribble under the splash, and on the agent's first
+  frame the splash is wiped and the screen is painted straight from the emulator.
+  So the `a m u x` splash + spinner now stays up for the whole boot.
+
 ## [0.16.0] - 2026-08-31
 
 ### Added

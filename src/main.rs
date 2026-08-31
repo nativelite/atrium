@@ -92,6 +92,23 @@ const DRAIN_READS_PER_TICK: usize = 64;
 /// as *loading*, not a hang. Written straight to the terminal and wrapped in
 /// synchronized output so each frame is atomic (no flicker from the per-frame
 /// clear); the drain wipes it on the pane's first real bytes.
+/// True while a pane's emulator has produced no *visible* content yet — every
+/// cell is default. Used to keep the startup splash up until the agent actually
+/// paints (its terminal-setup bytes arrive first and must not count as painted).
+/// Short-circuits, so it is cheap and only fully scans during the brief boot.
+fn term_blank(t: &vterm::Term) -> bool {
+    let s = t.screen();
+    let blank = ansi::Cell::default();
+    for r in 0..s.rows() {
+        for c in 0..s.cols() {
+            if s.cell(r, c) != blank {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
     const SPIN: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
     let (rows, cols) = (rows as usize, cols as usize);
@@ -757,18 +774,34 @@ fn run(
                         // Always feed the emulator so a later switch/split/zoom
                         // renders the current screen without a repaint nudge.
                         pane.term.feed(&buf[..n]);
-                        let first_paint = !pane.painted;
-                        pane.painted = true;
+                        // "painted" = the emulator now has *visible* content, not
+                        // merely that setup bytes arrived — so the splash stays up
+                        // until the agent's first frame.
+                        let first_paint = !pane.painted && !term_blank(&pane.term);
+                        if first_paint {
+                            pane.painted = true;
+                        }
                         if !tiled && pane.id == focus {
-                            // First real bytes after the startup splash: wipe it
-                            // so the agent paints onto a clean screen.
                             if first_paint {
+                                // Hand off from the splash: wipe it, then paint the
+                                // agent's current screen straight from the emulator
+                                // (which already reflects everything fed so far),
+                                // and resume live passthrough from here.
+                                let full = pane.term.screen().render_full();
                                 let _ = out.write_all(b"\x1b[2J\x1b[H");
+                                let _ = out.write_all(&full);
+                            } else if pane.painted {
+                                let cleaned = pane.filter.feed(&buf[..n]);
+                                let _ = out.write_all(&cleaned);
+                            } else {
+                                // Still on the splash: keep the passthrough filter's
+                                // state current, but suppress output so the agent's
+                                // setup bytes don't scribble under the splash.
+                                let _ = pane.filter.feed(&buf[..n]);
                             }
-                            let cleaned = pane.filter.feed(&buf[..n]);
-                            let _ = out.write_all(&cleaned);
                         } else if pane.id != focus {
                             pane.activity = true;
+                            pane.painted = true; // background/tiled: any output = painted
                         }
                     }
                     Ok(Some(_)) => {
