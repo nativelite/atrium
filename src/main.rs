@@ -27,7 +27,7 @@ use amux::layout::{self, Rect, Tree};
 use amux::tile::{compose, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -42,11 +42,31 @@ static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
 /// spawn is byte-identical to pre-ctl amux.
 static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
 
-/// Set once at startup iff `--trust` was given: every agent pane amux spawns gets
-/// claude's `--dangerously-skip-permissions` appended, so a spawned worker comes
-/// up trusted and in auto mode. Off ⇒ agents prompt for trust/permissions as
-/// usual. Read by the spawn path (`spawn_pane_full`).
-static AGENT_TRUST: AtomicBool = AtomicBool::new(false);
+/// Set once at startup from the `--trust` / `--skip-permissions` flags: how much
+/// amux relaxes the permission posture of every agent pane it spawns. Encoded as
+/// `0=Off`, `1=Edits` (`--trust`: acceptEdits + safe allowlist), `2=Skip`
+/// (`--skip-permissions`: full bypass). Read by the spawn path
+/// (`spawn_pane_full`) via [`trust_mode`].
+static AGENT_TRUST: AtomicU8 = AtomicU8::new(0);
+
+/// Decode [`AGENT_TRUST`] into the typed mode.
+fn trust_mode() -> amux::ctl::TrustMode {
+    match AGENT_TRUST.load(Ordering::Relaxed) {
+        1 => amux::ctl::TrustMode::Edits,
+        2 => amux::ctl::TrustMode::Skip,
+        _ => amux::ctl::TrustMode::Off,
+    }
+}
+
+/// Publish the launch trust mode to the spawn path.
+fn set_trust_mode(m: amux::ctl::TrustMode) {
+    let code = match m {
+        amux::ctl::TrustMode::Off => 0,
+        amux::ctl::TrustMode::Edits => 1,
+        amux::ctl::TrustMode::Skip => 2,
+    };
+    AGENT_TRUST.store(code, Ordering::Relaxed);
+}
 
 fn next_agent_id() -> usize {
     NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
@@ -213,9 +233,13 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
-             \x20      --trust: launch agents with --dangerously-skip-permissions AND pre-accept claude's folder-trust\n\
-             \x20               dialog for each pane's dir in ~/.claude.json (fully hands-off; agents run tools unsupervised)\n\
+            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      --trust: safe hands-off — agents auto-accept edits + a safe dev-command allowlist\n\
+             \x20               (build/test/run); anything else (curl, git push, rm outside the dir) still\n\
+             \x20               prompts, visibly, in its pane. Also pre-accepts claude's folder-trust dialog.\n\
+             \x20               Extend the allowlist with AMUX_TRUST_ALLOW=\"cmd one,cmd two\".\n\
+             \x20      --skip-permissions: FULL bypass (--dangerously-skip-permissions) — every command runs\n\
+             \x20               with no gate. Dangerous; amux asks you to confirm at launch.\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
@@ -251,6 +275,13 @@ fn main() -> ExitCode {
     } else {
         rest
     };
+    // `--skip-permissions` is full bypass — a conscious, dangerous choice. Make
+    // the human confirm it once, in plain terms, *before* the TUI takes the
+    // terminal (this reads stdin normally; the run loop takes raw mode after).
+    if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
+        eprintln!("amux: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
+        return ExitCode::SUCCESS;
+    }
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
@@ -268,6 +299,31 @@ fn main() -> ExitCode {
         max_depth,
         trust,
     )
+}
+
+/// Plain-English confirmation gate for `--skip-permissions` (full bypass). Prints
+/// what it does and the risk, then reads one line from stdin: only an explicit
+/// `y`/`yes` proceeds. Any other input, EOF, or a non-interactive stdin aborts,
+/// so the dangerous mode is never entered by accident. Runs before raw mode.
+fn confirm_skip_permissions() -> bool {
+    use std::io::Write;
+    let mut err = std::io::stderr();
+    let _ = writeln!(
+        err,
+        "\n\x1b[1;31mWARNING: --skip-permissions runs EVERY command with no gate.\x1b[0m\n\
+         Each agent pane (and every teammate it spawns) can run any command — delete\n\
+         files, git push, network calls — with no approval prompt, on this machine with\n\
+         your permissions. Use it only where damage is easily undone (a sandbox/VM).\n\
+         For safe hands-off instead, quit and use --trust (edits + a dev allowlist;\n\
+         dangerous commands still prompt, visibly)."
+    );
+    let _ = write!(err, "Proceed in full-bypass mode? [y/N] ");
+    let _ = err.flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(n) if n > 0 => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        _ => false, // EOF / non-interactive → do not enter the dangerous mode
+    }
 }
 
 // The run loop threads several independent, well-named launch parameters; a
@@ -290,14 +346,15 @@ fn run(
     // recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
     allow_ctl: bool,
     max_depth: usize,
-    // `--trust`: launch every agent pane with `--dangerously-skip-permissions`
-    // (trusted + auto mode). Published to the spawn path via `AGENT_TRUST` before
-    // the first spawn.
-    trust: bool,
+    // How amux relaxes each spawned agent's permissions: `Off`, `Edits`
+    // (`--trust`: acceptEdits + safe allowlist), or `Skip` (`--skip-permissions`:
+    // full bypass). Published to the spawn path via `AGENT_TRUST` before the
+    // first spawn.
+    trust: amux::ctl::TrustMode,
 ) -> ExitCode {
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
-    AGENT_TRUST.store(trust, Ordering::Relaxed);
+    set_trust_mode(trust);
     let mut out = std::io::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
@@ -1195,7 +1252,7 @@ fn fleet_up(name: &str) -> ExitCode {
         Some(window),
         false,
         amux::ctl::DEFAULT_MAX_DEPTH,
-        false,
+        amux::ctl::TrustMode::Off,
     )
 }
 
@@ -1898,23 +1955,35 @@ fn spawn_pane_full(
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
-    // `--trust`: for an agent pane, append claude's `--dangerously-skip-permissions`
-    // so it comes up in auto mode (no per-action permission prompts). Only for
-    // agent commands — a shell pane is never given the flag.
-    let trusted_launch = amux::bind::is_agent_stem(&title) && AGENT_TRUST.load(Ordering::Relaxed);
+    // Permission posture for an agent pane (never a shell pane):
+    //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
+    //                                dev-command allowlist; dangerous commands
+    //                                still prompt, visibly, in the pane.
+    //   Skip (`--skip-permissions`) → `--dangerously-skip-permissions` (full
+    //                                bypass; the human confirmed it at launch).
+    let mode = trust_mode();
+    let trusted_launch = amux::bind::is_agent_stem(&title) && mode != amux::ctl::TrustMode::Off;
     let base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
-        v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+        match mode {
+            amux::ctl::TrustMode::Edits => {
+                v.extend(amux::trust::accept_edits_args(&amux::trust::extra_allow_from_env()));
+            }
+            amux::ctl::TrustMode::Skip => {
+                v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+            }
+            amux::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
+        }
         v
     } else {
         command.to_vec()
     };
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
-    // directory — a separate gate `--dangerously-skip-permissions` does NOT
-    // cover (it's stored per-dir in ~/.claude.json). Without this a --trust
-    // launch in an untrusted folder still blocks on "trust this folder?". Only
-    // under --trust, only the trust bit, only this pane's cwd; a parse/IO
-    // problem is flashed and the pane spawns anyway (worst case: the dialog).
+    // directory — a separate gate the permission mode does NOT cover (it's stored
+    // per-dir in ~/.claude.json). Without this a trusted launch in an untrusted
+    // folder still blocks on "trust this folder?". Only under --trust/--skip, only
+    // the trust bit, only this pane's cwd; a parse/IO problem is flashed and the
+    // pane spawns anyway (worst case: the dialog).
     if trusted_launch {
         let dir = cwd
             .map(std::path::PathBuf::from)

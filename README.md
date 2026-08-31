@@ -278,17 +278,36 @@ vars into **every** pane it spawns:
 - **`AMUX_PANE`** — the caller pane's agent id, so the server attributes each
   request to its place in the spawn tree.
 
-**`--trust` (hands-off).** For an agent-driven fleet to run without you at the
-keyboard, `--trust` makes every agent pane amux launches come up fully trusted:
-it appends claude's `--dangerously-skip-permissions` (no per-action prompts)
-**and** pre-accepts claude's separate *folder-trust* dialog for that pane's
-working directory — the "Do you trust the files in this folder?" gate, which
-`--dangerously-skip-permissions` does *not* cover (it's stored per-directory in
-`~/.claude.json`). amux writes only that trust bit, only for the pane's own
-directory, only under `--trust`, atomically; a config it can't parse is left
-untouched and the pane still launches. This is the one place amux writes another
-tool's config — deliberate, opt-in, and genuinely powerful (agents then run
-tools unsupervised), so it stays off by default.
+**Hands-off modes — `--trust` (safe) and `--skip-permissions` (dangerous).**
+For an agent-driven fleet to run without you at the keyboard, amux can relax the
+permission posture of every agent pane it launches. Two levels, deliberately
+separate so the safe one is the easy one:
+
+- **`--trust` — the safe default.** Agents launch in claude's **auto-accept-edits**
+  mode plus an **allowlist of safe dev commands**, so the edit/build/test loop
+  runs hands-off — but anything outside the allowlist (`curl`, `git push`, `rm`
+  outside the working dir, a critical path) still surfaces as a **visible approval
+  prompt** in its pane (which shows as a waiting-on-you `?` in the chrome). The
+  built-in allowlist covers `python`/`pytest`, `cargo test`/`build`/`check`/
+  `clippy`/`fmt`, `go test`/`build`/`vet`, `node`, `npm test` (read-only shell like
+  `ls`/`cat`/`git status` is already auto-accepted by acceptEdits). Extend it with
+  **`AMUX_TRUST_ALLOW="cmd one,cmd two"`** — each comma-separated prefix `P`
+  becomes a `Bash(P *)` matcher, e.g. `AMUX_TRUST_ALLOW="just build,make test"`.
+
+- **`--skip-permissions` — full bypass, explicit.** Appends claude's
+  `--dangerously-skip-permissions`, so **every** command runs with no gate at all.
+  Genuinely dangerous (an agent, and every teammate it spawns, can delete files,
+  push to git, or hit the network unsupervised on your machine), so amux prints a
+  plain-English warning and asks you to **confirm at launch** before it starts.
+  The two flags are mutually exclusive.
+
+Both modes also **pre-accept claude's separate *folder-trust* dialog** for each
+pane's working directory — the "Do you trust the files in this folder?" gate,
+stored per-directory in `~/.claude.json`, which neither permission flag covers.
+amux writes only that trust bit, only for the pane's own directory, atomically; a
+config it can't parse is left untouched and the pane still launches. That write is
+the one place amux touches another tool's config — deliberate and opt-in. Default
+(no flag) leaves permissions entirely to claude.
 
 Any process in a pane — a shell command, or an agent via a tool/hook — issues
 control by running **`amux ctl <cmd>`**, which speaks one JSON request per line

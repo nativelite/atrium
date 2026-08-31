@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-31
+
+### Changed
+- **`--trust` is now safe by default.** It previously meant full bypass
+  (`--dangerously-skip-permissions`); it now launches agents in claude's
+  **auto-accept-edits** mode plus an **allowlist of safe dev commands**, so the
+  edit/build/test loop runs hands-off while anything outside the allowlist
+  (`curl`, `git push`, `rm` outside the working dir, critical paths) still
+  surfaces as a **visible approval prompt** in its pane. The built-in allowlist
+  covers `python`/`pytest`, `cargo test`/`build`/`check`/`clippy`/`fmt`,
+  `go test`/`build`/`vet`, `node`, `npm test`; extend it with
+  `AMUX_TRUST_ALLOW="cmd one,cmd two"` (each prefix → a `Bash(P *)` matcher).
+
+### Added
+- **`--skip-permissions`** — the previous full-bypass behavior
+  (`--dangerously-skip-permissions`, every command runs ungated), now behind an
+  explicit plain-English risk warning + a **launch confirmation**. Mutually
+  exclusive with `--trust`. Full bypass is a conscious, confirmed choice, not the
+  default trusted mode.
+- `AMUX_TRUST_ALLOW` — configure the `--trust` safe-command allowlist.
+
+Both trusted modes still pre-accept claude's per-directory folder-trust dialog
+(unchanged from 0.12.0). Verified: `dev.py check` green (145 lib incl. new
+flag-parsing + allowlist tests, 54 integ), clippy clean.
+
 ## [0.12.0] - 2026-08-30
 
 ### Fixed

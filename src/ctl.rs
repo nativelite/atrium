@@ -277,6 +277,26 @@ pub fn extra_allow_from_env() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// How much amux relaxes the permission posture of the agent panes it spawns.
+/// Two opt-in levels, deliberately separate so the safe one is the easy one and
+/// the dangerous one is a conscious choice:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustMode {
+    /// Default: no relaxation. claude decides per its own settings; amux does not
+    /// touch the folder-trust dialog or the permission mode.
+    Off,
+    /// `--trust`: **auto-accept edits + a safe dev-command allowlist.** Agents
+    /// edit and run the build/test loop hands-off, but a command outside the
+    /// allowlist (e.g. `curl`, `git push`, `rm` outside the workdir) still
+    /// surfaces as a **visible approval prompt** in its pane. Also pre-accepts
+    /// the folder-trust dialog. The safe hands-off default.
+    Edits,
+    /// `--skip-permissions`: **full bypass** (`--dangerously-skip-permissions`).
+    /// Every command runs with no gate at all. Genuinely dangerous — amux
+    /// requires an explicit launch confirmation before using it.
+    Skip,
+}
+
 /// Pull amux's own launch meta-flags off the front of the (already identity-
 /// stripped) argument vector, before the hosted command begins — exactly the way
 /// [`crate::spawn::parse`] pulls `-n`/`--grid`. Returns `(allow_ctl, max_depth,
@@ -286,18 +306,19 @@ pub fn extra_allow_from_env() -> Vec<String> {
 /// * `--allow-ctl` — opt in to the control channel (off by default).
 /// * `--max-depth <N>` — the recursion guard ceiling (default
 ///   [`DEFAULT_MAX_DEPTH`]); `0` means unlimited (the guard is removed).
-/// * `--trust` — launch every agent pane amux spawns with claude's
-///   `--dangerously-skip-permissions`, so a spawned worker comes up **trusted
-///   and in auto mode** (no workspace-trust dialog, no per-action prompts). This
-///   is what lets an agent-driven fleet run hands-off; it is also genuinely
-///   powerful (agents run tools unsupervised), hence opt-in.
+/// * `--trust` — [`TrustMode::Edits`]: auto-accept-edits + safe allowlist, the
+///   safe hands-off default (dangerous commands still prompt, visibly).
+/// * `--skip-permissions` — [`TrustMode::Skip`]: full `--dangerously-skip-
+///   permissions` bypass. Mutually exclusive with `--trust`; amux confirms it at
+///   launch (§`main`).
 ///
 /// Parsing stops at the first non-flag token, so a flag the hosted program takes
-/// is never eaten. A bad `--max-depth` value is a clear error.
-pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), String> {
+/// is never eaten. A bad `--max-depth` value, or both trust flags at once, is a
+/// clear error.
+pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<String>), String> {
     let mut allow = false;
     let mut max_depth = DEFAULT_MAX_DEPTH;
-    let mut trust = false;
+    let mut trust = TrustMode::Off;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -306,7 +327,17 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), 
                 i += 1;
             }
             "--trust" => {
-                trust = true;
+                if trust == TrustMode::Skip {
+                    return Err("use --trust or --skip-permissions, not both".to_string());
+                }
+                trust = TrustMode::Edits;
+                i += 1;
+            }
+            "--skip-permissions" => {
+                if trust == TrustMode::Edits {
+                    return Err("use --trust or --skip-permissions, not both".to_string());
+                }
+                trust = TrustMode::Skip;
                 i += 1;
             }
             "--max-depth" => {
@@ -326,8 +357,8 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, bool, Vec<String>), 
     Ok((allow, effective_depth(max_depth), trust, Vec::new()))
 }
 
-/// The claude flag `--trust` injects into every agent pane: skips the workspace
-/// trust dialog and all permission prompts.
+/// The claude flag `--skip-permissions` injects into every agent pane: skips the
+/// workspace trust dialog and **all** permission prompts (full bypass).
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
 fn parse_depth(val: &str) -> Result<usize, String> {
@@ -858,9 +889,9 @@ mod tests {
 
     #[test]
     fn flags_default_off_and_pass_command_through() {
-        let (allow, depth, yolo, rest) = parse_flags(&v(&["claude", "--continue"])).unwrap();
+        let (allow, depth, trust, rest) = parse_flags(&v(&["claude", "--continue"])).unwrap();
         assert!(!allow);
-        assert!(!yolo);
+        assert_eq!(trust, TrustMode::Off);
         assert_eq!(depth, DEFAULT_MAX_DEPTH);
         assert_eq!(rest, v(&["claude", "--continue"]));
     }
@@ -879,8 +910,26 @@ mod tests {
         let (allow, _depth, trust, rest) =
             parse_flags(&v(&["--allow-ctl", "--trust", "claude"])).unwrap();
         assert!(allow);
-        assert!(trust);
+        assert_eq!(trust, TrustMode::Edits);
         assert_eq!(rest, v(&["claude"]));
+    }
+
+    #[test]
+    fn flags_skip_permissions_is_parsed() {
+        let (_allow, _depth, trust, rest) =
+            parse_flags(&v(&["--skip-permissions", "claude"])).unwrap();
+        assert_eq!(trust, TrustMode::Skip);
+        assert_eq!(rest, v(&["claude"]));
+    }
+
+    #[test]
+    fn flags_trust_and_skip_permissions_conflict() {
+        assert!(parse_flags(&v(&["--trust", "--skip-permissions", "claude"]))
+            .unwrap_err()
+            .contains("not both"));
+        assert!(parse_flags(&v(&["--skip-permissions", "--trust", "claude"]))
+            .unwrap_err()
+            .contains("not both"));
     }
 
     #[test]

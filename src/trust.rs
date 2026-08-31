@@ -21,6 +21,73 @@ use std::path::{Path, PathBuf};
 
 use json::Value;
 
+/// Environment knob (comma-separated command prefixes) that **extends** the
+/// built-in `--trust` allowlist ([`DEFAULT_ALLOW`]) with the user's own safe dev
+/// commands — e.g. `AMUX_TRUST_ALLOW="just build,make test"`. Each prefix P
+/// becomes the claude matcher `Bash(P *)`, so it runs hands-off while anything
+/// outside the list still prompts. Set by the human who launches amux.
+pub const ENV_TRUST_ALLOW: &str = "AMUX_TRUST_ALLOW";
+
+/// The built-in safe dev-command prefixes `--trust` ([`crate::ctl::TrustMode::Edits`])
+/// lets an agent run **without a prompt** — the build/test/run loop. Read-only
+/// shell (ls, cat, grep, `git status`, …) is already auto-accepted by claude's
+/// `acceptEdits` mode, so it is not repeated here. Anything not on this list (and
+/// not extended via [`ENV_TRUST_ALLOW`]) still surfaces as a visible approval
+/// prompt in the pane — that is the safety of this mode.
+const DEFAULT_ALLOW: &[&str] = &[
+    "python",
+    "python3",
+    "pytest",
+    "cargo test",
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "cargo fmt",
+    "go test",
+    "go build",
+    "go vet",
+    "node",
+    "npm test",
+];
+
+/// Read [`ENV_TRUST_ALLOW`] into extra allow prefixes (trimmed, empties dropped).
+pub fn extra_allow_from_env() -> Vec<String> {
+    std::env::var(ENV_TRUST_ALLOW)
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Build the claude CLI args for the safe hands-off `--trust` posture:
+/// `--permission-mode acceptEdits` plus an `--allowedTools` allowlist mapping
+/// each safe command prefix `P` (built-in [`DEFAULT_ALLOW`] then `extra`) to the
+/// matcher `Bash(P *)`. Edits and those commands run without a prompt; everything
+/// else still prompts (a visible approval in the pane). Pure and unit-tested.
+pub fn accept_edits_args(extra: &[String]) -> Vec<String> {
+    let mut args = vec![
+        "--permission-mode".to_string(),
+        "acceptEdits".to_string(),
+        "--allowedTools".to_string(),
+    ];
+    let prefixes = DEFAULT_ALLOW
+        .iter()
+        .map(|s| s.to_string())
+        .chain(extra.iter().cloned());
+    for p in prefixes {
+        let p = p.trim();
+        if !p.is_empty() {
+            args.push(format!("Bash({p} *)"));
+        }
+    }
+    args
+}
+
 /// The per-project key claude sets when the folder-trust dialog is accepted.
 const KEY_TRUST: &str = "hasTrustDialogAccepted";
 /// Set alongside it so a freshly-trusted project also skips onboarding.
@@ -244,6 +311,21 @@ mod tests {
         assert!(set_trusted_in(&mut root, "D:/x"));
         assert_eq!(trusted(&root, "D:/x"), Some(true));
         assert_eq!(root.get("numStartups").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn accept_edits_args_map_prefixes_to_bash_matchers() {
+        let args = accept_edits_args(&["just build".to_string()]);
+        // mode + allowlist header present
+        assert_eq!(args[0], "--permission-mode");
+        assert_eq!(args[1], "acceptEdits");
+        assert_eq!(args[2], "--allowedTools");
+        // a built-in prefix and the extra both become Bash(P *) matchers
+        assert!(args.iter().any(|a| a == "Bash(pytest *)"), "{args:?}");
+        assert!(args.iter().any(|a| a == "Bash(cargo test *)"), "{args:?}");
+        assert!(args.iter().any(|a| a == "Bash(just build *)"), "{args:?}");
+        // and it does NOT open all of bash
+        assert!(!args.iter().any(|a| a == "Bash" || a == "Bash(*)"), "{args:?}");
     }
 
     #[test]
