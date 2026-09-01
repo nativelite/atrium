@@ -44,21 +44,23 @@ pub enum PaneState {
 }
 
 impl PaneState {
-    /// The border/title style for this state (my 0.2.1 color spec).
+    /// The border/title style for this state — the shared amux theme, so a
+    /// tile border and a bar entry in the same color mean the same thing. Vivid
+    /// truecolor for high contrast (focused must jump out from idle at a glance).
     fn style(self) -> Style {
         match self {
             PaneState::Focused => Style {
                 bold: true,
-                fg: Color::Indexed(14), // bright cyan
+                fg: crate::theme::FOCUSED, // bright cyan
                 ..Style::default()
             },
             PaneState::Exited => Style {
-                fg: Color::Indexed(1), // red
+                fg: crate::theme::EXITED, // red
                 ..Style::default()
             },
             PaneState::Active => Style::default(),
             PaneState::Idle => Style {
-                fg: Color::Indexed(8), // grey (no `dim` attribute assumed)
+                fg: crate::theme::IDLE, // dim grey (clearly recedes vs focused)
                 ..Style::default()
             },
         }
@@ -110,9 +112,9 @@ impl PaneView<'_> {
         match self.state {
             PaneState::Focused | PaneState::Exited => self.state.style(),
             _ => match self.agent.map(|a| a.status) {
-                // Bright yellow: an agent is blocked on the human.
+                // Amber: an agent is blocked on the human.
                 Some(agsess::Status::WaitingApproval) => Style {
-                    fg: Color::Indexed(11),
+                    fg: crate::theme::WAITING,
                     ..Style::default()
                 },
                 // Waiting for a prompt is an idle state — grey, same as Idle.
@@ -474,9 +476,9 @@ mod tests {
         let m = compose(5, 5, &panes, 0);
         let corner = m.cell(0, 0).style;
         assert!(corner.bold, "focused border should be bold");
-        assert_eq!(corner.fg, Color::Indexed(14), "focused border bright cyan");
+        assert_eq!(corner.fg, crate::theme::FOCUSED, "focused border bright cyan");
         // The title shares the border style.
-        assert_eq!(m.cell(0, 1).style.fg, Color::Indexed(14));
+        assert_eq!(m.cell(0, 1).style.fg, crate::theme::FOCUSED);
     }
 
     #[test]
@@ -497,7 +499,7 @@ mod tests {
         let m = compose(5, 5, &panes, 0);
         assert_eq!(
             m.cell(0, 0).style.fg,
-            Color::Indexed(1),
+            crate::theme::EXITED,
             "exited border red"
         );
     }
@@ -518,7 +520,7 @@ mod tests {
             PaneState::Idle,
         )];
         let m = compose(5, 5, &panes, 0);
-        assert_eq!(m.cell(0, 0).style.fg, Color::Indexed(8), "idle border grey");
+        assert_eq!(m.cell(0, 0).style.fg, crate::theme::IDLE, "idle border grey");
     }
 
     #[test]
@@ -636,7 +638,7 @@ mod tests {
         // Border tinted bright yellow (Indexed 11), overriding the local Idle grey.
         assert_eq!(
             m.cell(0, 0).style.fg,
-            Color::Indexed(11),
+            crate::theme::WAITING,
             "waiting-approval border should be bright yellow"
         );
         // Title badge: " 2:claude ? " appears in the top edge.
@@ -667,7 +669,7 @@ mod tests {
         assert!(corner.bold, "focused border stays bold");
         assert_eq!(
             corner.fg,
-            Color::Indexed(14),
+            crate::theme::FOCUSED,
             "focused border stays bright cyan, not yellow"
         );
         // No attention badge on a focused pane.
@@ -693,7 +695,7 @@ mod tests {
             agsess::Status::WaitingApproval,
         )];
         let m = compose(5, 12, &panes, 0);
-        assert_eq!(m.cell(0, 0).style.fg, Color::Indexed(1), "exited stays red");
+        assert_eq!(m.cell(0, 0).style.fg, crate::theme::EXITED, "exited stays red");
     }
 
     #[test]
@@ -743,7 +745,7 @@ mod tests {
         // WaitingPrompt reads as idle — grey — overriding the Active default.
         assert_eq!(
             m.cell(0, 0).style.fg,
-            Color::Indexed(8),
+            crate::theme::IDLE,
             "waiting-prompt border is grey"
         );
         let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();

@@ -121,6 +121,19 @@ fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, fram
     }
     let spin = SPIN[frame % SPIN.len()];
     let brand = "a m u x";
+    // The wordmark with a cool per-letter gradient (cyan → azure → indigo →
+    // violet), the same palette as the themed chrome. Escapes don't count toward
+    // width, so the visible run is still exactly `brand` (7 cols) — `bcol` below
+    // centers on that.
+    let mut brand_colored = String::new();
+    for (i, ch) in ['a', 'm', 'u', 'x'].iter().enumerate() {
+        if i > 0 {
+            brand_colored.push_str("\x1b[0m "); // plain space between letters
+        }
+        let (r, g, b) = amux::theme::SPLASH_GRADIENT[i];
+        brand_colored.push_str(&format!("\x1b[1;38;2;{r};{g};{b}m{ch}"));
+    }
+    brand_colored.push_str("\x1b[0m");
     let sub = format!("{spin}  starting your agent…  {spin}");
     let mid = (rows / 2).max(1);
     let bcol = (cols.saturating_sub(brand.chars().count()) / 2) + 1;
@@ -135,7 +148,7 @@ fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, fram
     // (`?25h`) at the handoff in the drain.
     let _ = write!(
         out,
-        "\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H\x1b[1;36m{brand}\x1b[0m\
+        "\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H{brand_colored}\
          \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m",
         mid + 1
     );

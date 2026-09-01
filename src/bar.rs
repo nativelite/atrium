@@ -1,7 +1,8 @@
-//! The status bar: one reverse-video line at the bottom of the real
-//! terminal, drawn around the passthrough stream (cursor saved/restored),
-//! naming every pane and flagging activity. Pure string building —
-//! testable without a terminal.
+//! The status bar: one themed line at the bottom of the real terminal, drawn
+//! around the passthrough stream (cursor saved/restored), naming every pane and
+//! flagging activity. A dark slate with a cyan `amux` signature chip and entries
+//! colored by pane state in the shared [`crate::theme`] language (the same colors
+//! the tile borders use). Pure string building — testable without a terminal.
 
 use crate::identity;
 use ansi::{Color, Style};
@@ -24,39 +25,62 @@ pub struct PaneInfo {
     pub identity: Option<String>,
 }
 
-/// One visible run of bar text and whether it is an identity tag (which the
-/// painter colors). Non-tag segments carry the bar's own (reverse-video) style.
-struct Segment {
-    text: String,
-    /// The identity **name** if this segment is a `·<name>` tag, else `None`.
-    /// Drives the per-identity tag color; the text is always present regardless.
-    tag: Option<String>,
+/// The color role of a bar segment. Text is identical to [`bar_text`]; only the
+/// SGR differs, and escapes never count toward `cols`.
+#[derive(Clone)]
+enum Role {
+    /// The `amux` wordmark — the cyan signature chip.
+    Brand,
+    /// A window entry, colored by the pane's state.
+    Entry(State),
+    /// The `| N waiting` fleet note (amber) or a flash note.
+    Note(bool),
+    /// The keys hint (dim).
+    Keys,
+    /// An identity `·name` tag in its per-identity color.
+    Identity(String),
 }
 
-/// Build the bar as an ordered list of visible segments. Splitting the identity
-/// tag into its own segment lets the painter color just that run without
-/// bleeding into the rest of the reverse-video line. Segment *text* never
+/// A window entry's state → its color, sharing the tile-border language.
+#[derive(Clone, Copy)]
+enum State {
+    Active,
+    Waiting,
+    Exited,
+    Activity,
+    Idle,
+}
+
+/// One visible run of bar text plus its color role. Splitting into roled
+/// segments lets the painter color each without bleeding. Segment *text* never
 /// contains escapes, so column accounting stays exact.
+struct Segment {
+    text: String,
+    role: Role,
+}
+
+/// Build the bar as an ordered list of roled segments.
 fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
-    let plain = |text: String| Segment { text, tag: None };
-    let mut segs = vec![plain(String::from(" amux "))];
+    let seg = |text: String, role: Role| Segment { text, role };
+    let mut segs = vec![seg(String::from(" amux "), Role::Brand)];
     for (i, p) in panes.iter().enumerate() {
         // Marker priority (§4.2): a dead child, then a waiting agent (it needs
         // you), then active, then background activity, then idle. `?` slots in
         // between `!` and `*` so an unfocused window whose agent is blocked
-        // outranks mere activity but never masks an exit.
-        let mark = if p.exited {
-            "!"
+        // outranks mere activity but never masks an exit. The entry's *color*
+        // tracks the same state, so the bar reads at a glance.
+        let (mark, state) = if p.exited {
+            ("!", State::Exited)
         } else if p.waiting {
-            "?"
+            ("?", State::Waiting)
         } else if p.active {
-            "*"
+            ("*", State::Active)
         } else if p.activity {
-            "+"
+            ("+", State::Activity)
         } else {
-            "-"
+            ("-", State::Idle)
         };
-        segs.push(plain(format!("| {}:{}{} ", i + 1, p.title, mark)));
+        segs.push(seg(format!("| {}:{}{} ", i + 1, p.title, mark), Role::Entry(state)));
         // The identity name-tag rides next to the window entry — the name only,
         // never the secret. Its own segment so the painter can color it; the
         // `·<name>` text is the load-bearing channel and is always present.
@@ -69,11 +93,8 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
                     last.text.pop();
                 }
             }
-            segs.push(Segment {
-                text: format!("·{name}"),
-                tag: Some(name.clone()),
-            });
-            segs.push(plain(String::from(" ")));
+            segs.push(seg(format!("·{name}"), Role::Identity(name.clone())));
+            segs.push(seg(String::from(" "), Role::Entry(state)));
         }
     }
     // Fleet note: when any *non-active* window has a waiting agent, count them
@@ -83,14 +104,15 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
         .filter(|p| p.waiting && !p.active && !p.exited)
         .count();
     if waiting > 0 {
-        segs.push(plain(format!("| {waiting} waiting ")));
+        segs.push(seg(format!("| {waiting} waiting "), Role::Note(true)));
     }
     if note.is_empty() {
-        segs.push(plain(String::from(
-            "| ^A c:win \":% split hjkl:focus z:zoom m:mouse x:kill q:quit",
-        )));
+        segs.push(seg(
+            String::from("| ^A c:win \":% split hjkl:focus z:zoom m:mouse x:kill q:quit"),
+            Role::Keys,
+        ));
     } else {
-        segs.push(plain(format!("| {note}")));
+        segs.push(seg(format!("| {note}"), Role::Note(false)));
     }
     segs
 }
@@ -111,16 +133,46 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
     out
 }
 
-/// The full escape sequence that paints the bar on `row` (1-based) without
-/// disturbing the pane: save cursor, jump, base (reverse-video) style, the
-/// segments — identity tags in their own per-identity color, everything else in
-/// the base style — then reset and restore. The visible text is exactly
-/// [`bar_text`]'s (same truncation/padding); only color escapes differ, and
-/// escapes never count toward the `cols` budget.
+/// The [`Style`] for a segment's color role — the themed statusline palette.
+/// Every style sets the bar background explicitly (so it fills the whole line
+/// with no reverse-video gaps), with a per-role foreground; the `amux` brand is a
+/// filled cyan chip, and identity tags keep their per-identity color.
+fn role_style(role: &Role) -> Style {
+    use crate::theme;
+    let on_bar = |fg: Color, bold: bool| Style {
+        fg,
+        bg: theme::BAR_BG,
+        bold,
+        ..Style::default()
+    };
+    match role {
+        Role::Brand => Style {
+            fg: theme::BRAND_FG,
+            bg: theme::BRAND_BG,
+            bold: true,
+            ..Style::default()
+        },
+        Role::Entry(State::Active) => on_bar(theme::FOCUSED, true),
+        Role::Entry(State::Waiting) => on_bar(theme::WAITING, true),
+        Role::Entry(State::Exited) => on_bar(theme::EXITED, false),
+        Role::Entry(State::Activity) => on_bar(theme::ACTIVITY, false),
+        Role::Entry(State::Idle) => on_bar(theme::IDLE, false),
+        Role::Note(true) => on_bar(theme::WAITING, true),
+        Role::Note(false) => on_bar(theme::EXITED, false),
+        Role::Keys => on_bar(theme::KEYS, false),
+        Role::Identity(name) => on_bar(Color::Indexed(identity::palette_index(name)), false),
+    }
+}
+
+/// The full escape sequence that paints the themed bar on `row` (1-based) without
+/// disturbing the pane: save cursor, jump, then each segment in its role color
+/// over the bar's dark background, padded to `cols`, then reset and restore. The
+/// visible text is exactly [`bar_text`]'s (same truncation/padding); only color
+/// escapes differ, and escapes never count toward the `cols` budget.
 pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> String {
     let base = Style {
-        reverse: true,
-        fg: Color::Default,
+        fg: crate::theme::BAR_FG,
+        bg: crate::theme::BAR_BG,
         ..Style::default()
     };
     let base_sgr = base.sgr();
@@ -137,31 +189,97 @@ pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> Strin
         if n == 0 {
             continue;
         }
-        match &seg.tag {
-            // An identity tag: render it as colored *text*, matching the tiled
-            // border tag. The bar's base line is reverse-video, so setting a
-            // foreground on a still-reversed cell would swap to a filled color
-            // block (a chip). Dropping `reverse` for the tag makes the identity
-            // color the *foreground* on the bar's normal background — legible
-            // colored text, the same SGR the border uses (`fg`, no reverse).
-            // The base reverse-video style is restored right after so the color
-            // (and the reverse drop) can't bleed into the following segments.
-            Some(name) => {
-                let tag_style = Style {
-                    fg: Color::Indexed(identity::palette_index(name)),
-                    ..Style::default()
-                };
-                body.push_str(&tag_style.sgr());
-                body.push_str(&text);
-                body.push_str(&base_sgr);
-            }
-            None => body.push_str(&text),
-        }
+        // Absolute SGR per segment (each is a full reset+set), so a color can
+        // never bleed into the next; the base style is re-applied for padding.
+        body.push_str(&role_style(&seg.role).sgr());
+        body.push_str(&text);
         used += n;
     }
-    // Pad the rest of the line (base style already active) so the bar fills cols.
+    // Pad the rest of the line in the base style so the bar fills cols evenly.
+    body.push_str(&base_sgr);
     for _ in used..cols {
         body.push(' ');
     }
     format!("\x1b7\x1b[{row};1H{base_sgr}{body}\x1b[0m\x1b8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Strip ANSI escapes (`ESC7`/`ESC8` and CSI `ESC[…X`) to recover the visible
+    /// glyphs — the a11y/column-accounting authority the painter must preserve.
+    fn strip(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\x1b' {
+                out.push(c);
+                continue;
+            }
+            match it.peek() {
+                Some('[') => {
+                    it.next();
+                    for c2 in it.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    it.next();
+                }
+                None => {}
+            }
+        }
+        out
+    }
+
+    fn pane(title: &str, active: bool, activity: bool) -> PaneInfo {
+        PaneInfo {
+            title: title.into(),
+            active,
+            activity,
+            exited: false,
+            waiting: false,
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn painted_visible_text_equals_bar_text() {
+        // The theme adds only color — the visible glyphs (and thus every column)
+        // must be byte-for-byte what `bar_text` promises.
+        let panes = vec![pane("claude", true, false), pane("cmd", false, true)];
+        for cols in [20usize, 40, 80, 200] {
+            let painted = bar_paint(&panes, 24, cols, "");
+            assert_eq!(strip(&painted), bar_text(&panes, cols, ""), "cols={cols}");
+        }
+    }
+
+    #[test]
+    fn every_state_color_is_distinct() {
+        // The whole point of the follow-up: states must be told apart at a glance.
+        let sgr = |st| role_style(&Role::Entry(st)).sgr();
+        let all = [
+            sgr(State::Active),
+            sgr(State::Waiting),
+            sgr(State::Exited),
+            sgr(State::Activity),
+            sgr(State::Idle),
+        ];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "states {i} and {j} share a color");
+            }
+        }
+    }
+
+    #[test]
+    fn brand_is_a_filled_bold_chip() {
+        let s = role_style(&Role::Brand);
+        assert_eq!(s.bg, crate::theme::BRAND_BG);
+        assert_eq!(s.fg, crate::theme::BRAND_FG);
+        assert!(s.bold);
+    }
 }

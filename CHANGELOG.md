@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-31
+
+### Added
+- **A themed color identity (`amux::theme`).** One shared, vivid truecolor palette
+  drives both the status bar and the tile borders, so the chrome reads as a
+  designed system and states are distinguishable at a glance:
+  - **Status bar** is now a dark themed statusline (was a raw reverse-video strip):
+    a cyan **`amux` signature chip**, and each window entry colored by its state in
+    the *same* language as the tile borders — focused = bright cyan, waiting =
+    amber, exited = red, background-activity = green, idle = dim grey. The visible
+    text (and every column) is unchanged; only color was added.
+  - **Tile borders** moved from muted 16-color indices to the shared vivid palette,
+    so a focused pane (bright cyan) clearly jumps out from idle (dim grey) — the
+    contrast complaint.
+  - **Startup splash** wordmark now sweeps a cool per-letter gradient (cyan → azure
+    → indigo → violet) instead of flat cyan.
+
+  All colors live in one place (`src/theme.rs`) for easy tuning.
+
 ## [0.18.1] - 2026-08-31
 
 ### Fixed
