@@ -53,6 +53,14 @@ pub enum Action {
         col: u16,
         row: u16,
     },
+    /// A scroll-wheel notch at 1-based terminal cell (`col`, `row`) — only
+    /// emitted while mouse mode is on. `up` is true for wheel-up. Routed to the
+    /// pane under the cursor so you can scroll whichever tile you're hovering.
+    MouseScroll {
+        up: bool,
+        col: u16,
+        row: u16,
+    },
     Quit,
 }
 
@@ -234,6 +242,9 @@ impl PrefixScanner {
                                 if is_left_press(cb) {
                                     flush(&mut run, &mut actions);
                                     actions.push(Action::MouseClick { col, row });
+                                } else if let Some(up) = wheel_dir(cb) {
+                                    flush(&mut run, &mut actions);
+                                    actions.push(Action::MouseScroll { up, col, row });
                                 }
                             }
                         }
@@ -282,6 +293,18 @@ fn is_left_press(cb: u32) -> bool {
     cb & 0b0110_0011 == 0
 }
 
+/// If `cb` is a **wheel** event (bit 6, `0x40`, set) and not pointer motion
+/// (bit 5, `0x20`, clear), return `Some(up)` — `up == true` for wheel-up
+/// (button 64) and `false` for wheel-down (button 65). The low bit selects the
+/// direction; modifier bits (2–4) are ignored. `None` for non-wheel events.
+fn wheel_dir(cb: u32) -> Option<bool> {
+    if cb & 0x40 != 0 && cb & 0x20 == 0 {
+        Some(cb & 0x01 == 0)
+    } else {
+        None
+    }
+}
+
 /// Emit a focus-move action, flushing any pending forward run first.
 fn push_move(
     dir: Dir,
@@ -301,5 +324,54 @@ fn arrow_dir(b: u8) -> Option<Dir> {
         b'C' => Some(Dir::Right),
         b'D' => Some(Dir::Left),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+
+    fn scan(bytes: &[u8]) -> Vec<Action> {
+        let mut s = PrefixScanner::new();
+        s.set_mouse(true);
+        s.feed(bytes)
+    }
+
+    #[test]
+    fn wheel_up_and_down_parse_to_scroll() {
+        // SGR: `ESC [ < 64 ; col ; row M` = wheel up; 65 = wheel down.
+        assert_eq!(
+            scan(b"\x1b[<64;12;7M"),
+            vec![Action::MouseScroll { up: true, col: 12, row: 7 }]
+        );
+        assert_eq!(
+            scan(b"\x1b[<65;3;20M"),
+            vec![Action::MouseScroll { up: false, col: 3, row: 20 }]
+        );
+    }
+
+    #[test]
+    fn wheel_with_modifiers_still_scrolls() {
+        // Ctrl+wheel-up: button 64 + 0x10 = 80; still a wheel-up.
+        assert_eq!(
+            scan(b"\x1b[<80;1;1M"),
+            vec![Action::MouseScroll { up: true, col: 1, row: 1 }]
+        );
+    }
+
+    #[test]
+    fn left_click_is_not_a_scroll() {
+        assert_eq!(
+            scan(b"\x1b[<0;5;5M"),
+            vec![Action::MouseClick { col: 5, row: 5 }]
+        );
+    }
+
+    #[test]
+    fn scroll_only_when_mouse_mode_on() {
+        // Mouse off: the sequence is forwarded verbatim, never a scroll.
+        let mut s = PrefixScanner::new();
+        let out = s.feed(b"\x1b[<64;12;7M");
+        assert!(matches!(out.as_slice(), [Action::Forward(_)]));
     }
 }

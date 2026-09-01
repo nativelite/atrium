@@ -113,6 +113,40 @@ fn term_blank(t: &vterm::Term) -> bool {
     true
 }
 
+/// Sniff a pty output chunk for the app turning mouse tracking on/off — a
+/// DECSET/DECRST for private mode 1000/1002/1003 (`ESC [ ? … h` / `… l`). Returns
+/// `Some(true)` if the chunk last enabled mouse, `Some(false)` if it last
+/// disabled it, `None` if it touched neither. Handles combined params
+/// (`ESC[?1002;1006h`). Best-effort and stateless: a sequence split across two
+/// reads may be missed, but apps emit these as a single write at startup/teardown
+/// so it reliably tracks whether a pane wants the wheel. Drives `Pane::mouse_wanted`.
+fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
+    let mut result = None;
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+            let start = i + 3;
+            let mut j = start;
+            while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                j += 1;
+            }
+            if j < buf.len() && (buf[j] == b'h' || buf[j] == b'l') {
+                let is_mouse = std::str::from_utf8(&buf[start..j])
+                    .ok()
+                    .map(|s| s.split(';').any(|p| matches!(p, "1000" | "1002" | "1003")))
+                    .unwrap_or(false);
+                if is_mouse {
+                    result = Some(buf[j] == b'h');
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
     const SPIN: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
     let (rows, cols) = (rows as usize, cols as usize);
@@ -264,6 +298,11 @@ struct Pane {
     /// instead of a blank screen (the tiled path uses a per-pane blank check in
     /// the compositor). Set on the pane's first byte in the drain.
     painted: bool,
+    /// True while this pane's app has mouse tracking enabled (it emitted a
+    /// DECSET 1000/1002/1003), sniffed from its output. Scroll-wheel notches are
+    /// only forwarded to a pane that wants mouse — so hovering a claude tile
+    /// scrolls it, while a bare shell never receives stray mouse bytes.
+    mouse_wanted: bool,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -334,7 +373,7 @@ fn main() -> ExitCode {
              \x20      --skip-permissions: alias for --trust skip.\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
-             \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
+             \x20      (mouse on by default: click focuses, wheel scrolls the hovered tile, Shift-drag selects; Ctrl+A m toggles it)"
         );
         return ExitCode::SUCCESS;
     }
@@ -531,10 +570,18 @@ fn run(
     }
     let mut active = 0usize; // active window index
     let mut scanner = PrefixScanner::new();
-    // Mouse mode is off by default (native drag-to-select / copy works); `Ctrl+A m`
-    // toggles it on to click-focus panes. Kept in sync between the terminal (which
-    // actually captures the mouse) and the scanner (which parses the clicks).
-    let mut mouse_on = false;
+    // Mouse capture is ON by default: a click focuses the pane under the cursor,
+    // and the wheel scrolls whichever tile you're hovering. While captured, native
+    // text selection is Shift-drag; `Ctrl+A m` toggles capture off if you prefer
+    // the terminal's own mouse. Kept in sync between the terminal (which actually
+    // captures the mouse) and the scanner (which parses the reports); if the
+    // terminal refuses capture we fall back to off cleanly.
+    let mut mouse_on = true;
+    if term.set_mouse(true).is_ok() {
+        scanner.set_mouse(true);
+    } else {
+        mouse_on = false;
+    }
     let mut buf = [0u8; 8192];
     let mut force_repaint = true;
     let mut last_bar_paint = Instant::now();
@@ -676,10 +723,10 @@ fn run(
                         scanner.set_mouse(mouse_on);
                         flash = Some((
                             if mouse_on {
-                                "mouse: ON — click a pane to focus (Shift-drag to select text)"
+                                "mouse: ON — click focuses, wheel scrolls the hovered tile (Shift-drag selects)"
                                     .to_string()
                             } else {
-                                "mouse: OFF — drag to select / copy".to_string()
+                                "mouse: OFF — native drag to select / copy".to_string()
                             },
                             Instant::now(),
                         ));
@@ -709,6 +756,53 @@ fn run(
                                 }
                                 break;
                             }
+                        }
+                    }
+                }
+                Action::MouseScroll { up, col, row } => {
+                    // Route a wheel notch to the tile under the cursor (not
+                    // necessarily the focused one) so you scroll whatever you're
+                    // hovering. Forward a translated SGR wheel event to that pane's
+                    // app — only if it wants the mouse, so a bare shell never gets
+                    // stray bytes. `64` = wheel up, `65` = wheel down.
+                    let w = &mut windows[active];
+                    let notch = if up { 64 } else { 65 };
+                    if w.tiled() {
+                        let outer = tiled_outer(rows, cols);
+                        let mx = col.saturating_sub(1) as usize;
+                        let my = row.saturating_sub(1) as usize;
+                        let hit = w.tree.rects(outer).into_iter().find(|(_, r)| {
+                            my >= r.row
+                                && my < r.row + r.rows
+                                && mx >= r.col
+                                && mx < r.col + r.cols
+                        });
+                        if let Some((id, rect)) = hit {
+                            if let Some(p) = w.pane_mut(id) {
+                                if p.mouse_wanted {
+                                    // Master cell → the pane's inner (bordered)
+                                    // 1-based coords: content is inset one cell.
+                                    let inner_cols = rect.cols.saturating_sub(2).max(1);
+                                    let inner_rows = rect.rows.saturating_sub(2).max(1);
+                                    let cx = mx
+                                        .saturating_sub(rect.col + 1)
+                                        .min(inner_cols - 1)
+                                        + 1;
+                                    let cy = my
+                                        .saturating_sub(rect.row + 1)
+                                        .min(inner_rows - 1)
+                                        + 1;
+                                    let seq = format!("\x1b[<{notch};{cx};{cy}M");
+                                    let _ = p.pty.write(seq.as_bytes());
+                                }
+                            }
+                        }
+                    } else if let Some(p) = windows[active].focused_mut() {
+                        // Passthrough / zoom: the sole pane fills the area above the
+                        // bar; forward with the original coordinates.
+                        if p.mouse_wanted {
+                            let seq = format!("\x1b[<{notch};{col};{row}M");
+                            let _ = p.pty.write(seq.as_bytes());
                         }
                     }
                 }
@@ -802,6 +896,11 @@ fn run(
                         // Always feed the emulator so a later switch/split/zoom
                         // renders the current screen without a repaint nudge.
                         pane.term.feed(&buf[..n]);
+                        // Track whether this pane's app wants the mouse (so scroll
+                        // routes to it, not a bare shell).
+                        if let Some(m) = sniff_mouse_mode(&buf[..n]) {
+                            pane.mouse_wanted = m;
+                        }
                         // "painted" = the emulator now has *visible* content, not
                         // merely that setup bytes arrived — so the splash stays up
                         // until the agent's first frame.
@@ -858,6 +957,9 @@ fn run(
                         break;
                     }
                     pane.term.feed(&buf[..n]);
+                    if let Some(m) = sniff_mouse_mode(&buf[..n]) {
+                        pane.mouse_wanted = m;
+                    }
                     pane.activity = true;
                 }
             }
@@ -2350,6 +2452,7 @@ fn spawn_pane_full(
         parent: None,
         depth: 0,
         painted: false,
+        mouse_wanted: false,
     })
 }
 

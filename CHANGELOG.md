@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-31
+
+### Added
+- **Scroll the tile your mouse is over.** The wheel now scrolls whichever tile the
+  cursor is hovering — not just the focused one. amux routes a wheel notch to the
+  pane under the cursor, translated into that pane's inner coordinates, and
+  forwards it as a mouse-wheel event to the app. It only forwards to a pane whose
+  app actually enabled mouse tracking (sniffed per-pane from its output), so
+  hovering a claude tile scrolls it while a bare shell never receives stray bytes.
+- **Mouse capture is now ON by default** (was opt-in via `Ctrl+A m`): a click
+  focuses the pane under the cursor and the wheel scrolls the hovered tile out of
+  the box. Native text selection while captured is **Shift-drag**; `Ctrl+A m`
+  still toggles capture off for the terminal's own mouse. Falls back to off if the
+  terminal refuses capture.
+
 ## [0.19.0] - 2026-08-31
 
 ### Added
