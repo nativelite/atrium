@@ -857,7 +857,12 @@ fn run(
                     }
                 }
             }
-            force_repaint = true;
+            // Repaint only when the user actually pressed something (the line
+            // changed, or it opened/closed) — NOT every idle tick, which made the
+            // prompt row flash rapidly.
+            if !bytes.is_empty() {
+                force_repaint = true;
+            }
             b""
         } else {
             &bytes
@@ -1517,7 +1522,11 @@ fn run(
         if force_repaint
             || splash_drawn
             || painted != last_bar
-            || last_bar_paint.elapsed() >= Duration::from_millis(500)
+            // The 500ms periodic refresh keeps the status bar's activity markers
+            // live, but while the command prompt is open it would reflash the
+            // prompt row twice a second — skip it there (the prompt repaints on
+            // keystroke via `painted != last_bar`).
+            || (prompt.is_none() && last_bar_paint.elapsed() >= Duration::from_millis(500))
         {
             frame.extend_from_slice(painted.as_bytes());
             last_bar = painted;
