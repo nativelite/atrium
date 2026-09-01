@@ -757,6 +757,12 @@ fn run(
     // capture on, native selection falls back to Shift-drag.) The scanner and the
     // terminal are kept in sync by the toggle.
     let mut mouse_on = false;
+    // Whether amux has forced the OUTER terminal's mouse reporting off because the
+    // focused pane does not want the mouse (a shell/WSL). A mouse app (claude)
+    // enables motion tracking via passthrough, which leaks to the terminal; once
+    // you switch to a non-mouse pane the terminal keeps sending motion events and
+    // they get forwarded into that pane as garbage text. See the re-assert below.
+    let mut outer_mouse_off = false;
     // The full-screen board dashboard overlay (`Ctrl+A b`). While on, the panes
     // keep running (drained, emulated) but are not painted, and keystrokes don't
     // reach them — it's a read-only view of the shared board.
@@ -1314,6 +1320,28 @@ fn run(
             resize_window(&mut windows[active], rows, cols);
             prev_master = None;
             force_repaint = true;
+        }
+
+        // 4b. Match the OUTER terminal's mouse reporting to the focused pane. A
+        //     mouse app (claude) turns on motion tracking, which passes through to
+        //     the terminal; when you then focus a pane that does NOT want the mouse
+        //     (a shell, WSL), the terminal keeps sending motion events and they get
+        //     forwarded into that pane as literal text (`35;79;16M…`). Force mouse
+        //     reporting OFF for a non-mouse focused pane; a mouse app re-asserts its
+        //     own modes on its next repaint when you switch back. Skipped while the
+        //     global mouse capture (`Ctrl+A m`) is on.
+        let focus_wants_mouse = {
+            let f = windows[active].tree.focus();
+            windows[active].pane(f).map(|p| p.mouse_wanted).unwrap_or(false)
+        };
+        if !mouse_on && !focus_wants_mouse {
+            if !outer_mouse_off {
+                let _ = out.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l");
+                let _ = out.flush();
+                outer_mouse_off = true;
+            }
+        } else {
+            outer_mouse_off = false;
         }
 
         // 5. resize propagation
