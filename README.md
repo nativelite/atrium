@@ -28,9 +28,12 @@ panes at once** (N a positive multiple of 2) in a balanced grid, and
 `--grid <R>x<C>` sets the grid shape explicitly. Both must come *before* the
 hosted command, so a later `-n`/`-I` the hosted program takes is never eaten.
 
-**Keys** — `Ctrl+A`, then: `c` new window · `1`-`9` switch window · `n`/`p`
-cycle · `"` split stacked · `%` split side-by-side · `h`/`j`/`k`/`l` (or arrows)
-move focus · `z` zoom the focused pane · `x` kill the focused pane · `q` quit ·
+**Keys** — `Ctrl+A`, then: `c` new window (runs the launch command) · `!` new
+shell pane · `:` **command prompt** (type any shell/program — `wsl`, `pwsh`,
+`claude` — to open in a new pane) · `1`-`9` switch window · `n`/`p` cycle · `"`
+split stacked · `%` split side-by-side · `h`/`j`/`k`/`l` (or arrows) move focus ·
+`z` zoom the focused pane · `m` mouse capture (off by default; on = click-to-focus
++ wheel-scroll) · `b` board+bus dashboard · `x` kill the focused pane · `q` quit ·
 `Ctrl+A Ctrl+A` sends a literal `Ctrl+A` through.
 
 The bar marks each window: `*` active, `?` a bound agent is waiting on you,

@@ -761,6 +761,10 @@ fn run(
     // keep running (drained, emulated) but are not painted, and keystrokes don't
     // reach them — it's a read-only view of the shared board.
     let mut board_view = false;
+    // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
+    // command to open in a new pane (any shell/program, not just the launch one).
+    // Keystrokes edit the line instead of reaching the panes; Enter opens it.
+    let mut prompt: Option<String> = None;
     let mut buf = [0u8; 8192];
     let mut force_repaint = true;
     let mut last_bar_paint = Instant::now();
@@ -818,7 +822,47 @@ fn run(
             let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
             eprint!("[amux-dbg stdin {}]\r\n", hex.join(" "));
         }
-        for action in scanner.feed(&bytes) {
+        // The command prompt captures keystrokes: while it is open, keys edit the
+        // command line (not the panes), and the scanner is fed nothing. Enter opens
+        // the typed command in a new pane; Esc/Ctrl+C cancels.
+        let feed: &[u8] = if prompt.is_some() {
+            match edit_prompt(prompt.as_mut().unwrap(), &bytes) {
+                PromptEdit::Continue => {}
+                PromptEdit::Cancel => prompt = None,
+                PromptEdit::Submit => {
+                    let argv = split_cmdline(prompt.take().unwrap_or_default().trim());
+                    if !argv.is_empty() {
+                        match spawn_window(
+                            &argv,
+                            rows,
+                            cols,
+                            windows.len(),
+                            identity,
+                            trust_mode(),
+                            &mut flash,
+                        ) {
+                            Ok(w) => {
+                                windows.push(w);
+                                let last = windows.len() - 1;
+                                switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
+                                prev_master = None;
+                            }
+                            Err(e) => {
+                                flash = Some((
+                                    format!("cannot start {:?}: {e}", argv[0]),
+                                    Instant::now(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            force_repaint = true;
+            b""
+        } else {
+            &bytes
+        };
+        for action in scanner.feed(feed) {
             match action {
                 Action::Forward(b) => {
                     // While the board overlay is up, swallow input — the panes are
@@ -905,6 +949,12 @@ fn run(
                         let _ = write!(out, "\x1b[?25h");
                     }
                     prev_master = None;
+                    force_repaint = true;
+                }
+                Action::OpenPrompt => {
+                    // Start the command prompt; subsequent keystrokes edit the line
+                    // (handled above the scanner) until Enter/Esc.
+                    prompt = Some(String::new());
                     force_repaint = true;
                 }
                 Action::SplitH => {
@@ -1455,7 +1505,14 @@ fn run(
                 decision_note.as_str()
             }
         });
-        let painted = bar_paint(&infos, rows, cols as usize, note);
+        // While the command prompt is open it takes over the bar row: a `:` and
+        // the line typed so far, cursor left right after it (visible) so you can
+        // see what you're launching. Otherwise the normal status bar.
+        let painted = if let Some(line) = &prompt {
+            format!("\x1b[{};1H\x1b[2K\x1b[1;38;2;70;235;255m:\x1b[0m{line}\x1b[?25h", rows)
+        } else {
+            bar_paint(&infos, rows, cols as usize, note)
+        };
         let mut bar_appended = false;
         if force_repaint
             || splash_drawn
@@ -1476,7 +1533,7 @@ fn run(
         // emulator, so `term.screen().cursor` is current. Both are 0-based; the
         // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
         // coordinates in either mode.
-        if bar_appended && !board_view {
+        if bar_appended && !board_view && prompt.is_none() {
             let cur = if windows[active].tiled() {
                 prev_master.as_ref().map(|m| m.cursor)
             } else {
@@ -2964,6 +3021,68 @@ fn default_shell() -> String {
     }
 }
 
+/// The outcome of feeding a keystroke chunk to the open command prompt.
+enum PromptEdit {
+    /// The line changed (or nothing happened); keep the prompt open.
+    Continue,
+    /// Esc / Ctrl+C: close the prompt without running anything.
+    Cancel,
+    /// Enter: the caller runs the accumulated line.
+    Submit,
+}
+
+/// Apply a chunk of raw input `bytes` to the prompt line `buf`: printable ASCII is
+/// appended, Backspace deletes, Enter submits, Esc/Ctrl+C cancels. Other control
+/// bytes (including the rest of an arrow-key escape) are ignored. Returns as soon
+/// as a terminating key (Enter/Esc) is seen so trailing bytes don't leak.
+fn edit_prompt(buf: &mut String, bytes: &[u8]) -> PromptEdit {
+    for &b in bytes {
+        match b {
+            b'\r' | b'\n' => return PromptEdit::Submit,
+            0x1b | 0x03 => return PromptEdit::Cancel, // Esc or Ctrl+C
+            0x7f | 0x08 => {
+                buf.pop();
+            }
+            0x20..=0x7e => buf.push(b as char),
+            _ => {} // ignore other control bytes
+        }
+    }
+    PromptEdit::Continue
+}
+
+/// Split a command line into argv, honoring double quotes so a path with spaces
+/// stays one argument (`"C:\Program Files\Git\bin\bash.exe" --login`). Whitespace
+/// separates unquoted words; quotes are removed. Minimal by design — enough to
+/// launch a shell with a flag, not a full shell parser.
+fn split_cmdline(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                has = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
 /// On Windows, resolve the command the way the shell would (PATH x PATHEXT) and
 /// host `.cmd`/`.bat` shims under `cmd /C` — npm-installed CLIs (Claude Code
 /// included) are such shims, and `CreateProcessW` cannot launch them directly.
@@ -2998,4 +3117,40 @@ fn effective_command(command: &[String]) -> Vec<String> {
 #[cfg(not(windows))]
 fn effective_command(command: &[String]) -> Vec<String> {
     command.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_cmdline_splits_on_whitespace() {
+        assert_eq!(split_cmdline("wsl -d Ubuntu"), vec!["wsl", "-d", "Ubuntu"]);
+        assert_eq!(split_cmdline("  pwsh   -NoLogo "), vec!["pwsh", "-NoLogo"]);
+        assert!(split_cmdline("   ").is_empty());
+    }
+
+    #[test]
+    fn split_cmdline_keeps_quoted_paths_whole() {
+        assert_eq!(
+            split_cmdline(r#""C:\Program Files\Git\bin\bash.exe" --login"#),
+            vec![r"C:\Program Files\Git\bin\bash.exe", "--login"]
+        );
+    }
+
+    #[test]
+    fn edit_prompt_appends_backspaces_submits_and_cancels() {
+        let mut b = String::new();
+        assert!(matches!(edit_prompt(&mut b, b"wsl"), PromptEdit::Continue));
+        assert_eq!(b, "wsl");
+        // backspace deletes the last char
+        assert!(matches!(edit_prompt(&mut b, &[0x7f]), PromptEdit::Continue));
+        assert_eq!(b, "ws");
+        // Enter submits, keeping what was typed so far
+        assert!(matches!(edit_prompt(&mut b, b"l\r"), PromptEdit::Submit));
+        assert_eq!(b, "wsl");
+        // Esc cancels
+        let mut c = String::from("pwsh");
+        assert!(matches!(edit_prompt(&mut c, &[0x1b]), PromptEdit::Cancel));
+    }
 }

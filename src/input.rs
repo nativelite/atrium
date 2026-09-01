@@ -55,6 +55,10 @@ pub enum Action {
     /// shared board (source-of-truth state); keystrokes don't reach the panes
     /// while it's up.
     ToggleBoard,
+    /// Open the **command prompt** — `Ctrl+A :`. The host reads a line and opens a
+    /// new pane running it, so any shell/program (`wsl`, `pwsh -NoLogo`, `claude`)
+    /// can be launched mid-session, not just the command amux was started with.
+    OpenPrompt,
     /// A left-button press at 1-based terminal cell (`col`, `row`) — only
     /// emitted while mouse mode is on. Used to focus the pane under the cursor.
     MouseClick {
@@ -202,6 +206,10 @@ impl PrefixScanner {
                         b'b' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::ToggleBoard);
+                        }
+                        b':' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::OpenPrompt);
                         }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
@@ -401,5 +409,11 @@ mod scroll_tests {
     fn prefix_b_toggles_the_board() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b'b']), vec![Action::ToggleBoard]);
+    }
+
+    #[test]
+    fn prefix_colon_opens_the_command_prompt() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b':']), vec![Action::OpenPrompt]);
     }
 }

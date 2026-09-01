@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [`abus`]: https://github.com/nativelite/abus
 
 ### Added
+- **Command prompt — `Ctrl+A :` — open any shell/program in a new pane.** Type a
+  command line (e.g. `wsl`, `wsl -d Ubuntu`, `pwsh -NoLogo`, `claude`, a quoted
+  path with spaces) and Enter opens it in a new window, mid-session — no longer
+  limited to the command amux was launched with. The prompt shows on the bar row
+  with the cursor; Esc or Ctrl+C cancels, Backspace edits. Quoted arguments are
+  honored so a path with spaces stays one argument.
 - **The bus — topic-routed pub/sub for a coordinating team** (coordination layer
   part 2, the active complement to the board's durable state). A teammate
   publishes a **structured event** to a **topic**; teammates **pull** the topics
