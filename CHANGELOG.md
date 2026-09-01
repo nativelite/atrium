@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.23.0] - 2026-09-01
 
+### Fixed
+- **amux no longer freezes at startup on a machine with many/large agent
+  transcripts.** The agent-status monitor (`agsess`) discovered stale sessions at
+  cold start but left them un-tailed, so the first status poll `read_to_end`'d
+  every historical transcript — on a box with a real fleet (hundreds of sessions,
+  several hundred MB each) that was >1 GB of reads in one loop tick, freezing the
+  event loop for tens of seconds (queued `ctl send`s never delivered, nothing
+  repainted). Fixed in `agsess`: a stale session is marked *caught up* (length
+  only, no read) so later polls tail only new bytes, and a single tail is now
+  capped at 16 MiB (reads the recent tail, resyncs at a line boundary). amux picks
+  this up via its `agsess` dependency.
+
 ### Added
 - **The bus — topic-routed pub/sub for a coordinating team** (coordination layer
   part 2, the active complement to the board's durable state). A teammate
