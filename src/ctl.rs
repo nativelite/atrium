@@ -348,10 +348,16 @@ pub enum TrustMode {
     /// workdir) still surfaces as a **visible approval prompt** in its pane. Also
     /// pre-accepts the folder-trust dialog. The safe hands-off default.
     Edits,
-    /// `automode` (`--skip-permissions`): **full bypass**
-    /// (`--dangerously-skip-permissions`). Every command runs with no gate at all.
-    /// Genuinely dangerous — amux requires an explicit launch confirmation before
-    /// using it.
+    /// `automode`: claude's **auto mode** (`--permission-mode auto`) — the
+    /// hands-off tier above accept-edits, auto-running edits *and* commands with
+    /// claude's own guardrails (distinct from `skip`, which removes the guardrails
+    /// entirely). Pre-accepts the folder-trust dialog. Note: claude only enters
+    /// auto mode when the plan/model/org allow it, else it falls back to default.
+    Auto,
+    /// `skip` (`--skip-permissions`): **full bypass**
+    /// (`--dangerously-skip-permissions`, i.e. `--permission-mode bypassPermissions`).
+    /// Every command runs with no gate at all. Genuinely dangerous — amux requires
+    /// an explicit launch confirmation before using it.
     Skip,
 }
 
@@ -366,19 +372,22 @@ impl TrustMode {
             TrustMode::Off => 0,
             TrustMode::Plan => 1,
             TrustMode::Edits => 2,
-            TrustMode::Skip => 3,
+            TrustMode::Auto => 3,
+            TrustMode::Skip => 4,
         }
     }
 
-    /// Parse a policy keyword (`plan` / `accept` / `automode` / `default`, with a
-    /// couple of intuitive aliases) into a mode. `None` for anything else — the
-    /// caller reports a clear error or treats the token as the hosted command.
+    /// Parse a policy keyword (`plan` / `accept` / `automode` / `skip` /
+    /// `default`, with a couple of intuitive aliases) into a mode. `None` for
+    /// anything else — the caller reports a clear error or treats the token as the
+    /// hosted command.
     pub fn from_policy_keyword(k: &str) -> Option<TrustMode> {
         match k {
             "plan" => Some(TrustMode::Plan),
             "accept" | "acceptedits" | "edits" => Some(TrustMode::Edits),
-            "automode" | "auto" | "skip" | "bypass" => Some(TrustMode::Skip),
-            "default" | "off" | "ask" => Some(TrustMode::Off),
+            "automode" | "auto" => Some(TrustMode::Auto),
+            "skip" | "bypass" | "dangerous" => Some(TrustMode::Skip),
+            "default" | "off" | "ask" | "manual" => Some(TrustMode::Off),
             _ => None,
         }
     }
@@ -391,7 +400,8 @@ impl TrustMode {
             TrustMode::Off => "default",
             TrustMode::Plan => "plan",
             TrustMode::Edits => "accept",
-            TrustMode::Skip => "automode",
+            TrustMode::Auto => "automode",
+            TrustMode::Skip => "skip",
         }
     }
 }
@@ -520,8 +530,10 @@ layout. Spawn each teammate as plain claude with NO raw permission flags: amux \
 applies the session trust policy to every pane it launches, so never add \
 --dangerously-skip-permissions or --permission-mode yourself. To request a \
 specific mode for a teammate, add --mode plan or --mode accept or --mode \
-automode to the spawn; amux honors it when the human operator asks and otherwise \
-caps it at the session policy (a worker cannot elevate itself). \
+automode or --mode skip to the spawn (plan is read-only, accept auto-accepts \
+edits, automode is claude auto mode, skip is full bypass); amux honors it when \
+the human operator asks and otherwise caps it at the session policy (a worker \
+cannot elevate itself). \
 Each teammate is a VISIBLE amux pane the human can watch, steer, and \
 take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
@@ -740,7 +752,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         Err(msg) => {
             eprintln!("amux ctl: {msg}");
             eprintln!(
-                "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode] -- <cmd...>\n\
+                "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]"
             );
             return ExitCode::FAILURE;
@@ -1152,7 +1164,8 @@ mod tests {
         // `--trust automode|plan|accept` sets the session policy; the keyword is
         // consumed and the command (`claude`) is left in `rest`.
         for (policy, want) in [
-            ("automode", TrustMode::Skip),
+            ("automode", TrustMode::Auto),
+            ("skip", TrustMode::Skip),
             ("plan", TrustMode::Plan),
             ("accept", TrustMode::Edits),
         ] {
@@ -1192,21 +1205,41 @@ mod tests {
 
     #[test]
     fn trust_mode_rank_orders_by_autonomous_power() {
+        // Off < plan < accept < automode < skip.
         assert!(TrustMode::Off.rank() < TrustMode::Plan.rank());
         assert!(TrustMode::Plan.rank() < TrustMode::Edits.rank());
-        assert!(TrustMode::Edits.rank() < TrustMode::Skip.rank());
+        assert!(TrustMode::Edits.rank() < TrustMode::Auto.rank());
+        assert!(TrustMode::Auto.rank() < TrustMode::Skip.rank());
         // Keyword ↔ label round-trip for every mode.
-        for m in [TrustMode::Off, TrustMode::Plan, TrustMode::Edits, TrustMode::Skip] {
+        for m in [
+            TrustMode::Off,
+            TrustMode::Plan,
+            TrustMode::Edits,
+            TrustMode::Auto,
+            TrustMode::Skip,
+        ] {
             assert_eq!(TrustMode::from_policy_keyword(m.policy_label()), Some(m));
         }
+        // `automode` and `skip` are DISTINCT (the 0.18.0 conflation bug).
+        assert_ne!(
+            TrustMode::from_policy_keyword("automode"),
+            TrustMode::from_policy_keyword("skip")
+        );
     }
 
     #[test]
     fn build_spawn_mode_roundtrips_through_parse() {
-        // `ctl spawn --mode automode` reaches the server as SpawnReq.mode = Skip.
+        // `ctl spawn --mode automode` reaches the server as SpawnReq.mode = Auto
+        // (auto mode) — NOT Skip (full bypass); they are separate.
         let line =
             build_request(&v(&["spawn", "--mode", "automode", "--", "claude"]), Some(0)).unwrap();
         match parse_request(&line).unwrap().cmd {
+            Cmd::Spawn(sp) => assert_eq!(sp.mode, Some(TrustMode::Auto)),
+            _ => panic!("expected spawn"),
+        }
+        // `--mode skip` is the separate full-bypass request.
+        let sk = build_request(&v(&["spawn", "--mode", "skip", "--", "claude"]), Some(0)).unwrap();
+        match parse_request(&sk).unwrap().cmd {
             Cmd::Spawn(sp) => assert_eq!(sp.mode, Some(TrustMode::Skip)),
             _ => panic!("expected spawn"),
         }

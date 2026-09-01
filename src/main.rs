@@ -55,6 +55,7 @@ fn trust_mode() -> amux::ctl::TrustMode {
         1 => amux::ctl::TrustMode::Edits,
         2 => amux::ctl::TrustMode::Skip,
         3 => amux::ctl::TrustMode::Plan,
+        4 => amux::ctl::TrustMode::Auto,
         _ => amux::ctl::TrustMode::Off,
     }
 }
@@ -66,6 +67,7 @@ fn set_trust_mode(m: amux::ctl::TrustMode) {
         amux::ctl::TrustMode::Edits => 1,
         amux::ctl::TrustMode::Skip => 2,
         amux::ctl::TrustMode::Plan => 3,
+        amux::ctl::TrustMode::Auto => 4,
     };
     AGENT_TRUST.store(code, Ordering::Relaxed);
 }
@@ -305,17 +307,19 @@ fn main() -> ExitCode {
     let (identity, rest) = amux::identity::parse(&args);
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
              \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
-             \x20               ceiling they are capped at. `accept` (bare --trust): auto-accept edits + a safe\n\
-             \x20               dev-command allowlist (build/test/run); anything else (curl, git push, rm outside\n\
-             \x20               the dir) still prompts, visibly. `plan`: read-only plan mode. `automode`: FULL\n\
-             \x20               bypass (--dangerously-skip-permissions, no gate; amux confirms it at launch).\n\
-             \x20               All pre-accept claude's folder-trust dialog. Extend the accept allowlist with\n\
-             \x20               AMUX_TRUST_ALLOW=\"cmd one,cmd two\". You (the root pane) can elevate a teammate\n\
-             \x20               above the policy per-spawn with `ctl spawn --mode …`; a worker cannot.\n\
-             \x20      --skip-permissions: alias for --trust automode.\n\
-             \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
+             \x20               ceiling they are capped at (low→high: plan < accept < automode < skip):\n\
+             \x20               `plan` read-only plan mode; `accept` (bare --trust) auto-accept edits + a safe\n\
+             \x20               dev-command allowlist (build/test/run), anything else (curl, git push, rm outside\n\
+             \x20               the dir) still prompts, visibly; `automode` claude's auto mode (hands-off edits +\n\
+             \x20               commands with claude's guardrails); `skip` FULL bypass (--dangerously-skip-\n\
+             \x20               permissions, no gate — amux confirms it at launch). All pre-accept claude's\n\
+             \x20               folder-trust dialog. Extend the accept allowlist with AMUX_TRUST_ALLOW=\"a,b\".\n\
+             \x20               You (the root pane) can elevate a teammate above the policy per-spawn with\n\
+             \x20               `ctl spawn --mode …`; a worker cannot.\n\
+             \x20      --skip-permissions: alias for --trust skip.\n\
+             \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (Ctrl+A ? in the bar shows keys; Ctrl+A m toggles mouse/click-to-focus)"
         );
@@ -2175,8 +2179,10 @@ fn spawn_pane_full(
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands
     //                                still prompt, visibly, in the pane.
-    //   Skip (`automode`)          → `--dangerously-skip-permissions` (full
-    //                                bypass; the human confirmed it at launch).
+    //   Auto (`automode`)          → `--permission-mode auto` (claude's auto mode:
+    //                                hands-off edits + commands, its own guardrails).
+    //   Skip (`skip`)              → `--dangerously-skip-permissions` (full bypass;
+    //                                the human confirmed it at launch).
     //   Plan (`plan`)              → `--permission-mode plan` (read-only).
     // `mode` is the *effective* mode for this pane: the session policy for the
     // panes amux opens itself, or — for a ctl spawn — the per-spawn `--mode` after
@@ -2188,6 +2194,10 @@ fn spawn_pane_full(
         match mode {
             amux::ctl::TrustMode::Edits => {
                 v.extend(amux::trust::accept_edits_args(&amux::trust::extra_allow_from_env()));
+            }
+            amux::ctl::TrustMode::Auto => {
+                v.push("--permission-mode".to_string());
+                v.push("auto".to_string());
             }
             amux::ctl::TrustMode::Skip => {
                 v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());

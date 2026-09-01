@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-08-31
+
+### Fixed
+- **`automode` and `skip` are now distinct policies (0.18.0 conflated them).**
+  0.18.0 mapped `automode` straight to `--dangerously-skip-permissions`, but those
+  are two different things. Per Claude Code v2.1.195 the permission modes are
+  `default` / `acceptEdits` / `plan` / **`auto`** / `dontAsk` / `bypassPermissions`,
+  and `--dangerously-skip-permissions` == `--permission-mode bypassPermissions`.
+  So now: **`automode` → `--permission-mode auto`** (claude's "auto mode on":
+  hands-off edits + commands with claude's guardrails) and a separate
+  **`skip` → `--dangerously-skip-permissions`** (full bypass, the nuclear option,
+  still confirmed at launch). Rank order is `plan < accept < automode < skip`;
+  `--skip-permissions` is now the alias for `--trust skip`. New `TrustMode::Auto`.
+
 ## [0.18.0] - 2026-08-31
 
 ### Added

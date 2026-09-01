@@ -278,19 +278,24 @@ vars into **every** pane it spawns:
 - **`AMUX_PANE`** — the caller pane's agent id, so the server attributes each
   request to its place in the spawn tree.
 
-**Hands-off policy — `--trust <plan|accept|automode>`.** For an agent-driven
+**Hands-off policy — `--trust <plan|accept|automode|skip>`.** For an agent-driven
 fleet to run without you at the keyboard, amux relaxes the permission posture of
 every agent pane it launches. The `--trust` argument sets the **session policy**:
-the mode spawned agents run in **and** the ceiling they are capped at.
+the mode spawned agents run in **and** the ceiling they are capped at. Ordered
+low→high power: `plan < accept < automode < skip`.
 
 - **`--trust plan`** — claude's read-only **plan mode**: agents analyze and
   propose, but make no edits and run no commands.
-- **`--trust accept`** (or bare **`--trust`**) — the safe default (below).
-- **`--trust automode`** (alias **`--skip-permissions`**) — full bypass (below).
+- **`--trust accept`** (or bare **`--trust`**) — auto-accept edits + a safe
+  allowlist (the safe default, below).
+- **`--trust automode`** — claude's **auto mode** (`--permission-mode auto`):
+  hands-off edits *and* commands under claude's own guardrails. (claude only
+  enters auto mode if your plan/model/org allow it, else it falls back to default.)
+- **`--trust skip`** (alias **`--skip-permissions`**) — **full bypass** (below).
 
 **Per-teammate mode, and who may elevate.** By default a `ctl spawn` teammate
-inherits the session policy. Add **`--mode plan|accept|automode`** to a spawn to
-pick a different mode for that teammate. amux governs who may do so: **you — the
+inherits the session policy. Add **`--mode plan|accept|automode|skip`** to a spawn
+to pick a different mode for that teammate. amux governs who may do so: **you — the
 operator, at the root pane — may set any mode** (raising a teammate above the
 policy is you directing the session); a **spawned worker is capped at the policy**
 and may only match or *de*-escalate, never elevate itself. amux also strips raw
@@ -310,8 +315,9 @@ in the spawn reply's `note` (never silent).
   **`AMUX_TRUST_ALLOW="cmd one,cmd two"`** — each comma-separated prefix `P`
   becomes a `Bash(P *)` matcher, e.g. `AMUX_TRUST_ALLOW="just build,make test"`.
 
-- **`automode` — full bypass, explicit.** Appends claude's
-  `--dangerously-skip-permissions`, so **every** command runs with no gate at all.
+- **`skip` — full bypass, explicit.** Appends claude's
+  `--dangerously-skip-permissions` (equivalent to `--permission-mode
+  bypassPermissions`), so **every** command runs with no gate at all.
   Genuinely dangerous (an agent, and every teammate it spawns, can delete files,
   push to git, or hit the network unsupervised on your machine), so amux prints a
   plain-English warning and asks you to **confirm at launch** before it starts.
