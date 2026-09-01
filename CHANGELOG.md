@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capped at 16 MiB (reads the recent tail, resyncs at a line boundary). amux picks
   this up via its `agsess` dependency.
 
+### Changed
+- **The coordination layer (board + bus) moved into the new [`abus`] org crate**
+  (the one-concern rule; amux stays "multi-agent terminal + broker"). No behavior
+  or API change — `amux::board` / `amux::bus` are re-exported from `abus`, so the
+  `ctl` surface and everything else are byte-for-byte the same. The 16 board/bus
+  unit tests moved with the code.
+
+[`abus`]: https://github.com/nativelite/abus
+
 ### Added
 - **The bus — topic-routed pub/sub for a coordinating team** (coordination layer
   part 2, the active complement to the board's durable state). A teammate

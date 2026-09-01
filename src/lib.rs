@@ -17,10 +17,12 @@
 
 pub mod audit;
 pub mod bar;
-pub mod board;
 pub mod bind;
-pub mod bus;
 pub mod ctl;
+// The coordination layer (board + bus) now lives in the `abus` org crate;
+// re-exported here so `amux::board` / `amux::bus` (and `crate::bus` inside the
+// crate) keep resolving unchanged.
+pub use abus::{board, bus};
 pub mod filter;
 pub mod fleet;
 pub mod identity;

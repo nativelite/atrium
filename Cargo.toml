@@ -11,6 +11,7 @@ categories = ["command-line-utilities"]
 
 # nativelite app rule: zero THIRD-PARTY dependencies; org crates only.
 [dependencies]
+abus = { git = "https://github.com/nativelite/abus", branch = "main" }
 pty = { git = "https://github.com/nativelite/pty-rs", branch = "main" }
 akey = { git = "https://github.com/nativelite/akey", branch = "main" }
 rawterm = { git = "https://github.com/nativelite/rawterm-rs", branch = "main" }
