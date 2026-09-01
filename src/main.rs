@@ -545,7 +545,7 @@ fn main() -> ExitCode {
              \x20      --skip-permissions: alias for --trust skip.\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
-             \x20      (mouse on by default: click focuses, wheel scrolls the hovered tile, Shift-drag selects; Ctrl+A m toggles it)"
+             \x20      (mouse capture is OFF by default so text selection works; Ctrl+A m turns it on: click focuses a pane, wheel scrolls the hovered tile)"
         );
         return ExitCode::SUCCESS;
     }
@@ -742,18 +742,13 @@ fn run(
     }
     let mut active = 0usize; // active window index
     let mut scanner = PrefixScanner::new();
-    // Mouse capture is ON by default: a click focuses the pane under the cursor,
-    // and the wheel scrolls whichever tile you're hovering. While captured, native
-    // text selection is Shift-drag; `Ctrl+A m` toggles capture off if you prefer
-    // the terminal's own mouse. Kept in sync between the terminal (which actually
-    // captures the mouse) and the scanner (which parses the reports); if the
-    // terminal refuses capture we fall back to off cleanly.
-    let mut mouse_on = true;
-    if term.set_mouse(true).is_ok() {
-        scanner.set_mouse(true);
-    } else {
-        mouse_on = false;
-    }
+    // Mouse capture is OFF by default so the terminal's own **text selection**
+    // works out of the box (dragging highlights, as in any shell) — the common
+    // case. `Ctrl+A m` toggles capture ON when you want the amux mouse: click to
+    // focus the pane under the cursor, wheel to scroll the hovered tile. (With
+    // capture on, native selection falls back to Shift-drag.) The scanner and the
+    // terminal are kept in sync by the toggle.
+    let mut mouse_on = false;
     // The full-screen board dashboard overlay (`Ctrl+A b`). While on, the panes
     // keep running (drained, emulated) but are not painted, and keystrokes don't
     // reach them — it's a read-only view of the shared board.
@@ -2179,7 +2174,10 @@ fn dispatch_ctl(
                 .map(|p| {
                     p.role
                         .clone()
-                        .unwrap_or_else(|| format!("pane {}", p.agent_id))
+                        // 1-based to match the status bar's `1:`, `2:` numbering
+                        // (agent_id is 0-based internally). Roles are the stable
+                        // identity; this is the human-friendly fallback label.
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id + 1))
                 })
                 .or_else(|| Some("operator".to_string()));
             match op {
@@ -2211,7 +2209,10 @@ fn dispatch_ctl(
                 .map(|p| {
                     p.role
                         .clone()
-                        .unwrap_or_else(|| format!("pane {}", p.agent_id))
+                        // 1-based to match the status bar's `1:`, `2:` numbering
+                        // (agent_id is 0-based internally). Roles are the stable
+                        // identity; this is the human-friendly fallback label.
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id + 1))
                 })
                 .unwrap_or_else(|| "operator".to_string());
             let now = agsess::sessions::now_ms();

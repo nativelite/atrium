@@ -1225,6 +1225,30 @@ pub fn status_glyph(status: &str) -> &'static str {
     }
 }
 
+/// Absorb one argv token into a `field=value` list, tolerating **unquoted spaced
+/// values**. A token that contains `=` starts a new field (`name` = everything
+/// after the first `=`); a token with no `=` is a *continuation* — appended,
+/// space-joined, to the current field's value. So the shell-split argv
+/// `["msg=merged", "the", "PR", "url=http://x"]` becomes `msg="merged the PR"`,
+/// `url="http://x"` without the caller needing to quote. Errors if a continuation
+/// arrives before any field has been named.
+fn absorb_field_token(fields: &mut Vec<(String, String)>, tok: &str) -> Result<(), String> {
+    if let Some((f, val)) = tok.split_once('=') {
+        fields.push((f.to_string(), val.to_string()));
+    } else if let Some((_, last)) = fields.last_mut() {
+        last.push(' ');
+        last.push_str(tok);
+    } else {
+        return Err(format!("expected field=value, got {tok:?}"));
+    }
+    Ok(())
+}
+
+/// Convert accumulated `(field, value)` string pairs into a JSON object value.
+fn fields_to_value(fields: Vec<(String, String)>) -> Value {
+    Value::Object(fields.into_iter().map(|(f, v)| (f, Value::String(v))).collect())
+}
+
 /// Turn `amux ctl` argv (after the `ctl` word) + caller id into a JSON request
 /// line. Pure and testable. Grammar:
 ///   `spawn [--role R] [--here | --window] [-- <cmd...>]`
@@ -1356,18 +1380,17 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                         .filter(|t| !t.starts_with('-'))
                         .ok_or_else(|| "board set needs a key".to_string())?;
                     pairs.push(("key", Value::String(key.clone())));
-                    // Remaining args are `field=value` pairs (empty value clears).
-                    let mut fields: Vec<(String, Value)> = Vec::new();
+                    // Remaining args are `field=value` pairs (empty value clears);
+                    // unquoted spaced values are joined across tokens.
+                    let mut fields: Vec<(String, String)> = Vec::new();
                     for a in &args[3.min(args.len())..] {
-                        let (f, val) = a.split_once('=').ok_or_else(|| {
-                            format!("board set: expected field=value, got {a:?}")
-                        })?;
-                        fields.push((f.to_string(), Value::String(val.to_string())));
+                        absorb_field_token(&mut fields, a)
+                            .map_err(|e| format!("board set: {e}"))?;
                     }
                     if fields.is_empty() {
                         return Err("board set needs at least one field=value".to_string());
                     }
-                    pairs.push(("fields", Value::Object(fields)));
+                    pairs.push(("fields", fields_to_value(fields)));
                 }
                 "get" | "del" => {
                     let key = args
@@ -1397,9 +1420,10 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                         .ok_or_else(|| "bus pub needs a topic".to_string())?;
                     pairs.push(("topic", Value::String(topic.clone())));
                     // Default FYI; `--decision` (or `--kind K`) escalates. Remaining
-                    // args are `field=value` pairs — the structured payload.
+                    // args are `field=value` pairs (unquoted spaced values are
+                    // joined across tokens) — the structured payload.
                     let mut kind = crate::bus::Kind::Fyi;
-                    let mut fields: Vec<(String, Value)> = Vec::new();
+                    let mut fields: Vec<(String, String)> = Vec::new();
                     let mut i = 3.min(args.len());
                     while i < args.len() {
                         let a = &args[i];
@@ -1418,10 +1442,8 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                                 i += 2;
                             }
                             _ => {
-                                let (f, val) = a.split_once('=').ok_or_else(|| {
-                                    format!("bus pub: expected field=value, got {a:?}")
-                                })?;
-                                fields.push((f.to_string(), Value::String(val.to_string())));
+                                absorb_field_token(&mut fields, a)
+                                    .map_err(|e| format!("bus pub: {e}"))?;
                                 i += 1;
                             }
                         }
@@ -1432,7 +1454,7 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                         );
                     }
                     pairs.push(("kind", s(kind.as_str())));
-                    pairs.push(("fields", Value::Object(fields)));
+                    pairs.push(("fields", fields_to_value(fields)));
                 }
                 "sub" | "unsub" => {
                     let topics: Vec<Value> = args[2.min(args.len())..]
@@ -1672,6 +1694,54 @@ mod tests {
     fn build_bus_resolve_roundtrip() {
         let r = parse_request(&build_request(&v(&["bus", "resolve", "7"]), None).unwrap()).unwrap();
         assert_eq!(r.cmd, Cmd::Bus(BusOp::Resolve { seq: 7 }));
+    }
+
+    #[test]
+    fn bus_pub_joins_unquoted_spaced_values() {
+        // The shell splits `msg=merged the PR` into three tokens; the parser must
+        // rejoin the continuation words into one value (no quoting needed).
+        let line = build_request(
+            &v(&["bus", "pub", "deploy", "msg=merged", "the", "PR", "url=https://x/pr/42"]),
+            None,
+        )
+        .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Bus(BusOp::Pub { fields, .. }) => {
+                assert!(fields.contains(&("msg".to_string(), "merged the PR".to_string())));
+                assert!(fields.contains(&("url".to_string(), "https://x/pr/42".to_string())));
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_pub_decision_keeps_spaced_value() {
+        let line =
+            build_request(&v(&["bus", "pub", "release", "--decision", "q=ship", "v2", "now?"]), None)
+                .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Bus(BusOp::Pub { kind, fields, .. }) => {
+                assert_eq!(kind, crate::bus::Kind::DecisionNeeded);
+                assert!(fields.contains(&("q".to_string(), "ship v2 now?".to_string())));
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn board_set_joins_unquoted_spaced_values() {
+        let line = build_request(
+            &v(&["board", "set", "task", "status=in", "progress", "owner=Max"]),
+            None,
+        )
+        .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Board(BoardOp::Set { fields, .. }) => {
+                assert!(fields.contains(&("status".to_string(), "in progress".to_string())));
+                assert!(fields.contains(&("owner".to_string(), "Max".to_string())));
+            }
+            other => panic!("expected board set, got {other:?}"),
+        }
     }
 
     #[test]

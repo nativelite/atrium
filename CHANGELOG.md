@@ -10,6 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.23.0] - 2026-09-01
 
 ### Fixed
+- **`board set` / `bus pub` accept unquoted spaced values.** The shell splits
+  `msg=merged the PR` into three argv tokens; the parser now rejoins continuation
+  words into the current field's value, so `amux ctl bus pub deploy msg=merged the
+  PR url=…` works without quoting (a token with `=` starts a new field; a token
+  without `=` appends to the current one).
+- **Text selection works by default.** Mouse capture is now **off** at startup, so
+  dragging selects/copies text as in any terminal; `Ctrl+A m` turns capture on
+  (click-to-focus, wheel-scrolls-the-hovered-tile) when you want it.
+- **Pane labels are 1-based**, matching the status bar. The `board`/`bus` "by/from"
+  attribution for an unnamed pane now reads `pane 1`, `pane 2` (was `pane 0`), so
+  it lines up with the bar's `1:`, `2:`. (Roles remain the stable identity.)
 - **amux no longer freezes at startup on a machine with many/large agent
   transcripts.** The agent-status monitor (`agsess`) discovered stale sessions at
   cold start but left them un-tailed, so the first status poll `read_to_end`'d
