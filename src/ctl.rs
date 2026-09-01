@@ -62,6 +62,8 @@ pub enum Cmd {
     Audit(AuditReq),
     /// Read or write the shared board — the team's source-of-truth tracker.
     Board(BoardOp),
+    /// Publish to / pull from the shared pub/sub bus — the team's event stream.
+    Bus(BusOp),
 }
 
 /// A `kill` request's payload.
@@ -109,6 +111,28 @@ pub enum BoardOp {
     List,
     /// Remove an entry.
     Del { key: String },
+}
+
+/// A `bus` operation — the shared pub/sub event stream ([`crate::bus`]). The
+/// server derives *who* (the caller's role or pane) itself, so these payloads
+/// never carry the subscriber name — a worker can't publish or subscribe *as*
+/// someone else.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BusOp {
+    /// Publish a structured event to `topic` with an urgency `kind`.
+    Pub {
+        topic: String,
+        kind: crate::bus::Kind,
+        fields: Vec<(String, String)>,
+    },
+    /// Subscribe the caller to `topics` (merged); `*` is the firehose.
+    Sub { topics: Vec<String> },
+    /// Unsubscribe the caller from `topics`; empty ⇒ drop all its subscriptions.
+    Unsub { topics: Vec<String> },
+    /// Pull the caller's subscribed events with `seq > since` (no echo).
+    Feed { since: u64 },
+    /// Mark a `decision_needed` event answered.
+    Resolve { seq: u64 },
 }
 
 /// A `spawn` request's payload.
@@ -562,6 +586,11 @@ amux ctl board set KEY field=value records current truth (status, owner, \
 blocker, url), amux ctl board get KEY reads one entry, and amux ctl board list \
 shows the whole board. Update the board when your status changes so the lead and \
 your teammates see it. \
+Share fast-moving events on the bus, not just durable state on the board: \
+amux ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
+when something needs a human decision, and amux ctl bus sub TOPIC then amux ctl \
+bus feed pulls what teammates published on the topics you follow. Post fyi \
+updates freely and reserve --decision for things that truly need the human. \
 Run amux ctl with no arguments for the full command surface, or use the \
 amux-coordinate or amux-delegate skills for the full workflow.";
 
@@ -675,6 +704,64 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             };
             Cmd::Board(op)
         }
+        Some("bus") => {
+            let op = match v.get("op").and_then(Value::as_str) {
+                Some("pub") => {
+                    let topic = v
+                        .get("topic")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "bus pub needs a topic".to_string())?
+                        .to_string();
+                    let kind = v
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .and_then(crate::bus::Kind::from_keyword)
+                        .unwrap_or(crate::bus::Kind::Fyi);
+                    let fields = v
+                        .get("fields")
+                        .and_then(Value::as_object)
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|(k, val)| {
+                                    val.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    BusOp::Pub { topic, kind, fields }
+                }
+                Some("sub") | Some("unsub") => {
+                    let topics = v
+                        .get("topics")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                    if v.get("op").and_then(Value::as_str) == Some("sub") {
+                        BusOp::Sub { topics }
+                    } else {
+                        BusOp::Unsub { topics }
+                    }
+                }
+                Some("feed") => {
+                    let since = v.get("since").and_then(Value::as_i64).unwrap_or(0).max(0) as u64;
+                    BusOp::Feed { since }
+                }
+                Some("resolve") => {
+                    let seq = v
+                        .get("seq")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| "bus resolve needs a seq".to_string())?
+                        .max(0) as u64;
+                    BusOp::Resolve { seq }
+                }
+                other => {
+                    return Err(format!(
+                        "bus op must be pub|sub|unsub|feed|resolve (got {other:?})"
+                    ))
+                }
+            };
+            Cmd::Bus(op)
+        }
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
     };
@@ -724,6 +811,46 @@ pub fn reply_board_del(key: &str, deleted: bool) -> String {
         ("ok", Value::Bool(true)),
         ("key", s(key)),
         ("deleted", Value::Bool(deleted)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"event":<event>}` — a bus `pub` result (the stored event, built
+/// by [`crate::bus::event_to_value`]).
+pub fn reply_bus_published(event: Value) -> String {
+    obj(vec![("ok", Value::Bool(true)), ("event", event)]).to_string()
+}
+
+/// `{"ok":true,"subscribed":[<topic>,…]}` — the caller's full topic set after a
+/// `sub`/`unsub`.
+pub fn reply_bus_subscribed(topics: Vec<String>) -> String {
+    let arr = topics.into_iter().map(Value::String).collect();
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("subscribed", Value::Array(arr)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"feed":[<event>,…],"cursor":<seq>}` — the pulled events (already
+/// serialized + scoped by the caller) and the new cursor to pass as the next
+/// `--since`. `cursor` is the max seq returned, or the request's `since` when the
+/// pull was empty (so the cursor never goes backwards).
+pub fn reply_bus_feed(feed: Value, cursor: u64) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("feed", feed),
+        ("cursor", Value::Number(Number::Int(cursor as i64))),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"seq":<seq>,"resolved":<bool>}` — a bus `resolve`.
+pub fn reply_bus_resolved(seq: u64, resolved: bool) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("seq", Value::Number(Number::Int(seq as i64))),
+        ("resolved", Value::Bool(resolved)),
     ])
     .to_string()
 }
@@ -845,7 +972,8 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             eprintln!(
                 "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
-                 \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>"
+                 \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
+                 \x20      | bus pub <topic> [--decision] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq>"
             );
             return ExitCode::FAILURE;
         }
@@ -857,6 +985,10 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             // prints its JSON reply verbatim.
             match (args.first().map(String::as_str), raw_json) {
                 (Some("board"), false) => match render_board(&reply) {
+                    Some(view) => println!("{view}"),
+                    None => println!("{reply}"),
+                },
+                (Some("bus"), false) => match render_bus(&reply) {
                     Some(view) => println!("{view}"),
                     None => println!("{reply}"),
                 },
@@ -923,6 +1055,87 @@ fn render_board(reply: &str) -> Option<String> {
         });
     }
     None
+}
+
+/// Render a `bus` reply as a human view: a `feed`/`pub` shows one line per event
+/// (seq, an urgency glyph, the topic, its fields, and who sent it); `sub`/`unsub`
+/// shows the resulting subscription set; `resolve` a one-line confirmation. `None`
+/// if the reply isn't a bus result (caller falls back to raw JSON).
+fn render_bus(reply: &str) -> Option<String> {
+    let v = json::parse(reply).ok()?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    // feed → a list of events (plus the cursor to resume from).
+    if let Some(arr) = v.get("feed").and_then(Value::as_array) {
+        if arr.is_empty() {
+            return Some("  (no new events)".to_string());
+        }
+        let cursor = v.get("cursor").and_then(Value::as_i64).unwrap_or(0);
+        let mut body = arr.iter().map(render_event_line).collect::<Vec<_>>().join("\n");
+        body.push_str(&format!("\n\x1b[2m  — cursor {cursor} (next: bus feed --since {cursor})\x1b[0m"));
+        return Some(body);
+    }
+    // pub → the single stored event.
+    if let Some(event) = v.get("event") {
+        return Some(render_event_line(event));
+    }
+    // sub/unsub → the resulting subscription set.
+    if let Some(subs) = v.get("subscribed").and_then(Value::as_array) {
+        if subs.is_empty() {
+            return Some("  (subscribed to nothing)".to_string());
+        }
+        let list = subs
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!("  subscribed: {list}"));
+    }
+    // resolve → a one-line confirmation.
+    if let Some(resolved) = v.get("resolved").and_then(Value::as_bool) {
+        let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
+        return Some(format!(
+            "  decision #{seq}: {}",
+            if resolved { "resolved" } else { "was not an open decision" }
+        ));
+    }
+    None
+}
+
+/// Format one bus event: `[#7] ! deploy  msg=ship it?  (from dev_1)`. A
+/// `decision_needed` event gets an amber `!` and bold topic so escalations stand
+/// out from FYI chatter (a dim `·`).
+fn render_event_line(event: &Value) -> String {
+    let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
+    let topic = event.get("topic").and_then(Value::as_str).unwrap_or("?");
+    let kind = event.get("kind").and_then(Value::as_str).unwrap_or("fyi");
+    let decision = kind == "decision_needed";
+    let (glyph, topic_sgr) = if decision {
+        ("\x1b[38;5;11m!\x1b[0m", "\x1b[1;38;5;11m") // amber bang, bold amber topic
+    } else {
+        ("\x1b[2m·\x1b[0m", "\x1b[1m") // dim dot, bold topic
+    };
+    let empty: &[(String, Value)] = &[];
+    let fields = event.get("fields").and_then(Value::as_object).unwrap_or(empty);
+    let field_str = fields
+        .iter()
+        .map(|(k, v)| {
+            let vs = v.as_str().unwrap_or("");
+            if is_url(vs) {
+                format!("{k}={}", hyperlink(vs, vs))
+            } else {
+                format!("{k}={vs}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    let from = event
+        .get("from")
+        .and_then(Value::as_str)
+        .map(|f| format!("  \x1b[2m(from {f})\x1b[0m"))
+        .unwrap_or_default();
+    format!("\x1b[2m[#{seq}]\x1b[0m {glyph} {topic_sgr}{topic}\x1b[0m  {field_str}{from}")
 }
 
 /// Format one board entry: `● key   status=DONE  owner=Max  url=<link>  (by dev_1)`.
@@ -1169,10 +1382,112 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                 }
             }
         }
+        Some("bus") => {
+            pairs.push(("cmd", s("bus")));
+            let sub = args
+                .get(1)
+                .map(String::as_str)
+                .ok_or_else(|| "bus needs pub|sub|unsub|feed|resolve".to_string())?;
+            pairs.push(("op", s(sub)));
+            match sub {
+                "pub" => {
+                    let topic = args
+                        .get(2)
+                        .filter(|t| !t.starts_with('-'))
+                        .ok_or_else(|| "bus pub needs a topic".to_string())?;
+                    pairs.push(("topic", Value::String(topic.clone())));
+                    // Default FYI; `--decision` (or `--kind K`) escalates. Remaining
+                    // args are `field=value` pairs — the structured payload.
+                    let mut kind = crate::bus::Kind::Fyi;
+                    let mut fields: Vec<(String, Value)> = Vec::new();
+                    let mut i = 3.min(args.len());
+                    while i < args.len() {
+                        let a = &args[i];
+                        match a.as_str() {
+                            "--decision" => {
+                                kind = crate::bus::Kind::DecisionNeeded;
+                                i += 1;
+                            }
+                            "--kind" => {
+                                let k = args
+                                    .get(i + 1)
+                                    .ok_or_else(|| "--kind needs fyi or decision_needed".to_string())?;
+                                kind = crate::bus::Kind::from_keyword(k).ok_or_else(|| {
+                                    format!("--kind: unknown {k:?} (use fyi or decision_needed)")
+                                })?;
+                                i += 2;
+                            }
+                            _ => {
+                                let (f, val) = a.split_once('=').ok_or_else(|| {
+                                    format!("bus pub: expected field=value, got {a:?}")
+                                })?;
+                                fields.push((f.to_string(), Value::String(val.to_string())));
+                                i += 1;
+                            }
+                        }
+                    }
+                    if fields.is_empty() {
+                        return Err(
+                            "bus pub needs at least one field=value (e.g. msg=merged the PR)".to_string(),
+                        );
+                    }
+                    pairs.push(("kind", s(kind.as_str())));
+                    pairs.push(("fields", Value::Object(fields)));
+                }
+                "sub" | "unsub" => {
+                    let topics: Vec<Value> = args[2.min(args.len())..]
+                        .iter()
+                        .filter(|t| !t.starts_with('-'))
+                        .map(|t| Value::String(t.clone()))
+                        .collect();
+                    if sub == "sub" && topics.is_empty() {
+                        return Err("bus sub needs at least one topic (or `*` for all)".to_string());
+                    }
+                    pairs.push(("topics", Value::Array(topics)));
+                }
+                "feed" => {
+                    // `--since N` resumes after cursor N; default 0 = from the start.
+                    let mut i = 2;
+                    while i < args.len() {
+                        if args[i] == "--since" {
+                            let n = args
+                                .get(i + 1)
+                                .and_then(|t| t.parse::<i64>().ok())
+                                .ok_or_else(|| "--since needs a number".to_string())?;
+                            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
+                            i += 2;
+                        } else if let Some(rest) = args[i].strip_prefix("--since=") {
+                            let n = rest
+                                .parse::<i64>()
+                                .map_err(|_| "--since needs a number".to_string())?;
+                            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
+                            i += 1;
+                        } else {
+                            return Err(format!("unexpected argument {:?} to bus feed", args[i]));
+                        }
+                    }
+                }
+                "resolve" => {
+                    let tok = args
+                        .get(2)
+                        .filter(|t| !t.starts_with('-'))
+                        .ok_or_else(|| "bus resolve needs a seq".to_string())?;
+                    let seq = tok
+                        .parse::<i64>()
+                        .map_err(|_| format!("bus resolve: seq must be a number, got {tok:?}"))?;
+                    pairs.push(("seq", Value::Number(Number::Int(seq.max(0)))));
+                }
+                other => {
+                    return Err(format!(
+                        "bus op must be pub|sub|unsub|feed|resolve (got {other:?})"
+                    ))
+                }
+            }
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
-                "needs a subcommand: spawn | list | send | status | kill | audit | board"
+                "needs a subcommand: spawn | list | send | status | kill | audit | board | bus"
                     .to_string(),
             )
         }
@@ -1299,6 +1614,64 @@ mod tests {
             Cmd::Spawn(sp) => assert!(!sp.new_window),
             _ => panic!("expected spawn"),
         }
+    }
+
+    #[test]
+    fn build_bus_pub_roundtrips_through_parse() {
+        let line = build_request(
+            &v(&["bus", "pub", "deploy", "msg=shipping v2", "url=https://x/pr/9"]),
+            Some(0),
+        )
+        .unwrap();
+        let req = parse_request(&line).unwrap();
+        match req.cmd {
+            Cmd::Bus(BusOp::Pub { topic, kind, fields }) => {
+                assert_eq!(topic, "deploy");
+                assert_eq!(kind, crate::bus::Kind::Fyi, "defaults to fyi");
+                assert!(fields.contains(&("msg".to_string(), "shipping v2".to_string())));
+                assert!(fields.contains(&("url".to_string(), "https://x/pr/9".to_string())));
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bus_pub_decision_flag_sets_kind() {
+        let line =
+            build_request(&v(&["bus", "pub", "release", "--decision", "q=ship now?"]), None).unwrap();
+        let req = parse_request(&line).unwrap();
+        match req.cmd {
+            Cmd::Bus(BusOp::Pub { kind, .. }) => {
+                assert_eq!(kind, crate::bus::Kind::DecisionNeeded)
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bus_pub_without_fields_is_an_error() {
+        let err = build_request(&v(&["bus", "pub", "deploy"]), None).unwrap_err();
+        assert!(err.contains("field=value"), "{err}");
+    }
+
+    #[test]
+    fn build_bus_sub_and_feed_roundtrip() {
+        let sub = parse_request(&build_request(&v(&["bus", "sub", "deploy", "*"]), None).unwrap()).unwrap();
+        assert_eq!(
+            sub.cmd,
+            Cmd::Bus(BusOp::Sub {
+                topics: v(&["deploy", "*"])
+            })
+        );
+        let feed =
+            parse_request(&build_request(&v(&["bus", "feed", "--since", "5"]), None).unwrap()).unwrap();
+        assert_eq!(feed.cmd, Cmd::Bus(BusOp::Feed { since: 5 }));
+    }
+
+    #[test]
+    fn build_bus_resolve_roundtrip() {
+        let r = parse_request(&build_request(&v(&["bus", "resolve", "7"]), None).unwrap()).unwrap();
+        assert_eq!(r.cmd, Cmd::Bus(BusOp::Resolve { seq: 7 }));
     }
 
     #[test]

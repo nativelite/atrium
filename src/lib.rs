@@ -19,6 +19,7 @@ pub mod audit;
 pub mod bar;
 pub mod board;
 pub mod bind;
+pub mod bus;
 pub mod ctl;
 pub mod filter;
 pub mod fleet;

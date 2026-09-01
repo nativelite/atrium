@@ -142,7 +142,11 @@ fn mouse_on_release_and_wheel_and_drag_are_not_clicks() {
     let mut s = PrefixScanner::new();
     s.set_mouse(true);
     assert_eq!(s.feed(b"\x1b[<0;12;7m"), vec![]); // release
-    assert_eq!(s.feed(b"\x1b[<64;1;1M"), vec![]); // wheel-up
+    // Wheel-up is not a click — it scrolls the hovered tile (the scroll feature).
+    assert_eq!(
+        s.feed(b"\x1b[<64;1;1M"),
+        vec![Action::MouseScroll { up: true, col: 1, row: 1 }]
+    );
     assert_eq!(s.feed(b"\x1b[<32;1;1M"), vec![]); // motion/drag
 }
 
@@ -297,47 +301,40 @@ fn bar_wif_identity_reads_apart_from_static() {
 #[test]
 fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
     // The `·<name>` tag must read as colored *text* — the identity color as the
-    // foreground on the bar's normal background, exactly the SGR the tiled
-    // border uses — NOT a filled color block. The bar line is reverse-video, so
-    // a foreground set while still reversed would swap to a background chip; the
-    // fix drops `reverse` for the tag so the color lands on the text. The text
-    // must stay intact regardless of color (a11y).
+    // foreground over the bar's themed background — NOT a reverse-video filled
+    // chip. (The themed statusline sets an explicit bg per segment; a segment's
+    // SGR is an absolute `reset + fg + bg`.) The text must stay intact regardless
+    // of color (a11y).
     let mut p = info("claude", true, false, false);
     p.identity = Some("work".into());
     let painted = bar_paint(&[p], 25, 120, "");
 
-    // The tag's SGR is `reset + fg` with NO reverse (`7`) attribute — colored
-    // text, not a reverse-video chip. Palette color for "work" maps via `sgr()`
-    // to a `90 + (n-8)` fg param (12 -> 94, 13 -> 95).
+    // Palette color for "work" maps via `sgr()` to a `90 + (n-8)` fg param
+    // (12 -> 94, 13 -> 95). The tag's SGR is an absolute run beginning `reset +
+    // fg` (then the themed bar bg); assert on that prefix so the test doesn't
+    // couple to the exact bg truecolor value.
     let idx = amux::identity::palette_index("work");
     let fg_param = 90 + (idx - 8) as u16;
-    let tag_sgr = format!("\x1b[0;{fg_param}m");
+    let tag_prefix = format!("\x1b[0;{fg_param}");
     assert!(
-        painted.contains(&tag_sgr),
-        "tag should be colored text (reset+fg, no reverse); sgr {tag_sgr:?} not in {painted:?}"
+        painted.contains(&tag_prefix),
+        "tag should be colored text (reset+fg); prefix {tag_prefix:?} not in {painted:?}"
     );
-    // It must NOT be the old reverse-video chip form (`0;7;<fg>`), which
-    // rendered as a filled background block.
-    let chip_sgr = format!("\x1b[0;7;{fg_param}m");
+    // It must NOT be the old reverse-video chip form (`0;7;<fg>`), a filled block.
+    let chip_sgr = format!("\x1b[0;7;{fg_param}");
     assert!(
         !painted.contains(&chip_sgr),
         "tag must not be a reverse-video chip; found {chip_sgr:?} in {painted:?}"
     );
 
-    // The colored run is immediately followed by the `·work` text.
-    let with_text = format!("{tag_sgr}·work");
-    assert!(
-        painted.contains(&with_text),
-        "colored tag text missing: {painted:?}"
-    );
+    // The `·work` text is present and intact (the load-bearing a11y channel).
+    assert!(painted.contains("·work"), "colored tag text missing: {painted:?}");
 
-    // Right after the tag text, the bar restores its reverse-video base
-    // (`\x1b[0;7m`) so neither the color nor the dropped `reverse` bleeds into
-    // the following segment.
-    let restore = format!("·work{}", "\x1b[0;7m");
+    // A fresh absolute SGR reset begins right after the tag text, so neither the
+    // color nor any attribute bleeds into the following segment.
     assert!(
-        painted.contains(&restore),
-        "base reverse-video style not restored after tag: {painted:?}"
+        painted.contains("·work\x1b[0;"),
+        "next segment not reset after the tag: {painted:?}"
     );
 }
 

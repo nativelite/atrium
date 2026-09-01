@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-09-01
+
+### Added
+- **The bus — topic-routed pub/sub for a coordinating team** (coordination layer
+  part 2, the active complement to the board's durable state). A teammate
+  publishes a **structured event** to a **topic**; teammates **pull** the topics
+  they subscribe to. Command surface (all `--allow-ctl` gated, like the board):
+  - `amux ctl bus pub <topic> [--decision] <field=value…>` — publish. Default
+    urgency is **`fyi`** (cheap, informational); `--decision` (or
+    `--kind decision_needed`) marks an **escalation** that needs a human/lead
+    answer.
+  - `amux ctl bus sub <topic…>` — subscribe (merged); `*` is the firehose.
+    `amux ctl bus unsub [topic…]` drops interest (empty ⇒ all).
+  - `amux ctl bus feed [--since <seq>]` — pull your subscribed events, resumable
+    via the returned `cursor`. Rendered as a colored feed (amber `!` decisions,
+    dim `·` FYI, clickable URLs); `--json` for the raw form.
+  - `amux ctl bus resolve <seq>` — mark a decision answered.
+  - **Backpressure is built in:** no echo of your own events, pull-not-push (you
+    only pay for topics you own), a per-agent publish **rate cap** (20 events /
+    10 s), and a **bounded ring** (512 events, oldest fall off). The server
+    derives *who* from the caller's role/pane, so a worker can't publish or
+    subscribe as someone else.
+  - **`AMUX_BUS=<file>`** persists the feed + subscriptions across a restart
+    (atomic snapshot), mirroring `AMUX_BOARD`.
+- **`Ctrl+A b` is now a board **+** bus dashboard.** The overlay shows the board on
+  top and the bus feed below a divider — open `decision_needed` escalations first
+  (amber), then recent events. Its title shows `N decisions awaiting you`.
+- **Open decisions escalate on the status bar.** When the bus has unresolved
+  `decision_needed` events and no flash note is up, the bar shows
+  `N decisions need you · Ctrl+A b` — the bus's push channel to the human.
+
 ## [0.22.1] - 2026-08-31
 
 ### Fixed

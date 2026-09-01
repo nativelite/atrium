@@ -76,6 +76,26 @@ poll `board list` for current truth — `owner`, `status`, `blocker` — rather 
 re-reading conversations. An empty field value clears it. Every write records who
 made it; the board is shared by the whole session (no per-teammate walls).
 
+## The bus — the team's event stream
+
+The board is durable *state* ("what is true now"); the **bus** is the flow of
+*events* ("what just happened"). Use it so a finished teammate can **notify** you
+instead of you polling the board:
+
+    amux ctl bus pub <topic> <field=value...>    # e.g. bus pub deploy msg=merged url=…
+    amux ctl bus pub <topic> --decision <f=v...> # an escalation that needs YOUR answer
+    amux ctl bus sub <topic...>                  # follow topics (`*` = everything)
+    amux ctl bus feed [--since <seq>]            # pull new events on your topics
+    amux ctl bus resolve <seq>                   # mark a decision answered
+
+Subscribe to the topics you own (or `*` as the lead), and tell each teammate in
+its brief to `bus pub` an update when it finishes a unit of work and to use
+`--decision` when it's blocked on a call only you can make — those surface on the
+`Ctrl+A b` panel and the status bar (`N decisions need you`). Default `fyi` events
+are cheap; you only pull the topics you subscribed to, so keep chatter on-topic.
+Poll `bus feed` between steps to see what landed, and `bus resolve <seq>` each
+decision once you've answered it.
+
 ## Finish cleanly — always reap
 
 Reaping is part of the job, not optional. As soon as you have collected a

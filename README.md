@@ -347,6 +347,10 @@ and prints the one-line JSON reply.
 | `amux ctl audit [N]` | The control-request log (most recent `N`, or all), for reconstructing a run. | `{"ok":true,"audit":[{"seq":1,"caller":0,"action":"spawn","detail":"role=dev_1 argv=claude identity=-","ok":true,"note":"pane=1"},…]}` |
 | `amux ctl board set <key> <field=value…>` | Merge fields into the shared board (create if absent); an empty value clears a field. | `{"ok":true,"key":"auth","entry":{"by":"dev_1","ms":…,"fields":{"status":"DONE","owner":"Max"}}}` |
 | `amux ctl board get <key>` / `list` / `del <key>` | Read one entry, roll up the whole board, or remove an entry. | `{"ok":true,"board":[{"key":"auth","by":"dev_1","fields":{"status":"DONE"}},…]}` |
+| `amux ctl bus pub <topic> [--decision] <field=value…>` | Publish a structured event to `topic`. Default urgency `fyi`; `--decision` marks an escalation that needs a human answer. | `{"ok":true,"event":{"seq":7,"topic":"deploy","kind":"fyi","from":"dev_1","fields":{"msg":"merged"}}}` |
+| `amux ctl bus sub <topic…>` / `unsub [<topic…>]` | Subscribe (merged; `*` = firehose) or unsubscribe (empty ⇒ all) the caller. | `{"ok":true,"subscribed":["deploy","*"]}` |
+| `amux ctl bus feed [--since <seq>]` | Pull the caller's subscribed events with `seq > since` (no echo of your own); returns a `cursor` to resume from. | `{"ok":true,"feed":[{"seq":7,"topic":"deploy",…}],"cursor":7}` |
+| `amux ctl bus resolve <seq>` | Mark a `decision_needed` event answered (clears the bar/panel escalation). | `{"ok":true,"seq":7,"resolved":true}` |
 
 ### The board — shared source of truth
 
@@ -360,9 +364,35 @@ transcript; teammates update their own entry as they work. It's part of the ctl
 surface, so it's gated by `--allow-ctl`; set **`AMUX_BOARD=<file>`** to persist it
 across restarts (in-memory otherwise). Every write records who made it (in the
 `audit` log and the entry's `by`), but the board is shared by the whole session —
-no per-teammate walls. (This is the first half of amux's coordination layer; a
-topic-routed pub/sub bus is the planned second half, to be extracted with the
-board into an `abus` org crate.)
+no per-teammate walls. (This is the first half of amux's coordination layer; the
+`bus` below is the second. Both are slated to be extracted into an `abus` org
+crate once the layer is clearly its own concern.)
+
+### The bus — the team's event stream
+
+If the board answers *"what is currently true?"*, the **bus** answers *"what just
+happened, and does anyone need to act?"* — the active half of the coordination
+layer. A teammate **publishes a structured event to a topic**
+(`bus pub deploy msg=shipping url=…`); teammates **pull** the topics they
+**subscribe** to (`bus sub deploy` then `bus feed`). State-only coordination means
+polling the board; the bus lets a finished worker *notify* without everyone
+re-checking.
+
+Two urgency classes carry the visibility-vs-approval split: **`fyi`** (the
+default — cheap, lands on the feed) and **`decision_needed`** (`--decision` — an
+escalation that needs a human/lead answer). Open decisions surface **actively**:
+the `Ctrl+A b` panel lists them first and the status bar shows
+`N decisions need you`, so you don't have to be looking. `bus resolve <seq>` clears
+one once answered.
+
+**Backpressure is designed in, not bolted on** — because unread messages cost
+attention: you never receive an echo of your own events; it's **pull, not push**
+(you only pay for topics you subscribed to); each agent has a **publish rate cap**
+(20 events / 10 s) so one looping worker can't storm the team; and the log is a
+**bounded ring** (the oldest 512 events, then they fall off). Like the board it
+lives in the single broker process (a plain in-memory log, no locking), is gated
+by `--allow-ctl`, records who sent each event, and persists across restarts with
+**`AMUX_BUS=<file>`**.
 
 ### The security model — the part that must be right
 

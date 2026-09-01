@@ -156,33 +156,67 @@ fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
     result
 }
 
-/// Render the full-screen board overlay (`Ctrl+A b`): hide the cursor, clear, and
-/// draw the shared board as colored rows — a status glyph + colored `status`, the
-/// key bold, remaining fields dim (URLs as clickable OSC-8 links), and the writer
-/// in parens. Positioned with absolute CUP per line (no scrolling); the bar row is
-/// left for the status bar.
-fn render_board_panel(board: &amux::board::Board, rows: u16, cols: u16) -> String {
-    use amux::ctl::{hyperlink, is_url, status_glyph, status_sgr};
+/// Render the full-screen coordination overlay (`Ctrl+A b`): the shared **board**
+/// (durable "what is true") on top, a divider, then the **bus** feed (recent
+/// events + any open `decision_needed` escalations, "what just happened") below.
+/// Hides the cursor, clears, and positions every line with absolute CUP (no
+/// scrolling); the bar row is left for the status bar.
+fn render_board_panel(
+    board: &amux::board::Board,
+    bus: &amux::bus::Bus,
+    rows: u16,
+    cols: u16,
+) -> String {
     let mut out = String::from("\x1b[?25l\x1b[2J");
-    out.push_str("\x1b[1;1H\x1b[1;38;5;37m  board\x1b[0m  \x1b[2m(Ctrl+A b to close · live)\x1b[0m");
+    let decisions = bus.pending_decisions();
+    out.push_str(&format!(
+        "\x1b[1;1H\x1b[1;38;5;37m  board + bus\x1b[0m  \x1b[2m(Ctrl+A b to close · live)\x1b[0m{}",
+        if decisions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "  \x1b[1;38;5;11m{} decision{} awaiting you\x1b[0m",
+                decisions.len(),
+                if decisions.len() == 1 { "" } else { "s" }
+            )
+        }
+    ));
     out.push_str(&format!(
         "\x1b[2;1H\x1b[38;5;238m{}\x1b[0m",
         "\u{2500}".repeat(cols as usize)
     ));
+
+    // Split the content rows (3..=bar-1) between the board (top) and the feed
+    // (bottom half). Defensive on tiny terminals: sections shrink, never overrun.
+    let content_last = rows.saturating_sub(1); // the bar lives on row `rows`
+    let region = content_last.saturating_sub(2); // rows 3..=content_last
+    let feed_h = (region / 2).clamp(3.min(region), region);
+    let board_last = content_last.saturating_sub(feed_h + 1).max(3);
+
+    render_board_rows(&mut out, board, board_last);
+
+    // The bus divider + feed, filling from `board_last + 2` down to the bar.
+    let div_row = board_last + 1;
+    out.push_str(&format!(
+        "\x1b[{div_row};1H\x1b[38;5;238m\u{2500}\u{2500} \x1b[0m\x1b[1;38;5;37mbus\x1b[0m \x1b[38;5;238m{}\x1b[0m",
+        "\u{2500}".repeat((cols as usize).saturating_sub(7))
+    ));
+    render_feed_rows(&mut out, bus, &decisions, div_row + 1, content_last);
+    out
+}
+
+/// Draw the board entries into `out`, from row 3 down to `last_row` (inclusive),
+/// with an overflow hint if there are more than fit.
+fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16) {
+    use amux::ctl::{hyperlink, is_url, status_glyph, status_sgr};
     let entries = board.list();
     if entries.is_empty() {
         out.push_str(
-            "\x1b[4;1H  \x1b[2m(empty — set one:  amux ctl board set launch status=WIP owner=you)\x1b[0m",
+            "\x1b[3;1H  \x1b[2m(board empty — set one:  amux ctl board set launch status=WIP owner=you)\x1b[0m",
         );
-        return out;
+        return;
     }
-    let key_w = entries
-        .iter()
-        .map(|(k, _)| k.len())
-        .max()
-        .unwrap_or(4)
-        .clamp(4, 24);
-    let last_row = rows.saturating_sub(2); // leave the bar row (rows) clear
+    let key_w = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(4).clamp(4, 24);
     let mut row = 3u16;
     let total = entries.len();
     for (i, (key, e)) in entries.iter().enumerate() {
@@ -196,19 +230,13 @@ fn render_board_panel(board: &amux::board::Board, rows: u16, cols: u16) -> Strin
         let status = e.fields.get("status").map(String::as_str);
         let color = status.map(status_sgr).unwrap_or("\x1b[0m");
         let glyph = status.map(status_glyph).unwrap_or("\u{00B7}");
-        let status_label = status
-            .map(|st| format!("{color}{st}\x1b[0m  "))
-            .unwrap_or_default();
+        let status_label = status.map(|st| format!("{color}{st}\x1b[0m  ")).unwrap_or_default();
         let mut fields = String::new();
         for (f, v) in &e.fields {
             if f == "status" {
                 continue;
             }
-            let rendered = if is_url(v) {
-                hyperlink(v, v)
-            } else {
-                v.clone()
-            };
+            let rendered = if is_url(v) { hyperlink(v, v) } else { v.clone() };
             fields.push_str(&format!("\x1b[2m{f}=\x1b[0m{rendered}  "));
         }
         let by = e
@@ -222,7 +250,73 @@ fn render_board_panel(board: &amux::board::Board, rows: u16, cols: u16) -> Strin
         ));
         row += 1;
     }
-    out
+}
+
+/// Draw the bus feed into `out`, from `first_row` down to `last_row`: open
+/// `decision_needed` escalations first (amber `!`), then recent FYI events
+/// (newest first, dim `·`). URLs render as clickable OSC-8 links.
+fn render_feed_rows(
+    out: &mut String,
+    bus: &amux::bus::Bus,
+    decisions: &[&amux::bus::Event],
+    first_row: u16,
+    last_row: u16,
+) {
+    if first_row > last_row {
+        return;
+    }
+    let cap = (last_row - first_row + 1) as usize;
+    // Open decisions get priority; fill the rest with recent non-open events,
+    // newest first, skipping any already shown as an open decision.
+    let open_seqs: std::collections::BTreeSet<u64> = decisions.iter().map(|e| e.seq).collect();
+    let mut lines: Vec<String> = decisions.iter().map(|e| feed_line(e)).collect();
+    if lines.len() < cap {
+        for e in bus.tail(cap * 2).into_iter().rev() {
+            if lines.len() >= cap {
+                break;
+            }
+            if open_seqs.contains(&e.seq) {
+                continue;
+            }
+            lines.push(feed_line(e));
+        }
+    }
+    if lines.is_empty() {
+        out.push_str(&format!(
+            "\x1b[{first_row};1H  \x1b[2m(no events — publish one:  amux ctl bus pub deploy msg=shipping)\x1b[0m"
+        ));
+        return;
+    }
+    for (i, line) in lines.into_iter().take(cap).enumerate() {
+        let row = first_row + i as u16;
+        out.push_str(&format!("\x1b[{row};1H{line}"));
+    }
+}
+
+/// One bus event as a panel line: `! deploy  msg=ship it?  (from dev_1)`. A
+/// `decision_needed` event gets an amber `!` and bold topic; an FYI a dim `·`.
+fn feed_line(e: &amux::bus::Event) -> String {
+    use amux::bus::Kind;
+    use amux::ctl::{hyperlink, is_url};
+    let (glyph, topic_sgr) = match e.kind {
+        Kind::DecisionNeeded => ("\x1b[1;38;5;11m!\x1b[0m", "\x1b[1;38;5;11m"),
+        Kind::Fyi => ("\x1b[2m·\x1b[0m", "\x1b[1m"),
+    };
+    let fields = e
+        .fields
+        .iter()
+        .map(|(f, v)| {
+            let rendered = if is_url(v) { hyperlink(v, v) } else { v.clone() };
+            format!("\x1b[2m{f}=\x1b[0m{rendered}")
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    let from = e
+        .from
+        .as_deref()
+        .map(|f| format!("  \x1b[2m(from {f})\x1b[0m"))
+        .unwrap_or_default();
+    format!("  {glyph} {topic_sgr}{}\x1b[0m  {fields}{from}", e.topic)
 }
 
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
@@ -692,6 +786,12 @@ fn run(
         Some(p) if !p.is_empty() => amux::board::Board::with_file(std::path::PathBuf::from(p)),
         _ => amux::board::Board::new(),
     };
+    // The shared pub/sub bus (coordination layer part 2): the team's event stream,
+    // in-memory unless AMUX_BUS names a snapshot file. Same ctl gating as the board.
+    let mut bus = match std::env::var_os(amux::bus::ENV_BUS) {
+        Some(p) if !p.is_empty() => amux::bus::Bus::with_file(std::path::PathBuf::from(p)),
+        _ => amux::bus::Bus::new(),
+    };
     let mut world = agsess::World::new(agsess::default_root());
     let process_start_ms = agsess::sessions::now_ms();
     world.refresh_since(process_start_ms);
@@ -992,6 +1092,7 @@ fn run(
                             identity,
                             &mut ctl_audit,
                             &mut board,
+                            &mut bus,
                         );
                         let _ = listener.respond(&reply);
                         prev_master = None;
@@ -1265,7 +1366,7 @@ fn run(
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
-                frame.extend_from_slice(render_board_panel(&board, rows, cols).as_bytes());
+                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols).as_bytes());
             }
         } else if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
@@ -1323,7 +1424,25 @@ fn run(
             flash = None;
             force_repaint = true;
         }
-        let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+        // A flash note wins; otherwise, if the bus has open `decision_needed`
+        // escalations, surface them on the bar so you see them without opening the
+        // `Ctrl+A b` panel — the bus's push channel to the human.
+        let decisions_open = bus.pending_decisions().len();
+        let decision_note = if decisions_open > 0 {
+            format!(
+                "{decisions_open} decision{} need you \u{00b7} Ctrl+A b",
+                if decisions_open == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or({
+            if decision_note.is_empty() {
+                ""
+            } else {
+                decision_note.as_str()
+            }
+        });
         let painted = bar_paint(&infos, rows, cols as usize, note);
         let mut bar_appended = false;
         if force_repaint
@@ -1835,6 +1954,7 @@ fn apply_ctl(
     session_identity: Option<&str>,
     audit: &mut amux::audit::Audit,
     board: &mut amux::board::Board,
+    bus: &mut amux::bus::Bus,
 ) -> String {
     use amux::ctl::{self, Cmd};
 
@@ -1869,6 +1989,7 @@ fn apply_ctl(
         session_identity,
         privileged,
         board,
+        bus,
     );
     let (ok, note) = audit_outcome(&reply);
     audit.record(caller, action, &detail, ok, &note);
@@ -1895,6 +2016,7 @@ fn dispatch_ctl(
     session_identity: Option<&str>,
     privileged: bool,
     board: &mut amux::board::Board,
+    bus: &mut amux::bus::Bus,
 ) -> String {
     use amux::ctl::{self, Cmd};
     let caller = req.caller;
@@ -2078,7 +2200,56 @@ fn dispatch_ctl(
                 }
             }
         }
+        Cmd::Bus(op) => {
+            // The bus is SHARED like the board. The server derives `who` (the
+            // caller's role, else its pane, else the operator) so a worker
+            // publishes and subscribes *as itself* — it cannot forge another
+            // sender. `who` is stable per pane, so the no-echo filter and a
+            // subscriber's cursor stay consistent across calls.
+            let who = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .map(|p| {
+                    p.role
+                        .clone()
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id))
+                })
+                .unwrap_or_else(|| "operator".to_string());
+            let now = agsess::sessions::now_ms();
+            match op {
+                ctl::BusOp::Pub { topic, kind, fields } => {
+                    match bus.publish(&topic, kind, Some(&who), &fields, now) {
+                        Ok(e) => ctl::reply_bus_published(amux::bus::event_to_value(&e)),
+                        Err(msg) => ctl::reply_err(&msg),
+                    }
+                }
+                ctl::BusOp::Sub { topics } => {
+                    bus.subscribe(&who, &topics);
+                    ctl::reply_bus_subscribed(current_subs(bus, &who))
+                }
+                ctl::BusOp::Unsub { topics } => {
+                    bus.unsubscribe(&who, &topics);
+                    ctl::reply_bus_subscribed(current_subs(bus, &who))
+                }
+                ctl::BusOp::Feed { since } => {
+                    let events = bus.feed(&who, since);
+                    // The new cursor is the max seq pulled, or `since` when empty,
+                    // so it never rewinds.
+                    let cursor = events.iter().map(|e| e.seq).max().unwrap_or(since);
+                    ctl::reply_bus_feed(amux::bus::events_to_value(&events), cursor)
+                }
+                ctl::BusOp::Resolve { seq } => {
+                    ctl::reply_bus_resolved(seq, bus.resolve(seq))
+                }
+            }
+        }
     }
+}
+
+/// A subscriber's current topic set as a `Vec` (for the `sub`/`unsub` reply).
+fn current_subs(bus: &amux::bus::Bus, who: &str) -> Vec<String> {
+    bus.subscriptions(who)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Truncate a string to `n` chars (char-safe), appending `…` when cut. Keeps a
@@ -2141,6 +2312,18 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
                 amux::ctl::BoardOp::Get { key } => format!("get {key}"),
                 amux::ctl::BoardOp::List => "list".to_string(),
                 amux::ctl::BoardOp::Del { key } => format!("del {key}"),
+            },
+        ),
+        Cmd::Bus(op) => (
+            "bus",
+            match op {
+                amux::ctl::BusOp::Pub { topic, kind, fields } => {
+                    format!("pub {topic} {} fields={}", kind.as_str(), fields.len())
+                }
+                amux::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
+                amux::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
+                amux::ctl::BusOp::Feed { since } => format!("feed since={since}"),
+                amux::ctl::BusOp::Resolve { seq } => format!("resolve {seq}"),
             },
         ),
     }
