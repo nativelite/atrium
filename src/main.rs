@@ -1147,6 +1147,7 @@ fn run(
         }
         let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
         let painted = bar_paint(&infos, rows, cols as usize, note);
+        let mut bar_appended = false;
         if force_repaint
             || splash_drawn
             || painted != last_bar
@@ -1155,6 +1156,27 @@ fn run(
             frame.extend_from_slice(painted.as_bytes());
             last_bar = painted;
             last_bar_paint = Instant::now();
+            bar_appended = true;
+        }
+        // The bar leaves the cursor parked on the bar row. Move it back to the
+        // pane's real cursor with an explicit CUP — NOT DECSC/DECRC, whose single
+        // save slot is shared with the hosted app (claude parks its cursor there
+        // for its own menus; saving/restoring around the bar corrupted it and left
+        // redraw fragments in passthrough). We track the cursor ourselves: the
+        // tiled master carries it, and even a passthrough pane is fed to its
+        // emulator, so `term.screen().cursor` is current. Both are 0-based; the
+        // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
+        // coordinates in either mode.
+        if bar_appended {
+            let cur = if windows[active].tiled() {
+                prev_master.as_ref().map(|m| m.cursor)
+            } else {
+                let fp = windows[active].tree.focus();
+                windows[active].pane(fp).map(|p| p.term.screen().cursor)
+            };
+            if let Some((cr, cc)) = cur {
+                frame.extend_from_slice(format!("\x1b[{};{}H", cr + 1, cc + 1).as_bytes());
+            }
         }
         // Emit the tick's composite+bar as ONE synchronized frame, so the outer
         // terminal never shows it half-drawn (the tiled "shutter"). Nothing to

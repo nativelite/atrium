@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-08-31
+
+### Fixed
+- **Redraw fragments at the bottom of a passthrough pane** (e.g. claude's `/`
+  command menu leaving overlapping text). The status bar painted itself with
+  `ESC 7`/`ESC 8` (DECSC/DECRC), whose single cursor-save slot is **shared** with
+  the hosted app — claude parks its cursor there to draw a popup and restores it
+  later, so a bar repaint landing in between corrupted claude's saved cursor and
+  its next draw landed in the wrong place. amux now tracks the cursor itself (the
+  tiled master carries it; a passthrough pane is fed to its emulator) and
+  repositions with an explicit CUP after the bar instead of DECSC/DECRC — no
+  shared state, no fragments. Tiled mode was already immune (the app's cursor
+  saves never reach the real terminal).
+
 ## [0.20.0] - 2026-08-31
 
 ### Added

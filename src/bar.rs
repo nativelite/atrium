@@ -164,9 +164,13 @@ fn role_style(role: &Role) -> Style {
     }
 }
 
-/// The full escape sequence that paints the themed bar on `row` (1-based) without
-/// disturbing the pane: save cursor, jump, then each segment in its role color
-/// over the bar's dark background, padded to `cols`, then reset and restore. The
+/// The escape sequence that paints the themed bar on `row` (1-based): jump to the
+/// bar row, then each segment in its role color over the bar's dark background,
+/// padded to `cols`, then reset. It leaves the cursor at the end of the bar — the
+/// caller repositions the cursor to the pane's tracked position afterward. It
+/// deliberately does **not** DECSC/DECRC (`ESC 7`/`ESC 8`) around the paint: that
+/// register is shared with the hosted app (claude saves its cursor there for its
+/// own popups), and clobbering it left redraw fragments in passthrough. The
 /// visible text is exactly [`bar_text`]'s (same truncation/padding); only color
 /// escapes differ, and escapes never count toward the `cols` budget.
 pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> String {
@@ -200,7 +204,7 @@ pub fn bar_paint(panes: &[PaneInfo], row: u16, cols: usize, note: &str) -> Strin
     for _ in used..cols {
         body.push(' ');
     }
-    format!("\x1b7\x1b[{row};1H{base_sgr}{body}\x1b[0m\x1b8")
+    format!("\x1b[{row};1H{base_sgr}{body}\x1b[0m")
 }
 
 #[cfg(test)]
