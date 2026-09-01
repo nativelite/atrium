@@ -382,6 +382,14 @@ const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
 /// deliver anyway once the send has waited this long, so a queue never wedges.
 const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
 
+/// Max height (rows) of a spurious "shrink" amux ignores in the resize poll: the
+/// Windows Terminal ConPTY reports a few rows fewer once amux is on the alternate
+/// screen, and adopting it leaves a strip of stale content below the bar. A
+/// height-only shrink no larger than this is treated as that reservation, not a
+/// real resize. Generous enough to cover the observed reserve, small enough that a
+/// genuine window resize (usually larger, and changing width) is still honored.
+const ALT_SCREEN_RESERVE_ROWS: u16 = 8;
+
 /// Find a hosted pane by its global agent id (immutable / mutable).
 fn pane_by_agent(windows: &[Window], id: usize) -> Option<&Pane> {
     windows
@@ -1257,7 +1265,16 @@ fn run(
         if last_size_check.elapsed() >= Duration::from_millis(150) {
             last_size_check = Instant::now();
             if let Ok((r, c)) = term.size() {
-                if (r, c) != (rows, cols) && r >= 3 {
+                // Windows Terminal's ConPTY reports a few rows FEWER once amux is
+                // in the alternate screen buffer (a persistent reservation), and
+                // adopting it makes amux redraw short — leaving a strip of stale
+                // content below the bar (the initial full-screen draw was correct).
+                // Treat a small height-only shrink as that reservation and keep the
+                // current size; real resizes (width change, growth, or a large
+                // shrink) still apply.
+                let altscreen_reserve =
+                    c == cols && r < rows && rows - r <= ALT_SCREEN_RESERVE_ROWS;
+                if (r, c) != (rows, cols) && r >= 3 && !altscreen_reserve {
                     rows = r;
                     cols = c;
                     // Reset the scroll region for the new height, then wipe the
