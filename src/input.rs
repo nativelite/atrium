@@ -51,6 +51,10 @@ pub enum Action {
     /// host captures the mouse); when off, the terminal's native drag-to-select
     /// / copy is restored.
     ToggleMouse,
+    /// Toggle the full-screen **board** dashboard — `Ctrl+A b`. An overlay of the
+    /// shared board (source-of-truth state); keystrokes don't reach the panes
+    /// while it's up.
+    ToggleBoard,
     /// A left-button press at 1-based terminal cell (`col`, `row`) — only
     /// emitted while mouse mode is on. Used to focus the pane under the cursor.
     MouseClick {
@@ -194,6 +198,10 @@ impl PrefixScanner {
                         b'm' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::ToggleMouse);
+                        }
+                        b'b' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::ToggleBoard);
                         }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
@@ -387,5 +395,11 @@ mod scroll_tests {
     fn prefix_bang_opens_a_shell_pane() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b'!']), vec![Action::NewShellPane]);
+    }
+
+    #[test]
+    fn prefix_b_toggles_the_board() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'b']), vec![Action::ToggleBoard]);
     }
 }

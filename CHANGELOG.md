@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-31
+
+### Added
+- **Live board panel — `Ctrl+A b`.** A full-screen dashboard of the shared board:
+  a status glyph + colored `status` (● done green, ○ blocked red, ◐ in-progress),
+  the key bold, remaining fields dim with **clickable URLs**, and the writer in
+  parens. It updates **live** — any `ctl board` write repaints it — while the panes
+  keep running underneath (drained and emulated, just not painted); keystrokes are
+  swallowed so they don't reach the hidden panes, and `Ctrl+A b` again drops you
+  back with the panes repainted and the cursor restored. This is the visual payoff
+  of the board (and the future home for pub/sub bus events). Status colors and the
+  clickable-link rendering are now shared between the panel and the CLI board view.
+
 ## [0.21.3] - 2026-08-31
 
 ### Fixed

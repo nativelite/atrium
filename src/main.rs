@@ -156,6 +156,75 @@ fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
     result
 }
 
+/// Render the full-screen board overlay (`Ctrl+A b`): hide the cursor, clear, and
+/// draw the shared board as colored rows — a status glyph + colored `status`, the
+/// key bold, remaining fields dim (URLs as clickable OSC-8 links), and the writer
+/// in parens. Positioned with absolute CUP per line (no scrolling); the bar row is
+/// left for the status bar.
+fn render_board_panel(board: &amux::board::Board, rows: u16, cols: u16) -> String {
+    use amux::ctl::{hyperlink, is_url, status_glyph, status_sgr};
+    let mut out = String::from("\x1b[?25l\x1b[2J");
+    out.push_str("\x1b[1;1H\x1b[1;38;5;37m  board\x1b[0m  \x1b[2m(Ctrl+A b to close · live)\x1b[0m");
+    out.push_str(&format!(
+        "\x1b[2;1H\x1b[38;5;238m{}\x1b[0m",
+        "\u{2500}".repeat(cols as usize)
+    ));
+    let entries = board.list();
+    if entries.is_empty() {
+        out.push_str(
+            "\x1b[4;1H  \x1b[2m(empty — set one:  amux ctl board set launch status=WIP owner=you)\x1b[0m",
+        );
+        return out;
+    }
+    let key_w = entries
+        .iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 24);
+    let last_row = rows.saturating_sub(2); // leave the bar row (rows) clear
+    let mut row = 3u16;
+    let total = entries.len();
+    for (i, (key, e)) in entries.iter().enumerate() {
+        if row > last_row {
+            out.push_str(&format!(
+                "\x1b[{row};1H  \x1b[2m… {} more (resize taller)\x1b[0m",
+                total - i
+            ));
+            break;
+        }
+        let status = e.fields.get("status").map(String::as_str);
+        let color = status.map(status_sgr).unwrap_or("\x1b[0m");
+        let glyph = status.map(status_glyph).unwrap_or("\u{00B7}");
+        let status_label = status
+            .map(|st| format!("{color}{st}\x1b[0m  "))
+            .unwrap_or_default();
+        let mut fields = String::new();
+        for (f, v) in &e.fields {
+            if f == "status" {
+                continue;
+            }
+            let rendered = if is_url(v) {
+                hyperlink(v, v)
+            } else {
+                v.clone()
+            };
+            fields.push_str(&format!("\x1b[2m{f}=\x1b[0m{rendered}  "));
+        }
+        let by = e
+            .updated_by
+            .as_deref()
+            .map(|b| format!("\x1b[2m(by {b})\x1b[0m"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "\x1b[{row};1H  {color}{glyph}\x1b[0m \x1b[1m{key:<kw$}\x1b[0m  {status_label}{fields}{by}",
+            kw = key_w,
+        ));
+        row += 1;
+    }
+    out
+}
+
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
     const SPIN: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
     let (rows, cols) = (rows as usize, cols as usize);
@@ -591,6 +660,10 @@ fn run(
     } else {
         mouse_on = false;
     }
+    // The full-screen board dashboard overlay (`Ctrl+A b`). While on, the panes
+    // keep running (drained, emulated) but are not painted, and keystrokes don't
+    // reach them — it's a read-only view of the shared board.
+    let mut board_view = false;
     let mut buf = [0u8; 8192];
     let mut force_repaint = true;
     let mut last_bar_paint = Instant::now();
@@ -645,8 +718,12 @@ fn run(
         for action in scanner.feed(&bytes) {
             match action {
                 Action::Forward(b) => {
-                    if let Some(p) = windows[active].focused_mut() {
-                        let _ = p.pty.write(&b);
+                    // While the board overlay is up, swallow input — the panes are
+                    // hidden, so keystrokes shouldn't reach them.
+                    if !board_view {
+                        if let Some(p) = windows[active].focused_mut() {
+                            let _ = p.pty.write(&b);
+                        }
                     }
                 }
                 Action::NextPane => {
@@ -715,6 +792,17 @@ fn run(
                             force_repaint = true;
                         }
                     }
+                }
+                Action::ToggleBoard => {
+                    board_view = !board_view;
+                    // Toggling either way is a full repaint: on → draw the panel
+                    // (it clears the screen); off → recompose/repaint the panes the
+                    // panel covered. On close, restore the cursor the panel hid.
+                    if !board_view {
+                        let _ = write!(out, "\x1b[?25h");
+                    }
+                    prev_master = None;
+                    force_repaint = true;
                 }
                 Action::SplitH => {
                     split_focused(
@@ -956,7 +1044,13 @@ fn run(
                             pane.painted = true;
                         }
                         if !tiled && pane.id == focus {
-                            if first_paint {
+                            if board_view {
+                                // Board overlay is up: keep the passthrough filter
+                                // state current, but don't paint the pane over the
+                                // panel. (The emulator was already fed above, so a
+                                // toggle-off repaints from the current screen.)
+                                let _ = pane.filter.feed(&buf[..n]);
+                            } else if first_paint {
                                 // Hand off from the splash: restore the cursor the
                                 // splash hid, then paint the agent's current screen
                                 // straight from the emulator (its `render_full`
@@ -1149,7 +1243,14 @@ fn run(
         // Set when this tick composited the startup splash into `frame`; its `2J`
         // wipes the bar, so the bar is force-appended below to keep the frame whole.
         let mut splash_drawn = false;
-        if windows[active].tiled() {
+        if board_view {
+            // The board overlay replaces the panes. Re-render only on a repaint
+            // (toggle, or a board write — every ctl request forces one), so idle
+            // ticks leave the panel steady; the bar still paints below.
+            if force_repaint {
+                frame.extend_from_slice(render_board_panel(&board, rows, cols).as_bytes());
+            }
+        } else if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
             match &prev_master {
                 Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
@@ -1227,7 +1328,7 @@ fn run(
         // emulator, so `term.screen().cursor` is current. Both are 0-based; the
         // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
         // coordinates in either mode.
-        if bar_appended {
+        if bar_appended && !board_view {
             let cur = if windows[active].tiled() {
                 prev_master.as_ref().map(|m| m.cursor)
             } else {

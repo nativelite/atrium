@@ -946,7 +946,7 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
             let rendered = if k == "status" {
                 format!("{}{vs}\x1b[0m", status_sgr(vs))
             } else if is_url(vs) {
-                hyperlink(vs)
+                hyperlink(vs, vs)
             } else {
                 vs.to_string()
             };
@@ -964,7 +964,8 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
 
 /// A status string → an SGR color: green done/shipped, red blocked/failed, cyan
 /// in-progress, amber waiting/todo, default otherwise. Case-insensitive substring.
-fn status_sgr(status: &str) -> &'static str {
+/// Shared by the CLI board view and the in-chrome board panel.
+pub fn status_sgr(status: &str) -> &'static str {
     let s = status.to_ascii_lowercase();
     if s.contains("done") || s.contains("ship") || s.contains("complete") || s == "ok" {
         "\x1b[38;5;10m" // green
@@ -980,14 +981,35 @@ fn status_sgr(status: &str) -> &'static str {
 }
 
 /// A value that looks like a web link.
-fn is_url(v: &str) -> bool {
+pub fn is_url(v: &str) -> bool {
     v.starts_with("http://") || v.starts_with("https://")
 }
 
-/// Wrap `url` as an OSC-8 hyperlink (clickable in modern terminals), showing the
-/// url as its own label.
-fn hyperlink(url: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+/// Wrap `url` as an OSC-8 hyperlink (clickable in modern terminals). `label` is
+/// the visible text (pass the url itself to show it verbatim).
+pub fn hyperlink(url: &str, label: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+}
+
+/// A one-glyph status marker for a status string: `●` done, `○` blocked, `◐`
+/// in-progress/waiting, `·` otherwise. Pair with [`status_sgr`] for color.
+pub fn status_glyph(status: &str) -> &'static str {
+    let s = status.to_ascii_lowercase();
+    if s.contains("done") || s.contains("ship") || s.contains("complete") || s == "ok" {
+        "\u{25CF}" // ●
+    } else if s.contains("block") || s.contains("fail") || s.contains("stuck") {
+        "\u{25CB}" // ○
+    } else if s.contains("wip")
+        || s.contains("progress")
+        || s.contains("working")
+        || s.contains("wait")
+        || s.contains("todo")
+        || s.contains("pending")
+    {
+        "\u{25D0}" // ◐
+    } else {
+        "\u{00B7}" // ·
+    }
 }
 
 /// Turn `amux ctl` argv (after the `ctl` word) + caller id into a JSON request
