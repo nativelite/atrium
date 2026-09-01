@@ -108,7 +108,7 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
     }
     if note.is_empty() {
         segs.push(seg(
-            String::from("| ^A c:win \":% split hjkl:focus z:zoom m:mouse x:kill q:quit"),
+            String::from("| ^A c:win !:shell \":% split hjkl:focus z:zoom m:mouse x:kill q:quit"),
             Role::Keys,
         ));
     } else {

@@ -32,6 +32,10 @@ pub enum Action {
     NextPane,
     PrevPane,
     NewPane,
+    /// Open a plain **shell** in a new window — `Ctrl+A !`. Unlike `NewPane`
+    /// (which runs the launch command, e.g. claude), this gives you a shell to
+    /// drive `amux ctl` from and see its rendered output.
+    NewShellPane,
     KillPane,
     /// Switch to pane index (0-based; from digits 1-9).
     SwitchTo(usize),
@@ -162,6 +166,10 @@ impl PrefixScanner {
                         b'c' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::NewPane);
+                        }
+                        b'!' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::NewShellPane);
                         }
                         b'x' => {
                             flush(&mut run, &mut actions);
@@ -373,5 +381,11 @@ mod scroll_tests {
         let mut s = PrefixScanner::new();
         let out = s.feed(b"\x1b[<64;12;7M");
         assert!(matches!(out.as_slice(), [Action::Forward(_)]));
+    }
+
+    #[test]
+    fn prefix_bang_opens_a_shell_pane() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'!']), vec![Action::NewShellPane]);
     }
 }

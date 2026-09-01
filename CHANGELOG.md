@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.2] - 2026-08-31
+
+### Added
+- **`Ctrl+A !` opens a plain shell in a new window.** Every other pane runs your
+  launch command (e.g. claude); this gives you a shell to drive `amux ctl` from —
+  so you can run `amux ctl board list` and actually *see* the rendered, colored,
+  clickable board view (agent tool-output panes render it plainly). The shell gets
+  the ctl env injected like any pane, but no trust posture (it isn't an agent).
+  Uses `$SHELL` / `%COMSPEC%`.
+
 ## [0.21.1] - 2026-08-31
 
 ### Added

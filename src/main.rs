@@ -677,6 +677,36 @@ fn run(
                         }
                     }
                 }
+                Action::NewShellPane => {
+                    // A plain shell in a new window — no identity, no trust posture
+                    // (it's not an agent), but it still gets the ctl env injected,
+                    // so you can run `amux ctl board list` here and see it rendered.
+                    let shell = vec![default_shell()];
+                    match spawn_window(
+                        &shell,
+                        rows,
+                        cols,
+                        windows.len(),
+                        None,
+                        amux::ctl::TrustMode::Off,
+                        &mut flash,
+                    ) {
+                        Ok(w) => {
+                            windows.push(w);
+                            let last = windows.len() - 1;
+                            switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
+                            prev_master = None;
+                            force_repaint = true;
+                        }
+                        Err(e) => {
+                            flash = Some((
+                                format!("cannot start shell {:?}: {e}", shell[0]),
+                                Instant::now(),
+                            ));
+                            force_repaint = true;
+                        }
+                    }
+                }
                 Action::SplitH => {
                     split_focused(
                         &mut windows[active],
