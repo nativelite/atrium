@@ -832,6 +832,12 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|p| p.parse::<usize>().ok());
 
+    // `--json` prints the raw reply (for scripting); otherwise a `board` view
+    // renders as a colored table with clickable links.
+    let raw_json = args.iter().any(|a| a == "--json");
+    let filtered: Vec<String> = args.iter().filter(|a| a.as_str() != "--json").cloned().collect();
+    let args = &filtered[..];
+
     let request = match build_request(args, caller) {
         Ok(r) => r,
         Err(msg) => {
@@ -847,7 +853,15 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
 
     match crate::ipc::request(&address, &request) {
         Ok(reply) => {
-            println!("{reply}");
+            // A `board` result renders as a table (unless --json); everything else
+            // prints its JSON reply verbatim.
+            match (args.first().map(String::as_str), raw_json) {
+                (Some("board"), false) => match render_board(&reply) {
+                    Some(view) => println!("{view}"),
+                    None => println!("{reply}"),
+                },
+                _ => println!("{reply}"),
+            }
             let ok = json::parse(&reply)
                 .ok()
                 .and_then(|v| v.get("ok").and_then(json::Value::as_bool))
@@ -863,6 +877,117 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Render a `board` reply as a human view: one line per entry, the `status`
+/// field colored, `http(s)` values as OSC-8 clickable links, and the writer dim
+/// in parens. `None` if the reply isn't a board result (caller falls back to the
+/// raw JSON). Escapes are cosmetic — piping `--json` gives the machine form.
+fn render_board(reply: &str) -> Option<String> {
+    let v = json::parse(reply).ok()?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    // list → a table of entries (each carrying its own inline "key").
+    if let Some(arr) = v.get("board").and_then(Value::as_array) {
+        if arr.is_empty() {
+            return Some("  (board is empty)".to_string());
+        }
+        let body = arr
+            .iter()
+            .map(|e| {
+                let key = e.get("key").and_then(Value::as_str).unwrap_or("?");
+                render_entry_line(key, e)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(body);
+    }
+    // del → a one-line confirmation.
+    if let Some(deleted) = v.get("deleted").and_then(Value::as_bool) {
+        let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
+        return Some(format!(
+            "  {key}: {}",
+            if deleted {
+                "removed"
+            } else {
+                "was not on the board"
+            }
+        ));
+    }
+    // get/set → one entry (or "not on the board").
+    if let Some(key) = v.get("key").and_then(Value::as_str) {
+        return Some(match v.get("entry") {
+            Some(Value::Null) | None => format!("  {key}: (not on the board)"),
+            Some(entry) => render_entry_line(key, entry),
+        });
+    }
+    None
+}
+
+/// Format one board entry: `● key   status=DONE  owner=Max  url=<link>  (by dev_1)`.
+/// `entry` is `{by, ms, fields:{…}}`; the `key` is passed in (list entries carry it
+/// inline, get/set entries don't).
+fn render_entry_line(key: &str, entry: &Value) -> String {
+    let empty: &[(String, Value)] = &[];
+    let fields = entry.get("fields").and_then(Value::as_object).unwrap_or(empty);
+    let status = fields
+        .iter()
+        .find(|(k, _)| k == "status")
+        .and_then(|(_, v)| v.as_str());
+    let glyph = match status {
+        Some(st) => format!("{}\u{25CF}\x1b[0m ", status_sgr(st)),
+        None => "  ".to_string(),
+    };
+    let field_str = fields
+        .iter()
+        .map(|(k, v)| {
+            let vs = v.as_str().unwrap_or("");
+            let rendered = if k == "status" {
+                format!("{}{vs}\x1b[0m", status_sgr(vs))
+            } else if is_url(vs) {
+                hyperlink(vs)
+            } else {
+                vs.to_string()
+            };
+            format!("{k}={rendered}")
+        })
+        .collect::<Vec<_>>()
+        .join("  ");
+    let by = entry
+        .get("by")
+        .and_then(Value::as_str)
+        .map(|b| format!("  \x1b[2m(by {b})\x1b[0m"))
+        .unwrap_or_default();
+    format!("{glyph}\x1b[1m{key:<12}\x1b[0m {field_str}{by}")
+}
+
+/// A status string → an SGR color: green done/shipped, red blocked/failed, cyan
+/// in-progress, amber waiting/todo, default otherwise. Case-insensitive substring.
+fn status_sgr(status: &str) -> &'static str {
+    let s = status.to_ascii_lowercase();
+    if s.contains("done") || s.contains("ship") || s.contains("complete") || s == "ok" {
+        "\x1b[38;5;10m" // green
+    } else if s.contains("block") || s.contains("fail") || s.contains("stuck") {
+        "\x1b[38;5;9m" // red
+    } else if s.contains("wip") || s.contains("progress") || s.contains("working") {
+        "\x1b[38;5;14m" // cyan
+    } else if s.contains("wait") || s.contains("todo") || s.contains("pending") {
+        "\x1b[38;5;11m" // amber
+    } else {
+        "\x1b[0m"
+    }
+}
+
+/// A value that looks like a web link.
+fn is_url(v: &str) -> bool {
+    v.starts_with("http://") || v.starts_with("https://")
+}
+
+/// Wrap `url` as an OSC-8 hyperlink (clickable in modern terminals), showing the
+/// url as its own label.
+fn hyperlink(url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
 }
 
 /// Turn `amux ctl` argv (after the `ctl` word) + caller id into a JSON request
@@ -1417,6 +1542,43 @@ mod tests {
             parse_request(&del).unwrap().cmd,
             Cmd::Board(BoardOp::Del { key }) if key == "auth"
         ));
+    }
+
+    #[test]
+    fn board_view_renders_status_color_and_clickable_url() {
+        // A list reply renders each entry with a colored status and an OSC-8 link.
+        let reply = r#"{"ok":true,"board":[{"key":"auth","by":"dev_1","ms":1,"fields":{"status":"DONE","owner":"Max","url":"https://x.io"}}]}"#;
+        let view = render_board(reply).unwrap();
+        assert!(view.contains("auth"), "key present");
+        assert!(view.contains("owner=Max"));
+        assert!(view.contains("\x1b[38;5;10m"), "DONE is green");
+        // The url is wrapped as an OSC-8 hyperlink, not shown as bare text only.
+        assert!(view.contains("\x1b]8;;https://x.io\x1b\\"), "url is clickable");
+        assert!(view.contains("(by dev_1)"));
+    }
+
+    #[test]
+    fn board_view_handles_empty_and_missing() {
+        assert_eq!(
+            render_board(r#"{"ok":true,"board":[]}"#).unwrap(),
+            "  (board is empty)"
+        );
+        assert!(render_board(r#"{"ok":true,"key":"x","entry":null}"#)
+            .unwrap()
+            .contains("not on the board"));
+        // A non-board (or failed) reply → None, so the caller prints raw JSON.
+        assert!(render_board(r#"{"ok":true,"pane":3}"#).is_none());
+        assert!(render_board(r#"{"ok":false,"err":"nope"}"#).is_none());
+    }
+
+    #[test]
+    fn status_color_map() {
+        assert_eq!(status_sgr("DONE"), "\x1b[38;5;10m");
+        assert_eq!(status_sgr("Blocked on api"), "\x1b[38;5;9m");
+        assert_eq!(status_sgr("wip"), "\x1b[38;5;14m");
+        assert_eq!(status_sgr("waiting"), "\x1b[38;5;11m");
+        assert_eq!(status_sgr("anything else"), "\x1b[0m");
+        assert!(is_url("https://x") && !is_url("Max"));
     }
 
     #[test]

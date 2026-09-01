@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-08-31
+
+### Added
+- **Rendered board view with clickable links.** `amux ctl board list` / `get` /
+  `set` now print a human table instead of raw JSON: one line per entry, the
+  `status` field **colored** (green done/shipped, red blocked, cyan in-progress,
+  amber waiting), any `http(s)` value rendered as an **OSC-8 clickable hyperlink**,
+  and the writer shown dim (`by …`). Field names stay freeform — the coloring keys
+  off whatever you put in `status`, and links off anything URL-shaped. Pass
+  `--json` for the raw machine reply (scripting). `del` prints a one-line
+  confirmation.
+
 ## [0.21.0] - 2026-08-31
 
 ### Added
