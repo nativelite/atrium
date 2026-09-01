@@ -59,6 +59,23 @@ do NOT return a value to you.
 Poll status until teammates are idle, then read the files they changed and
 integrate. Use `amux ctl audit` to review what you delegated and how it resolved.
 
+## The board — shared source of truth
+
+Coordinate through the **board**, the durable shared state for the team, instead
+of scraping each teammate's transcript. You set the tasks; teammates update their
+own status; you read the roll-up to decide next moves.
+
+    amux ctl board set <key> <field=value...>   # e.g. board set auth status=WIP owner=dev_1
+    amux ctl board get <key>                     # one entry's fields
+    amux ctl board list                          # the whole board
+    amux ctl board del <key>                     # remove an entry
+
+Give each teammate a `--role` and, in its brief, tell it to update its own board
+entry as it works (`amux ctl board set <its-task> status=DONE url=…`). Then you
+poll `board list` for current truth — `owner`, `status`, `blocker` — rather than
+re-reading conversations. An empty field value clears it. Every write records who
+made it; the board is shared by the whole session (no per-teammate walls).
+
 ## Finish cleanly — always reap
 
 Reaping is part of the job, not optional. As soon as you have collected a

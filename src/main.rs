@@ -603,6 +603,13 @@ fn run(
     // keystrokes; amux can never care about a session that stopped writing
     // before it started. Thereafter: bound panes tail ~1 s, discovery ~5 s
     // (accelerated to ~1 s while any agent pane is still unbound).
+    // The shared board (coordination layer): source-of-truth team state, in-memory
+    // unless AMUX_BOARD names a snapshot file. Part of the ctl surface, so it is
+    // already gated by `--allow-ctl`.
+    let mut board = match std::env::var_os(amux::board::ENV_BOARD) {
+        Some(p) if !p.is_empty() => amux::board::Board::with_file(std::path::PathBuf::from(p)),
+        _ => amux::board::Board::new(),
+    };
     let mut world = agsess::World::new(agsess::default_root());
     let process_start_ms = agsess::sessions::now_ms();
     world.refresh_since(process_start_ms);
@@ -857,6 +864,7 @@ fn run(
                             &world,
                             identity,
                             &mut ctl_audit,
+                            &mut board,
                         );
                         let _ = listener.respond(&reply);
                         prev_master = None;
@@ -1650,6 +1658,7 @@ fn apply_ctl(
     world: &agsess::World,
     session_identity: Option<&str>,
     audit: &mut amux::audit::Audit,
+    board: &mut amux::board::Board,
 ) -> String {
     use amux::ctl::{self, Cmd};
 
@@ -1683,6 +1692,7 @@ fn apply_ctl(
         world,
         session_identity,
         privileged,
+        board,
     );
     let (ok, note) = audit_outcome(&reply);
     audit.record(caller, action, &detail, ok, &note);
@@ -1708,6 +1718,7 @@ fn dispatch_ctl(
     world: &agsess::World,
     session_identity: Option<&str>,
     privileged: bool,
+    board: &mut amux::board::Board,
 ) -> String {
     use amux::ctl::{self, Cmd};
     let caller = req.caller;
@@ -1860,6 +1871,37 @@ fn dispatch_ctl(
         }
         // `audit` is handled in `apply_ctl` (it needs the log); never reaches here.
         Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
+        Cmd::Board(op) => {
+            // The board is SHARED team state: any pane in the session reads and
+            // writes the same source of truth (no subtree scoping — coordination
+            // is the team's job, and `updated_by` + the audit log keep it
+            // accountable). Single-writer daemon ⇒ no locking.
+            let by = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .map(|p| {
+                    p.role
+                        .clone()
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id))
+                })
+                .or_else(|| Some("operator".to_string()));
+            match op {
+                ctl::BoardOp::Set { key, fields } => {
+                    let e = board.set(&key, &fields, by.as_deref(), agsess::sessions::now_ms());
+                    ctl::reply_board_entry(&key, Some(amux::board::entry_to_value(&e)))
+                }
+                ctl::BoardOp::Get { key } => {
+                    let entry = board.get(&key).map(amux::board::entry_to_value);
+                    ctl::reply_board_entry(&key, entry)
+                }
+                ctl::BoardOp::List => {
+                    ctl::reply_board_list(amux::board::entries_to_value(&board.list()))
+                }
+                ctl::BoardOp::Del { key } => {
+                    let deleted = board.del(&key);
+                    ctl::reply_board_del(&key, deleted)
+                }
+            }
+        }
     }
 }
 
@@ -1914,6 +1956,17 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
         }
         Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
         Cmd::Audit(_) => ("audit", String::new()),
+        Cmd::Board(op) => (
+            "board",
+            match op {
+                amux::ctl::BoardOp::Set { key, fields } => {
+                    format!("set {key} fields={}", fields.len())
+                }
+                amux::ctl::BoardOp::Get { key } => format!("get {key}"),
+                amux::ctl::BoardOp::List => "list".to_string(),
+                amux::ctl::BoardOp::Del { key } => format!("del {key}"),
+            },
+        ),
     }
 }
 

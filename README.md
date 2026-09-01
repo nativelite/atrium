@@ -345,6 +345,24 @@ and prints the one-line JSON reply.
 | `amux ctl status [<target>]` | One target's status, or (no target) a roll-up of the caller's subtree. Backed by `agsess` — `working` / `waiting-approval` / `waiting-prompt` / `idle` (or `null` if unbound). | `{"ok":true,"pane":3,"status":"working"}` |
 | `amux ctl kill <target>` | Terminate a worker **and its whole subtree** (a lead's kill reaps its ICs). The dead panes' windows re-tile / close on the next tick. | `{"ok":true,"killed":[3,4,5]}` |
 | `amux ctl audit [N]` | The control-request log (most recent `N`, or all), for reconstructing a run. | `{"ok":true,"audit":[{"seq":1,"caller":0,"action":"spawn","detail":"role=dev_1 argv=claude identity=-","ok":true,"note":"pane=1"},…]}` |
+| `amux ctl board set <key> <field=value…>` | Merge fields into the shared board (create if absent); an empty value clears a field. | `{"ok":true,"key":"auth","entry":{"by":"dev_1","ms":…,"fields":{"status":"DONE","owner":"Max"}}}` |
+| `amux ctl board get <key>` / `list` / `del <key>` | Read one entry, roll up the whole board, or remove an entry. | `{"ok":true,"board":[{"key":"auth","by":"dev_1","fields":{"status":"DONE"}},…]}` |
+
+### The board — shared source of truth
+
+`send` is the ephemeral message stream ("I just shipped auth"); the **board** is
+the durable current truth (`auth: DONE, owner: Max, url: …`). It's a schemaless
+`key → fields` tracker living in the amux daemon — and because amux is the single
+broker process every pane talks to, it's a plain map behind the pipe: **single
+writer, no locking, no consensus.** A coordinating lead sets tasks and reads
+`board list` for status/owner/blocker instead of re-scraping each teammate's
+transcript; teammates update their own entry as they work. It's part of the ctl
+surface, so it's gated by `--allow-ctl`; set **`AMUX_BOARD=<file>`** to persist it
+across restarts (in-memory otherwise). Every write records who made it (in the
+`audit` log and the entry's `by`), but the board is shared by the whole session —
+no per-teammate walls. (This is the first half of amux's coordination layer; a
+topic-routed pub/sub bus is the planned second half, to be extracted with the
+board into an `abus` org crate.)
 
 ### The security model — the part that must be right
 

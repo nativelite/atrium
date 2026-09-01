@@ -17,6 +17,7 @@
 
 pub mod audit;
 pub mod bar;
+pub mod board;
 pub mod bind;
 pub mod ctl;
 pub mod filter;

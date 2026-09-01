@@ -60,6 +60,8 @@ pub enum Cmd {
     /// Report the ctl request log (subtree-scoped for a worker), most recent
     /// `tail` entries or all of the in-memory ring.
     Audit(AuditReq),
+    /// Read or write the shared board — the team's source-of-truth tracker.
+    Board(BoardOp),
 }
 
 /// A `kill` request's payload.
@@ -90,6 +92,23 @@ pub struct SendReq {
 pub struct StatusReq {
     /// A specific pane id/role, or `None` for the caller's subtree roll-up.
     pub target: Option<String>,
+}
+
+/// A `board` operation — the shared source-of-truth tracker.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BoardOp {
+    /// Merge `fields` into entry `key` (create if absent); an empty value clears
+    /// that field.
+    Set {
+        key: String,
+        fields: Vec<(String, String)>,
+    },
+    /// Read one entry's fields.
+    Get { key: String },
+    /// Roll up every entry.
+    List,
+    /// Remove an entry.
+    Del { key: String },
 }
 
 /// A `spawn` request's payload.
@@ -537,9 +556,14 @@ cannot elevate itself). \
 Each teammate is a VISIBLE amux pane the human can watch, steer, and \
 take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
-invisibly and defeat the purpose of amux. Run amux ctl with no arguments for the \
-full command surface, or use the amux-coordinate or amux-delegate skills for the \
-full workflow.";
+invisibly and defeat the purpose of amux. \
+Track shared team state on the board instead of re-reading transcripts: \
+amux ctl board set KEY field=value records current truth (status, owner, \
+blocker, url), amux ctl board get KEY reads one entry, and amux ctl board list \
+shows the whole board. Update the board when your status changes so the lead and \
+your teammates see it. \
+Run amux ctl with no arguments for the full command surface, or use the \
+amux-coordinate or amux-delegate skills for the full workflow.";
 
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
@@ -618,6 +642,39 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .map(|n| n.max(0) as usize);
             Cmd::Audit(AuditReq { tail })
         }
+        Some("board") => {
+            let key = || -> Result<String, String> {
+                v.get("key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| "board needs a key".to_string())
+            };
+            let op = match v.get("op").and_then(Value::as_str) {
+                Some("set") => {
+                    let fields = v
+                        .get("fields")
+                        .and_then(Value::as_object)
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|(k, val)| {
+                                    val.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    BoardOp::Set { key: key()?, fields }
+                }
+                Some("get") => BoardOp::Get { key: key()? },
+                Some("list") => BoardOp::List,
+                Some("del") => BoardOp::Del { key: key()? },
+                other => {
+                    return Err(format!(
+                        "board op must be set|get|list|del (got {other:?})"
+                    ))
+                }
+            };
+            Cmd::Board(op)
+        }
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
     };
@@ -641,6 +698,34 @@ fn i(n: usize) -> Value {
 /// `{"ok":false,"err":"<msg>"}`
 pub fn reply_err(msg: &str) -> String {
     obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]).to_string()
+}
+
+/// `{"ok":true,"key":<key>,"entry":<entry|null>}` — a board `get`/`set` result.
+/// `entry` (built by [`crate::board::entry_to_value`]) is `null` when the key is
+/// absent. The caller passes the rendered value so this layer stays independent of
+/// the board's internals.
+pub fn reply_board_entry(key: &str, entry: Option<Value>) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("key", s(key)),
+        ("entry", entry.unwrap_or(Value::Null)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"board":[{key,by,ms,fields}, …]}` — the whole board (a `list`).
+pub fn reply_board_list(board: Value) -> String {
+    obj(vec![("ok", Value::Bool(true)), ("board", board)]).to_string()
+}
+
+/// `{"ok":true,"key":<key>,"deleted":<bool>}` — a board `del`.
+pub fn reply_board_del(key: &str, deleted: bool) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("key", s(key)),
+        ("deleted", Value::Bool(deleted)),
+    ])
+    .to_string()
 }
 
 /// `{"ok":true,"pane":<id>,"role":<role|null>,"session":<sid|null>,"note":<note|null>}`.
@@ -753,7 +838,8 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             eprintln!("amux ctl: {msg}");
             eprintln!(
                 "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
-                 \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]"
+                 \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
+                 \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>"
             );
             return ExitCode::FAILURE;
         }
@@ -896,10 +982,51 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                 pairs.push(("tail", Value::Number(Number::Int(n as i64))));
             }
         }
+        Some("board") => {
+            pairs.push(("cmd", s("board")));
+            let sub = args
+                .get(1)
+                .map(String::as_str)
+                .ok_or_else(|| "board needs set|get|list|del".to_string())?;
+            pairs.push(("op", s(sub)));
+            match sub {
+                "set" => {
+                    let key = args
+                        .get(2)
+                        .filter(|t| !t.starts_with('-'))
+                        .ok_or_else(|| "board set needs a key".to_string())?;
+                    pairs.push(("key", Value::String(key.clone())));
+                    // Remaining args are `field=value` pairs (empty value clears).
+                    let mut fields: Vec<(String, Value)> = Vec::new();
+                    for a in &args[3.min(args.len())..] {
+                        let (f, val) = a.split_once('=').ok_or_else(|| {
+                            format!("board set: expected field=value, got {a:?}")
+                        })?;
+                        fields.push((f.to_string(), Value::String(val.to_string())));
+                    }
+                    if fields.is_empty() {
+                        return Err("board set needs at least one field=value".to_string());
+                    }
+                    pairs.push(("fields", Value::Object(fields)));
+                }
+                "get" | "del" => {
+                    let key = args
+                        .get(2)
+                        .filter(|t| !t.starts_with('-'))
+                        .ok_or_else(|| format!("board {sub} needs a key"))?;
+                    pairs.push(("key", Value::String(key.clone())));
+                }
+                "list" => {}
+                other => {
+                    return Err(format!("board op must be set|get|list|del (got {other:?})"))
+                }
+            }
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
-                "needs a subcommand: spawn | list | send | status | kill | audit".to_string(),
+                "needs a subcommand: spawn | list | send | status | kill | audit | board"
+                    .to_string(),
             )
         }
     }
@@ -1253,6 +1380,54 @@ mod tests {
         assert!(build_request(&v(&["spawn", "--mode", "yolo", "--", "claude"]), None)
             .unwrap_err()
             .contains("--mode"));
+    }
+
+    #[test]
+    fn build_board_set_roundtrips_through_parse() {
+        // `board set auth status=DONE owner=Max` → BoardOp::Set with both fields.
+        let line = build_request(
+            &v(&["board", "set", "auth", "status=DONE", "owner=Max"]),
+            Some(0),
+        )
+        .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Board(BoardOp::Set { key, fields }) => {
+                assert_eq!(key, "auth");
+                assert!(fields.contains(&("status".to_string(), "DONE".to_string())));
+                assert!(fields.contains(&("owner".to_string(), "Max".to_string())));
+            }
+            _ => panic!("expected board set"),
+        }
+    }
+
+    #[test]
+    fn build_board_get_list_del_roundtrip() {
+        let get = build_request(&v(&["board", "get", "auth"]), None).unwrap();
+        assert!(matches!(
+            parse_request(&get).unwrap().cmd,
+            Cmd::Board(BoardOp::Get { key }) if key == "auth"
+        ));
+        let list = build_request(&v(&["board", "list"]), None).unwrap();
+        assert!(matches!(
+            parse_request(&list).unwrap().cmd,
+            Cmd::Board(BoardOp::List)
+        ));
+        let del = build_request(&v(&["board", "del", "auth"]), None).unwrap();
+        assert!(matches!(
+            parse_request(&del).unwrap().cmd,
+            Cmd::Board(BoardOp::Del { key }) if key == "auth"
+        ));
+    }
+
+    #[test]
+    fn board_set_needs_a_field() {
+        // A key with no field=value is a clear client error, and a bad pair too.
+        assert!(build_request(&v(&["board", "set", "auth"]), None)
+            .unwrap_err()
+            .contains("field=value"));
+        assert!(build_request(&v(&["board", "set", "auth", "nofieldeq"]), None)
+            .unwrap_err()
+            .contains("field=value"));
     }
 
     #[test]

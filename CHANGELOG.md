@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-31
+
+### Added
+- **The shared board — a source-of-truth tracker for a coordinating team.** New
+  `amux ctl board set <key> <field=value…> | get <key> | list | del <key>`. Where
+  `send` is the ephemeral message stream, the board is the durable current truth
+  (`auth: DONE, owner: Max, url: …`) — a schemaless `key → fields` map living in
+  the amux daemon. Because amux is the single broker process, it's a plain map
+  behind the pipe: single writer, no locking, no consensus. A lead reads
+  `board list` for status/owner/blocker instead of re-scraping teammate
+  transcripts (the readback gap from real use); teammates update their own entry
+  as they work. Shared by the whole session (no per-teammate walls); every write
+  records `by` and is audited. Gated by `--allow-ctl`; set `AMUX_BOARD=<file>` to
+  persist across restarts (in-memory otherwise). The injected agent directive and
+  the amux-coordinate skill now teach teammates to keep the board current.
+
+  This is the first increment of amux's coordination layer; a topic-routed pub/sub
+  bus (structured `fyi` vs `decision_needed` events, backpressure) is the planned
+  second half, at which point the board + bus extract into an `abus` org crate.
+  New `amux::board` module (`Board`, `Entry`, snapshot persistence).
+
 ## [0.20.1] - 2026-08-31
 
 ### Fixed
