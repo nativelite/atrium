@@ -2954,26 +2954,32 @@ fn spawn_pane_full(
     // not silent, and never unauthenticated-without-saying-so (§7).
     let pty = if inject {
         let name = identity.expect("wants_env implies Some");
-        match akey::resolve(name) {
-            Ok(env) => {
-                // `env` holds secret values; merged with the (non-secret) ctl
-                // base env for this one spawn, then dropped. Deliberately never
-                // formatted, logged, or stored.
-                let mut merged = base_env.clone();
-                merged.extend(env);
-                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &merged, cwd)?
-            }
-            Err(e) => {
-                // Name only in the message — `e` is akey's own error text
-                // ("no key or WIF profile named …"), which carries the name the
-                // user typed, never any secret value.
-                *flash = Some((
-                    format!("identity {name:?} unresolved: {e} — running without it"),
-                    Instant::now(),
-                ));
-                pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
+        // An identity may be a comma-separated list (`work,hf`) so one agent gets
+        // several keys at once — each resolves to its own env var(s) and they are
+        // merged. A later entry that maps to the same var wins. The resolved env
+        // holds secret values: merged with the (non-secret) ctl base env for this
+        // one spawn, then dropped — never formatted, logged, or stored.
+        let mut merged = base_env.clone();
+        let mut failed: Vec<String> = Vec::new();
+        for part in name.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            match akey::resolve(part) {
+                Ok(env) => merged.extend(env),
+                // Names only in the message (akey's error carries the typed name,
+                // never a secret); one bad name doesn't sink the others.
+                Err(_) => failed.push(part.to_string()),
             }
         }
+        if !failed.is_empty() {
+            *flash = Some((
+                format!(
+                    "identity {:?} unresolved — running without {}",
+                    failed.join(","),
+                    if merged.len() == base_env.len() { "credentials" } else { "those" }
+                ),
+                Instant::now(),
+            ));
+        }
+        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &merged, cwd)?
     } else {
         pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
     };

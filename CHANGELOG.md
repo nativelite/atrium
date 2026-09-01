@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [`abus`]: https://github.com/nativelite/abus
 
 ### Added
+- **`--identity` accepts multiple keys — one agent, several credentials.** Give a
+  comma-separated list (`amux --identity work,hf claude`) and each resolves to its
+  own environment variable(s) and they're all injected into that pane. Pairs with
+  the new `akey` per-key env-var support: `akey set hf --for huggingface` stores a
+  Hugging Face token as `HF_TOKEN`, `akey set X --env VAR` for anything custom — so
+  an agent can hold, say, `ANTHROPIC_API_KEY` + `HF_TOKEN` at once. A name that
+  fails to resolve is surfaced in the bar without sinking the others.
 - **Command prompt — `Ctrl+A :` — open any shell/program in a new pane.** Type a
   command line (e.g. `wsl`, `wsl -d Ubuntu`, `pwsh -NoLogo`, `claude`, a quoted
   path with spaces) and Enter opens it in a new window, mid-session — no longer
