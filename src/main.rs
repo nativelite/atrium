@@ -113,6 +113,15 @@ fn term_blank(t: &vterm::Term) -> bool {
     true
 }
 
+/// True if `bytes` contains a full-screen erase (`ESC[2J` or `ESC[3J`). Unlike a
+/// scroll, `2J`/`3J` ignore the scroll region and wipe the whole screen — the bar
+/// row included — so amux must repaint the bar after one.
+fn clears_screen(bytes: &[u8]) -> bool {
+    bytes
+        .windows(4)
+        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
+}
+
 /// Sniff a pty output chunk for the app turning mouse tracking on/off — a
 /// DECSET/DECRST for private mode 1000/1002/1003 (`ESC [ ? … h` / `… l`). Returns
 /// `Some(true)` if the chunk last enabled mouse, `Some(false)` if it last
@@ -956,9 +965,22 @@ fn run(
                                 let full = pane.term.screen().render_full();
                                 let _ = out.write_all(b"\x1b[?25h");
                                 let _ = out.write_all(&full);
+                                // render_full cleared the whole screen (the bar row
+                                // too); repaint the bar this tick so it never blinks
+                                // out during the handoff.
+                                force_repaint = true;
                             } else if pane.painted {
                                 let cleaned = pane.filter.feed(&buf[..n]);
                                 let _ = out.write_all(&cleaned);
+                                // A full-screen clear from the app (claude emits one
+                                // at startup, and again as its UI settles) ignores
+                                // the scroll region and wipes the bar row. Repaint the
+                                // bar this tick so it doesn't vanish until some later
+                                // trigger (which is why it only appeared once ctl/
+                                // remote-control connected).
+                                if clears_screen(&buf[..n]) {
+                                    force_repaint = true;
+                                }
                             } else {
                                 // Still on the splash: keep the passthrough filter's
                                 // state current, but suppress output so the agent's
@@ -1406,7 +1428,11 @@ fn switch_window(
     for p in windows[to].panes.iter_mut() {
         p.activity = false;
     }
-    let _ = write!(out, "\x1b[2J\x1b[H");
+    // Re-assert the bar-protecting scroll region (rows-1) before clearing: a
+    // passthrough app (claude) may have changed or reset the real terminal's
+    // scroll region while it ran, and without restoring it the next pane can
+    // scroll into the bar row.
+    let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows.saturating_sub(1).max(1));
     let _ = out.flush();
     resize_window(&mut windows[to], rows, cols);
 }
@@ -1415,7 +1441,9 @@ fn switch_window(
 /// repaints in full (ConPTY always does; Unix full-screen apps redraw on
 /// SIGWINCH). Used on window switch and mode changes into passthrough.
 fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
-    let _ = write!(out, "\x1b[2J\x1b[H");
+    // Re-assert the bar-protecting scroll region (see `switch_window`) before the
+    // repaint nudge, so the refreshed pane stays out of the bar row.
+    let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows.saturating_sub(1).max(1));
     let _ = out.flush();
     let ar = rows.saturating_sub(1).max(1);
     let focus = w.tree.focus();

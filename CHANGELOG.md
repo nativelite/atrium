@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.3] - 2026-08-31
+
+### Fixed
+- **The status bar no longer disappears on initial load** (until the agent's UI
+  settled / remote-control connected). A passthrough app emits a full-screen erase
+  (`ESC[2J`) at startup and again as it settles; `2J` ignores the scroll region and
+  wipes the bar row, and amux only repainted the bar on a change or a 500 ms
+  heartbeat. amux now repaints the bar immediately after the splash→app handoff and
+  after any full-screen clear, so the bar is present from the first frame.
+- **A newly-switched passthrough pane no longer scrolls into the bar row** (seen as
+  the `Ctrl+A !` shell "shrinking" a row after the first command). `switch_window`
+  and the repaint nudge now re-assert the bar-protecting scroll region (`rows-1`)
+  before clearing — a passthrough app can reset the real terminal's scroll region
+  while it runs, and without restoring it the next pane could scroll over the bar.
+
 ## [0.21.2] - 2026-08-31
 
 ### Added
