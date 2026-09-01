@@ -1158,7 +1158,7 @@ fn run(
         }
 
         // 5. resize propagation
-        if last_size_check.elapsed() >= Duration::from_millis(400) {
+        if last_size_check.elapsed() >= Duration::from_millis(150) {
             last_size_check = Instant::now();
             if let Ok((r, c)) = term.size() {
                 if (r, c) != (rows, cols) && r >= 3 {
@@ -1180,6 +1180,23 @@ fn run(
                     // and resize share, so their inner-rect math cannot drift.
                     for w in windows.iter_mut() {
                         resize_window(w, rows, cols);
+                    }
+                    // Force a full redraw of the focused passthrough pane at the new
+                    // size with a *second* resize (to size-1, then size). A single
+                    // resize can be missed by an app mid-boot or mid-reconnect —
+                    // claude keeps drawing at the stale size, ending up in a corner
+                    // of the larger terminal. The extra resize guarantees a fresh
+                    // SIGWINCH/redraw. (The `force_repaint` path below only nudges
+                    // once the pane has painted, so it misses exactly the boot
+                    // window the founder hit; this covers it.)
+                    if !windows[active].tiled() {
+                        let ar = rows.saturating_sub(1).max(1);
+                        let focus = windows[active].tree.focus();
+                        if let Some(p) = windows[active].pane_mut(focus) {
+                            let _ = p.pty.resize(ar.saturating_sub(1).max(1), cols);
+                            let _ = p.pty.resize(ar, cols);
+                            p.term.resize(ar as usize, cols as usize);
+                        }
                     }
                     // Force a full recompose at the new size: tiled repaints via
                     // `render_full` (which re-clears + paints every cell),

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-08-31
+
+### Fixed
+- **Resizing during an agent's boot/reconnect no longer leaves it drawn in a
+  corner.** A single pty resize can be missed by an app mid-boot (claude while
+  `/rc` is connecting), so it kept rendering at the stale size in the top-left of
+  the enlarged terminal. On a resize amux now forces a full redraw of the focused
+  passthrough pane with a second resize (size-1 → size) — which fires even during
+  boot, unlike the previous nudge that only ran once the pane had painted. Size is
+  also polled faster (150 ms, was 400 ms) so a resize settles sooner.
+
 ## [0.22.0] - 2026-08-31
 
 ### Added
