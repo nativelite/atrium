@@ -1803,15 +1803,34 @@ fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
 fn fleet_cmd(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("up") => match args.get(1) {
-            Some(name) => fleet_up(name),
-            None => {
+            Some(name) if !name.starts_with('-') => {
+                // Anything after the name is amux's own meta-flags — `--allow-ctl`
+                // (so the fleet can coordinate over the control plane), `--trust
+                // <policy>`, `--max-depth`. Parsed with the shared parser.
+                match amux::ctl::parse_flags(&args[2..]) {
+                    Ok((allow_ctl, max_depth, trust, rest)) if rest.is_empty() => {
+                        fleet_up(name, allow_ctl, max_depth, trust)
+                    }
+                    Ok((_, _, _, rest)) => {
+                        eprintln!("amux fleet up: unexpected argument {:?}", rest[0]);
+                        ExitCode::FAILURE
+                    }
+                    Err(e) => {
+                        eprintln!("amux fleet up: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            _ => {
                 eprintln!("amux fleet up <name>: needs a fleet name (try `amux fleet ls`)");
                 ExitCode::FAILURE
             }
         },
         Some("ls") => fleet_ls(),
         _ => {
-            eprintln!("usage: amux fleet up <name> | amux fleet ls");
+            eprintln!(
+                "usage: amux fleet up <name> [--allow-ctl] [--trust <policy>] | amux fleet ls"
+            );
             ExitCode::FAILURE
         }
     }
@@ -1858,7 +1877,10 @@ fn fleet_ls() -> ExitCode {
 /// and hand it to the run loop. Any error before spawning (no file, bad JSON,
 /// unknown name, empty fleet, a bad grid, a missing `cwd`) is reported and
 /// **nothing is spawned** — never a partial fleet.
-fn fleet_up(name: &str) -> ExitCode {
+fn fleet_up(name: &str, allow_ctl: bool, max_depth: usize, trust: amux::ctl::TrustMode) -> ExitCode {
+    // Publish the trust policy before the fleet's panes are spawned (they read it
+    // via `trust_mode()`), so every agent comes up under the requested posture.
+    set_trust_mode(trust);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let located = match amux::fleet::discover(&cwd) {
         Ok(l) => l,
@@ -1947,17 +1969,17 @@ fn fleet_up(name: &str) -> ExitCode {
     // New panes / splits opened later host a shell under the fleet's default
     // identity — a scratch pane in-role, not another copy of an agent.
     let scratch = vec![default_shell()];
-    // ctl is opt-in via the `amux --allow-ctl` path; the fleet path runs without
-    // it in C1 (a fleet + live ctl-spawn combination lands later).
+    // ctl is opt-in for a fleet too (`amux fleet up <name> --allow-ctl`), so the
+    // roster can coordinate over the board/bus; without the flag it runs as before.
     run(
         &mut term,
         &scratch,
         fleet.identity.as_deref(),
         None,
         Some(window),
-        false,
-        amux::ctl::DEFAULT_MAX_DEPTH,
-        amux::ctl::TrustMode::Off,
+        allow_ctl,
+        max_depth,
+        trust,
     )
 }
 
