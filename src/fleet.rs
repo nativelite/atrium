@@ -90,6 +90,12 @@ pub struct Agent {
     pub model: Option<String>,
     /// The reasoning effort (→ `--effort <effort>`).
     pub effort: Option<String>,
+    /// An initial **user** prompt appended as the final positional argument, so
+    /// the agent starts working the moment the fleet comes up instead of waiting
+    /// for the human to type. For claude this is `claude … "<kickoff>"`, which
+    /// seeds an interactive session with that first message. Absent ⇒ the agent
+    /// idles until prompted (the previous behavior).
+    pub kickoff: Option<String>,
 }
 
 impl Agent {
@@ -125,6 +131,11 @@ impl Agent {
         if let Some(e) = &self.effort {
             v.push("--effort".to_string());
             v.push(e.clone());
+        }
+        // The kickoff is the trailing **positional** prompt, after every flag, so
+        // the agent (claude) treats it as the first user message and starts.
+        if let Some(k) = &self.kickoff {
+            v.push(k.clone());
         }
         v
     }
@@ -255,6 +266,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
     let prompt = str_field("prompt")?;
     let model = str_field("model")?;
     let effort = str_field("effort")?;
+    let kickoff = str_field("kickoff")?;
 
     let add_dirs = match get("add_dirs") {
         Some(v) => {
@@ -287,6 +299,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         prompt,
         model,
         effort,
+        kickoff,
     })
 }
 
@@ -433,6 +446,23 @@ mod tests {
         assert_eq!(a.prompt, None);
         assert_eq!(a.model, None);
         assert_eq!(a.effort, None);
+    }
+
+    #[test]
+    fn kickoff_parses_and_is_the_trailing_positional_prompt() {
+        let text = r#"{ "fleets": { "f": { "agents": [
+          { "name": "a", "cmd": ["claude"], "prompt": "P", "kickoff": "go now" }
+        ] } } }"#;
+        let f = parse(text).unwrap();
+        let a = &f.get("f").unwrap().agents[0];
+        assert_eq!(a.kickoff.as_deref(), Some("go now"));
+        // The kickoff is LAST — after every flag — so claude reads it as the first
+        // user message and starts working immediately.
+        let argv = a.args(&["/ctx".to_string()]);
+        assert_eq!(
+            argv,
+            s(&["claude", "--add-dir", "/ctx", "--append-system-prompt", "P", "go now"])
+        );
     }
 
     #[test]

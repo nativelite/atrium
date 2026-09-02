@@ -42,6 +42,27 @@ static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
 /// spawn is byte-identical to pre-ctl amux.
 static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
 
+/// Bind the per-process ctl endpoint and publish its address to [`CTL_ADDRESS`]
+/// so every pane spawned afterward is born with `AMUX_CTL`/`AMUX_PANE` in its
+/// env. Returns the [`amux::ipc::Listener`] to poll, or `None` on a bind failure
+/// (surfaced in the bar, non-fatal). `CTL_ADDRESS` is a `OnceLock`, so only the
+/// first successful bind per process publishes the address.
+fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<amux::ipc::Listener> {
+    let addr = amux::ipc::default_address();
+    match amux::ipc::Listener::bind(&addr) {
+        Ok(l) => {
+            let _ = CTL_ADDRESS.set(addr);
+            Some(l)
+        }
+        Err(e) => {
+            if flash.is_none() {
+                *flash = Some((format!("ctl channel disabled: {e}"), Instant::now()));
+            }
+            None
+        }
+    }
+}
+
 /// Set once at startup from the `--trust` / `--skip-permissions` flags: how much
 /// amux relaxes the permission posture of every agent pane it spawns. Encoded as
 /// `0=Off`, `1=Edits` (`--trust`: acceptEdits + safe allowlist), `2=Skip`
@@ -609,6 +630,7 @@ fn main() -> ExitCode {
         allow_ctl,
         max_depth,
         trust,
+        None,
     )
 }
 
@@ -662,6 +684,10 @@ fn run(
     // full bypass). Published to the spawn path via `AGENT_TRUST` before the
     // first spawn.
     trust: amux::ctl::TrustMode,
+    // A pre-bound ctl endpoint. The fleet path binds it *before* spawning its
+    // panes (so they get `AMUX_CTL` in their env) and hands the listener here;
+    // `None` means run() binds its own after the initial spawn (the default path).
+    mut ctl_listener: Option<amux::ipc::Listener>,
 ) -> ExitCode {
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
@@ -685,7 +711,6 @@ fn run(
     // initial one included — is born with `AMUX_CTL`/`AMUX_PANE` in its
     // environment. A bind failure is non-fatal: amux still runs, just without
     // ctl, and says so in the bar (never silently unavailable).
-    let mut ctl_listener: Option<amux::ipc::Listener> = None;
     // Queue-until-idle deliveries for `ctl send` (flushed each tick).
     let mut pending_sends: Vec<PendingSend> = Vec::new();
     // Operator-approved extra allowlist stems (AMUX_CTL_ALLOW); empty ⇒ the
@@ -695,17 +720,11 @@ fn run(
     } else {
         Vec::new()
     };
-    if allow_ctl {
-        let addr = amux::ipc::default_address();
-        match amux::ipc::Listener::bind(&addr) {
-            Ok(l) => {
-                let _ = CTL_ADDRESS.set(addr);
-                ctl_listener = Some(l);
-            }
-            Err(e) => {
-                flash = Some((format!("ctl channel disabled: {e}"), Instant::now()));
-            }
-        }
+    // Bind the endpoint here only if a caller hasn't already (the fleet path
+    // pre-binds so its panes get `AMUX_CTL`). `CTL_ADDRESS` is a `OnceLock`, so a
+    // pre-bind means this is a no-op.
+    if allow_ctl && ctl_listener.is_none() {
+        ctl_listener = bind_ctl(&mut flash);
     }
     // ctl audit log (design §5): in-memory always when ctl is on, mirrored to a
     // JSONL file when the operator opts in via `AMUX_CTL_AUDIT`. A file that
@@ -1523,13 +1542,10 @@ fn run(
         // escalations, surface them on the bar so you see them without opening the
         // `Ctrl+A b` panel — the bus's push channel to the human.
         let decisions_open = bus.pending_decisions().len();
-        let decision_note = if decisions_open > 0 {
-            format!(
-                "{decisions_open} decision{} need you \u{00b7} Ctrl+A b",
-                if decisions_open == 1 { "" } else { "s" }
-            )
-        } else {
-            String::new()
+        let decision_note = match decisions_open {
+            0 => String::new(),
+            1 => "1 decision needs you \u{00b7} Ctrl+A b".to_string(),
+            n => format!("{n} decisions need you \u{00b7} Ctrl+A b"),
         };
         let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or({
             if decision_note.is_empty() {
@@ -1958,6 +1974,11 @@ fn fleet_up(name: &str, allow_ctl: bool, max_depth: usize, trust: amux::ctl::Tru
     let (rows, cols) = term.size().unwrap_or((24, 80));
 
     let mut flash: Option<(String, Instant)> = None;
+    // Bind the ctl endpoint BEFORE spawning the fleet's panes, so each agent is
+    // born with `AMUX_CTL`/`AMUX_PANE` in its env and can drive the board/bus.
+    // (The default path binds inside run() after its single spawn; a fleet spawns
+    // its whole roster up front, so it must publish the address first.)
+    let ctl_listener = if allow_ctl { bind_ctl(&mut flash) } else { None };
     let window = match spawn_fleet_window(&fleet, &located.dir, grid, rows, cols, &mut flash) {
         Ok(w) => w,
         Err(e) => {
@@ -1980,6 +2001,7 @@ fn fleet_up(name: &str, allow_ctl: bool, max_depth: usize, trust: amux::ctl::Tru
         allow_ctl,
         max_depth,
         trust,
+        ctl_listener,
     )
 }
 

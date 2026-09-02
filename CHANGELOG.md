@@ -44,8 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`amux fleet up <name>` now takes `--allow-ctl` / `--trust <policy>`**, so a
   saved roster can coordinate over the control plane (board + bus) — the fleet
-  path previously always ran without ctl. `amux fleet up demo --allow-ctl --trust
-  accept` brings the team up already able to `ctl board`/`ctl bus` each other.
+  path previously always ran without ctl. The ctl endpoint is bound *before* the
+  fleet's panes spawn, so each agent is born with `AMUX_CTL` in its env (a fleet
+  spawns its whole roster up front, unlike the single-pane path).
+- **Fleet agents can auto-start** via a per-agent `"kickoff"` field in
+  `amux.fleet.json` — appended as the trailing positional prompt, so claude reads
+  it as the first user message and begins working the moment the fleet comes up
+  (no more waiting for a human to type). Absent ⇒ the agent idles as before.
 - **`--identity` accepts multiple keys — one agent, several credentials.** Give a
   comma-separated list (`amux --identity work,hf claude`) and each resolves to its
   own environment variable(s) and they're all injected into that pane. Pairs with
