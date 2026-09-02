@@ -177,6 +177,191 @@ fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
     result
 }
 
+/// One agent in the overview: where it lives (for dive-in), its label, tree
+/// depth, live status, identity, and current action.
+struct OverviewNode {
+    window: usize,
+    pane_id: usize,
+    label: String,
+    depth: usize,
+    status: Option<agsess::Status>,
+    identity: Option<String>,
+    exited: bool,
+    action: String,
+}
+
+/// Collect every pane, across all windows, as an overview node in spawn-tree
+/// order (windows in order, panes in order). Each carries its live agsess status
+/// and last action. This is the model the overview renders and the selection
+/// cursor indexes into — the same list at 3 agents and 300.
+fn overview_nodes(windows: &[Window], world: &agsess::World) -> Vec<OverviewNode> {
+    let mut nodes = Vec::new();
+    for (wi, w) in windows.iter().enumerate() {
+        for p in &w.panes {
+            let status = amux::bind::status_for(p.session_id.as_deref(), &world.sessions);
+            let action = p
+                .session_id
+                .as_deref()
+                .and_then(|id| world.sessions.iter().find(|s| s.id == id))
+                .map(|s| s.last_action.clone())
+                .unwrap_or_default();
+            nodes.push(OverviewNode {
+                window: wi,
+                pane_id: p.id,
+                label: p.role.clone().unwrap_or_else(|| p.title.clone()),
+                depth: p.depth,
+                status,
+                identity: p.identity.clone(),
+                exited: p.exited,
+                action,
+            });
+        }
+    }
+    nodes
+}
+
+/// A status → (glyph, SGR color) for an overview node, sharing the bar's color
+/// language: green working, amber waiting-on-you, cyan waiting-for-a-message,
+/// grey idle, red exited.
+fn overview_glyph(node: &OverviewNode) -> (&'static str, String) {
+    use amux::theme;
+    let sgr = |c: ansi::Color| ansi::Style { fg: c, ..Default::default() }.sgr();
+    if node.exited {
+        return ("\u{2717}", sgr(theme::EXITED)); // ✗
+    }
+    match node.status {
+        Some(agsess::Status::Working) => ("\u{25CF}", sgr(theme::ACTIVITY)), // ●
+        Some(agsess::Status::WaitingApproval) => ("\u{0021}", sgr(theme::WAITING)), // !
+        Some(agsess::Status::WaitingPrompt) => ("\u{25D0}", sgr(theme::FOCUSED)), // ◐
+        Some(agsess::Status::Idle) => ("\u{00B7}", sgr(theme::IDLE)),        // ·
+        None => ("\u{00B7}", sgr(theme::IDLE)),                              // shell / unbound
+    }
+}
+
+/// Render the full-screen **overview** overlay (`Ctrl+A o`): a header of live
+/// counts, any open decisions, then the agent tree colored by status with a
+/// selection cursor (`sel`). Diving into the selected agent (Enter) is handled by
+/// the caller. Absolute CUP per line; the bar row is left for the status bar.
+fn render_overview_panel(
+    windows: &[Window],
+    bus: &amux::bus::Bus,
+    nodes: &[OverviewNode],
+    sel: usize,
+    rows: u16,
+    cols: u16,
+) -> String {
+    let mut out = String::from("\x1b[?25l\x1b[2J");
+    // Header: counts by state.
+    let (mut working, mut waiting, mut idle, mut exited) = (0, 0, 0, 0);
+    for n in nodes {
+        if n.exited {
+            exited += 1;
+        } else {
+            match n.status {
+                Some(agsess::Status::Working) => working += 1,
+                Some(agsess::Status::WaitingApproval) => waiting += 1,
+                Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) | None => idle += 1,
+            }
+        }
+    }
+    let decisions = bus.pending_decisions();
+    out.push_str(&format!(
+        "\x1b[1;1H\x1b[1;38;5;37m  overview\x1b[0m  \x1b[2m{} agents\x1b[0m   \
+         \x1b[38;2;95;240;140m\u{25CF} {working} working\x1b[0m   \
+         \x1b[38;2;255;200;70m\u{0021} {waiting} waiting\x1b[0m   \
+         \x1b[38;2;150;152;165m\u{00B7} {idle} idle\x1b[0m   \
+         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}",
+        nodes.len(),
+        if decisions.is_empty() {
+            String::new()
+        } else {
+            format!("   \x1b[1;38;5;11m\u{26A0} {} decisions\x1b[0m", decisions.len())
+        }
+    ));
+    out.push_str(&format!(
+        "\x1b[2;1H\x1b[38;5;238m{}\x1b[0m",
+        "\u{2500}".repeat(cols as usize)
+    ));
+
+    let mut row = 3u16;
+    let bar_row = rows; // status bar lives here
+    let footer_row = rows.saturating_sub(1);
+
+    // Open decisions first — the thing that needs the human.
+    if !decisions.is_empty() {
+        for e in decisions.iter().take(3) {
+            if row >= footer_row {
+                break;
+            }
+            let from = e.from.as_deref().unwrap_or("?");
+            let summary = e
+                .fields
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push_str(&format!(
+                "\x1b[{row};1H  \x1b[1;38;5;11m\u{0021}\x1b[0m \x1b[1m{}\x1b[0m  {summary}  \x1b[2m(from {from})\x1b[0m",
+                e.topic
+            ));
+            row += 1;
+        }
+        out.push_str(&format!(
+            "\x1b[{row};1H\x1b[38;5;238m{}\x1b[0m",
+            "\u{2500}".repeat(cols as usize)
+        ));
+        row += 1;
+    }
+
+    // Agent rows, scrolled so the selection stays visible.
+    let list_first = row;
+    let list_rows = footer_row.saturating_sub(list_first) as usize;
+    if nodes.is_empty() {
+        out.push_str(&format!("\x1b[{row};1H  \x1b[2m(no agents)\x1b[0m"));
+    } else if list_rows > 0 {
+        let start = sel.saturating_sub(list_rows.saturating_sub(1));
+        for (i, n) in nodes.iter().enumerate().skip(start).take(list_rows) {
+            let r = list_first + (i - start) as u16;
+            let (glyph, color) = overview_glyph(n);
+            let selected = i == sel;
+            let indent = "  ".repeat(n.depth);
+            let status = n
+                .status
+                .map(status_label)
+                .unwrap_or(if n.exited { "exited" } else { "shell" });
+            let ident = n
+                .identity
+                .as_deref()
+                .map(|x| format!("  \x1b[2m\u{00B7}{x}\x1b[0m"))
+                .unwrap_or_default();
+            let action = if n.action.is_empty() {
+                String::new()
+            } else {
+                format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
+            };
+            let cursor = if selected { "\x1b[1;38;5;37m\u{25B8}\x1b[0m" } else { " " };
+            let line = format!(
+                "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{ident}{action}",
+                truncate(&n.label, 16),
+            );
+            // Highlight the selected row with a faint bar background.
+            if selected {
+                out.push_str(&format!("\x1b[{r};1H\x1b[48;5;236m\x1b[K{line}\x1b[0m"));
+            } else {
+                out.push_str(&format!("\x1b[{r};1H{line}"));
+            }
+        }
+    }
+
+    // Footer hint.
+    let _ = windows; // reserved for future tree connectors
+    out.push_str(&format!(
+        "\x1b[{footer_row};1H\x1b[2m  j/k or \u{2191}\u{2193} move  \u{00b7}  Enter dive in  \u{00b7}  Esc / Ctrl+A o close\x1b[0m"
+    ));
+    let _ = bar_row;
+    out
+}
+
 /// Render the full-screen coordination overlay (`Ctrl+A b`): the shared **board**
 /// (durable "what is true") on top, a divider, then the **bus** feed (recent
 /// events + any open `decision_needed` escalations, "what just happened") below.
@@ -786,6 +971,11 @@ fn run(
     // keep running (drained, emulated) but are not painted, and keystrokes don't
     // reach them — it's a read-only view of the shared board.
     let mut board_view = false;
+    // The mission-control overview (`Ctrl+A o`): the agent tree colored by status
+    // with a selection cursor. While on, keystrokes drive the cursor / dive-in
+    // instead of reaching the panes. `overview_sel` is the selected agent index.
+    let mut overview_view = false;
+    let mut overview_sel = 0usize;
     // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
     // command to open in a new pane (any shell/program, not just the launch one).
     // Keystrokes edit the line instead of reaching the panes; Enter opens it.
@@ -893,6 +1083,57 @@ fn run(
             &bytes
         };
         for action in scanner.feed(feed) {
+            // While the overview is open, keystrokes drive the selection cursor and
+            // dive-in — not the panes. `Ctrl+A o` (toggle) and `Ctrl+A q` (quit)
+            // still work via the scanner; everything else is consumed here.
+            if overview_view {
+                let count: usize = windows.iter().map(|w| w.panes.len()).sum();
+                match &action {
+                    Action::ToggleOverview => {
+                        overview_view = false;
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::Quit => break 'outer,
+                    Action::MoveFocus(Dir::Up) => {
+                        overview_sel = overview_sel.saturating_sub(1);
+                        force_repaint = true;
+                    }
+                    Action::MoveFocus(Dir::Down) => {
+                        overview_sel = (overview_sel + 1).min(count.saturating_sub(1));
+                        force_repaint = true;
+                    }
+                    Action::Forward(b) => {
+                        let s = b.as_slice();
+                        if s == b"\r" || s == b"\n" {
+                            // Dive into the selected agent: focus + zoom its pane.
+                            let target = overview_nodes(&windows, &world)
+                                .get(overview_sel)
+                                .map(|n| (n.window, n.pane_id));
+                            if let Some((wi, pid)) = target {
+                                active = wi;
+                                windows[active].tree.focus_pane(pid);
+                                windows[active].zoomed = true;
+                                overview_view = false;
+                                prev_master = None;
+                                force_repaint = true;
+                            }
+                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
+                            overview_sel = (overview_sel + 1).min(count.saturating_sub(1));
+                            force_repaint = true;
+                        } else if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
+                            overview_sel = overview_sel.saturating_sub(1);
+                            force_repaint = true;
+                        } else if s == b"\x1b" {
+                            overview_view = false;
+                            prev_master = None;
+                            force_repaint = true;
+                        }
+                    }
+                    _ => {} // swallow every other command while the overview is up
+                }
+                continue;
+            }
             match action {
                 Action::Forward(b) => {
                     // While the board overlay is up, swallow input — the panes are
@@ -985,6 +1226,21 @@ fn run(
                     // Start the command prompt; subsequent keystrokes edit the line
                     // (handled above the scanner) until Enter/Esc.
                     prompt = Some(String::new());
+                    force_repaint = true;
+                }
+                Action::ToggleOverview => {
+                    // Open the overview (close the board if it was up — one overlay
+                    // at a time). Selection starts at the focused agent so Enter
+                    // dives back into what you were watching.
+                    overview_view = true;
+                    board_view = false;
+                    let focus = windows[active].tree.focus();
+                    overview_sel = overview_nodes(&windows, &world)
+                        .iter()
+                        .position(|n| n.window == active && n.pane_id == focus)
+                        .unwrap_or(0);
+                    let _ = write!(out, "\x1b[?25h");
+                    prev_master = None;
                     force_repaint = true;
                 }
                 Action::SplitH => {
@@ -1228,11 +1484,12 @@ fn run(
                             pane.painted = true;
                         }
                         if !tiled && pane.id == focus {
-                            if board_view {
-                                // Board overlay is up: keep the passthrough filter
-                                // state current, but don't paint the pane over the
-                                // panel. (The emulator was already fed above, so a
-                                // toggle-off repaints from the current screen.)
+                            if board_view || overview_view {
+                                // An overlay (board / overview) is up: keep the
+                                // passthrough filter state current, but don't paint
+                                // the pane over the panel. (The emulator was already
+                                // fed above, so a toggle-off repaints from the
+                                // current screen.)
                                 let _ = pane.filter.feed(&buf[..n]);
                             } else if first_paint {
                                 // Hand off from the splash: restore the cursor the
@@ -1462,6 +1719,11 @@ fn run(
             // this is ~a handful of stats for a small grid.
             world.refresh();
             last_agent_poll = Instant::now();
+            // Keep the overview live but calm: repaint it once per status poll
+            // (~1 Hz), not every tick, so nodes update without flicker.
+            if overview_view {
+                force_repaint = true;
+            }
         }
 
         // 6. render the active window (tiled compose+diff, else passthrough is
@@ -1475,7 +1737,19 @@ fn run(
         // Set when this tick composited the startup splash into `frame`; its `2J`
         // wipes the bar, so the bar is force-appended below to keep the frame whole.
         let mut splash_drawn = false;
-        if board_view {
+        if overview_view {
+            // The overview replaces the panes. Clamp the selection to the live
+            // agent count (panes may have been reaped) and re-render on a repaint.
+            let count: usize = windows.iter().map(|w| w.panes.len()).sum();
+            overview_sel = overview_sel.min(count.saturating_sub(1));
+            if force_repaint {
+                let nodes = overview_nodes(&windows, &world);
+                frame.extend_from_slice(
+                    render_overview_panel(&windows, &bus, &nodes, overview_sel, rows, cols)
+                        .as_bytes(),
+                );
+            }
+        } else if board_view {
             // The board overlay replaces the panes. Re-render only on a repaint
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
@@ -1586,7 +1860,7 @@ fn run(
         // emulator, so `term.screen().cursor` is current. Both are 0-based; the
         // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
         // coordinates in either mode.
-        if bar_appended && !board_view && prompt.is_none() {
+        if bar_appended && !board_view && !overview_view && prompt.is_none() {
             let cur = if windows[active].tiled() {
                 prev_master.as_ref().map(|m| m.cursor)
             } else {

@@ -59,6 +59,11 @@ pub enum Action {
     /// new pane running it, so any shell/program (`wsl`, `pwsh -NoLogo`, `claude`)
     /// can be launched mid-session, not just the command amux was started with.
     OpenPrompt,
+    /// Toggle the **overview** — `Ctrl+A o`. A mission-control panel: the agent
+    /// tree colored by status (working/waiting/idle/exited) with a selection
+    /// cursor, so you can watch a whole fleet and dive into any one agent. Scales
+    /// past the `Ctrl+A <digit>` limit by selecting, not numbering.
+    ToggleOverview,
     /// A left-button press at 1-based terminal cell (`col`, `row`) — only
     /// emitted while mouse mode is on. Used to focus the pane under the cursor.
     MouseClick {
@@ -210,6 +215,10 @@ impl PrefixScanner {
                         b':' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::OpenPrompt);
+                        }
+                        b'o' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::ToggleOverview);
                         }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
@@ -415,5 +424,11 @@ mod scroll_tests {
     fn prefix_colon_opens_the_command_prompt() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b':']), vec![Action::OpenPrompt]);
+    }
+
+    #[test]
+    fn prefix_o_toggles_the_overview() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'o']), vec![Action::ToggleOverview]);
     }
 }

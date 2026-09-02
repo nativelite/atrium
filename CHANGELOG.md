@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [`abus`]: https://github.com/nativelite/abus
 
 ### Added
+- **Overview — `Ctrl+A o` — mission control for a fleet.** A full-screen panel of
+  the agent tree colored by live status (green working, amber waiting-on-you, cyan
+  waiting-for-a-message, grey idle, red exited), a counts header, and any open
+  `decision_needed` events up top. A selection cursor moves with `j`/`k` or the
+  arrows; **Enter dives into that agent** (focus + zoom its pane); Esc / `Ctrl+A o`
+  closes. Built to scale past the `Ctrl+A <digit>` limit — you *select* an agent,
+  you don't *number* it — so the same panel works at 3 agents and at 300. Updates
+  live at ~1 Hz (calm, not flickering).
 - **`amux fleet up <name>` now takes `--allow-ctl` / `--trust <policy>`**, so a
   saved roster can coordinate over the control plane (board + bus) — the fleet
   path previously always ran without ctl. The ctl endpoint is bound *before* the
