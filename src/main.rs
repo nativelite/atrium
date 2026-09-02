@@ -188,6 +188,9 @@ struct OverviewNode {
     identity: Option<String>,
     exited: bool,
     action: String,
+    /// True if amux launched this pane as an agent (it has a session id). Lets the
+    /// overview show an as-yet-unbound agent as "starting" rather than "shell".
+    is_agent: bool,
 }
 
 /// Collect every pane, across all windows, as an overview node in spawn-tree
@@ -214,6 +217,7 @@ fn overview_nodes(windows: &[Window], world: &agsess::World) -> Vec<OverviewNode
                 identity: p.identity.clone(),
                 exited: p.exited,
                 action,
+                is_agent: p.session_id.is_some(),
             });
         }
     }
@@ -250,8 +254,12 @@ fn render_overview_panel(
     rows: u16,
     cols: u16,
 ) -> String {
-    let mut out = String::from("\x1b[?25l\x1b[2J");
-    // Header: counts by state.
+    // Redraw in place (no full-screen `2J`) so moving the cursor only changes the
+    // rows that changed — no flicker. Every content row ends with `\x1b[K` (clear
+    // to EOL), and the rows between the list and the footer are blanked, so a
+    // deselected row's highlight and any stale content are wiped without a clear.
+    let mut out = String::from("\x1b[?25l");
+    let _ = windows; // reserved for future tree connectors
     let (mut working, mut waiting, mut idle, mut exited) = (0, 0, 0, 0);
     for n in nodes {
         if n.exited {
@@ -270,7 +278,7 @@ fn render_overview_panel(
          \x1b[38;2;95;240;140m\u{25CF} {working} working\x1b[0m   \
          \x1b[38;2;255;200;70m\u{0021} {waiting} waiting\x1b[0m   \
          \x1b[38;2;150;152;165m\u{00B7} {idle} idle\x1b[0m   \
-         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}",
+         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}\x1b[0m\x1b[K",
         nodes.len(),
         if decisions.is_empty() {
             String::new()
@@ -284,7 +292,6 @@ fn render_overview_panel(
     ));
 
     let mut row = 3u16;
-    let bar_row = rows; // status bar lives here
     let footer_row = rows.saturating_sub(1);
 
     // Open decisions first — the thing that needs the human.
@@ -301,7 +308,7 @@ fn render_overview_panel(
                 .collect::<Vec<_>>()
                 .join(" ");
             out.push_str(&format!(
-                "\x1b[{row};1H  \x1b[1;38;5;11m\u{0021}\x1b[0m \x1b[1m{}\x1b[0m  {summary}  \x1b[2m(from {from})\x1b[0m",
+                "\x1b[{row};1H  \x1b[1;38;5;11m\u{0021}\x1b[0m \x1b[1m{}\x1b[0m  {summary}  \x1b[2m(from {from})\x1b[0m\x1b[K",
                 e.topic
             ));
             row += 1;
@@ -316,8 +323,10 @@ fn render_overview_panel(
     // Agent rows, scrolled so the selection stays visible.
     let list_first = row;
     let list_rows = footer_row.saturating_sub(list_first) as usize;
+    let mut last_row = row.saturating_sub(1);
     if nodes.is_empty() {
-        out.push_str(&format!("\x1b[{row};1H  \x1b[2m(no agents)\x1b[0m"));
+        out.push_str(&format!("\x1b[{row};1H  \x1b[2m(no agents)\x1b[0m\x1b[K"));
+        last_row = row;
     } else if list_rows > 0 {
         let start = sel.saturating_sub(list_rows.saturating_sub(1));
         for (i, n) in nodes.iter().enumerate().skip(start).take(list_rows) {
@@ -325,10 +334,13 @@ fn render_overview_panel(
             let (glyph, color) = overview_glyph(n);
             let selected = i == sel;
             let indent = "  ".repeat(n.depth);
-            let status = n
-                .status
-                .map(status_label)
-                .unwrap_or(if n.exited { "exited" } else { "shell" });
+            let status = n.status.map(status_label).unwrap_or(if n.exited {
+                "exited"
+            } else if n.is_agent {
+                "starting"
+            } else {
+                "shell"
+            });
             let ident = n
                 .identity
                 .as_deref()
@@ -344,21 +356,28 @@ fn render_overview_panel(
                 "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{ident}{action}",
                 truncate(&n.label, 16),
             );
-            // Highlight the selected row with a faint bar background.
             if selected {
+                // Faint bar background; `\x1b[K` fills the row, then the text.
                 out.push_str(&format!("\x1b[{r};1H\x1b[48;5;236m\x1b[K{line}\x1b[0m"));
             } else {
-                out.push_str(&format!("\x1b[{r};1H{line}"));
+                // Reset + `\x1b[K` clears any leftover highlight from when this
+                // row was the selection, so nothing lingers as the cursor moves.
+                out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
             }
+            last_row = r;
         }
     }
 
-    // Footer hint.
-    let _ = windows; // reserved for future tree connectors
+    // Blank the rows between the content and the footer (in place, no full clear).
+    let mut r = last_row + 1;
+    while r < footer_row {
+        out.push_str(&format!("\x1b[{r};1H\x1b[K"));
+        r += 1;
+    }
+
     out.push_str(&format!(
-        "\x1b[{footer_row};1H\x1b[2m  j/k or \u{2191}\u{2193} move  \u{00b7}  Enter dive in  \u{00b7}  Esc / Ctrl+A o close\x1b[0m"
+        "\x1b[{footer_row};1H\x1b[2m  j/k or \u{2191}\u{2193} move  \u{00b7}  Enter dive in  \u{00b7}  Esc / Ctrl+A o close\x1b[0m\x1b[K"
     ));
-    let _ = bar_row;
     out
 }
 
@@ -1106,14 +1125,18 @@ fn run(
                     Action::Forward(b) => {
                         let s = b.as_slice();
                         if s == b"\r" || s == b"\n" {
-                            // Dive into the selected agent: focus + zoom its pane.
+                            // Dive into the selected agent: focus its pane, zoom it
+                            // full-screen, and RESIZE it (as `Ctrl+A z` does) — the
+                            // pane was a small tile, so without the resize it would
+                            // paint into a corner.
                             let target = overview_nodes(&windows, &world)
                                 .get(overview_sel)
                                 .map(|n| (n.window, n.pane_id));
                             if let Some((wi, pid)) = target {
                                 active = wi;
                                 windows[active].tree.focus_pane(pid);
-                                windows[active].zoomed = true;
+                                windows[active].zoomed = windows[active].panes.len() > 1;
+                                resize_window(&mut windows[active], rows, cols);
                                 overview_view = false;
                                 prev_master = None;
                                 force_repaint = true;
