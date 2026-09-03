@@ -10,7 +10,7 @@
         },
         {
           "name": "codex",
-          "cmd": ["codex", "--ask-for-approval", "never", "--sandbox", "workspace-write"]
+          "cmd": ["codex"]
         }
       ]
     }

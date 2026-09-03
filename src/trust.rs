@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::ctl::TrustMode;
 use json::Value;
 
 /// Environment knob (comma-separated command prefixes) that **extends** the
@@ -86,6 +87,39 @@ pub fn accept_edits_args(extra: &[String]) -> Vec<String> {
         }
     }
     args
+}
+
+/// Build the **codex** (OpenAI) CLI args for a trust posture — the codex analog
+/// of [`accept_edits_args`]. codex has no claude-style `--permission-mode`; its
+/// autonomy is governed by `--ask-for-approval <policy>` + `--sandbox <mode>`
+/// (verified against codex 0.153.0). Its approval granularity is coarser than
+/// claude's — there is no per-command allowlist, only `on-request`/`never` — so
+/// the hands-off-but-safe postures (`Edits`, `Auto`) both map to *never prompt,
+/// confined to the workspace*; `Skip` is the full parity with claude's
+/// `--dangerously-skip-permissions` (no approvals, no sandbox); `Plan` is a
+/// read-only sandbox (inspect but never modify or run mutating commands). Pure
+/// and unit-tested. NOTE: codex also has a per-folder *trust_level* stored in
+/// `~/.codex/config.toml` (its own "trust this folder?" gate); writing that
+/// safely needs a TOML-preserving editor and is a deliberate follow-up — these
+/// flags deliver hands-off approval, which is the piece that was missing.
+pub fn codex_trust_args(mode: TrustMode) -> Vec<String> {
+    let s = |x: &str| x.to_string();
+    match mode {
+        // Auto-approve, but confined to the working tree — the safe hands-off default.
+        TrustMode::Edits | TrustMode::Auto => {
+            vec![s("--ask-for-approval"), s("never"), s("--sandbox"), s("workspace-write")]
+        }
+        // Full bypass: no approvals, no sandbox. The human confirmed `skip` at launch.
+        TrustMode::Skip => vec![s("--dangerously-bypass-approvals-and-sandbox")],
+        // Read-only exploration: codex may inspect but not modify or run mutating cmds.
+        TrustMode::Plan => {
+            vec![s("--sandbox"), s("read-only"), s("--ask-for-approval"), s("never")]
+        }
+        // `Off` → no flags, by contract: a caller must not rely on Off producing a
+        // posture (the spawn path never calls this with Off — a trusted launch gates
+        // it out). Total-match returning empty keeps the fn safe if ever called with Off.
+        TrustMode::Off => Vec::new(),
+    }
 }
 
 /// The per-project key claude sets when the folder-trust dialog is accepted.
@@ -326,6 +360,32 @@ mod tests {
         assert!(args.iter().any(|a| a == "Bash(just build *)"), "{args:?}");
         // and it does NOT open all of bash
         assert!(!args.iter().any(|a| a == "Bash" || a == "Bash(*)"), "{args:?}");
+    }
+
+    #[test]
+    fn codex_trust_args_map_each_posture_to_codex_flags() {
+        // Edits/Auto → never-prompt, workspace-sandboxed autonomy.
+        for m in [TrustMode::Edits, TrustMode::Auto] {
+            let a = codex_trust_args(m);
+            assert_eq!(a, vec!["--ask-for-approval", "never", "--sandbox", "workspace-write"], "{m:?}");
+        }
+        // Skip → full bypass (parity with claude --dangerously-skip-permissions).
+        assert_eq!(
+            codex_trust_args(TrustMode::Skip),
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        // Plan → read-only sandbox, no prompts.
+        assert_eq!(
+            codex_trust_args(TrustMode::Plan),
+            vec!["--sandbox", "read-only", "--ask-for-approval", "never"]
+        );
+        // Off → nothing (never applied in a trusted launch).
+        assert!(codex_trust_args(TrustMode::Off).is_empty());
+        // Crucially, none of these are claude flags (would break codex's launch).
+        for m in [TrustMode::Edits, TrustMode::Auto, TrustMode::Skip, TrustMode::Plan] {
+            let a = codex_trust_args(m);
+            assert!(!a.iter().any(|x| x == "--permission-mode" || x == "--allowedTools"), "{m:?}");
+        }
     }
 
     #[test]

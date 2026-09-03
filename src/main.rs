@@ -4040,34 +4040,43 @@ fn spawn_pane_full(
     // `mode` is the *effective* mode for this pane: the session policy for the
     // panes amux opens itself, or — for a ctl spawn — the per-spawn `--mode` after
     // the operator-elevate / worker-cap governance in `apply_ctl`.
-    // The trust-posture flags, `--append-system-prompt`, `--session-id`, and the
-    // folder-trust gate below are all Claude Code CLI specifics — injecting them
-    // into another vendor's agent would break its launch. So the *narrower* claude
-    // test (`is_claude`) gates every claude-flavored injection, while the *broad*
-    // `is_agent_stem` still governs vendor-neutral treatment like the identity-env
-    // decision in `wants_env` below. A non-claude agent therefore launches with its
-    // command untouched (and stays unbound until per-vendor status parsing lands in
-    // `agsess`).
+    // `--session-id`, `--append-system-prompt`, and the ~/.claude.json folder-trust
+    // gate below are all Claude Code CLI specifics — injecting them into another
+    // vendor would break its launch — so the narrow `is_claude` test gates them.
+    // The **trust posture** now maps per vendor: claude gets its `--permission-mode`
+    // flags, codex gets its own `--ask-for-approval`/`--sandbox` flags (§`--trust`
+    // is vendor-aware). Any other agent still launches with its command untouched.
+    // The broad `is_agent_stem` continues to govern vendor-neutral treatment like
+    // the identity-env decision in `wants_env` below.
     let is_claude = amux::bind::is_claude_stem(&title);
-    let trusted_launch = is_claude && mode != amux::ctl::TrustMode::Off;
+    let is_codex = amux::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex);
+    let trusted_launch = (is_claude || is_codex) && mode != amux::ctl::TrustMode::Off;
     let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
-        match mode {
-            amux::ctl::TrustMode::Edits => {
-                v.extend(amux::trust::accept_edits_args(&amux::trust::extra_allow_from_env()));
+        if is_claude {
+            match mode {
+                amux::ctl::TrustMode::Edits => {
+                    v.extend(amux::trust::accept_edits_args(&amux::trust::extra_allow_from_env()));
+                }
+                amux::ctl::TrustMode::Auto => {
+                    v.push("--permission-mode".to_string());
+                    v.push("auto".to_string());
+                }
+                amux::ctl::TrustMode::Skip => {
+                    v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+                }
+                amux::ctl::TrustMode::Plan => {
+                    v.push("--permission-mode".to_string());
+                    v.push("plan".to_string());
+                }
+                amux::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
             }
-            amux::ctl::TrustMode::Auto => {
-                v.push("--permission-mode".to_string());
-                v.push("auto".to_string());
-            }
-            amux::ctl::TrustMode::Skip => {
-                v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
-            }
-            amux::ctl::TrustMode::Plan => {
-                v.push("--permission-mode".to_string());
-                v.push("plan".to_string());
-            }
-            amux::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
+        } else if is_codex {
+            // codex's approval/sandbox flags — its analog of the above. Guarded by
+            // `is_codex` (not a bare `else`) so that if the claude/codex stem sets
+            // ever overlap or a third vendor is added, codex flags reach ONLY a
+            // codex pane — never silently some other agent's command.
+            v.extend(amux::trust::codex_trust_args(mode));
         }
         v
     } else {
@@ -4087,10 +4096,11 @@ fn spawn_pane_full(
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
     // per-dir in ~/.claude.json). Without this a trusted launch in an untrusted
-    // folder still blocks on "trust this folder?". Only under --trust/--skip, only
-    // the trust bit, only this pane's cwd; a parse/IO problem is flashed and the
-    // pane spawns anyway (worst case: the dialog).
-    if trusted_launch {
+    // folder still blocks on "trust this folder?". claude-only: codex has its own
+    // per-folder trust in ~/.codex/config.toml (TOML — a follow-up; see
+    // `trust::codex_trust_args`). Only under --trust/--skip, only the trust bit,
+    // only this pane's cwd; a parse/IO problem is flashed and the pane spawns anyway.
+    if trusted_launch && is_claude {
         let dir = cwd
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
