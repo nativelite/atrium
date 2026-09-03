@@ -554,6 +554,162 @@ fn wrap_to(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// One row of the merged activity log: a timestamp, a colored source glyph, who,
+/// and what.
+struct LogRow {
+    ts: u64,
+    glyph: &'static str,
+    who: String,
+    text: String,
+}
+
+/// Merge the bus, the board, and each agent's latest action into one activity
+/// log, sorted oldest→newest. The bus is the bulk (every event, already stamped
+/// + attributed); the board contributes each current entry at its last-update
+/// time; agsess contributes each agent's most recent action, attributed to the
+/// persona via the pane that owns its session.
+fn collect_log(
+    windows: &[Window],
+    world: &agsess::World,
+    board: &amux::board::Board,
+    bus: &amux::bus::Bus,
+) -> Vec<LogRow> {
+    let mut rows: Vec<LogRow> = Vec::new();
+    for e in bus.tail(amux::bus::RING_CAP) {
+        let glyph = match e.kind {
+            amux::bus::Kind::DecisionNeeded => "\x1b[1;38;5;11m!\x1b[0m",
+            amux::bus::Kind::Fyi => "\x1b[38;5;37m\u{00B7}\x1b[0m",
+        };
+        let fields = e
+            .fields
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.push(LogRow {
+            ts: e.ts_ms,
+            glyph,
+            who: e.from.clone().unwrap_or_else(|| "?".to_string()),
+            text: format!("{}  {}", e.topic, fields),
+        });
+    }
+    for (key, entry) in board.list() {
+        let status = entry.fields.get("status").cloned().unwrap_or_default();
+        rows.push(LogRow {
+            ts: entry.updated_ms,
+            glyph: "\x1b[38;5;10m\u{25C6}\x1b[0m",
+            who: entry.updated_by.clone().unwrap_or_default(),
+            text: format!("board {key} = {status}"),
+        });
+    }
+    for s in &world.sessions {
+        if let Some(ts) = s.last_ts_ms {
+            if s.last_action.is_empty() {
+                continue;
+            }
+            let who = windows
+                .iter()
+                .flat_map(|w| &w.panes)
+                .find(|p| p.session_id.as_deref() == Some(s.id.as_str()))
+                .and_then(|p| p.role.clone())
+                .unwrap_or_else(|| format!("session {}", &s.id[..s.id.len().min(6)]));
+            rows.push(LogRow {
+                ts,
+                glyph: "\x1b[38;5;39m\u{25B8}\x1b[0m",
+                who,
+                text: s.last_action.clone(),
+            });
+        }
+    }
+    rows.sort_by_key(|r| r.ts);
+    rows
+}
+
+/// Compact "time ago" for a log stamp — timezone-free and zero-dep: `12s`, `3m`,
+/// `2h`, `4d`.
+fn ago(now_ms: u64, ts_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(ts_ms) / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// The activity-log panel (`Ctrl+A l`): the merged [`collect_log`] rendered
+/// newest-at-the-bottom (tailing), scrollable up for history. `scroll` is how
+/// many events back from the newest the window is shifted.
+fn render_log_panel(
+    windows: &[Window],
+    world: &agsess::World,
+    board: &amux::board::Board,
+    bus: &amux::bus::Bus,
+    rows: u16,
+    cols: u16,
+    scroll: usize,
+    now_ms: u64,
+) -> String {
+    let mut out = String::from("\x1b[?25l\x1b[2J");
+    let log = collect_log(windows, world, board, bus);
+    out.push_str(&format!(
+        "\x1b[1;1H\x1b[1;38;5;37m  activity log\x1b[0m  \x1b[2m(Ctrl+A l to close · live · {} events · PgUp/PgDn scroll)\x1b[0m",
+        log.len()
+    ));
+    out.push_str(&format!(
+        "\x1b[2;1H\x1b[38;5;238m{}\x1b[0m",
+        "\u{2500}".repeat(cols as usize)
+    ));
+    let content_last = rows.saturating_sub(1);
+    let first_row = 3u16;
+    if first_row > content_last {
+        return out;
+    }
+    if log.is_empty() {
+        out.push_str(&format!(
+            "\x1b[{first_row};1H  \x1b[2m(nothing yet — the bus, board, and agent actions land here)\x1b[0m"
+        ));
+        return out;
+    }
+    let mut cap = (content_last - first_row + 1) as usize;
+    // Reserve the bottom row for a scroll hint when the log overflows the panel.
+    let scrollable = log.len() > cap;
+    let hint = if scrollable && cap > 0 {
+        cap -= 1;
+        let scroll = scroll.min(log.len() - cap);
+        let older = log.len() - cap - scroll;
+        Some(format!(
+            "\x1b[2m  \u{2195} PgUp/PgDn · {older} older ↑ · {scroll} newer ↓\x1b[0m"
+        ))
+    } else {
+        None
+    };
+    // Newest at the bottom: the window ends `scroll` events before the newest.
+    let scroll = scroll.min(log.len().saturating_sub(cap));
+    let start = log.len().saturating_sub(cap).saturating_sub(scroll);
+    for (i, r) in log[start..(start + cap).min(log.len())].iter().enumerate() {
+        let row = first_row + i as u16;
+        let stamp = format!("{:>4}", ago(now_ms, r.ts));
+        let who: String = r.who.chars().take(16).collect();
+        // Budget the variable text so the visible line fits `cols` (the prefix is
+        // "  " + stamp(4) + " " + glyph(1) + " " + who + " · ").
+        let head = 2 + 4 + 1 + 1 + 1 + who.chars().count() + 3;
+        let budget = (cols as usize).saturating_sub(head).max(4);
+        let text: String = r.text.chars().take(budget).collect();
+        out.push_str(&format!(
+            "\x1b[{row};1H  \x1b[2m{stamp}\x1b[0m {} \x1b[1m{who}\x1b[0m \x1b[2m·\x1b[0m {text}",
+            r.glyph
+        ));
+    }
+    if let Some(h) = hint {
+        out.push_str(&format!("\x1b[{content_last};1H\x1b[K{h}"));
+    }
+    out
+}
+
 /// Draw the board entries into `out`, from row 3 down to `last_row` (inclusive),
 /// with an overflow hint if there are more than fit.
 fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16) {
@@ -1158,6 +1314,11 @@ fn run(
     // list). j/k move it; `r` resolves it; `g`/Enter jumps to the agent that
     // raised it. The detail bar shows the selected decision's full question.
     let mut decision_sel = 0usize;
+    // The activity log (`Ctrl+A l`): a time-ordered merge of bus + board + agent
+    // actions. `log_scroll` is how many events back from the newest (bottom) the
+    // view is scrolled; `0` = tailing the latest.
+    let mut log_view = false;
+    let mut log_scroll = 0usize;
     // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
     // command to open in a new pane (any shell/program, not just the launch one).
     // Keystrokes edit the line instead of reaching the panes; Enter opens it.
@@ -1287,6 +1448,13 @@ fn run(
                         prev_master = None;
                         force_repaint = true;
                     }
+                    Action::ToggleLog => {
+                        overview_view = false;
+                        log_view = true;
+                        log_scroll = 0;
+                        prev_master = None;
+                        force_repaint = true;
+                    }
                     Action::Quit => break 'outer,
                     Action::MoveFocus(Dir::Up) => {
                         overview_sel = overview_sel.saturating_sub(1);
@@ -1374,6 +1542,14 @@ fn run(
                         prev_master = None;
                         force_repaint = true;
                     }
+                    Action::ToggleLog => {
+                        board_view = false;
+                        log_view = true;
+                        log_scroll = 0;
+                        let _ = write!(out, "\x1b[?25h");
+                        prev_master = None;
+                        force_repaint = true;
+                    }
                     Action::Quit => break 'outer,
                     Action::MoveFocus(Dir::Up) => {
                         nav(true, &mut decision_sel, &mut feed_scroll);
@@ -1441,6 +1617,70 @@ fn run(
                         }
                     }
                     _ => {} // swallow every other command while the board is up
+                }
+                continue;
+            }
+            // While the activity log is up, keystrokes scroll it or switch views.
+            if log_view {
+                let total = collect_log(&windows, &world, &board, &bus).len();
+                let scroll_max = total.saturating_sub(1);
+                match &action {
+                    Action::ToggleLog => {
+                        log_view = false;
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::ToggleBoard => {
+                        log_view = false;
+                        board_view = true;
+                        feed_scroll = 0;
+                        decision_sel = 0;
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::ToggleOverview => {
+                        log_view = false;
+                        overview_view = true;
+                        overview_sel = overview_nodes(&windows, &world)
+                            .iter()
+                            .position(|n| {
+                                n.window == active && n.pane_id == windows[active].tree.focus()
+                            })
+                            .unwrap_or(0);
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::Quit => break 'outer,
+                    // Up/k = older (scroll back); down/j = newer; PgUp/PgDn ×10.
+                    Action::MoveFocus(Dir::Up) => {
+                        log_scroll = (log_scroll + 1).min(scroll_max);
+                        force_repaint = true;
+                    }
+                    Action::MoveFocus(Dir::Down) => {
+                        log_scroll = log_scroll.saturating_sub(1);
+                        force_repaint = true;
+                    }
+                    Action::Forward(b) => {
+                        let s = b.as_slice();
+                        if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
+                            log_scroll = (log_scroll + 1).min(scroll_max);
+                            force_repaint = true;
+                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
+                            log_scroll = log_scroll.saturating_sub(1);
+                            force_repaint = true;
+                        } else if s == b"\x1b[5~" {
+                            log_scroll = (log_scroll + 10).min(scroll_max);
+                            force_repaint = true;
+                        } else if s == b"\x1b[6~" {
+                            log_scroll = log_scroll.saturating_sub(10);
+                            force_repaint = true;
+                        } else if s == b"\x1b" {
+                            log_view = false;
+                            prev_master = None;
+                            force_repaint = true;
+                        }
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -1547,6 +1787,16 @@ fn run(
                         .iter()
                         .position(|n| n.window == active && n.pane_id == focus)
                         .unwrap_or(0);
+                    let _ = write!(out, "\x1b[?25h");
+                    prev_master = None;
+                    force_repaint = true;
+                }
+                Action::ToggleLog => {
+                    // Open the activity log (one overlay at a time).
+                    log_view = true;
+                    board_view = false;
+                    overview_view = false;
+                    log_scroll = 0;
                     let _ = write!(out, "\x1b[?25h");
                     prev_master = None;
                     force_repaint = true;
@@ -1792,7 +2042,7 @@ fn run(
                             pane.painted = true;
                         }
                         if !tiled && pane.id == focus {
-                            if board_view || overview_view {
+                            if board_view || overview_view || log_view {
                                 // An overlay (board / overview) is up: keep the
                                 // passthrough filter state current, but don't paint
                                 // the pane over the panel. (The emulator was already
@@ -2027,9 +2277,9 @@ fn run(
             // this is ~a handful of stats for a small grid.
             world.refresh();
             last_agent_poll = Instant::now();
-            // Keep the overview live but calm: repaint it once per status poll
-            // (~1 Hz), not every tick, so nodes update without flicker.
-            if overview_view {
+            // Keep the overview and activity log live but calm: repaint once per
+            // status poll (~1 Hz), not every tick, so they update without flicker.
+            if overview_view || log_view {
                 force_repaint = true;
             }
         }
@@ -2063,6 +2313,16 @@ fn run(
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
                 frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols, feed_scroll, decision_sel).as_bytes());
+            }
+        } else if log_view {
+            // The activity log overlay: a live time-ordered merge of bus + board
+            // + agent actions. Re-rendered on a repaint (toggle, scroll, or any
+            // agent/ctl activity that forces one).
+            if force_repaint {
+                let now = agsess::sessions::now_ms();
+                frame.extend_from_slice(
+                    render_log_panel(&windows, &world, &board, &bus, rows, cols, log_scroll, now).as_bytes(),
+                );
             }
         } else if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
@@ -2172,7 +2432,7 @@ fn run(
         // emulator, so `term.screen().cursor` is current. Both are 0-based; the
         // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
         // coordinates in either mode.
-        if bar_appended && !board_view && !overview_view && prompt.is_none() {
+        if bar_appended && !board_view && !overview_view && !log_view && prompt.is_none() {
             let cur = if windows[active].tiled() {
                 prev_master.as_ref().map(|m| m.cursor)
             } else {
@@ -3909,6 +4169,40 @@ mod tests {
         let flat: String = strip_csi(&out).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(q), "full question visible: {flat}");
         assert!(flat.contains("#1") && flat.contains("grace"), "seq + source shown: {flat}");
+    }
+
+    #[test]
+    fn ago_formats_coarsely() {
+        assert_eq!(ago(10_000, 5_000), "5s");
+        assert_eq!(ago(200_000, 20_000), "3m");
+        assert_eq!(ago(10_000_000, 2_800_000), "2h");
+        assert_eq!(ago(200_000_000, 200_000), "2d");
+    }
+
+    #[test]
+    fn collect_log_merges_bus_and_board_in_time_order() {
+        let mut bus = amux::bus::Bus::new();
+        bus.publish(
+            "ui",
+            amux::bus::Kind::Fyi,
+            Some("ada"),
+            &[("msg".to_string(), "hi".to_string())],
+            300,
+        )
+        .unwrap();
+        let mut board = amux::board::Board::new();
+        board.set(
+            "title",
+            &[("status".to_string(), "done".to_string())],
+            Some("lead"),
+            100,
+        );
+        let world = agsess::World::new(agsess::default_root()); // no sessions
+        let rows = collect_log(&[], &world, &board, &bus);
+        assert!(rows.len() >= 2, "bus + board rows present");
+        assert!(rows.windows(2).all(|w| w[0].ts <= w[1].ts), "sorted ascending by ts");
+        assert!(rows.iter().any(|r| r.who == "lead" && r.text.contains("title")));
+        assert!(rows.iter().any(|r| r.who == "ada" && r.text.contains("ui")));
     }
 
     #[test]

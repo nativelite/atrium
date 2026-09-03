@@ -64,6 +64,10 @@ pub enum Action {
     /// cursor, so you can watch a whole fleet and dive into any one agent. Scales
     /// past the `Ctrl+A <digit>` limit by selecting, not numbering.
     ToggleOverview,
+    /// Toggle the **activity log** — `Ctrl+A a`. A time-ordered, scrollable merge
+    /// of the bus, board changes, and each agent's latest action, so you can
+    /// reconstruct what the whole fleet did, in order. (`l` is focus-right.)
+    ToggleLog,
     /// A left-button press at 1-based terminal cell (`col`, `row`) — only
     /// emitted while mouse mode is on. Used to focus the pane under the cursor.
     MouseClick {
@@ -219,6 +223,10 @@ impl PrefixScanner {
                         b'o' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::ToggleOverview);
+                        }
+                        b'a' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::ToggleLog);
                         }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
@@ -424,6 +432,19 @@ mod scroll_tests {
     fn prefix_colon_opens_the_command_prompt() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b':']), vec![Action::OpenPrompt]);
+    }
+
+    #[test]
+    fn prefix_a_toggles_the_log() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'a']), vec![Action::ToggleLog]);
+    }
+
+    #[test]
+    fn prefix_l_still_moves_focus_right() {
+        // The log is on `a`; `l` remains vim-style focus-right (hjkl).
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'l']), vec![Action::MoveFocus(Dir::Right)]);
     }
 
     #[test]

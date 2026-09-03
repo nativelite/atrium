@@ -120,7 +120,7 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
     }
     if note.is_empty() {
         segs.push(seg(
-            String::from("| ^A c:win !:shell ::run b:board o:overview \":% split hjkl:focus z:zoom x:kill q:quit"),
+            String::from("| ^A c:win !:shell ::run b:board o:overview a:log \":% split hjkl:focus z:zoom x:kill q:quit"),
             Role::Keys,
         ));
     } else {
