@@ -249,10 +249,80 @@ fn overview_glyph(node: &OverviewNode) -> (&'static str, String) {
     }
 }
 
+/// A per-window (per-fleet) status rollup for the overview's group header.
+struct WindowAgg {
+    /// Window index (0-based); rendered 1-based as "window N".
+    window: usize,
+    total: usize,
+    working: usize,
+    waiting: usize,
+    idle: usize,
+    exited: usize,
+}
+
+/// One row in the overview body: either an aggregated per-window header or an
+/// agent carrying its index into `nodes` (so selection, which indexes `nodes`,
+/// maps straight through).
+enum OvRow {
+    Header(WindowAgg),
+    Agent(usize),
+}
+
+/// Status rollup for one window across `nodes`.
+fn window_agg(nodes: &[OverviewNode], window: usize) -> WindowAgg {
+    let mut a = WindowAgg { window, total: 0, working: 0, waiting: 0, idle: 0, exited: 0 };
+    for n in nodes.iter().filter(|n| n.window == window) {
+        a.total += 1;
+        if n.exited {
+            a.exited += 1;
+        } else {
+            match n.status {
+                Some(agsess::Status::Working) => a.working += 1,
+                Some(agsess::Status::WaitingApproval) => a.waiting += 1,
+                _ => a.idle += 1,
+            }
+        }
+    }
+    a
+}
+
+/// Build the overview's display rows. With more than one window present, each
+/// window's agents are preceded by a [`WindowAgg`] header so many fleets stay
+/// legible at a glance; with a single window the rows are just the agents — the
+/// global counts in the panel header already cover that case, and a lone header
+/// would be noise. `nodes` are in window order (see [`overview_nodes`]), so a
+/// header is emitted whenever the window changes.
+fn overview_rows(nodes: &[OverviewNode]) -> Vec<OvRow> {
+    let multi = nodes.first().map(|f| f.window).is_some()
+        && nodes.iter().any(|n| n.window != nodes[0].window);
+    let mut rows = Vec::with_capacity(nodes.len());
+    let mut cur: Option<usize> = None;
+    for (i, n) in nodes.iter().enumerate() {
+        if multi && cur != Some(n.window) {
+            cur = Some(n.window);
+            rows.push(OvRow::Header(window_agg(nodes, n.window)));
+        }
+        rows.push(OvRow::Agent(i));
+    }
+    rows
+}
+
+/// The first display row to show so `sel_row` stays visible, filling the viewport
+/// (no wasted blank rows when scrolled to the end). Pins the selection near the
+/// bottom edge while scrolling down, like the pre-aggregation list did.
+fn overview_scroll_start(total: usize, sel_row: usize, list_rows: usize) -> usize {
+    if list_rows == 0 || total <= list_rows {
+        return 0;
+    }
+    let start = sel_row.saturating_sub(list_rows.saturating_sub(1));
+    start.min(total - list_rows)
+}
+
 /// Render the full-screen **overview** overlay (`Ctrl+A o`): a header of live
 /// counts, any open decisions, then the agent tree colored by status with a
-/// selection cursor (`sel`). Diving into the selected agent (Enter) is handled by
-/// the caller. Absolute CUP per line; the bar row is left for the status bar.
+/// selection cursor (`sel`). With multiple fleets open, each window's agents are
+/// grouped under an aggregated header. Diving into the selected agent (Enter) is
+/// handled by the caller. Absolute CUP per line; the bar row is left for the bar.
 fn render_overview_panel(
     windows: &[Window],
     bus: &amux::bus::Bus,
@@ -327,55 +397,87 @@ fn render_overview_panel(
         row += 1;
     }
 
-    // Agent rows, scrolled so the selection stays visible.
+    // Agent rows (grouped by window when multiple fleets are open), scrolled so
+    // the selection stays visible.
     let list_first = row;
     let list_rows = footer_row.saturating_sub(list_first) as usize;
     let mut last_row = row.saturating_sub(1);
-    if nodes.is_empty() {
+    let disp = overview_rows(nodes);
+    if disp.is_empty() {
         out.push_str(&format!("\x1b[{row};1H  \x1b[2m(no agents)\x1b[0m\x1b[K"));
         last_row = row;
     } else if list_rows > 0 {
-        let start = sel.saturating_sub(list_rows.saturating_sub(1));
-        for (i, n) in nodes.iter().enumerate().skip(start).take(list_rows) {
-            let r = list_first + (i - start) as u16;
-            let (glyph, color) = overview_glyph(n);
-            let selected = i == sel;
-            let indent = "  ".repeat(n.depth);
-            let status = n.status.map(status_label).unwrap_or(if n.exited {
-                "exited"
-            } else if n.is_agent {
-                "starting"
-            } else {
-                "shell"
-            });
-            let ident = n
-                .identity
-                .as_deref()
-                .map(|x| format!("  \x1b[2m\u{00B7}{x}\x1b[0m"))
-                .unwrap_or_default();
-            let action = if n.action.is_empty() {
-                String::new()
-            } else {
-                format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
-            };
-            let cursor = if selected { "\x1b[1;38;5;37m\u{25B8}\x1b[0m" } else { " " };
-            // Vendor tag next to the status (claude's tag is "" → pixel-identical).
-            let vtag_str = if n.vtag.is_empty() {
-                String::new()
-            } else {
-                format!(" \x1b[2m{}\x1b[0m", n.vtag)
-            };
-            let line = format!(
-                "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{action}",
-                truncate(&n.label, 16),
-            );
-            if selected {
-                // Faint bar background; `\x1b[K` fills the row, then the text.
-                out.push_str(&format!("\x1b[{r};1H\x1b[48;5;236m\x1b[K{line}\x1b[0m"));
-            } else {
-                // Reset + `\x1b[K` clears any leftover highlight from when this
-                // row was the selection, so nothing lingers as the cursor moves.
-                out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
+        // Scroll over *display* rows (headers + agents), centering the selected
+        // agent (which indexes `nodes`) via its display-row position.
+        let sel_row = disp
+            .iter()
+            .position(|d| matches!(d, OvRow::Agent(i) if *i == sel))
+            .unwrap_or(0);
+        let start = overview_scroll_start(disp.len(), sel_row, list_rows);
+        for (off, d) in disp.iter().enumerate().skip(start).take(list_rows) {
+            let r = list_first + (off - start) as u16;
+            match d {
+                OvRow::Header(a) => {
+                    // Aggregated per-window group header: window label + rollup,
+                    // reusing the panel-header color scheme. Waiting is highlighted
+                    // (it's the count that wants the human).
+                    let line = format!(
+                        "  \x1b[1;38;5;39m\u{25B8} window {}\x1b[0m  \x1b[2m{} agents\x1b[0m  \
+                         \x1b[38;2;95;240;140m\u{25CF}{}\x1b[0m \
+                         \x1b[38;2;255;200;70m\u{0021}{}\x1b[0m \
+                         \x1b[38;2;150;152;165m\u{00B7}{}\x1b[0m \
+                         \x1b[38;2;255;95;95m\u{2717}{}\x1b[0m",
+                        a.window + 1,
+                        a.total,
+                        a.working,
+                        a.waiting,
+                        a.idle,
+                        a.exited,
+                    );
+                    out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
+                }
+                OvRow::Agent(i) => {
+                    let n = &nodes[*i];
+                    let (glyph, color) = overview_glyph(n);
+                    let selected = *i == sel;
+                    let indent = "  ".repeat(n.depth);
+                    let status = n.status.map(status_label).unwrap_or(if n.exited {
+                        "exited"
+                    } else if n.is_agent {
+                        "starting"
+                    } else {
+                        "shell"
+                    });
+                    let ident = n
+                        .identity
+                        .as_deref()
+                        .map(|x| format!("  \x1b[2m\u{00B7}{x}\x1b[0m"))
+                        .unwrap_or_default();
+                    let action = if n.action.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
+                    };
+                    let cursor = if selected { "\x1b[1;38;5;37m\u{25B8}\x1b[0m" } else { " " };
+                    // Vendor tag next to the status (claude's tag is "" → identical).
+                    let vtag_str = if n.vtag.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" \x1b[2m{}\x1b[0m", n.vtag)
+                    };
+                    let line = format!(
+                        "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{action}",
+                        truncate(&n.label, 16),
+                    );
+                    if selected {
+                        // Faint bar background; `\x1b[K` fills the row, then the text.
+                        out.push_str(&format!("\x1b[{r};1H\x1b[48;5;236m\x1b[K{line}\x1b[0m"));
+                    } else {
+                        // Reset + `\x1b[K` clears any leftover highlight so nothing
+                        // lingers as the cursor moves.
+                        out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
+                    }
+                }
             }
             last_row = r;
         }
@@ -4293,6 +4395,110 @@ mod tests {
             }
         }
         out
+    }
+
+    /// A minimal OverviewNode for aggregation tests.
+    fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> OverviewNode {
+        OverviewNode {
+            window,
+            pane_id: 0,
+            label: "a".into(),
+            depth: 0,
+            status,
+            identity: None,
+            exited,
+            action: String::new(),
+            is_agent: true,
+            vtag: "",
+        }
+    }
+
+    #[test]
+    fn window_agg_counts_by_status() {
+        use agsess::Status::*;
+        let nodes = vec![
+            ov_node(0, Some(Working), false),
+            ov_node(0, Some(WaitingApproval), false),
+            ov_node(0, Some(Idle), false),
+            ov_node(0, None, false),        // unbound → idle bucket
+            ov_node(0, Some(Working), true), // exited wins over status
+            ov_node(1, Some(Working), false), // other window — excluded
+        ];
+        let a = window_agg(&nodes, 0);
+        assert_eq!(a.total, 5);
+        assert_eq!(a.working, 1);
+        assert_eq!(a.waiting, 1);
+        assert_eq!(a.idle, 2);
+        assert_eq!(a.exited, 1);
+    }
+
+    #[test]
+    fn overview_rows_single_window_has_no_header() {
+        let nodes = vec![ov_node(0, None, false), ov_node(0, None, false)];
+        let rows = overview_rows(&nodes);
+        // Two agents, no group header (global counts already cover one fleet).
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| matches!(r, OvRow::Agent(_))));
+    }
+
+    #[test]
+    fn overview_rows_multi_window_inserts_one_header_per_window() {
+        let nodes = vec![
+            ov_node(0, None, false),
+            ov_node(0, None, false),
+            ov_node(1, None, false),
+        ];
+        let rows = overview_rows(&nodes);
+        // Header(w0), Agent0, Agent1, Header(w1), Agent2 = 5 rows.
+        assert_eq!(rows.len(), 5);
+        let headers: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                OvRow::Header(a) => Some(a.window),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, vec![0, 1], "one header per window, in order");
+        // Agent rows still carry their original node indices, in order.
+        let agents: Vec<usize> = rows
+            .iter()
+            .filter_map(|r| match r {
+                OvRow::Agent(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(agents, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn overview_scroll_start_keeps_selection_visible_and_fills() {
+        // Fits entirely → no scroll.
+        assert_eq!(overview_scroll_start(5, 4, 10), 0);
+        // Selection near the top → start at 0.
+        assert_eq!(overview_scroll_start(20, 2, 5), 0);
+        // Selection deep → pinned to the bottom edge (sel at last visible row).
+        assert_eq!(overview_scroll_start(20, 12, 5), 8);
+        // Selection at the very end → clamp so the viewport is filled, not overshot.
+        assert_eq!(overview_scroll_start(20, 19, 5), 15);
+        // Degenerate list_rows.
+        assert_eq!(overview_scroll_start(20, 19, 0), 0);
+    }
+
+    #[test]
+    fn overview_panel_shows_window_headers_only_when_multiple_fleets() {
+        let bus = amux::bus::Bus::new();
+        // One window: no "window 1" group header.
+        let one = vec![ov_node(0, None, false), ov_node(0, None, false)];
+        let r1 = strip_csi(&render_overview_panel(&[], &bus, &one, 0, 24, 100));
+        assert!(!r1.contains("window 1"), "single fleet must not show a group header");
+        // Two windows: both group headers appear.
+        let two = vec![
+            ov_node(0, None, false),
+            ov_node(1, None, false),
+        ];
+        let r2 = strip_csi(&render_overview_panel(&[], &bus, &two, 0, 24, 100));
+        assert!(r2.contains("window 1"), "multi-fleet must group window 1");
+        assert!(r2.contains("window 2"), "multi-fleet must group window 2");
     }
 
     #[test]
