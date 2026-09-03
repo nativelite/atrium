@@ -4031,11 +4031,12 @@ fn spawn_pane_full(
     // ctl env (non-secret): when the control channel is on, every pane learns
     // the endpoint (`AMUX_CTL`) and its own id (`AMUX_PANE`). This is the base
     // env; identity secrets (if any) are merged on top for this one spawn.
-    // A per-pane capability token: two uuids of std entropy concatenated, so a
-    // sibling pane cannot guess it. Injected as AMUX_TOKEN and stored on the pane;
-    // the ctl server authenticates a request by matching it. (A CSPRNG-quality
-    // token and peer-credential binding are the documented hardening follow-ups.)
-    let token = format!("{}{}", amux::uid::v4(), amux::uid::v4());
+    // A per-pane capability token: 32 bytes of OS CSPRNG entropy (hex), so a
+    // sibling pane cannot guess or brute-force it. Injected as AMUX_TOKEN and
+    // stored on the pane; the ctl server authenticates a request by matching it.
+    // Peer-credential binding at the ipc layer (same-user endpoint) is the second
+    // gate underneath this token — see `ipc.rs`.
+    let token = amux::uid::token();
     let mut base_env: Vec<(String, String)> = Vec::new();
     if let Some(addr) = CTL_ADDRESS.get() {
         base_env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.clone()));

@@ -71,6 +71,71 @@ pub fn v4() -> String {
     )
 }
 
+/// Mint an unguessable **capability token**: 32 bytes of OS entropy, hex-encoded
+/// to a 64-char string. Unlike [`v4`], this **is a secret** — it is the per-pane
+/// `AMUX_TOKEN` the ctl server matches to authenticate a request, so it must be
+/// unpredictable, not merely unique.
+///
+/// Entropy comes straight from the OS CSPRNG (`BCryptGenRandom` on Windows,
+/// `/dev/urandom` on unix) — no third-party crate. If the OS RNG is somehow
+/// unavailable it falls back to folding several [`v4`] identifiers (weaker, but a
+/// spawn must never fail for lack of a token); callers treat the token as a secret
+/// regardless. The fallback path is not expected to run on a healthy system.
+pub fn token() -> String {
+    let mut bytes = [0u8; 32];
+    if os_random(&mut bytes) {
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    } else {
+        // Fallback only: OS entropy failed. Fold four non-crypto ids into 128 hex
+        // chars of best-effort unpredictability rather than refuse to spawn.
+        format!("{}{}{}{}", v4(), v4(), v4(), v4()).replace('-', "")
+    }
+}
+
+/// Fill `buf` with cryptographically-strong bytes from the OS. Returns `false`
+/// (leaving `buf` unchanged) if the OS RNG could not be read.
+#[cfg(windows)]
+fn os_random(buf: &mut [u8]) -> bool {
+    #[link(name = "bcrypt")]
+    extern "system" {
+        fn BCryptGenRandom(
+            alg: *mut std::ffi::c_void,
+            buf: *mut u8,
+            len: u32,
+            flags: u32,
+        ) -> i32;
+    }
+    // Use the system-preferred RNG so no algorithm handle is needed.
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    // Returns STATUS_SUCCESS (0) on success.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    status == 0
+}
+
+#[cfg(unix)]
+fn os_random(buf: &mut [u8]) -> bool {
+    use std::io::Read;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(buf))
+        .is_ok()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn os_random(_buf: &mut [u8]) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +170,37 @@ mod tests {
         for _ in 0..10_000 {
             assert!(seen.insert(v4()), "duplicate uuid minted");
         }
+    }
+
+    #[test]
+    fn token_is_64_hex_chars_from_os_entropy() {
+        let t = token();
+        // On any supported platform the OS RNG path is taken → 32 bytes → 64 hex.
+        // (The v4 fallback would be 128 chars; assert we are NOT on it here.)
+        assert_eq!(t.len(), 64, "expected 32 bytes of OS entropy hex-encoded: {t}");
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {t}");
+    }
+
+    #[test]
+    fn tokens_are_distinct_and_unlike_uuids() {
+        let mut seen = HashSet::new();
+        for _ in 0..10_000 {
+            let t = token();
+            assert!(seen.insert(t.clone()), "duplicate token minted");
+            // A token is a raw hex secret, not a dashed uuid.
+            assert!(!t.contains('-'), "token must not look like a uuid: {t}");
+        }
+    }
+
+    #[test]
+    fn os_random_fills_all_bytes() {
+        // Two independent draws must differ in overwhelming probability, proving
+        // the buffer is actually written (not left zeroed) by the OS RNG.
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        assert!(os_random(&mut a), "OS RNG must succeed on this platform");
+        assert!(os_random(&mut b), "OS RNG must succeed on this platform");
+        assert_ne!(a, b, "two OS-random draws must differ");
+        assert_ne!(a, [0u8; 32], "OS RNG must not leave the buffer zeroed");
     }
 }

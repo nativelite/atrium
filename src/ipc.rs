@@ -19,6 +19,15 @@
 //! Framing is one `\n`-terminated line each way. This is a control plane for a
 //! handful of agents, not a high-throughput bus; serving one request per tick is
 //! plenty and keeps the state machine trivial.
+//!
+//! **Same-user endpoint (peer-cred).** The endpoint is restricted to the user who
+//! launched amux: on unix the socket is 0600 and every accepted connection's peer
+//! uid is checked against `geteuid` (`SO_PEERCRED` / `getpeereid`) — a mismatched
+//! client is dropped before its request is read; on Windows the pipe is created
+//! with a security descriptor granting access only to the current user and
+//! SYSTEM. This is defense in depth *beneath* the per-pane capability token
+//! (`AMUX_TOKEN`), which remains the primary authenticator; together they close
+//! the cross-user connect vector on a shared machine.
 
 use std::io;
 
@@ -124,6 +133,103 @@ mod sys {
         ) -> i32;
         fn FlushFileBuffers(handle: Handle) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    // Security-descriptor plumbing so the control pipe is openable only by the
+    // user who created it (+ SYSTEM) — the Windows analog of unix peer-cred.
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: Handle, access: u32, token: *mut Handle) -> i32;
+        fn GetTokenInformation(
+            token: Handle,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut c_void, out: *mut *mut u16) -> i32;
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: *const u16,
+            revision: u32,
+            psd: *mut *mut c_void,
+            size: *mut u32,
+        ) -> i32;
+    }
+
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER_CLASS: i32 = 1; // TOKEN_INFORMATION_CLASS::TokenUser
+    const SDDL_REVISION_1: u32 = 1;
+
+    /// SECURITY_ATTRIBUTES: nLength, lpSecurityDescriptor, bInheritHandle.
+    #[repr(C)]
+    struct SecurityAttributes {
+        len: u32,
+        sd: *mut c_void,
+        inherit: i32,
+    }
+
+    /// SID_AND_ATTRIBUTES: the first (and only relevant) member of TOKEN_USER; its
+    /// `sid` points into the same buffer GetTokenInformation filled.
+    #[repr(C)]
+    struct SidAndAttributes {
+        sid: *mut c_void,
+        attributes: u32,
+    }
+
+    /// Read a NUL-terminated wide (UTF-16) string the OS allocated.
+    unsafe fn read_wide(mut p: *const u16) -> String {
+        let mut units = Vec::new();
+        while *p != 0 {
+            units.push(*p);
+            p = p.add(1);
+        }
+        String::from_utf16_lossy(&units)
+    }
+
+    /// Build the SDDL for a DACL that grants full access only to the current user
+    /// and LocalSystem, e.g. `D:P(A;;GA;;;S-1-5-21-…)(A;;GA;;;SY)`. `None` if the
+    /// user SID can't be resolved (caller then falls back to the default DACL).
+    fn current_user_sddl() -> Option<Vec<u16>> {
+        // GetCurrentProcess returns a pseudo-handle; no CloseHandle needed for it.
+        let proc = unsafe { GetCurrentProcess() };
+        let mut token: Handle = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(proc, TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        // First call sizes the buffer; second fills it.
+        let mut need = 0u32;
+        unsafe { GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut need) };
+        if need == 0 {
+            unsafe { CloseHandle(token) };
+            return None;
+        }
+        let mut buf = vec![0u8; need as usize];
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TOKEN_USER_CLASS,
+                buf.as_mut_ptr() as *mut c_void,
+                need,
+                &mut need,
+            )
+        };
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return None;
+        }
+        // The buffer begins with a SID_AND_ATTRIBUTES whose `sid` points inside it.
+        let sa = unsafe { &*(buf.as_ptr() as *const SidAndAttributes) };
+        let mut sid_str: *mut u16 = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(sa.sid, &mut sid_str) } == 0 || sid_str.is_null() {
+            return None;
+        }
+        let sid = unsafe { read_wide(sid_str) };
+        unsafe { LocalFree(sid_str as *mut c_void) };
+        // P = protected (no inheritance); GA = generic all; SY = LocalSystem.
+        let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)");
+        Some(wide(&sddl))
     }
 
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -164,6 +270,32 @@ mod sys {
 
     impl Listener {
         fn create_instance(addr: &[u16]) -> io::Result<Handle> {
+            // Restrict the endpoint to the current user (+SYSTEM): another user's
+            // process cannot open the control pipe even on a shared machine. This
+            // is the Windows analog of the unix peer-uid check. If the descriptor
+            // can't be built we fall back to the default DACL — never fail the bind
+            // over this defense-in-depth layer (the pane token is the primary gate).
+            let mut psd: *mut c_void = std::ptr::null_mut();
+            let mut sec_ptr: *mut c_void = std::ptr::null_mut();
+            let mut sa = SecurityAttributes {
+                len: std::mem::size_of::<SecurityAttributes>() as u32,
+                sd: std::ptr::null_mut(),
+                inherit: 0,
+            };
+            if let Some(sddl) = current_user_sddl() {
+                let ok = unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        sddl.as_ptr(),
+                        SDDL_REVISION_1,
+                        &mut psd,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok != 0 && !psd.is_null() {
+                    sa.sd = psd;
+                    sec_ptr = &mut sa as *mut SecurityAttributes as *mut c_void;
+                }
+            }
             let h = unsafe {
                 CreateNamedPipeW(
                     addr.as_ptr(),
@@ -173,9 +305,14 @@ mod sys {
                     8192,
                     8192,
                     0,
-                    std::ptr::null_mut(),
+                    sec_ptr,
                 )
             };
+            // The kernel copies the descriptor into the object at create time, so
+            // the local SD can be freed immediately after the call.
+            if !psd.is_null() {
+                unsafe { LocalFree(psd) };
+            }
             if h == INVALID_HANDLE_VALUE {
                 return Err(io::Error::last_os_error());
             }
@@ -384,9 +521,62 @@ mod sys {
 #[cfg(unix)]
 mod sys {
     use std::io::{self, Read, Write};
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::time::Duration;
+
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+
+    /// The effective uid of the connected peer, if the OS can report it. `None`
+    /// means the credential couldn't be read (caller then does not reject on it).
+    ///
+    /// Linux/Android use `SO_PEERCRED`; macOS/BSD use `getpeereid`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+        use std::ffi::c_void;
+        #[repr(C)]
+        struct Ucred {
+            pid: i32,
+            uid: u32,
+            gid: u32,
+        }
+        extern "C" {
+            fn getsockopt(
+                fd: i32,
+                level: i32,
+                optname: i32,
+                optval: *mut c_void,
+                optlen: *mut u32,
+            ) -> i32;
+        }
+        const SOL_SOCKET: i32 = 1;
+        const SO_PEERCRED: i32 = 17;
+        let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<Ucred>() as u32;
+        let r = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_PEERCRED,
+                &mut cred as *mut Ucred as *mut c_void,
+                &mut len,
+            )
+        };
+        (r == 0).then_some(cred.uid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
+        extern "C" {
+            fn getpeereid(fd: i32, euid: *mut u32, egid: *mut u32) -> i32;
+        }
+        let mut euid = 0u32;
+        let mut egid = 0u32;
+        (unsafe { getpeereid(fd, &mut euid, &mut egid) } == 0).then_some(euid)
+    }
 
     pub fn default_address(pid: u32) -> String {
         std::env::temp_dir()
@@ -431,6 +621,12 @@ mod sys {
             let _ = std::fs::remove_file(&path);
             let listener = UnixListener::bind(&path)?;
             listener.set_nonblocking(true)?;
+            // Owner-only (0600) so the socket file itself is not connectable by
+            // other users — defense in depth beneath the per-connection uid check.
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
             Ok(Listener {
                 listener,
                 path,
@@ -441,6 +637,17 @@ mod sys {
         pub fn poll(&mut self) -> io::Result<Option<String>> {
             match self.listener.accept() {
                 Ok((mut stream, _)) => {
+                    // Peer-cred gate: reject a client owned by a different user
+                    // outright — do not even read its request. The pane token is
+                    // still the primary auth; this closes the cross-user connect
+                    // vector on a shared machine. A credential we can't read (None)
+                    // does not reject (the token remains the gate).
+                    if let Some(peer) = peer_uid(stream.as_raw_fd()) {
+                        if peer != unsafe { geteuid() } {
+                            // Drop the stream (disconnect) and report idle.
+                            return Ok(None);
+                        }
+                    }
                     // The client sends immediately then waits; a short blocking
                     // read of one line is safe and keeps framing simple.
                     stream.set_nonblocking(false)?;
