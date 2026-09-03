@@ -3202,6 +3202,17 @@ fn dispatch_ctl(
                     Ok(d) => d,
                     Err(denied) => return ctl::reply_err(&denied.message()),
                 };
+            // Pane cap (host-resource guard): the depth guard bounds recursion; this
+            // bounds total *breadth* so a runaway fan-out can't exhaust the machine
+            // (agent processes dominate RAM, not amux). Host-derived, overridable
+            // with AMUX_MAX_PANES.
+            let live = windows.iter().map(|w| w.panes.len()).sum::<usize>();
+            let cap = amux::resources::effective_cap();
+            if live >= cap {
+                return ctl::reply_err(&format!(
+                    "pane cap reached ({live}/{cap}) — reap an agent or raise it with AMUX_MAX_PANES"
+                ));
+            }
             // Credential-delegation guard (§5): a worker may only pass down an
             // identity it itself holds (its own or the session default); the
             // operator delegates anything.

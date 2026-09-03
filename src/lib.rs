@@ -30,6 +30,7 @@ pub mod input;
 pub mod ipc;
 pub mod layout;
 pub mod resolve;
+pub mod resources;
 pub mod spawn;
 pub mod theme;
 pub mod tile;
