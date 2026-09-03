@@ -637,6 +637,9 @@ fn render_decision_detail(
 /// Word-wrap `text` to `width` columns across at most `max_lines` lines; if it
 /// still overflows, the last line ends with `…`. Whitespace-collapsing — good
 /// enough for a one-shot question, not a general typesetter.
+// `while let … next()` (not `for`) is deliberate: after the loop `words` is
+// reused via `words.peek()` to detect overflow, which a `for` would consume.
+#[allow(clippy::while_let_on_iterator)]
 fn wrap_to(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -680,7 +683,7 @@ struct LogRow {
 
 /// Merge the bus, the board, and each agent's latest action into one activity
 /// log, sorted oldest→newest. The bus is the bulk (every event, already stamped
-/// + attributed); the board contributes each current entry at its last-update
+/// and attributed); the board contributes each current entry at its last-update
 /// time; agsess contributes each agent's most recent action, attributed to the
 /// persona via the pane that owns its session.
 fn collect_log(
@@ -758,6 +761,7 @@ fn ago(now_ms: u64, ts_ms: u64) -> String {
 /// The activity-log panel (`Ctrl+A l`): the merged [`collect_log`] rendered
 /// newest-at-the-bottom (tailing), scrollable up for history. `scroll` is how
 /// many events back from the newest the window is shifted.
+#[allow(clippy::too_many_arguments)]
 fn render_log_panel(
     windows: &[Window],
     world: &amux::vendors::VendorWorlds,
@@ -3185,6 +3189,7 @@ fn ctl_is_read_only(cmd: &amux::ctl::Cmd) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_ctl(
     line: &str,
     windows: &mut Vec<Window>,
@@ -4569,7 +4574,7 @@ mod tests {
         .unwrap();
         let decisions = bus.pending_decisions();
         let mut out = String::new();
-        render_decision_detail(&mut out, decisions.get(0), 24, 80);
+        render_decision_detail(&mut out, decisions.first(), 24, 80);
         let flat: String = strip_csi(&out).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(q), "full question visible: {flat}");
         assert!(flat.contains("#1") && flat.contains("grace"), "seq + source shown: {flat}");

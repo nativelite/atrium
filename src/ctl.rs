@@ -2248,9 +2248,11 @@ mod tests {
         let view = render_board(&reply).expect("claim reply renders");
         assert!(view.contains("held by scout"), "view was: {view}");
         // A granted claim shows the confirmation.
-        let mut e = crate::board::Entry::default();
-        e.claimed_by = Some("cli".to_string());
-        e.lease_ms = 1100;
+        let e = crate::board::Entry {
+            claimed_by: Some("cli".to_string()),
+            lease_ms: 1100,
+            ..Default::default()
+        };
         let granted = reply_board_claim("cli", &crate::board::Claim::Granted(e));
         let gview = render_board(&granted).expect("granted renders");
         assert!(gview.contains("claimed cli"), "view was: {gview}");
