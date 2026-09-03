@@ -10,24 +10,27 @@
 //! could not hand it a `--session-id` ([`adopt_session_for`]), and the overview
 //! decoration for a node's vendor ([`vendor_tag`]).
 //!
-//! ## Supported vs. experimental (be realistic — founder directive 2026-09-03)
-//! We only build worlds for the vendors we're actually committing to:
-//! [`SUPPORTED_VENDORS`] = Claude, Gemini, Codex (the three that matter —
-//! Anthropic, Google, OpenAI). Claude's root/format is **verified**; Gemini and
-//! Codex are the two we're wiring first-class and testing against synthetic
-//! transcripts. The remaining `agsess::Vendor` variants (Aider, Cursor, Copilot,
-//! Qwen, OpenCode, Goose) keep their stem/root/tag helpers here for the day we
-//! promote one, but **no world is built for them** — an amux running those CLIs
-//! simply won't track their status yet. We don't claim what we haven't run.
+//! ## Supported vs. recognised (be realistic — founder directive 2026-09-03)
+//! We only build worlds for the two vendors that (a) run as a terminal CLI in a
+//! pane and (b) write append-only JSONL amux can tail: [`SUPPORTED_VENDORS`] =
+//! **Claude (Anthropic)** and **Codex (OpenAI)**. Claude's format is verified;
+//! Codex writes rollout JSONL (`~/.codex/sessions/**/rollout-*.jsonl`), which the
+//! agsess codex parser reads. Every other `agsess::Vendor` (Gemini, Aider, Cursor,
+//! Copilot, Qwen, OpenCode, Goose) keeps its stem/root/tag helpers here but **no
+//! world is built** — those panes show a tag yet aren't status-tracked.
+//!
+//! Google's individual CLIs were inspected against a live install and are
+//! excluded on purpose: the Gemini CLI writes a growing JSON *array*, and the
+//! Antigravity CLI uses protobuf + SQLite — neither is a tailable JSONL log, so
+//! they don't fit this model (see [`SUPPORTED_VENDORS`] for the specifics).
 //!
 //! ## Honest ceiling
-//! Even Gemini/Codex transcript roots are sourced from published docs, not
-//! confirmed against a live install (same limitation agsess's vendor parsers
-//! carry). The deliverable is the *structural* wiring — a vendor world that binds
-//! and displays correctly — proven end-to-end against **synthetic** transcript
-//! dirs (see `vendorworlds_discovers_adopts_and_binds_a_gemini_pane`). Anything
-//! unverified is labeled with a `NOTE` here; never a guessed path dressed up as
-//! confirmed.
+//! The Codex transcript root is sourced from the openai/codex source, not yet
+//! confirmed against a live install. The deliverable is the *structural* wiring —
+//! a vendor world that binds and displays correctly — proven end-to-end against
+//! **synthetic** transcript dirs (see `vendorworlds_discovers_adopts_and_binds…`).
+//! Anything unverified is labeled with a `NOTE` here; never a guessed path dressed
+//! up as confirmed.
 
 use agsess::{Status, Vendor, World};
 use std::path::PathBuf;
@@ -48,12 +51,20 @@ pub const ALL_VENDORS: &[Vendor] = &[
     Vendor::Goose,
 ];
 
-/// The vendors amux actually builds a world for and stands behind — Claude
-/// (Anthropic), Gemini (Google), Codex (OpenAI). [`VendorWorlds::new`] enumerates
-/// exactly these. Everything else in [`ALL_VENDORS`] is recognised (stem → tag in
-/// the overview) but not tracked; promoting a vendor is one line here once its
-/// root/format is verified against a live install.
-pub const SUPPORTED_VENDORS: &[Vendor] = &[Vendor::ClaudeCode, Vendor::Gemini, Vendor::Codex];
+/// The vendors amux actually builds a world for and stands behind — **Claude
+/// (Anthropic)** and **Codex (OpenAI)**. Both write append-only JSONL transcripts,
+/// which is exactly what amux's tail-by-byte-offset model reads.
+/// [`VendorWorlds::new`] enumerates exactly these. Everything else in
+/// [`ALL_VENDORS`] is recognised (stem → tag in the overview) but not tracked.
+///
+/// Google's individual CLIs are **deliberately excluded** (verified against a live
+/// install 2026-09-03): the Gemini CLI writes a single growing JSON *array*
+/// (`~/.gemini/tmp/<user>/logs.json`), not line-delimited JSON, and the Antigravity
+/// CLI stores conversations as protobuf + SQLite (`~/.gemini/antigravity-cli/`,
+/// `.pb` files + `conversation_summaries.db`). Neither is tailable by the current
+/// model, so tracking them would be a separate SQLite/array integration, not a
+/// parser tweak — and we don't claim what we can't read.
+pub const SUPPORTED_VENDORS: &[Vendor] = &[Vendor::ClaudeCode, Vendor::Codex];
 
 /// Map a pane command stem to the `agsess::Vendor` it produces transcripts for.
 ///
@@ -101,9 +112,15 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // Verified: Claude Code writes to ~/.claude/projects/<project>/<session>.jsonl.
         Vendor::ClaudeCode => Some(agsess::default_root()),
 
-        // NOTE(roots): researched-stub. Gemini CLI writes session transcripts under
-        // ~/.gemini/tmp/<session-id>/<session>.jsonl (from published Gemini CLI
-        // docs; not verified against a live install).
+        // NOTE(roots): recognised-not-tracked, NOT in SUPPORTED_VENDORS. Verified
+        // against a live install 2026-09-03: the Gemini CLI does NOT write per-
+        // session JSONL — it keeps a single growing JSON *array* at
+        // ~/.gemini/tmp/<user>/logs.json plus chats under ~/.gemini/tmp/<user>/chats/.
+        // A JSON array can't be append-tailed line-by-line, so no world is built
+        // for Gemini today. (Google's newer Antigravity CLI is worse for this model
+        // still: protobuf + SQLite under ~/.gemini/antigravity-cli/.) The path below
+        // is retained only so a future array-aware integration has a starting point;
+        // it is unused while Gemini stays out of SUPPORTED_VENDORS.
         // Override: AMUX_GEMINI_ROOT env var.
         Vendor::Gemini => Some(
             std::env::var("AMUX_GEMINI_ROOT")
@@ -382,14 +399,16 @@ mod tests {
         assert_eq!(worlds.status_for(None), None);
     }
 
-    /// Only the supported three get a world; the experimental vendors are
-    /// recognised but not built (be-realistic scope).
+    /// Only the supported two (Claude + Codex) get a world; every other vendor —
+    /// Gemini included — is recognised but not built (be-realistic scope).
     #[test]
     fn only_supported_vendors_get_a_world() {
-        assert_eq!(SUPPORTED_VENDORS, &[Vendor::ClaudeCode, Vendor::Gemini, Vendor::Codex]);
+        assert_eq!(SUPPORTED_VENDORS, &[Vendor::ClaudeCode, Vendor::Codex]);
+        // Google's CLIs are deliberately excluded (non-tailable storage).
+        assert!(!SUPPORTED_VENDORS.contains(&Vendor::Gemini), "Gemini must not be tracked");
         let worlds = VendorWorlds::new();
-        // Claude + Gemini + Codex all have a known root → three worlds.
-        assert_eq!(worlds.worlds.len(), 3, "exactly the supported three build a world");
+        // Claude + Codex both have a known root → two worlds.
+        assert_eq!(worlds.worlds.len(), 2, "exactly the supported two build a world");
     }
 
     #[test]
@@ -691,55 +710,61 @@ mod tests {
         assert_eq!(id, "new-sess");
     }
 
+    /// A Codex rollout line (event_msg/agent_message) — no `cwd`, so the discovered
+    /// session's `cwd` stays `None`, matching a pane launched with unknown cwd.
+    const CODEX_LINE: &str =
+        r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}"#;
+
     /// End-to-end chain (the DoD for this feature): the exact sequence the run
     /// loop drives — a `VendorWorlds` built the way the app builds it discovers a
-    /// gemini session under its (env-overridden) root, [`adopt_session_for`] over
-    /// *that vendor's* sessions yields the id to stamp on the pane, and
-    /// [`VendorWorlds::status_for`] then binds it. This is what makes a gemini pane
-    /// light up.
+    /// **codex** session under its (env-overridden) root, [`adopt_session_for`]
+    /// over *that vendor's* sessions yields the id to stamp on the pane, and
+    /// [`VendorWorlds::status_for`] then binds it. This is what makes a codex pane
+    /// light up — codex being one of the two SUPPORTED_VENDORS.
     ///
-    /// Uses `AMUX_GEMINI_ROOT` (the operator override) to point the gemini world
-    /// at a synthetic transcript dir, so it goes through `VendorWorlds::new()` —
-    /// not a hand-built `World` — proving the real path end to end.
+    /// Uses `CODEX_HOME` (codex's own root override → `$CODEX_HOME/sessions`) to
+    /// point the codex world at a synthetic transcript dir, so it goes through
+    /// `VendorWorlds::new()` — not a hand-built `World` — proving the real path.
     #[test]
-    fn vendorworlds_discovers_adopts_and_binds_a_gemini_pane() {
-        let td = TempDir::new("e2e-gemini");
-        write_adopt_session(&td.0, "proj", "gemini-live-1", &[GEMINI_LINE]);
+    fn vendorworlds_discovers_adopts_and_binds_a_codex_pane() {
+        let td = TempDir::new("e2e-codex");
+        // vendor_root(Codex) == $CODEX_HOME/sessions, so write under sessions/.
+        let sessions_root = td.0.join("sessions");
+        write_adopt_session(&sessions_root, "proj", "rollout-live-1", &[CODEX_LINE]);
 
         // Capture launch just before the world first sees the file, so the
         // discovered session's `first_seen_ms >= launch_ms` (the time gate).
         let launch_ms = agsess::sessions::now_ms();
 
-        // Point the gemini world at our synthetic root exactly as an operator
-        // would, then build + refresh via the same API the run loop uses.
-        // Serialize with the other AMUX_*_ROOT tests via ENV_LOCK, and
-        // save/restore, since set_var/remove_var are process-global.
+        // Point the codex world at our synthetic root exactly as an operator would
+        // (CODEX_HOME is codex's own env var), then build + refresh via the same
+        // API the run loop uses. Serialize with the other env tests via ENV_LOCK.
         let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("AMUX_GEMINI_ROOT").ok();
-        std::env::set_var("AMUX_GEMINI_ROOT", &td.0);
+        let prev = std::env::var("CODEX_HOME").ok();
+        std::env::set_var("CODEX_HOME", &td.0);
         let mut worlds = VendorWorlds::new();
         worlds.refresh();
         match prev {
-            Some(v) => std::env::set_var("AMUX_GEMINI_ROOT", v),
-            None => std::env::remove_var("AMUX_GEMINI_ROOT"),
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
         }
 
-        // Scope to Gemini sessions (what the run loop passes to adopt for a gemini
+        // Scope to Codex sessions (what the run loop passes to adopt for a codex
         // pane) so real ~/.claude sessions on the dev box can't perturb the test.
-        let gemini: Vec<&agsess::AgentSession> = worlds
+        let codex: Vec<&agsess::AgentSession> = worlds
             .sessions()
             .into_iter()
-            .filter(|s| s.vendor == Vendor::Gemini)
+            .filter(|s| s.vendor == Vendor::Codex)
             .collect();
         assert!(
-            gemini.iter().any(|s| s.id == "gemini-live-1"),
-            "VendorWorlds must discover the gemini session under the overridden root"
+            codex.iter().any(|s| s.id == "rollout-live-1"),
+            "VendorWorlds must discover the codex session under the overridden root"
         );
 
         // A pane launched at `launch_ms` (cwd unknown) adopts that session…
-        let id = adopt_session_for(&gemini, None, launch_ms)
-            .expect("a started gemini pane adopts its discovered session");
-        assert_eq!(id, "gemini-live-1");
+        let id = adopt_session_for(&codex, None, launch_ms)
+            .expect("a started codex pane adopts its discovered session");
+        assert_eq!(id, "rollout-live-1");
 
         // …and once stamped, the pane binds: status_for resolves a live Status,
         // i.e. the overview node is no longer grey/unbound.
