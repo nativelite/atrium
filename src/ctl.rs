@@ -111,6 +111,13 @@ pub enum BoardOp {
     List,
     /// Remove an entry.
     Del { key: String },
+    /// Atomically claim `key` for the caller with an optional lease `ttl_ms`
+    /// (`None` ⇒ the board's [`crate::board::DEFAULT_LEASE_MS`]). The owner is
+    /// derived server-side from the caller, never carried in the request, so a
+    /// worker can't claim as someone else.
+    Claim { key: String, ttl_ms: Option<u64> },
+    /// Release the caller-visible claim on `key`, freeing it for the next taker.
+    Release { key: String },
 }
 
 /// A `bus` operation — the shared pub/sub event stream ([`crate::bus`]). The
@@ -586,6 +593,13 @@ amux ctl board set KEY field=value records current truth (status, owner, \
 blocker, url), amux ctl board get KEY reads one entry, and amux ctl board list \
 shows the whole board. Update the board when your status changes so the lead and \
 your teammates see it. \
+Before you start working a task, claim it: amux ctl board claim KEY takes it for \
+you and holds a short lease. If the claim is denied it names who already holds it, \
+so pick a different unclaimed task rather than assuming a teammate owns \
+everything. Your board set updates renew your lease automatically while you work, \
+so a task you hold never slips away. When you finish, amux ctl board release KEY \
+frees it for others. Claim before you build and the team divides work with no \
+collisions. \
 Share fast-moving events on the bus, not just durable state on the board: \
 amux ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
 when something needs a human decision, and amux ctl bus sub TOPIC then amux ctl \
@@ -696,9 +710,18 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 Some("get") => BoardOp::Get { key: key()? },
                 Some("list") => BoardOp::List,
                 Some("del") => BoardOp::Del { key: key()? },
+                Some("claim") => {
+                    let ttl_ms = v
+                        .get("ttl_ms")
+                        .and_then(Value::as_i64)
+                        .filter(|n| *n > 0)
+                        .map(|n| n as u64);
+                    BoardOp::Claim { key: key()?, ttl_ms }
+                }
+                Some("release") => BoardOp::Release { key: key()? },
                 other => {
                     return Err(format!(
-                        "board op must be set|get|list|del (got {other:?})"
+                        "board op must be set|get|list|del|claim|release (got {other:?})"
                     ))
                 }
             };
@@ -811,6 +834,43 @@ pub fn reply_board_del(key: &str, deleted: bool) -> String {
         ("ok", Value::Bool(true)),
         ("key", s(key)),
         ("deleted", Value::Bool(deleted)),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"key":<key>,"granted":<bool>,"holder":<who|null>,"lease_ms":<n>,
+/// "entry":<entry|null>}` — a board `claim`. On grant, `entry` carries the fresh
+/// claim; on denial, `holder`/`lease_ms` name who holds it and until when.
+pub fn reply_board_claim(key: &str, claim: &crate::board::Claim) -> String {
+    use crate::board::{entry_to_value, Claim};
+    let (granted, holder, lease_ms, entry) = match claim {
+        Claim::Granted(e) => (
+            true,
+            e.claimed_by.clone().map(Value::String).unwrap_or(Value::Null),
+            e.lease_ms,
+            entry_to_value(e),
+        ),
+        Claim::Denied { holder, lease_ms } => {
+            (false, Value::String(holder.clone()), *lease_ms, Value::Null)
+        }
+    };
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("key", s(key)),
+        ("granted", Value::Bool(granted)),
+        ("holder", holder),
+        ("lease_ms", Value::Number(Number::Int(lease_ms as i64))),
+        ("entry", entry),
+    ])
+    .to_string()
+}
+
+/// `{"ok":true,"key":<key>,"released":<bool>}` — a board `release`.
+pub fn reply_board_release(key: &str, released: bool) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("key", s(key)),
+        ("released", Value::Bool(released)),
     ])
     .to_string()
 }
@@ -973,6 +1033,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                 "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
+                 \x20      | board claim <key> [--ttl secs] | board release <key>\n\
                  \x20      | bus pub <topic> [--decision] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq>"
             );
             return ExitCode::FAILURE;
@@ -1045,6 +1106,29 @@ fn render_board(reply: &str) -> Option<String> {
             } else {
                 "was not on the board"
             }
+        ));
+    }
+    // claim → granted shows the now-held entry; denied names the current holder.
+    if let Some(granted) = v.get("granted").and_then(Value::as_bool) {
+        let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
+        if granted {
+            let line = match v.get("entry") {
+                Some(entry) if entry != &Value::Null => render_entry_line(key, entry),
+                _ => format!("  {key}"),
+            };
+            return Some(format!("{line}\n  \x1b[38;5;10mclaimed {key}\x1b[0m"));
+        }
+        let holder = v.get("holder").and_then(Value::as_str).unwrap_or("someone");
+        return Some(format!(
+            "  \x1b[38;5;11m{key} is held by {holder}\x1b[0m — pick another task"
+        ));
+    }
+    // release → a one-line confirmation.
+    if let Some(released) = v.get("released").and_then(Value::as_bool) {
+        let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
+        return Some(format!(
+            "  {key}: {}",
+            if released { "released" } else { "was not on the board" }
         ));
     }
     // get/set → one entry (or "not on the board").
@@ -1167,12 +1251,19 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ");
+    // A live claim shows a magenta `⊙holder` tag so a glance at the board tells
+    // you who is actively working each task (empty when unclaimed).
+    let held = entry
+        .get("claimed_by")
+        .and_then(Value::as_str)
+        .map(|h| format!("  \x1b[38;5;13m\u{2299}{h}\x1b[0m"))
+        .unwrap_or_default();
     let by = entry
         .get("by")
         .and_then(Value::as_str)
         .map(|b| format!("  \x1b[2m(by {b})\x1b[0m"))
         .unwrap_or_default();
-    format!("{glyph}\x1b[1m{key:<12}\x1b[0m {field_str}{by}")
+    format!("{glyph}\x1b[1m{key:<12}\x1b[0m {field_str}{held}{by}")
 }
 
 /// A status string → an SGR color: green done/shipped, red blocked/failed, cyan
@@ -1371,7 +1462,7 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             let sub = args
                 .get(1)
                 .map(String::as_str)
-                .ok_or_else(|| "board needs set|get|list|del".to_string())?;
+                .ok_or_else(|| "board needs set|get|list|del|claim|release".to_string())?;
             pairs.push(("op", s(sub)));
             match sub {
                 "set" => {
@@ -1392,16 +1483,34 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                     }
                     pairs.push(("fields", fields_to_value(fields)));
                 }
-                "get" | "del" => {
+                "get" | "del" | "release" => {
                     let key = args
                         .get(2)
                         .filter(|t| !t.starts_with('-'))
                         .ok_or_else(|| format!("board {sub} needs a key"))?;
                     pairs.push(("key", Value::String(key.clone())));
                 }
+                "claim" => {
+                    let key = args
+                        .get(2)
+                        .filter(|t| !t.starts_with('-'))
+                        .ok_or_else(|| "board claim needs a key".to_string())?;
+                    pairs.push(("key", Value::String(key.clone())));
+                    // Optional `--ttl SECS` overrides the default lease length.
+                    if let Some(pos) = args.iter().position(|a| a == "--ttl") {
+                        let secs = args
+                            .get(pos + 1)
+                            .ok_or_else(|| "--ttl needs a value in seconds".to_string())?
+                            .parse::<u64>()
+                            .map_err(|_| "--ttl must be a whole number of seconds".to_string())?;
+                        pairs.push(("ttl_ms", Value::Number(Number::Int((secs * 1000) as i64))));
+                    }
+                }
                 "list" => {}
                 other => {
-                    return Err(format!("board op must be set|get|list|del (got {other:?})"))
+                    return Err(format!(
+                        "board op must be set|get|list|del|claim|release (got {other:?})"
+                    ))
                 }
             }
         }
@@ -2007,6 +2116,72 @@ mod tests {
             parse_request(&del).unwrap().cmd,
             Cmd::Board(BoardOp::Del { key }) if key == "auth"
         ));
+    }
+
+    #[test]
+    fn build_board_claim_and_release_roundtrip() {
+        // Bare claim → default lease (ttl_ms None).
+        let claim = build_request(&v(&["board", "claim", "cli"]), Some(0)).unwrap();
+        assert!(matches!(
+            parse_request(&claim).unwrap().cmd,
+            Cmd::Board(BoardOp::Claim { key, ttl_ms: None }) if key == "cli"
+        ));
+        // `--ttl 90` → 90_000 ms carried through to the server.
+        let ttl = build_request(&v(&["board", "claim", "cli", "--ttl", "90"]), Some(0)).unwrap();
+        assert!(matches!(
+            parse_request(&ttl).unwrap().cmd,
+            Cmd::Board(BoardOp::Claim { key, ttl_ms: Some(90_000) }) if key == "cli"
+        ));
+        // release → BoardOp::Release.
+        let rel = build_request(&v(&["board", "release", "cli"]), Some(0)).unwrap();
+        assert!(matches!(
+            parse_request(&rel).unwrap().cmd,
+            Cmd::Board(BoardOp::Release { key }) if key == "cli"
+        ));
+        // A malformed --ttl is a clear client error, not a silent default.
+        assert!(build_request(&v(&["board", "claim", "cli", "--ttl", "soon"]), Some(0))
+            .unwrap_err()
+            .contains("--ttl"));
+    }
+
+    #[test]
+    fn agent_directive_has_no_shim_breaking_chars() {
+        // The directive is injected via `--append-system-prompt` through a Windows
+        // `cmd /C` shim; a shell-metacharacter would break the quoting and kill the
+        // agent pane on launch. Guard the load-bearing set so a future edit (like
+        // the claim/lease lines) can't silently reintroduce one.
+        for c in ['"', '`', '&', '|', '<', '>', '^', '%'] {
+            assert!(
+                !AGENT_CTL_DIRECTIVE.contains(c),
+                "directive contains shim-breaking {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_directive_teaches_claim_before_work() {
+        // The behavioral half of the claim protocol: agents are told to claim
+        // before building and release when done, else the primitive goes unused.
+        assert!(AGENT_CTL_DIRECTIVE.contains("board claim"));
+        assert!(AGENT_CTL_DIRECTIVE.contains("board release"));
+    }
+
+    #[test]
+    fn board_claim_denied_view_names_the_holder() {
+        // A denied claim renders the current holder so a loser knows to move on.
+        let reply = reply_board_claim(
+            "cli",
+            &crate::board::Claim::Denied { holder: "scout".to_string(), lease_ms: 1100 },
+        );
+        let view = render_board(&reply).expect("claim reply renders");
+        assert!(view.contains("held by scout"), "view was: {view}");
+        // A granted claim shows the confirmation.
+        let mut e = crate::board::Entry::default();
+        e.claimed_by = Some("cli".to_string());
+        e.lease_ms = 1100;
+        let granted = reply_board_claim("cli", &crate::board::Claim::Granted(e));
+        let gview = render_board(&granted).expect("granted renders");
+        assert!(gview.contains("claimed cli"), "view was: {gview}");
     }
 
     #[test]

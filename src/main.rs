@@ -2648,6 +2648,20 @@ fn dispatch_ctl(
                     let deleted = board.del(&key);
                     ctl::reply_board_del(&key, deleted)
                 }
+                ctl::BoardOp::Claim { key, ttl_ms } => {
+                    // The owner is the caller (`by`), derived server-side — a
+                    // worker can't claim as someone else. Default the lease to the
+                    // board's DEFAULT_LEASE_MS unless the caller set --ttl.
+                    let owner = by.as_deref().unwrap_or("operator");
+                    let ttl = ttl_ms.unwrap_or(amux::board::DEFAULT_LEASE_MS);
+                    let outcome =
+                        board.claim(&key, owner, ttl, agsess::sessions::now_ms());
+                    ctl::reply_board_claim(&key, &outcome)
+                }
+                ctl::BoardOp::Release { key } => {
+                    let released = board.release(&key, agsess::sessions::now_ms());
+                    ctl::reply_board_release(&key, released)
+                }
             }
         }
         Cmd::Bus(op) => {
@@ -2765,6 +2779,8 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
                 amux::ctl::BoardOp::Get { key } => format!("get {key}"),
                 amux::ctl::BoardOp::List => "list".to_string(),
                 amux::ctl::BoardOp::Del { key } => format!("del {key}"),
+                amux::ctl::BoardOp::Claim { key, .. } => format!("claim {key}"),
+                amux::ctl::BoardOp::Release { key } => format!("release {key}"),
             },
         ),
         Cmd::Bus(op) => (
