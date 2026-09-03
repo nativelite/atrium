@@ -23,6 +23,11 @@ pub struct PaneInfo {
     /// a `·<name>` tag next to the window entry (name-only, a11y text always
     /// present; see `identity::IDENTITY_PALETTE` for the tunable color).
     pub identity: Option<String>,
+    /// The window's agent **role/persona** (`lead`, `gemini`) when it has one —
+    /// a fleet agent's name or a ctl `--role`. Rendered as a `:<role>` suffix on
+    /// the entry (`1:claude:lead`) so a decision's `from=lead` maps to a window
+    /// number at a glance. `None` (manual panes, shells) ⇒ just `N:title`.
+    pub role: Option<String>,
 }
 
 /// The color role of a bar segment. Text is identical to [`bar_text`]; only the
@@ -80,7 +85,14 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
         } else {
             ("-", State::Idle)
         };
-        segs.push(seg(format!("| {}:{}{} ", i + 1, p.title, mark), Role::Entry(state)));
+        // Append the persona/role as `:role` when it adds information (a fleet
+        // agent or ctl `--role`), so the entry reads `1:claude:lead`. Skip it when
+        // absent or identical to the title, keeping plain panes as `1:cmd`.
+        let name = match &p.role {
+            Some(r) if !r.is_empty() && *r != p.title => format!("{}:{}", p.title, r),
+            _ => p.title.clone(),
+        };
+        segs.push(seg(format!("| {}:{}{} ", i + 1, name, mark), Role::Entry(state)));
         // The identity name-tag rides next to the window entry — the name only,
         // never the secret. Its own segment so the painter can color it; the
         // `·<name>` text is the load-bearing channel and is always present.
@@ -247,6 +259,7 @@ mod tests {
             exited: false,
             waiting: false,
             identity: None,
+            role: None,
         }
     }
 
@@ -277,6 +290,19 @@ mod tests {
                 assert_ne!(all[i], all[j], "states {i} and {j} share a color");
             }
         }
+    }
+
+    #[test]
+    fn role_renders_as_a_persona_suffix() {
+        // A fleet agent's role shows as `N:claude:role`; a plain pane (no role,
+        // or role == title) stays `N:title`.
+        let mut agent = pane("claude", true, false);
+        agent.role = Some("lead".into());
+        let plain = pane("cmd", false, false);
+        let text = bar_text(&[agent, plain], 80, "");
+        assert!(text.contains("1:claude:lead"), "persona suffix: {text}");
+        assert!(text.contains("2:cmd"), "plain pane keeps its title: {text}");
+        assert!(!text.contains("2:cmd:"), "no dangling colon on a roleless pane: {text}");
     }
 
     #[test]

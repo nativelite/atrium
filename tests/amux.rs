@@ -176,6 +176,7 @@ fn info(title: &str, active: bool, activity: bool, exited: bool) -> PaneInfo {
         exited,
         waiting: false,
         identity: None,
+        role: None,
     }
 }
 
@@ -188,6 +189,7 @@ fn waiting_info(title: &str, active: bool) -> PaneInfo {
         exited: false,
         waiting: true,
         identity: None,
+        role: None,
     }
 }
 

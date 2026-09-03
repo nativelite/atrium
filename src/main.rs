@@ -1931,6 +1931,10 @@ fn run(
                 // The window's identity tag: the first pane's identity name (all
                 // panes in a window inherit the same identity in v1). Name only.
                 identity: w.panes.first().and_then(|p| p.identity.clone()),
+                // The window's persona/role (fleet agent name or ctl --role), so
+                // the entry reads `N:claude:persona` and a decision's `from` maps
+                // to a window number.
+                role: w.panes.first().and_then(|p| p.role.clone()),
             })
             .collect();
         if flash
