@@ -392,19 +392,22 @@ fn render_board_panel(
     rows: u16,
     cols: u16,
     feed_scroll: usize,
+    decision_sel: usize,
 ) -> String {
     let mut out = String::from("\x1b[?25l\x1b[2J");
     let decisions = bus.pending_decisions();
+    let has_detail = !decisions.is_empty();
+    let sel = decision_sel.min(decisions.len().saturating_sub(1));
     out.push_str(&format!(
         "\x1b[1;1H\x1b[1;38;5;37m  board + bus\x1b[0m  \x1b[2m(Ctrl+A b to close · live)\x1b[0m{}",
-        if decisions.is_empty() {
-            String::new()
-        } else {
+        if has_detail {
             format!(
-                "  \x1b[1;38;5;11m{} decision{} awaiting you\x1b[0m  \x1b[2m· answer in the agent's pane, then  amux ctl bus resolve <#>\x1b[0m",
+                "  \x1b[1;38;5;11m{} decision{} awaiting you\x1b[0m  \x1b[2m· j/k select · r resolve · g go to agent\x1b[0m",
                 decisions.len(),
                 if decisions.len() == 1 { "" } else { "s" }
             )
+        } else {
+            String::new()
         }
     ));
     out.push_str(&format!(
@@ -412,23 +415,143 @@ fn render_board_panel(
         "\u{2500}".repeat(cols as usize)
     ));
 
-    // Split the content rows (3..=bar-1) between the board (top) and the feed
-    // (bottom half). Defensive on tiny terminals: sections shrink, never overrun.
-    let content_last = rows.saturating_sub(1); // the bar lives on row `rows`
-    let region = content_last.saturating_sub(2); // rows 3..=content_last
+    // The bar lives on `rows`. When a decision is selected, reserve the bottom
+    // four rows for a detail bar (divider + 3 content rows) that shows its full,
+    // wrapped question — so a truncated one-liner never hides what's being asked.
+    let content_last = rows.saturating_sub(1);
+    let usable_last = if has_detail {
+        content_last.saturating_sub(4).max(3)
+    } else {
+        content_last
+    };
+
+    // Split the usable rows (3..=usable_last) between the board (top) and the
+    // bus region (bottom). Defensive on tiny terminals: sections shrink.
+    let region = usable_last.saturating_sub(2);
     let feed_h = (region / 2).clamp(3.min(region), region);
-    let board_last = content_last.saturating_sub(feed_h + 1).max(3);
+    let board_last = usable_last.saturating_sub(feed_h + 1).max(3);
 
     render_board_rows(&mut out, board, board_last);
 
-    // The bus divider + feed, filling from `board_last + 2` down to the bar.
+    // The bus divider, then the open decisions (selectable), then the scrollable
+    // FYI history below them.
     let div_row = board_last + 1;
     out.push_str(&format!(
         "\x1b[{div_row};1H\x1b[38;5;238m\u{2500}\u{2500} \x1b[0m\x1b[1;38;5;37mbus\x1b[0m \x1b[38;5;238m{}\x1b[0m",
         "\u{2500}".repeat((cols as usize).saturating_sub(7))
     ));
-    render_feed_rows(&mut out, bus, &decisions, div_row + 1, content_last, feed_scroll);
+    let after_decisions = render_decisions_block(&mut out, &decisions, sel, div_row + 1, usable_last);
+    render_fyi_feed(&mut out, bus, &decisions, after_decisions, usable_last, feed_scroll);
+
+    if has_detail {
+        render_decision_detail(&mut out, decisions.get(sel), content_last, cols);
+    }
     out
+}
+
+/// Draw the open decisions as a selectable list from `first_row` down, the
+/// selected one marked with a bright `▶` and bolded. Returns the next free row
+/// (where the FYI feed begins). Decisions past the space are dropped — the detail
+/// bar still shows the selected one in full.
+fn render_decisions_block(
+    out: &mut String,
+    decisions: &[&amux::bus::Event],
+    sel: usize,
+    first_row: u16,
+    last_row: u16,
+) -> u16 {
+    let mut row = first_row;
+    for (i, d) in decisions.iter().enumerate() {
+        if row > last_row {
+            break;
+        }
+        let body = feed_line(d);
+        let body = body.trim_start(); // drop the leading indent; we add our own marker
+        if i == sel {
+            out.push_str(&format!("\x1b[{row};1H \x1b[1;38;5;11m\u{25B6}\x1b[0m \x1b[1m{body}\x1b[0m"));
+        } else {
+            out.push_str(&format!("\x1b[{row};1H   {body}"));
+        }
+        row += 1;
+    }
+    row
+}
+
+/// The detail bar for the selected decision: a divider, then its seq + source
+/// persona, then the full question wrapped across up to two rows — so a long
+/// question that truncates in the list is always fully readable here.
+fn render_decision_detail(
+    out: &mut String,
+    decision: Option<&&amux::bus::Event>,
+    last_row: u16,
+    cols: u16,
+) {
+    let div_row = last_row.saturating_sub(3);
+    out.push_str(&format!(
+        "\x1b[{div_row};1H\x1b[38;5;238m\u{2500}\u{2500} \x1b[0m\x1b[1;38;5;11mselected decision\x1b[0m \x1b[38;5;238m{}\x1b[0m",
+        "\u{2500}".repeat((cols as usize).saturating_sub(20))
+    ));
+    let Some(d) = decision else { return };
+    let from = d.from.as_deref().unwrap_or("?");
+    // Head row: seq + who raised it + the action hints.
+    out.push_str(&format!(
+        "\x1b[{};1H  \x1b[1;38;5;11m#{}\x1b[0m from \x1b[1m{from}\x1b[0m  \x1b[2m·  r resolve  ·  g go to {from}  ·  esc close\x1b[0m",
+        div_row + 1,
+        d.seq
+    ));
+    // The full question, preferring a `q=` field, else all fields joined, wrapped
+    // across the two remaining rows (truncated with … only if it overflows both).
+    let question = d
+        .fields
+        .iter()
+        .find(|(k, _)| k.as_str() == "q")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| {
+            d.fields
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("  ")
+        });
+    let width = (cols as usize).saturating_sub(4).max(8);
+    for (j, line) in wrap_to(&question, width, 2).into_iter().enumerate() {
+        out.push_str(&format!("\x1b[{};1H  {line}", div_row + 2 + j as u16));
+    }
+}
+
+/// Word-wrap `text` to `width` columns across at most `max_lines` lines; if it
+/// still overflows, the last line ends with `…`. Whitespace-collapsing — good
+/// enough for a one-shot question, not a general typesetter.
+fn wrap_to(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut words = text.split_whitespace().peekable();
+    while let Some(w) = words.next() {
+        if cur.is_empty() {
+            cur = w.to_string();
+        } else if cur.chars().count() + 1 + w.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(w);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = w.to_string();
+            if lines.len() == max_lines {
+                break;
+            }
+        }
+    }
+    if lines.len() < max_lines && !cur.is_empty() {
+        lines.push(cur);
+    }
+    // Overflow: more words remain than fit → mark the last line truncated.
+    if words.peek().is_some() {
+        if let Some(last) = lines.last_mut() {
+            let keep = width.saturating_sub(1);
+            let trimmed: String = last.chars().take(keep).collect();
+            *last = format!("{trimmed}…");
+        }
+    }
+    lines
 }
 
 /// Draw the board entries into `out`, from row 3 down to `last_row` (inclusive),
@@ -478,10 +601,11 @@ fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16
     }
 }
 
-/// Draw the bus feed into `out`, from `first_row` down to `last_row`: open
-/// `decision_needed` escalations first (amber `!`), then recent FYI events
-/// (newest first, dim `·`). URLs render as clickable OSC-8 links.
-fn render_feed_rows(
+/// Draw the scrollable FYI history into `out`, from `first_row` down to
+/// `last_row`, newest first (dim `·`), excluding the open decisions shown in
+/// their own block above. URLs render as clickable OSC-8 links; a bottom-row
+/// hint shows the scroll offset when the history overflows.
+fn render_fyi_feed(
     out: &mut String,
     bus: &amux::bus::Bus,
     decisions: &[&amux::bus::Event],
@@ -492,14 +616,11 @@ fn render_feed_rows(
     if first_row > last_row {
         return;
     }
-    let cap = (last_row - first_row + 1) as usize;
+    let mut cap = (last_row - first_row + 1) as usize;
     let open_seqs: std::collections::BTreeSet<u64> = decisions.iter().map(|e| e.seq).collect();
-    // Open decisions are pinned at the top (they need you) and don't scroll.
-    let mut lines: Vec<String> = decisions.iter().map(|e| feed_line(e)).collect();
-    lines.truncate(cap);
-    let mut remaining = cap - lines.len();
 
-    // The scrollable FYI history: every non-open event, newest first.
+    // The scrollable FYI history: every non-decision event, newest first (open
+    // decisions are shown in their own block above and excluded here).
     let fyi: Vec<String> = bus
         .tail(amux::bus::RING_CAP)
         .into_iter()
@@ -510,36 +631,34 @@ fn render_feed_rows(
 
     // When the history overflows the space, reserve the bottom row for a scroll
     // hint so the offset is legible and the affordance is discoverable.
-    let scrollable = fyi.len() > remaining;
-    let hint = if scrollable && remaining > 0 {
-        remaining -= 1;
-        let start = scroll.min(fyi.len().saturating_sub(remaining));
+    let scrollable = fyi.len() > cap;
+    let hint = if scrollable && cap > 0 {
+        cap -= 1;
+        let start = scroll.min(fyi.len().saturating_sub(cap));
         let newer = start;
-        let older = fyi.len().saturating_sub(start + remaining);
+        let older = fyi.len().saturating_sub(start + cap);
         Some(format!(
-            "\x1b[2m  \u{2195} j/k scroll · {newer} newer · {older} older\x1b[0m"
+            "\x1b[2m  \u{2195} PgUp/PgDn scroll · {newer} newer · {older} older\x1b[0m"
         ))
     } else {
         None
     };
 
     // Window into the FYI history at the (clamped) scroll offset.
-    let start = if fyi.len() > remaining {
-        scroll.min(fyi.len() - remaining)
+    let start = if fyi.len() > cap {
+        scroll.min(fyi.len() - cap)
     } else {
         0
     };
-    for line in fyi.into_iter().skip(start).take(remaining) {
-        lines.push(line);
-    }
+    let shown: Vec<String> = fyi.into_iter().skip(start).take(cap).collect();
 
-    if lines.is_empty() {
+    if shown.is_empty() && decisions.is_empty() {
         out.push_str(&format!(
             "\x1b[{first_row};1H  \x1b[2m(no events — publish one:  amux ctl bus pub deploy msg=shipping)\x1b[0m"
         ));
         return;
     }
-    for (i, line) in lines.into_iter().take(cap).enumerate() {
+    for (i, line) in shown.into_iter().enumerate() {
         let row = first_row + i as u16;
         out.push_str(&format!("\x1b[{row};1H{line}"));
     }
@@ -1033,8 +1152,12 @@ fn run(
     let mut overview_sel = 0usize;
     // Scrollback offset for the board panel's bus feed: how many of the newest FYI
     // events to skip so older ones come into view (`0` = live/newest). Reset when
-    // the panel opens; driven by j/k / arrows / PgUp-PgDn while it's up.
+    // the panel opens; driven by PgUp/PgDn while it's up.
     let mut feed_scroll = 0usize;
+    // Which open decision is selected in the board panel (index into the pending
+    // list). j/k move it; `r` resolves it; `g`/Enter jumps to the agent that
+    // raised it. The detail bar shows the selected decision's full question.
+    let mut decision_sel = 0usize;
     // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
     // command to open in a new pane (any shell/program, not just the launch one).
     // Keystrokes edit the line instead of reaching the panes; Enter opens it.
@@ -1160,6 +1283,7 @@ fn run(
                         overview_view = false;
                         board_view = true;
                         feed_scroll = 0;
+                        decision_sel = 0;
                         prev_master = None;
                         force_repaint = true;
                     }
@@ -1211,11 +1335,26 @@ fn run(
             // quit) rather than reaching the hidden panes. Mirrors the overview
             // block above; `Ctrl+A b` closes, `Ctrl+A o` switches to the overview.
             if board_view {
-                // The FYI history available to scroll through (decisions stay
-                // pinned at the top and don't scroll). Bounds the offset so you
-                // can't scroll past the oldest event.
-                let history = bus.tail(amux::bus::RING_CAP).len();
-                let scroll_max = history.saturating_sub(1);
+                // Snapshot the selected decision's seq + source before any mutation
+                // (pending_decisions borrows the bus; resolving needs it free).
+                let decisions_now = bus.pending_decisions();
+                let dcount = decisions_now.len();
+                let dsel = decision_sel.min(dcount.saturating_sub(1));
+                let sel_seq = decisions_now.get(dsel).map(|e| e.seq);
+                let sel_from = decisions_now.get(dsel).and_then(|e| e.from.clone());
+                drop(decisions_now);
+                let scroll_max = bus.tail(amux::bus::RING_CAP).len().saturating_sub(1);
+                // Up/down select a decision when there are any; otherwise they
+                // scroll the FYI history. PgUp/PgDn always scroll it.
+                let nav = |up: bool, decision_sel: &mut usize, feed_scroll: &mut usize| {
+                    if dcount > 0 {
+                        *decision_sel = if up { dsel.saturating_sub(1) } else { (dsel + 1).min(dcount - 1) };
+                    } else if up {
+                        *feed_scroll = (*feed_scroll + 1).min(scroll_max);
+                    } else {
+                        *feed_scroll = feed_scroll.saturating_sub(1);
+                    }
+                };
                 match &action {
                     Action::ToggleBoard => {
                         board_view = false;
@@ -1237,22 +1376,20 @@ fn run(
                     }
                     Action::Quit => break 'outer,
                     Action::MoveFocus(Dir::Up) => {
-                        feed_scroll = (feed_scroll + 1).min(scroll_max);
+                        nav(true, &mut decision_sel, &mut feed_scroll);
                         force_repaint = true;
                     }
                     Action::MoveFocus(Dir::Down) => {
-                        feed_scroll = feed_scroll.saturating_sub(1);
+                        nav(false, &mut decision_sel, &mut feed_scroll);
                         force_repaint = true;
                     }
                     Action::Forward(b) => {
-                        // k / up = older (scroll back); j / down = newer; PgUp/PgDn
-                        // jump by ten; Esc closes the panel.
                         let s = b.as_slice();
                         if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
-                            feed_scroll = (feed_scroll + 1).min(scroll_max);
+                            nav(true, &mut decision_sel, &mut feed_scroll);
                             force_repaint = true;
                         } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
-                            feed_scroll = feed_scroll.saturating_sub(1);
+                            nav(false, &mut decision_sel, &mut feed_scroll);
                             force_repaint = true;
                         } else if s == b"\x1b[5~" {
                             feed_scroll = (feed_scroll + 10).min(scroll_max);
@@ -1260,6 +1397,42 @@ fn run(
                         } else if s == b"\x1b[6~" {
                             feed_scroll = feed_scroll.saturating_sub(10);
                             force_repaint = true;
+                        } else if s == b"r" || s == b"R" {
+                            // Resolve the selected decision (after you've answered it
+                            // in the agent's pane); clear it from the awaiting list.
+                            if let Some(seq) = sel_seq {
+                                bus.resolve(seq);
+                                flash = Some((format!("resolved decision #{seq}"), Instant::now()));
+                                decision_sel = decision_sel.min(dcount.saturating_sub(2));
+                                force_repaint = true;
+                            }
+                        } else if s == b"g" || s == b"\r" || s == b"\n" {
+                            // Jump to the pane of the agent that raised the decision
+                            // (by role), zoomed, and close the panel — go answer it.
+                            let target = sel_from.as_ref().and_then(|role| {
+                                windows.iter().enumerate().find_map(|(wi, w)| {
+                                    w.panes
+                                        .iter()
+                                        .find(|p| p.role.as_deref() == Some(role.as_str()))
+                                        .map(|p| (wi, p.id))
+                                })
+                            });
+                            if let Some((wi, pid)) = target {
+                                active = wi;
+                                windows[active].tree.focus_pane(pid);
+                                windows[active].zoomed = windows[active].panes.len() > 1;
+                                resize_window(&mut windows[active], rows, cols);
+                                board_view = false;
+                                let _ = write!(out, "\x1b[?25h");
+                                prev_master = None;
+                                force_repaint = true;
+                            } else {
+                                flash = Some((
+                                    format!("no pane for agent {}", sel_from.clone().unwrap_or_default()),
+                                    Instant::now(),
+                                ));
+                                force_repaint = true;
+                            }
                         } else if s == b"\x1b" {
                             board_view = false;
                             let _ = write!(out, "\x1b[?25h");
@@ -1347,6 +1520,7 @@ fn run(
                 Action::ToggleBoard => {
                     board_view = !board_view;
                     feed_scroll = 0; // always open at the live/newest end
+                    decision_sel = 0;
                     // Toggling either way is a full repaint: on → draw the panel
                     // (it clears the screen); off → recompose/repaint the panes the
                     // panel covered. On close, restore the cursor the panel hid.
@@ -1888,7 +2062,7 @@ fn run(
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
-                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols, feed_scroll).as_bytes());
+                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols, feed_scroll, decision_sel).as_bytes());
             }
         } else if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
@@ -3690,7 +3864,7 @@ mod tests {
         }
         let render = |scroll| {
             let mut out = String::new();
-            render_feed_rows(&mut out, &bus, &[], 1, 3, scroll);
+            render_fyi_feed(&mut out, &bus, &[], 1, 3, scroll);
             strip_csi(&out)
         };
         // Live (scroll 0): the two newest, not the oldest.
@@ -3701,6 +3875,40 @@ mod tests {
         let back = render(2);
         assert!(back.contains("e4") && back.contains("e3"), "scroll 2: {back}");
         assert!(!back.contains("e6"), "newest scrolled off at scroll 2: {back}");
+    }
+
+    #[test]
+    fn wrap_to_wraps_within_width_and_marks_overflow() {
+        // Fits: two short lines, each within the width.
+        let w = wrap_to("alpha beta gamma delta", 11, 3);
+        assert!(w.iter().all(|l| l.chars().count() <= 11), "within width: {w:?}");
+        assert_eq!(w.join(" "), "alpha beta gamma delta");
+        // Overflows the line budget: the last line ends with an ellipsis.
+        let long = "aaa bbb ccc ddd eee fff ggg hhh iii jjj";
+        let w2 = wrap_to(long, 7, 2);
+        assert_eq!(w2.len(), 2);
+        assert!(w2.last().unwrap().ends_with('…'), "overflow marked: {w2:?}");
+    }
+
+    #[test]
+    fn decision_detail_shows_the_full_question() {
+        // The panel line can truncate; the detail bar must show the whole question.
+        let mut bus = amux::bus::Bus::new();
+        let q = "Should the initial release be tagged 0.1.0 as a pre-release alpha or 1.0.0 as the first stable release";
+        bus.publish(
+            "ui",
+            amux::bus::Kind::DecisionNeeded,
+            Some("grace"),
+            &[("q".to_string(), q.to_string())],
+            1,
+        )
+        .unwrap();
+        let decisions = bus.pending_decisions();
+        let mut out = String::new();
+        render_decision_detail(&mut out, decisions.get(0), 24, 80);
+        let flat: String = strip_csi(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(q), "full question visible: {flat}");
+        assert!(flat.contains("#1") && flat.contains("grace"), "seq + source shown: {flat}");
     }
 
     #[test]
