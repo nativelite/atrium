@@ -2421,8 +2421,15 @@ fn run(
         }
         // A flash note wins; otherwise, if the bus has open `decision_needed`
         // escalations, surface them on the bar so you see them without opening the
-        // `Ctrl+A b` panel — the bus's push channel to the human.
-        let decisions_open = bus.pending_decisions().len();
+        // `Ctrl+A b` panel — the bus's push channel to the human. A decision
+        // addressed to a live teammate (`to=<role>`) is that agent's to answer, so
+        // it is NOT counted here (the human still sees it in the board panel — the
+        // broker keeps full visibility, just isn't urgently pinged for it).
+        let decisions_open = bus
+            .pending_decisions()
+            .iter()
+            .filter(|e| !decision_for_agent(e, &windows))
+            .count();
         let decision_note = match decisions_open {
             0 => String::new(),
             1 => "1 decision needs you \u{00b7} Ctrl+A b".to_string(),
@@ -2979,6 +2986,19 @@ fn status_label(s: agsess::Status) -> &'static str {
 /// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
 /// delegation-scoped.
 #[allow(clippy::too_many_arguments)]
+/// Is this decision addressed to a live teammate (a `to=<role>` field naming a
+/// pane that exists)? Such a decision routes to that agent — the human isn't
+/// urgently pinged for it — implementing worker→lead escalation before lead→human.
+/// A `to` naming no live pane, or no `to` at all, is human-facing.
+fn decision_for_agent(e: &amux::bus::Event, windows: &[Window]) -> bool {
+    e.fields.get("to").is_some_and(|to| {
+        windows
+            .iter()
+            .flat_map(|w| &w.panes)
+            .any(|p| p.role.as_deref() == Some(to.as_str()))
+    })
+}
+
 /// Read-only control commands — served to any caller, authenticated or not.
 /// Everything else mutates the fleet or its shared state (spawn, send, kill,
 /// board writes/claims, bus publish/subscribe/resolve) and requires an

@@ -615,9 +615,14 @@ frees it for others. Claim before you build and the team divides work with no \
 collisions. \
 Share fast-moving events on the bus, not just durable state on the board: \
 amux ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
-when something needs a human decision, and amux ctl bus sub TOPIC then amux ctl \
+when something needs a decision, and amux ctl bus sub TOPIC then amux ctl \
 bus feed pulls what teammates published on the topics you follow. Post fyi \
-updates freely and reserve --decision for things that truly need the human. \
+updates freely. Route a decision to the teammate who should answer it with \
+--to ROLE: a design question for the lead is amux ctl bus pub TOPIC --decision \
+--to lead q=your question, which reaches the lead first instead of the human. \
+Reserve a plain --decision with no --to for things that truly need the human. \
+If you are the lead, watch your feed for decisions addressed to you and resolve \
+them with amux ctl bus resolve SEQ once answered. \
 Run amux ctl with no arguments for the full command surface, or use the \
 amux-coordinate or amux-delegate skills for the full workflow.";
 
@@ -1048,7 +1053,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
                  \x20      | board claim <key> [--ttl secs] | board release <key>\n\
-                 \x20      | bus pub <topic> [--decision] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq>"
+                 \x20      | bus pub <topic> [--decision] [--to <role>] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq>"
             );
             return ExitCode::FAILURE;
         }
@@ -1562,6 +1567,17 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                             "--decision" => {
                                 kind = crate::bus::Kind::DecisionNeeded;
                                 i += 1;
+                            }
+                            "--to" => {
+                                // Address the event to a teammate role (e.g. the
+                                // lead). Sugar for a `to=<role>` field: an
+                                // agent-addressed decision routes to that agent
+                                // instead of firing the human's urgent bar.
+                                let role = args
+                                    .get(i + 1)
+                                    .ok_or_else(|| "--to needs a role (e.g. --to lead)".to_string())?;
+                                fields.push(("to".to_string(), role.clone()));
+                                i += 2;
                             }
                             "--kind" => {
                                 let k = args
@@ -2138,6 +2154,29 @@ mod tests {
             parse_request(&del).unwrap().cmd,
             Cmd::Board(BoardOp::Del { key }) if key == "auth"
         ));
+    }
+
+    #[test]
+    fn bus_pub_to_addresses_a_decision_to_a_role() {
+        // `--to lead` becomes a `to=lead` field, so the server/surfacing can route
+        // the decision to that teammate instead of the human.
+        let line = build_request(
+            &v(&["bus", "pub", "build", "--decision", "--to", "lead", "q=wire order?"]),
+            Some(0),
+        )
+        .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Bus(BusOp::Pub { kind, fields, .. }) => {
+                assert_eq!(kind, crate::bus::Kind::DecisionNeeded);
+                assert!(fields.contains(&("to".to_string(), "lead".to_string())));
+                assert!(fields.iter().any(|(k, _)| k == "q"));
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+        // `--to` without a role is a clear client error.
+        assert!(build_request(&v(&["bus", "pub", "t", "--decision", "--to"]), None)
+            .unwrap_err()
+            .contains("--to"));
     }
 
     #[test]
