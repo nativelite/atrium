@@ -1113,6 +1113,15 @@ fn run(
                         prev_master = None;
                         force_repaint = true;
                     }
+                    Action::ToggleBoard => {
+                        // Switch straight from the overview to the board — one press,
+                        // no need to close the overview first (the board render hides
+                        // the cursor and clears the screen itself).
+                        overview_view = false;
+                        board_view = true;
+                        prev_master = None;
+                        force_repaint = true;
+                    }
                     Action::Quit => break 'outer,
                     Action::MoveFocus(Dir::Up) => {
                         overview_sel = overview_sel.saturating_sub(1);
