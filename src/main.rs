@@ -3189,8 +3189,16 @@ fn spawn_pane_full(
     // `mode` is the *effective* mode for this pane: the session policy for the
     // panes amux opens itself, or — for a ctl spawn — the per-spawn `--mode` after
     // the operator-elevate / worker-cap governance in `apply_ctl`.
-    let is_agent = amux::bind::is_agent_stem(&title);
-    let trusted_launch = is_agent && mode != amux::ctl::TrustMode::Off;
+    // The trust-posture flags, `--append-system-prompt`, `--session-id`, and the
+    // folder-trust gate below are all Claude Code CLI specifics — injecting them
+    // into another vendor's agent would break its launch. So the *narrower* claude
+    // test (`is_claude`) gates every claude-flavored injection, while the *broad*
+    // `is_agent_stem` still governs vendor-neutral treatment like the identity-env
+    // decision in `wants_env` below. A non-claude agent therefore launches with its
+    // command untouched (and stays unbound until per-vendor status parsing lands in
+    // `agsess`).
+    let is_claude = amux::bind::is_claude_stem(&title);
+    let trusted_launch = is_claude && mode != amux::ctl::TrustMode::Off;
     let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
         match mode {
@@ -3221,7 +3229,7 @@ fn spawn_pane_full(
     // `--append-system-prompt`), so reliable delegation no longer hinges on a
     // skill happening to surface. Appended after any trust flags so it terminates
     // the `--allowedTools` list cleanly rather than being read as one of its values.
-    if is_agent && CTL_ADDRESS.get().is_some() {
+    if is_claude && CTL_ADDRESS.get().is_some() {
         base.push("--append-system-prompt".to_string());
         base.push(amux::ctl::AGENT_CTL_DIRECTIVE.to_string());
     }

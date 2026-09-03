@@ -19,9 +19,26 @@
 //! is then unit-tested against a trivial in-test stand-in — no real `World`, no
 //! I/O — while the app calls it with real sessions.
 
-/// The command file-stems amux treats as agents worth binding (§3.3 step 0).
-/// Just Claude Code in 0.3; a set so a second vendor is one entry, not a branch.
-pub const AGENT_STEMS: &[&str] = &["claude"];
+/// The command file-stems amux treats as agents worth hosting with agent-aware
+/// chrome (§3.3 step 0): status binding, layout, identity-env injection, and the
+/// `ctl` spawn allowlist. Claude Code plus the other agent CLIs amux can host. A
+/// set so a new vendor is one entry, not a branch.
+///
+/// Membership here is deliberately broad — it only says "this pane is an agent,
+/// give it agent treatment". It does **not** imply the vendor speaks Claude
+/// Code's CLI dialect; that is a separate, narrower question ([`CLAUDE_STEMS`]).
+pub const AGENT_STEMS: &[&str] = &["claude", "gemini", "codex", "aider", "cursor-agent"];
+
+/// The subset of [`AGENT_STEMS`] that speak Claude Code's CLI dialect. The flags
+/// amux injects at spawn — `--session-id`, the trust-posture flags
+/// (`--permission-mode`, `--dangerously-skip-permissions`), and
+/// `--append-system-prompt` — plus the `~/.claude.json` folder-trust gate are all
+/// Claude-specific. Passing them to another vendor's CLI would break its launch,
+/// so amux only adds them for a claude stem. Every other agent launches with its
+/// command untouched and stays **unbound** (no status chrome) until per-vendor
+/// transcript/status parsing lands in `agsess` — see the board note for that
+/// deeper work.
+pub const CLAUDE_STEMS: &[&str] = &["claude"];
 
 /// Command flags that mean the *user* already chose a session identity, so amux
 /// must not inject its own `--session-id` (it would override or conflict). Covers
@@ -34,6 +51,15 @@ const USER_SESSION_ARGS: &[&str] = &["--session-id", "--resume", "-r", "--contin
 /// panes (shells, editors) are never bound and never get agent chrome.
 pub fn is_agent_stem(stem: &str) -> bool {
     AGENT_STEMS.contains(&stem)
+}
+
+/// Does this stem speak Claude Code's CLI dialect? True only for a claude stem.
+/// Gates every Claude-specific flag injection ([`session_id_for`] and, in the
+/// spawn core, the trust-posture / `--append-system-prompt` / folder-trust steps)
+/// so a non-claude agent — recognized as an agent by [`is_agent_stem`] — still
+/// launches with its own command untouched.
+pub fn is_claude_stem(stem: &str) -> bool {
+    CLAUDE_STEMS.contains(&stem)
 }
 
 /// Did the user already pass a session-selecting flag? If so amux leaves the
@@ -55,8 +81,9 @@ pub fn has_user_session_arg(args: &[String]) -> bool {
 /// before any Windows `cmd /C` shim wrapping — the agent decision is about what
 /// the user asked to run, not how the platform hosts it.
 ///
-/// Returns `Some(uuid)` only for an agent command with no user-supplied session
-/// arg; `None` for shells, non-agents, or an agent the user already gave a
+/// Returns `Some(uuid)` only for a **claude** command with no user-supplied
+/// session arg; `None` for shells, non-agents, a non-claude agent (whose CLI does
+/// not understand `--session-id`), or a claude agent the user already gave a
 /// session identity. On `Some`, the caller appends `--session-id <uuid>` to the
 /// agent's args and stores `uuid` on the pane for the binder.
 pub fn session_id_for(command: &[String]) -> Option<String> {
@@ -64,7 +91,8 @@ pub fn session_id_for(command: &[String]) -> Option<String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| command[0].clone());
-    if !is_agent_stem(&stem) {
+    // `--session-id` is a Claude Code flag; only claude gets an injected id.
+    if !is_claude_stem(&stem) {
         return None;
     }
     if has_user_session_arg(&command[1..]) {
@@ -202,6 +230,43 @@ mod tests {
         assert_eq!(session_id_for(&cmd(&["sh", "-i"])), None);
         assert_eq!(session_id_for(&cmd(&["bash"])), None);
         assert_eq!(session_id_for(&cmd(&["vim"])), None);
+    }
+
+    // --- multi-vendor agent recognition ------------------------------------
+
+    #[test]
+    fn other_agent_clis_are_recognized_as_agents() {
+        // These get agent-aware chrome (layout, identity env, ctl allowlist)…
+        for stem in ["gemini", "codex", "aider", "cursor-agent"] {
+            assert!(is_agent_stem(stem), "{stem} should be an agent");
+        }
+        // …including from a full path, exactly as amux derives the title.
+        assert!(is_agent_stem(
+            std::path::Path::new("/usr/local/bin/gemini")
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        ));
+    }
+
+    #[test]
+    fn only_claude_speaks_the_claude_cli_dialect() {
+        assert!(is_claude_stem("claude"));
+        for stem in ["gemini", "codex", "aider", "cursor-agent", "cmd", "bash"] {
+            assert!(!is_claude_stem(stem), "{stem} is not claude");
+        }
+    }
+
+    #[test]
+    fn non_claude_agents_get_no_session_id() {
+        // Recognized as agents, but their CLI does not understand `--session-id`,
+        // so amux must not mint one — they launch with the command untouched.
+        assert_eq!(session_id_for(&cmd(&["gemini"])), None);
+        assert_eq!(session_id_for(&cmd(&["codex", "--model", "o1"])), None);
+        assert_eq!(session_id_for(&cmd(&["aider"])), None);
+        assert_eq!(session_id_for(&cmd(&["cursor-agent"])), None);
+        assert_eq!(session_id_for(&cmd(&["/opt/bin/gemini"])), None);
     }
 
     #[test]

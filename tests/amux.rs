@@ -340,6 +340,14 @@ fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
 
 // --- command resolution (the npm .cmd shim trap) -----------------------------
 
+// Windows-only: `resolve` mimics cmd.exe's PATHEXT lookup, whose case-insensitive
+// extension match (`.EXE` finds `tool.exe`) is a property of the Windows/macOS
+// case-insensitive filesystem, not of `resolve` itself. On a case-sensitive
+// volume (Linux ext4, or a case-sensitive APFS/macOS volume) this fixture would
+// not resolve `tool` against `.EXE` and the test would panic. The resolver is
+// only *used* on Windows (`effective_command` calls it under `#[cfg(windows)]`),
+// so gate the test there rather than assume a case-insensitive FS off-platform.
+#[cfg(windows)]
 #[test]
 fn resolver_finds_shims_and_flags_shell_hosting() {
     use amux::resolve::{needs_shell, resolve};

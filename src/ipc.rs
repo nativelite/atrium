@@ -404,6 +404,29 @@ mod sys {
     impl Listener {
         pub fn bind(addr: &str) -> io::Result<Listener> {
             let path = PathBuf::from(addr);
+            // A unix-domain socket path must fit in `sockaddr_un.sun_path`, which
+            // holds fewer bytes on macOS/BSD (104, incl. the NUL) than on Linux
+            // (108). macOS's per-user `$TMPDIR` (`/var/folders/…`) is long, so
+            // guard explicitly and fail with an actionable message rather than a
+            // cryptic OS error from deep inside `UnixListener::bind`.
+            const SUN_PATH_MAX: usize = if cfg!(any(target_os = "linux", target_os = "android")) {
+                108
+            } else {
+                104
+            };
+            // `>=`: one byte of `sun_path` is reserved for the trailing NUL.
+            if path.as_os_str().len() >= SUN_PATH_MAX {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "amux control-socket path is {} bytes, over the {}-byte \
+                         unix-domain socket limit on this platform: {}",
+                        path.as_os_str().len(),
+                        SUN_PATH_MAX,
+                        path.display()
+                    ),
+                ));
+            }
             // A stale socket file from a crashed prior run would block the bind.
             let _ = std::fs::remove_file(&path);
             let listener = UnixListener::bind(&path)?;
@@ -536,6 +559,21 @@ mod tests {
 
         let reply = client.join().expect("client thread");
         assert!(reply.contains("\"ok\":true"), "client saw: {reply}");
+    }
+
+    /// macOS/BSD cap `sockaddr_un.sun_path` at 104 bytes, so an over-long temp
+    /// path must fail fast with a clear error, not a cryptic late OS failure.
+    #[cfg(unix)]
+    #[test]
+    fn unix_bind_rejects_overlong_path() {
+        let long = std::env::temp_dir()
+            .join("x".repeat(200))
+            .to_string_lossy()
+            .into_owned();
+        match Listener::bind(&long) {
+            Ok(_) => panic!("overlong socket path must be rejected"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::InvalidInput),
+        }
     }
 
     #[test]
