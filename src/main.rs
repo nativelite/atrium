@@ -401,7 +401,7 @@ fn render_board_panel(
             String::new()
         } else {
             format!(
-                "  \x1b[1;38;5;11m{} decision{} awaiting you\x1b[0m",
+                "  \x1b[1;38;5;11m{} decision{} awaiting you\x1b[0m  \x1b[2m· answer in the agent's pane, then  amux ctl bus resolve <#>\x1b[0m",
                 decisions.len(),
                 if decisions.len() == 1 { "" } else { "s" }
             )
@@ -571,7 +571,13 @@ fn feed_line(e: &amux::bus::Event) -> String {
         .as_deref()
         .map(|f| format!("  \x1b[2m(from {f})\x1b[0m"))
         .unwrap_or_default();
-    format!("  {glyph} {topic_sgr}{}\x1b[0m  {fields}{from}", e.topic)
+    // A decision shows its seq so it can be cleared with `bus resolve <seq>`
+    // after you answer it in the agent's pane; FYIs carry no actionable id.
+    let seq_tag = match e.kind {
+        Kind::DecisionNeeded => format!("\x1b[38;5;11m#{}\x1b[0m ", e.seq),
+        Kind::Fyi => String::new(),
+    };
+    format!("  {glyph} {seq_tag}{topic_sgr}{}\x1b[0m  {fields}{from}", e.topic)
 }
 
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
@@ -2463,7 +2469,13 @@ fn spawn_fleet_window(
             trust_mode(),
             flash,
         ) {
-            Ok(pane) => panes.push(pane),
+            Ok(mut pane) => {
+                // Tag the pane with the agent's fleet name as its role, so the
+                // board/bus attribution (`by`/`from`), the overview, and the bar
+                // all show the persona (`lead`, `ada`) instead of `pane N`.
+                pane.role = Some(agent.name.clone());
+                panes.push(pane);
+            }
             Err(e) => {
                 for p in panes.iter_mut() {
                     let _ = p.pty.kill();
