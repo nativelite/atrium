@@ -391,6 +391,7 @@ fn render_board_panel(
     bus: &amux::bus::Bus,
     rows: u16,
     cols: u16,
+    feed_scroll: usize,
 ) -> String {
     let mut out = String::from("\x1b[?25l\x1b[2J");
     let decisions = bus.pending_decisions();
@@ -426,7 +427,7 @@ fn render_board_panel(
         "\x1b[{div_row};1H\x1b[38;5;238m\u{2500}\u{2500} \x1b[0m\x1b[1;38;5;37mbus\x1b[0m \x1b[38;5;238m{}\x1b[0m",
         "\u{2500}".repeat((cols as usize).saturating_sub(7))
     ));
-    render_feed_rows(&mut out, bus, &decisions, div_row + 1, content_last);
+    render_feed_rows(&mut out, bus, &decisions, div_row + 1, content_last, feed_scroll);
     out
 }
 
@@ -486,26 +487,52 @@ fn render_feed_rows(
     decisions: &[&amux::bus::Event],
     first_row: u16,
     last_row: u16,
+    scroll: usize,
 ) {
     if first_row > last_row {
         return;
     }
     let cap = (last_row - first_row + 1) as usize;
-    // Open decisions get priority; fill the rest with recent non-open events,
-    // newest first, skipping any already shown as an open decision.
     let open_seqs: std::collections::BTreeSet<u64> = decisions.iter().map(|e| e.seq).collect();
+    // Open decisions are pinned at the top (they need you) and don't scroll.
     let mut lines: Vec<String> = decisions.iter().map(|e| feed_line(e)).collect();
-    if lines.len() < cap {
-        for e in bus.tail(cap * 2).into_iter().rev() {
-            if lines.len() >= cap {
-                break;
-            }
-            if open_seqs.contains(&e.seq) {
-                continue;
-            }
-            lines.push(feed_line(e));
-        }
+    lines.truncate(cap);
+    let mut remaining = cap - lines.len();
+
+    // The scrollable FYI history: every non-open event, newest first.
+    let fyi: Vec<String> = bus
+        .tail(amux::bus::RING_CAP)
+        .into_iter()
+        .rev()
+        .filter(|e| !open_seqs.contains(&e.seq))
+        .map(feed_line)
+        .collect();
+
+    // When the history overflows the space, reserve the bottom row for a scroll
+    // hint so the offset is legible and the affordance is discoverable.
+    let scrollable = fyi.len() > remaining;
+    let hint = if scrollable && remaining > 0 {
+        remaining -= 1;
+        let start = scroll.min(fyi.len().saturating_sub(remaining));
+        let newer = start;
+        let older = fyi.len().saturating_sub(start + remaining);
+        Some(format!(
+            "\x1b[2m  \u{2195} j/k scroll · {newer} newer · {older} older\x1b[0m"
+        ))
+    } else {
+        None
+    };
+
+    // Window into the FYI history at the (clamped) scroll offset.
+    let start = if fyi.len() > remaining {
+        scroll.min(fyi.len() - remaining)
+    } else {
+        0
+    };
+    for line in fyi.into_iter().skip(start).take(remaining) {
+        lines.push(line);
     }
+
     if lines.is_empty() {
         out.push_str(&format!(
             "\x1b[{first_row};1H  \x1b[2m(no events — publish one:  amux ctl bus pub deploy msg=shipping)\x1b[0m"
@@ -515,6 +542,9 @@ fn render_feed_rows(
     for (i, line) in lines.into_iter().take(cap).enumerate() {
         let row = first_row + i as u16;
         out.push_str(&format!("\x1b[{row};1H{line}"));
+    }
+    if let Some(h) = hint {
+        out.push_str(&format!("\x1b[{last_row};1H\x1b[K{h}"));
     }
 }
 
@@ -995,6 +1025,10 @@ fn run(
     // instead of reaching the panes. `overview_sel` is the selected agent index.
     let mut overview_view = false;
     let mut overview_sel = 0usize;
+    // Scrollback offset for the board panel's bus feed: how many of the newest FYI
+    // events to skip so older ones come into view (`0` = live/newest). Reset when
+    // the panel opens; driven by j/k / arrows / PgUp-PgDn while it's up.
+    let mut feed_scroll = 0usize;
     // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
     // command to open in a new pane (any shell/program, not just the launch one).
     // Keystrokes edit the line instead of reaching the panes; Enter opens it.
@@ -1119,6 +1153,7 @@ fn run(
                         // the cursor and clears the screen itself).
                         overview_view = false;
                         board_view = true;
+                        feed_scroll = 0;
                         prev_master = None;
                         force_repaint = true;
                     }
@@ -1166,14 +1201,74 @@ fn run(
                 }
                 continue;
             }
+            // While the board panel is up, keystrokes drive it (scroll / switch /
+            // quit) rather than reaching the hidden panes. Mirrors the overview
+            // block above; `Ctrl+A b` closes, `Ctrl+A o` switches to the overview.
+            if board_view {
+                // The FYI history available to scroll through (decisions stay
+                // pinned at the top and don't scroll). Bounds the offset so you
+                // can't scroll past the oldest event.
+                let history = bus.tail(amux::bus::RING_CAP).len();
+                let scroll_max = history.saturating_sub(1);
+                match &action {
+                    Action::ToggleBoard => {
+                        board_view = false;
+                        let _ = write!(out, "\x1b[?25h");
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::ToggleOverview => {
+                        overview_view = true;
+                        board_view = false;
+                        overview_sel = overview_nodes(&windows, &world)
+                            .iter()
+                            .position(|n| {
+                                n.window == active && n.pane_id == windows[active].tree.focus()
+                            })
+                            .unwrap_or(0);
+                        prev_master = None;
+                        force_repaint = true;
+                    }
+                    Action::Quit => break 'outer,
+                    Action::MoveFocus(Dir::Up) => {
+                        feed_scroll = (feed_scroll + 1).min(scroll_max);
+                        force_repaint = true;
+                    }
+                    Action::MoveFocus(Dir::Down) => {
+                        feed_scroll = feed_scroll.saturating_sub(1);
+                        force_repaint = true;
+                    }
+                    Action::Forward(b) => {
+                        // k / up = older (scroll back); j / down = newer; PgUp/PgDn
+                        // jump by ten; Esc closes the panel.
+                        let s = b.as_slice();
+                        if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
+                            feed_scroll = (feed_scroll + 1).min(scroll_max);
+                            force_repaint = true;
+                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
+                            feed_scroll = feed_scroll.saturating_sub(1);
+                            force_repaint = true;
+                        } else if s == b"\x1b[5~" {
+                            feed_scroll = (feed_scroll + 10).min(scroll_max);
+                            force_repaint = true;
+                        } else if s == b"\x1b[6~" {
+                            feed_scroll = feed_scroll.saturating_sub(10);
+                            force_repaint = true;
+                        } else if s == b"\x1b" {
+                            board_view = false;
+                            let _ = write!(out, "\x1b[?25h");
+                            prev_master = None;
+                            force_repaint = true;
+                        }
+                    }
+                    _ => {} // swallow every other command while the board is up
+                }
+                continue;
+            }
             match action {
                 Action::Forward(b) => {
-                    // While the board overlay is up, swallow input — the panes are
-                    // hidden, so keystrokes shouldn't reach them.
-                    if !board_view {
-                        if let Some(p) = windows[active].focused_mut() {
-                            let _ = p.pty.write(&b);
-                        }
+                    if let Some(p) = windows[active].focused_mut() {
+                        let _ = p.pty.write(&b);
                     }
                 }
                 Action::NextPane => {
@@ -1245,6 +1340,7 @@ fn run(
                 }
                 Action::ToggleBoard => {
                     board_view = !board_view;
+                    feed_scroll = 0; // always open at the live/newest end
                     // Toggling either way is a full repaint: on → draw the panel
                     // (it clears the screen); off → recompose/repaint the panes the
                     // panel covered. On close, restore the cursor the panel hid.
@@ -1786,7 +1882,7 @@ fn run(
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
-                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols).as_bytes());
+                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols, feed_scroll).as_bytes());
             }
         } else if windows[active].tiled() {
             let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
@@ -3539,6 +3635,57 @@ fn effective_command(command: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip CSI escapes so a rendered panel can be asserted on its glyphs.
+    fn strip_csi(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                if it.peek() == Some(&'[') {
+                    it.next();
+                    for c2 in it.by_ref() {
+                        if c2.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn feed_scroll_pages_back_through_history() {
+        // Six FYI events, a 3-row feed. One row is the scroll hint, so two events
+        // show at a time; scroll offsets the window toward older events.
+        let mut bus = amux::bus::Bus::new();
+        for i in 1..=6u64 {
+            bus.publish(
+                "t",
+                amux::bus::Kind::Fyi,
+                Some("w"),
+                &[("msg".to_string(), format!("e{i}"))],
+                i,
+            )
+            .unwrap();
+        }
+        let render = |scroll| {
+            let mut out = String::new();
+            render_feed_rows(&mut out, &bus, &[], 1, 3, scroll);
+            strip_csi(&out)
+        };
+        // Live (scroll 0): the two newest, not the oldest.
+        let top = render(0);
+        assert!(top.contains("e6") && top.contains("e5"), "scroll 0: {top}");
+        assert!(!top.contains("e1"), "oldest hidden at scroll 0: {top}");
+        // Scrolled back two: the window slides to older events.
+        let back = render(2);
+        assert!(back.contains("e4") && back.contains("e3"), "scroll 2: {back}");
+        assert!(!back.contains("e6"), "newest scrolled off at scroll 2: {back}");
+    }
 
     #[test]
     fn split_cmdline_splits_on_whitespace() {
