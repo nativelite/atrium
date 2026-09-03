@@ -1365,6 +1365,15 @@ fn run(
     // The previous composited master, kept per-frame so tiled mode diffs. Reset
     // to None (full repaint) on mode/layout/window changes.
     let mut prev_master: Option<ansi::Screen> = None;
+    // The last view identity (window / zoom / focused pane / overlay / size). A
+    // passthrough (single or zoomed) pane only gets the heavy repaint nudge
+    // (clear + resize) on a *real* transition — never on a routine `force_repaint`
+    // from bus/board/flash churn. Without this, a zoomed pane during a fleet run
+    // is cleared several times a second (every ctl request forces a repaint),
+    // which reads as paint corruption and makes text selection impossible (the
+    // clear wipes the drag). Sentinel start so the first frame counts as a change.
+    let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
+        (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
 
     // The read at the top can fail (terminal gone) *and* commands deep inside
     // `break 'outer`; a labeled `loop` expresses both. clippy's while-let
@@ -2295,6 +2304,21 @@ fn run(
         // Set when this tick composited the startup splash into `frame`; its `2J`
         // wipes the bar, so the bar is force-appended below to keep the frame whole.
         let mut splash_drawn = false;
+        // A real view transition (which window, zoom, focused pane, overlay, or
+        // terminal size) — the only thing that should trigger a passthrough pane's
+        // clear+repaint nudge. Bus/board/flash `force_repaint`s don't change it.
+        let view_key = (
+            active,
+            windows.get(active).map(|w| w.zoomed).unwrap_or(false),
+            windows.get(active).map(|w| w.tree.focus()).unwrap_or(usize::MAX),
+            board_view,
+            overview_view,
+            log_view,
+            rows,
+            cols,
+        );
+        let view_changed = view_key != last_view;
+        last_view = view_key;
         if overview_view {
             // The overview replaces the panes. Clamp the selection to the live
             // agent count (panes may have been reaped) and re-render on a repaint.
@@ -2344,9 +2368,15 @@ fn run(
                     last_splash_frame = spin_frame;
                     splash_drawn = true;
                 }
-            } else if force_repaint {
-                // Nudge the focused pane's pty to repaint in full, the same trick
-                // 0.1 uses on window switch.
+            } else if view_changed {
+                // Nudge the focused pane's pty to repaint in full (the same trick
+                // 0.1 uses on window switch) — but ONLY on a real view transition,
+                // not on every force_repaint. A zoomed pane during a fleet run sees
+                // constant force_repaints (each ctl request forces one); nudging on
+                // those would clear + redraw it several times a second, wrecking the
+                // paint and any in-progress text selection. The pane paints its own
+                // steady-state output through passthrough; the nudge is only needed
+                // to recover after a transition cleared the screen.
                 repaint_focused(&mut windows[active], rows, cols, &mut out);
             }
         }
