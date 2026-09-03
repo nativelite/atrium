@@ -24,13 +24,15 @@
 //! Antigravity CLI uses protobuf + SQLite — neither is a tailable JSONL log, so
 //! they don't fit this model (see [`SUPPORTED_VENDORS`] for the specifics).
 //!
-//! ## Honest ceiling
-//! The Codex transcript root is sourced from the openai/codex source, not yet
-//! confirmed against a live install. The deliverable is the *structural* wiring —
-//! a vendor world that binds and displays correctly — proven end-to-end against
-//! **synthetic** transcript dirs (see `vendorworlds_discovers_adopts_and_binds…`).
-//! Anything unverified is labeled with a `NOTE` here; never a guessed path dressed
-//! up as confirmed.
+//! ## Verification status
+//! Both supported vendors are confirmed against live installs: Claude from day
+//! one, and Codex 0.153.0 on 2026-09-03 (a real codex pane bound and appeared in
+//! the amux activity log; its transcripts live exactly at
+//! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The mechanism is also proven
+//! end-to-end against a **synthetic** codex root in
+//! `vendorworlds_discovers_adopts_and_binds_a_codex_pane`. Any *future* vendor
+//! stays labeled with a `NOTE` until likewise verified; never a guessed path
+//! dressed up as confirmed.
 
 use agsess::{Status, Vendor, World};
 use std::path::PathBuf;
@@ -128,11 +130,14 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
                 .unwrap_or_else(|_| home().join(".gemini").join("tmp")),
         ),
 
-        // NOTE(roots): researched-stub. Codex CLI writes session transcripts under
-        // ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl (from
-        // openai/codex README; not verified against a live install).
-        // Override: CODEX_HOME (the app's own override) — replaces ~/.codex,
-        // so the sessions subdir becomes $CODEX_HOME/sessions.
+        // NOTE(roots): VERIFIED against a live install (codex 0.153.0, 2026-09-03):
+        // Codex CLI writes session transcripts to
+        // ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl — a real codex pane
+        // bound and showed in the amux activity log. Override: CODEX_HOME (the app's
+        // own override) — replaces ~/.codex, so the sessions subdir becomes
+        // $CODEX_HOME/sessions. (Auto-approval for unattended runs is codex-side:
+        // `approval_policy = "never"` in ~/.codex/config.toml, or the launch flags
+        // --ask-for-approval never --sandbox workspace-write.)
         Vendor::Codex => Some(
             std::env::var("CODEX_HOME")
                 .map(|h| PathBuf::from(h).join("sessions"))
