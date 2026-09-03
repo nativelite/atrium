@@ -999,6 +999,11 @@ struct Pane {
     /// stable across windows. Injected into the pane as `AMUX_PANE` so an agent
     /// inside can attribute its own `ctl spawn` calls.
     agent_id: usize,
+    /// The pane's **capability token** — an unguessable secret injected into its
+    /// env as `AMUX_TOKEN` and matched by the ctl server to authenticate requests
+    /// from this pane (identity comes from the token, not the self-reported
+    /// `AMUX_PANE`). Empty for panes spawned before the ctl endpoint existed.
+    token: String,
     /// The ctl role label this pane was spawned under (`dev_1`), if any. `None`
     /// for the human's own panes and shells.
     role: Option<String>,
@@ -2974,6 +2979,23 @@ fn status_label(s: agsess::Status) -> &'static str {
 /// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
 /// delegation-scoped.
 #[allow(clippy::too_many_arguments)]
+/// Read-only control commands — served to any caller, authenticated or not.
+/// Everything else mutates the fleet or its shared state (spawn, send, kill,
+/// board writes/claims, bus publish/subscribe/resolve) and requires an
+/// authenticated, token-matched caller.
+fn ctl_is_read_only(cmd: &amux::ctl::Cmd) -> bool {
+    use amux::ctl::{BoardOp, BusOp, Cmd};
+    matches!(
+        cmd,
+        Cmd::List
+            | Cmd::Status(_)
+            | Cmd::Audit(_)
+            | Cmd::Board(BoardOp::Get { .. })
+            | Cmd::Board(BoardOp::List)
+            | Cmd::Bus(BusOp::Feed { .. })
+    )
+}
+
 fn apply_ctl(
     line: &str,
     windows: &mut Vec<Window>,
@@ -2990,7 +3012,7 @@ fn apply_ctl(
 ) -> String {
     use amux::ctl::{self, Cmd};
 
-    let req = match ctl::parse_request(line) {
+    let mut req = match ctl::parse_request(line) {
         Ok(r) => r,
         Err(e) => {
             let reply = ctl::reply_err(&e);
@@ -2998,6 +3020,34 @@ fn apply_ctl(
             return reply;
         }
     };
+    // Authenticate the caller by its capability token, not its self-reported id:
+    // the caller *is* the pane whose minted token matches. This overwrites the
+    // self-reported `caller`, so a pane cannot claim another pane's id or claim
+    // operator (its own token forces its real, depth-scoped identity). A request
+    // with no token or a non-matching one is unauthenticated. Every pane amux
+    // spawns in a ctl session is born with a token (the endpoint binds before any
+    // spawn), so a legitimate caller is never locked out; only an external or
+    // token-stripped request is. See §4.1 of the whitepaper for the threat model
+    // and the peer-credential hardening that closes the remaining raw-socket vector.
+    let authed = req.token.as_deref().filter(|t| !t.is_empty()).and_then(|tok| {
+        windows
+            .iter()
+            .flat_map(|w| &w.panes)
+            .find(|p| p.token == tok)
+            .map(|p| p.agent_id)
+    });
+    let authenticated = authed.is_some();
+    req.caller = authed;
+    // Reads (list/status/audit/board get/list/bus feed) are open; anything that
+    // mutates the fleet or its shared state requires an authenticated caller.
+    if !authenticated && !ctl_is_read_only(&req.cmd) {
+        let reply = ctl::reply_err(
+            "unauthenticated: control request carries no valid pane token (AMUX_TOKEN)",
+        );
+        let (action, detail) = audit_label(&req);
+        audit.record(None, action, &detail, false, "unauthenticated");
+        return reply;
+    }
     let caller = req.caller;
     let privileged = caller_privileged(windows, caller);
 
@@ -3883,10 +3933,16 @@ fn spawn_pane_full(
     // ctl env (non-secret): when the control channel is on, every pane learns
     // the endpoint (`AMUX_CTL`) and its own id (`AMUX_PANE`). This is the base
     // env; identity secrets (if any) are merged on top for this one spawn.
+    // A per-pane capability token: two uuids of std entropy concatenated, so a
+    // sibling pane cannot guess it. Injected as AMUX_TOKEN and stored on the pane;
+    // the ctl server authenticates a request by matching it. (A CSPRNG-quality
+    // token and peer-credential binding are the documented hardening follow-ups.)
+    let token = format!("{}{}", amux::uid::v4(), amux::uid::v4());
     let mut base_env: Vec<(String, String)> = Vec::new();
     if let Some(addr) = CTL_ADDRESS.get() {
         base_env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.clone()));
         base_env.push((amux::ctl::ENV_PANE.to_string(), agent_id.to_string()));
+        base_env.push((amux::ctl::ENV_TOKEN.to_string(), token.clone()));
     }
 
     // Identity injection (path B): only for an agent pane with an identity set.
@@ -3948,6 +4004,7 @@ fn spawn_pane_full(
         // decision the spawn used, so tag and env can never disagree.
         identity: identity.filter(|_| inject).map(str::to_string),
         agent_id,
+        token,
         // Spawn-tree fields default to "root pane the human opened"; the ctl
         // spawn handler overrides role/parent/depth for a ctl-created worker.
         role: None,
@@ -4199,6 +4256,25 @@ mod tests {
         let flat: String = strip_csi(&out).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(q), "full question visible: {flat}");
         assert!(flat.contains("#1") && flat.contains("grace"), "seq + source shown: {flat}");
+    }
+
+    #[test]
+    fn ctl_read_ops_are_open_mutations_require_auth() {
+        use amux::ctl::{BoardOp, Cmd, KillReq};
+        // Reads are servable to an unauthenticated caller…
+        assert!(ctl_is_read_only(&Cmd::List));
+        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::List)));
+        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::Get { key: "auth".into() })));
+        // …while anything that mutates the fleet or shared state is gated.
+        assert!(!ctl_is_read_only(&Cmd::Kill(KillReq { target: "w".into() })));
+        assert!(!ctl_is_read_only(&Cmd::Board(BoardOp::Set {
+            key: "t".into(),
+            fields: vec![],
+        })));
+        assert!(!ctl_is_read_only(&Cmd::Board(BoardOp::Claim {
+            key: "t".into(),
+            ttl_ms: None,
+        })));
     }
 
     #[test]

@@ -28,6 +28,13 @@ pub const ENV_ADDRESS: &str = "AMUX_CTL";
 /// Environment variable carrying the *caller* pane's agent id, so the server can
 /// attribute a spawn to its parent (spawn tree + depth). Injected per pane.
 pub const ENV_PANE: &str = "AMUX_PANE";
+/// Environment variable carrying the pane's **capability token** — an unguessable
+/// per-pane secret minted at spawn. The server authenticates a request by looking
+/// up the pane whose token matches (identity comes from the token, not the
+/// self-reported `AMUX_PANE`), so a pane can neither claim another pane's id nor
+/// claim operator. A request with no valid token is *unauthenticated* and may
+/// only run read-only commands. Injected per pane alongside `AMUX_PANE`.
+pub const ENV_TOKEN: &str = "AMUX_TOKEN";
 
 /// The default spawn-depth ceiling: the recursion circuit-breaker (design §5).
 /// Generous — a real hierarchy is CEO→lead→IC (depth 2–3); this only stops a
@@ -37,8 +44,14 @@ pub const DEFAULT_MAX_DEPTH: usize = 6;
 /// A parsed control request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
-    /// The agent id of the pane that issued this (from `AMUX_PANE`), if any.
+    /// The agent id of the pane that issued this (from `AMUX_PANE`), if any. This
+    /// is *self-reported* and used only as a hint; the server authenticates the
+    /// caller by [`Request::token`], never by trusting this field.
     pub caller: Option<usize>,
+    /// The pane's capability token (from `AMUX_TOKEN`). The server resolves the
+    /// real caller identity by matching this against a pane's minted token; absent
+    /// or non-matching ⇒ the request is unauthenticated.
+    pub token: Option<String>,
     pub cmd: Cmd,
 }
 
@@ -627,6 +640,7 @@ fn effective_depth(d: usize) -> usize {
 pub fn parse_request(line: &str) -> Result<Request, String> {
     let v = json::parse(line).map_err(|e| format!("bad request json: {e}"))?;
     let caller = v.get("caller").and_then(Value::as_i64).map(|n| n as usize);
+    let token = v.get("token").and_then(Value::as_str).map(str::to_string);
     let cmd = match v.get("cmd").and_then(Value::as_str) {
         Some("spawn") => {
             let argv = match v.get("argv").and_then(Value::as_array) {
@@ -788,7 +802,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
     };
-    Ok(Request { caller, cmd })
+    Ok(Request { caller, token, cmd })
 }
 
 // ---- reply builders (compact JSON via `Value`'s Display) ------------------
@@ -1348,6 +1362,14 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
     let mut pairs: Vec<(&str, Value)> = Vec::new();
     if let Some(c) = caller {
         pairs.push(("caller", Value::Number(Number::Int(c as i64))));
+    }
+    // The capability token authenticates the caller. It is env-sourced (like the
+    // endpoint address and the caller id in `ctl_cmd`); tests, which never set
+    // `AMUX_TOKEN`, simply send no token and are treated as unauthenticated.
+    if let Ok(tok) = std::env::var(ENV_TOKEN) {
+        if !tok.is_empty() {
+            pairs.push(("token", Value::String(tok)));
+        }
     }
     match args.first().map(String::as_str) {
         Some("spawn") => {
@@ -2116,6 +2138,17 @@ mod tests {
             parse_request(&del).unwrap().cmd,
             Cmd::Board(BoardOp::Del { key }) if key == "auth"
         ));
+    }
+
+    #[test]
+    fn parse_request_carries_the_capability_token() {
+        // The server reads the token off the wire to authenticate the caller.
+        let req = parse_request(r#"{"caller":2,"token":"deadbeef","cmd":"list"}"#).unwrap();
+        assert_eq!(req.caller, Some(2));
+        assert_eq!(req.token.as_deref(), Some("deadbeef"));
+        // Absent token parses as None (an unauthenticated request).
+        let req = parse_request(r#"{"cmd":"list"}"#).unwrap();
+        assert_eq!(req.token, None);
     }
 
     #[test]
