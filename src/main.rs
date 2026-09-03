@@ -191,21 +191,25 @@ struct OverviewNode {
     /// True if amux launched this pane as an agent (it has a session id). Lets the
     /// overview show an as-yet-unbound agent as "starting" rather than "shell".
     is_agent: bool,
+    /// Short vendor tag from the pane's command stem (`""` for claude, so its
+    /// appearance is unchanged; `"gem"`, `"cdx"` for the other supported agents).
+    /// Empty for non-agent panes.
+    vtag: &'static str,
 }
 
 /// Collect every pane, across all windows, as an overview node in spawn-tree
 /// order (windows in order, panes in order). Each carries its live agsess status
 /// and last action. This is the model the overview renders and the selection
 /// cursor indexes into — the same list at 3 agents and 300.
-fn overview_nodes(windows: &[Window], world: &agsess::World) -> Vec<OverviewNode> {
+fn overview_nodes(windows: &[Window], world: &amux::vendors::VendorWorlds) -> Vec<OverviewNode> {
     let mut nodes = Vec::new();
     for (wi, w) in windows.iter().enumerate() {
         for p in &w.panes {
-            let status = amux::bind::status_for(p.session_id.as_deref(), &world.sessions);
+            let status = world.status_for(p.session_id.as_deref());
             let action = p
                 .session_id
                 .as_deref()
-                .and_then(|id| world.sessions.iter().find(|s| s.id == id))
+                .and_then(|id| world.sessions().into_iter().find(|s| s.id == id))
                 .map(|s| s.last_action.clone())
                 .unwrap_or_default();
             nodes.push(OverviewNode {
@@ -218,6 +222,9 @@ fn overview_nodes(windows: &[Window], world: &agsess::World) -> Vec<OverviewNode
                 exited: p.exited,
                 action,
                 is_agent: p.session_id.is_some(),
+                vtag: amux::vendors::vendor_for_stem(&p.title)
+                    .map(amux::vendors::vendor_tag)
+                    .unwrap_or(""),
             });
         }
     }
@@ -352,8 +359,14 @@ fn render_overview_panel(
                 format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
             };
             let cursor = if selected { "\x1b[1;38;5;37m\u{25B8}\x1b[0m" } else { " " };
+            // Vendor tag next to the status (claude's tag is "" → pixel-identical).
+            let vtag_str = if n.vtag.is_empty() {
+                String::new()
+            } else {
+                format!(" \x1b[2m{}\x1b[0m", n.vtag)
+            };
             let line = format!(
-                "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{ident}{action}",
+                "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{action}",
                 truncate(&n.label, 16),
             );
             if selected {
@@ -570,7 +583,7 @@ struct LogRow {
 /// persona via the pane that owns its session.
 fn collect_log(
     windows: &[Window],
-    world: &agsess::World,
+    world: &amux::vendors::VendorWorlds,
     board: &amux::board::Board,
     bus: &amux::bus::Bus,
 ) -> Vec<LogRow> {
@@ -602,7 +615,7 @@ fn collect_log(
             text: format!("board {key} = {status}"),
         });
     }
-    for s in &world.sessions {
+    for s in world.sessions() {
         if let Some(ts) = s.last_ts_ms {
             if s.last_action.is_empty() {
                 continue;
@@ -645,7 +658,7 @@ fn ago(now_ms: u64, ts_ms: u64) -> String {
 /// many events back from the newest the window is shifted.
 fn render_log_panel(
     windows: &[Window],
-    world: &agsess::World,
+    world: &amux::vendors::VendorWorlds,
     board: &amux::board::Board,
     bus: &amux::bus::Bus,
     rows: u16,
@@ -989,6 +1002,16 @@ struct Pane {
     /// agent it launched (§3.3). `None` for shells and agents amux did not
     /// bind. The binder maps this to the pane's live `agsess::Status`.
     session_id: Option<String>,
+    /// When amux launched this pane (epoch ms, agsess clock). Used to *adopt* a
+    /// session for a non-claude agent pane: amux cannot hand it a `--session-id`,
+    /// so after launch it associates the pane with the newest session discovered
+    /// under the vendor's root *at or after* this instant (see
+    /// [`amux::vendors::adopt_session_for`]).
+    launch_ms: u64,
+    /// The working directory this pane's agent was launched in, if known. A tie-
+    /// breaker for session adoption (prefer a discovered session whose `cwd`
+    /// matches). `None` for panes opened in amux's own cwd.
+    cwd: Option<String>,
     /// The credential identity **name** this pane's agent runs under, if any
     /// (path B). Only the name is stored — never the resolved secret. On every
     /// spawn amux re-resolves the env via `akey` and injects it for that child
@@ -1362,7 +1385,7 @@ fn run(
         Some(p) if !p.is_empty() => amux::bus::Bus::with_file(std::path::PathBuf::from(p)),
         _ => amux::bus::Bus::new(),
     };
-    let mut world = agsess::World::new(agsess::default_root());
+    let mut world = amux::vendors::VendorWorlds::new();
     let process_start_ms = agsess::sessions::now_ms();
     world.refresh_since(process_start_ms);
     let mut last_agent_poll = Instant::now();
@@ -2259,7 +2282,7 @@ fn run(
             w.panes.iter().any(|p| {
                 p.session_id
                     .as_deref()
-                    .is_some_and(|id| !world.sessions.iter().any(|s| s.id == id))
+                    .is_some_and(|id| world.status_for(Some(id)).is_none())
             })
         });
         let discover_every = if any_unbound {
@@ -2278,6 +2301,7 @@ fn run(
                 .pane(windows[active].tree.focus())
                 .map(|p| !p.painted)
                 .unwrap_or(false);
+        let mut did_refresh = false;
         if booting_splash {
             // hold off — resumes as soon as the pane paints
         } else if last_agent_discover.elapsed() >= discover_every {
@@ -2286,15 +2310,58 @@ fn run(
             world.refresh();
             last_agent_discover = Instant::now();
             last_agent_poll = Instant::now();
+            did_refresh = true;
         } else if last_agent_poll.elapsed() >= Duration::from_millis(1000) {
             // Bound-pane tick: refresh tails only files whose length grew, so
             // this is ~a handful of stats for a small grid.
             world.refresh();
             last_agent_poll = Instant::now();
+            did_refresh = true;
             // Keep the overview and activity log live but calm: repaint once per
             // status poll (~1 Hz), not every tick, so they update without flicker.
             if overview_view || log_view {
                 force_repaint = true;
+            }
+        }
+
+        // 5c. session adoption. A claude pane binds via the `--session-id` amux
+        //     injected at spawn; a non-claude agent's CLI does not understand that
+        //     flag, so its pane launches with `session_id == None` and would never
+        //     bind. After each refresh, associate every still-unstamped non-claude
+        //     agent pane with the newest session discovered under its vendor root
+        //     at/after the pane's launch (cwd-preferred) and stamp that id — from
+        //     then on the pane binds through the normal `status_for` path.
+        //     Idempotent: only `None`, non-exited, known-non-claude panes are
+        //     considered; a successful adopt fills `session_id` so later passes skip
+        //     it.
+        if did_refresh {
+            let sessions = world.sessions();
+            if !sessions.is_empty() {
+                for w in &mut windows {
+                    for p in &mut w.panes {
+                        if p.session_id.is_some() || p.exited {
+                            continue;
+                        }
+                        // Only a *known non-claude* vendor pane adopts (claude
+                        // panes already carry an injected id). Scope the candidate
+                        // pool to this pane's own vendor via `AgentSession.vendor`,
+                        // so a gemini pane can never adopt the newest claude session
+                        // that happens to sit in the merged pool.
+                        let Some(vendor) = amux::vendors::vendor_for_stem(&p.title) else {
+                            continue;
+                        };
+                        if vendor == agsess::Vendor::ClaudeCode {
+                            continue;
+                        }
+                        let mine: Vec<&agsess::AgentSession> =
+                            sessions.iter().copied().filter(|s| s.vendor == vendor).collect();
+                        if let Some(id) =
+                            amux::vendors::adopt_session_for(&mine, p.cwd.as_deref(), p.launch_ms)
+                        {
+                            p.session_id = Some(id);
+                        }
+                    }
+                }
             }
         }
 
@@ -2354,7 +2421,7 @@ fn run(
                 );
             }
         } else if windows[active].tiled() {
-            let master = render_tiled(&windows[active], rows, cols, &world.sessions, spin_frame);
+            let master = render_tiled(&windows[active], rows, cols, &world, spin_frame);
             match &prev_master {
                 Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
                 None => frame.extend_from_slice(&master.render_full()),
@@ -2399,7 +2466,7 @@ fn run(
                 // on the human (§4.2 rung 3). Status only.
                 waiting: w.panes.iter().any(|p| {
                     matches!(
-                        amux::bind::status_for(p.session_id.as_deref(), &world.sessions),
+                        world.status_for(p.session_id.as_deref()),
                         Some(agsess::Status::WaitingApproval)
                     )
                 }),
@@ -2542,7 +2609,7 @@ fn render_tiled(
     w: &Window,
     rows: u16,
     cols: u16,
-    sessions: &[agsess::AgentSession],
+    world: &amux::vendors::VendorWorlds,
     frame: usize,
 ) -> ansi::Screen {
     let outer = tiled_outer(rows, cols);
@@ -2571,7 +2638,7 @@ fn render_tiled(
                 let agent = if *id == focus {
                     None
                 } else {
-                    amux::bind::status_for(p.session_id.as_deref(), sessions)
+                    world.status_for(p.session_id.as_deref())
                         .map(|status| AgentMark { status })
                 };
                 let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
@@ -3024,7 +3091,7 @@ fn apply_ctl(
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &agsess::World,
+    world: &amux::vendors::VendorWorlds,
     session_identity: Option<&str>,
     audit: &mut amux::audit::Audit,
     board: &mut amux::board::Board,
@@ -3114,7 +3181,7 @@ fn dispatch_ctl(
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &agsess::World,
+    world: &amux::vendors::VendorWorlds,
     session_identity: Option<&str>,
     privileged: bool,
     board: &mut amux::board::Board,
@@ -3141,7 +3208,7 @@ fn dispatch_ctl(
                     return deny;
                 }
                 let status = pane_by_agent(windows, id).and_then(|p| {
-                    amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
+                    world.status_for(p.session_id.as_deref())
                         .map(status_label)
                 });
                 ctl::reply_status_one(id, status)
@@ -3160,7 +3227,7 @@ fn dispatch_ctl(
             // and happens when the target is idle.
             let busy = matches!(
                 pane_by_agent(windows, id)
-                    .and_then(|p| amux::bind::status_for(p.session_id.as_deref(), &world.sessions)),
+                    .and_then(|p| world.status_for(p.session_id.as_deref())),
                 Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
             );
             pending.push(PendingSend {
@@ -3524,7 +3591,7 @@ fn audit_reply(
 
 /// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
 /// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
-fn reply_tree(windows: &[Window], world: &agsess::World, root: Option<usize>) -> String {
+fn reply_tree(windows: &[Window], world: &amux::vendors::VendorWorlds, root: Option<usize>) -> String {
     let parents = ctl_parents(windows);
     let mut panes: Vec<&Pane> = windows
         .iter()
@@ -3543,7 +3610,7 @@ fn reply_tree(windows: &[Window], world: &agsess::World, root: Option<usize>) ->
             role: p.role.as_deref(),
             title: &p.title,
             depth: p.depth,
-            status: amux::bind::status_for(p.session_id.as_deref(), &world.sessions)
+            status: world.status_for(p.session_id.as_deref())
                 .map(status_label),
         })
         .collect();
@@ -3696,7 +3763,7 @@ fn spawn_worker_here(
 fn flush_sends(
     pending: &mut Vec<PendingSend>,
     windows: &mut [Window],
-    world: &agsess::World,
+    world: &amux::vendors::VendorWorlds,
 ) -> bool {
     if pending.is_empty() {
         return false;
@@ -3710,7 +3777,7 @@ fn flush_sends(
                 let ready = match pane_by_agent(windows, ps.target) {
                     None => return false, // target gone — drop the send
                     Some(p) => {
-                        match amux::bind::status_for(p.session_id.as_deref(), &world.sessions) {
+                        match world.status_for(p.session_id.as_deref()) {
                             Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) => {
                                 true
                             }
@@ -4029,6 +4096,8 @@ fn spawn_pane_full(
         activity: false,
         exited: false,
         session_id,
+        launch_ms: agsess::sessions::now_ms(),
+        cwd: cwd.map(str::to_string),
         // Store the identity NAME only, and only for panes that would actually
         // run under it (agent panes) — a shell keeps `None`, so no misleading
         // tag on a pane that was never credentialed. `inject` is the same
@@ -4334,7 +4403,7 @@ mod tests {
             Some("lead"),
             100,
         );
-        let world = agsess::World::new(agsess::default_root()); // no sessions
+        let world = amux::vendors::VendorWorlds::new(); // no sessions (unrefreshed)
         let rows = collect_log(&[], &world, &board, &bus);
         assert!(rows.len() >= 2, "bus + board rows present");
         assert!(rows.windows(2).all(|w| w[0].ts <= w[1].ts), "sorted ascending by ts");

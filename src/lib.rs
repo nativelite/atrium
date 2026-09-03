@@ -36,3 +36,4 @@ pub mod theme;
 pub mod tile;
 pub mod trust;
 pub mod uid;
+pub mod vendors;
