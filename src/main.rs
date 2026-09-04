@@ -1241,6 +1241,32 @@ fn main() -> ExitCode {
     // mass-spawn, `fleet up` — is covered.
     amux::signals::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Watchdog mode: a re-exec of amux that outlives this session and cleans up
+    // if it dies in a way no handler can catch (SIGKILL, panic, OOM). Dispatched
+    // before anything else — it must never touch the terminal.
+    if args.first().map(String::as_str) == Some(amux::reap::WATCHDOG_FLAG) {
+        let parent: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let registry = args.get(2).map(std::path::PathBuf::from);
+        match (parent, registry) {
+            (0, _) | (_, None) => return ExitCode::FAILURE,
+            (parent, Some(reg)) => {
+                amux::reap::ignore_terminal_signals();
+                amux::reap::watchdog_main(parent, &reg);
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+    // `amux reap` cleans up after sessions that are already gone — a crash, or a
+    // session from before any of this existed.
+    if args.first().map(String::as_str) == Some("reap") {
+        let n = amux::reap::reap_stale();
+        if n == 0 {
+            println!("amux reap: nothing to clean up");
+        } else {
+            println!("amux reap: cleaned up {n} dead session(s)");
+        }
+        return ExitCode::SUCCESS;
+    }
     // `amux fleet …` is its own command family (a saved roster of agents), not a
     // hosted program — dispatch it before any of amux's flag parsing so `fleet`
     // and its subcommands are never mistaken for a command to host.
@@ -1559,6 +1585,13 @@ fn run(
     // is cleared several times a second (every ctl request forces a repaint),
     // which reads as paint corruption and makes text selection impossible (the
     // clear wipes the drag). Sentinel start so the first frame counts as a change.
+    // The crash registry: the pane process groups a watchdog should kill if this
+    // process dies without running any teardown at all.
+    let registry_path = amux::reap::registry_path(std::process::id());
+    let mut registered: Vec<u32> = Vec::new();
+    // Held for the whole run: dropping this Child closes the pipe amux uses as
+    // its death signal, which would fire the watchdog early.
+    let mut watchdog: Option<std::process::Child> = None;
     let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
         (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
 
@@ -1577,6 +1610,23 @@ fn run(
                 eprint!("[amux-dbg signal-quit]\r\n");
             }
             break 'outer;
+        }
+        // 0b. Keep the crash registry current. Rewritten only when the pane set
+        // changes, so an idle session does no filesystem work; the watchdog
+        // re-reads it at teardown, which is how panes opened later are covered.
+        {
+            let cur: Vec<u32> = windows
+                .iter()
+                .flat_map(|w| w.panes.iter().map(|p| p.pty.pid()))
+                .filter(|p| *p != 0)
+                .collect();
+            if cur != registered {
+                let _ = amux::reap::write_registry(&registry_path, &cur);
+                registered = cur;
+            }
+            if watchdog.is_none() && !registered.is_empty() {
+                watchdog = amux::reap::spawn_watchdog(&registry_path).ok();
+            }
         }
         // 1. keystrokes -> scanner -> focused pane / commands
         let bytes = match term.read_bytes(Duration::from_millis(15)) {
@@ -2797,6 +2847,9 @@ fn run(
         .copied()
         .filter(|p| amux::reap::tree_alive(*p))
         .collect();
+    // A clean teardown leaves nothing for the watchdog: emptying the registry
+    // before it notices is what makes a normal quit silent.
+    let _ = std::fs::remove_file(&registry_path);
     if !survivors.is_empty() {
         eprintln!(
             "amux: warning: {} pane process group(s) survived teardown: {:?}",

@@ -1363,3 +1363,58 @@ fn quitting_kills_the_panes_whole_process_tree() {
         "pane grandchildren survived a clean quit: {survivors:?}"
     );
 }
+
+/// **A SIGKILLed amux must not leave the tree behind** (lifecycle layer 4).
+///
+/// Signal handlers cannot run on `SIGKILL`, a panic, or an OOM kill, so no
+/// teardown inside amux can cover them — the whole tree simply leaks. The
+/// watchdog is a re-exec of amux that outlives the session: when amux vanishes
+/// it kills every process group the crash registry names. This is the only layer
+/// that covers a death amux cannot observe.
+#[cfg(unix)]
+#[test]
+fn a_sigkilled_amux_still_takes_its_tree_down() {
+    let marker = std::env::temp_dir().join(format!("amux-kill9-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
+    let mut p =
+        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let grandkid: u32 = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if let Ok(v) = t.trim().parse::<u32>() {
+                break v;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild never reported its pid"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Give the loop a tick to register the pane and start the watchdog.
+    std::thread::sleep(Duration::from_millis(600));
+
+    // The one death amux cannot handle.
+    let amux = p.pid();
+    assert!(amux != 0, "no amux pid");
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &amux.to_string()])
+        .status();
+
+    // Watchdog poll (250ms) + SIGTERM + grace (750ms), with room to spare.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while Instant::now() < deadline {
+        if !pid_alive(grandkid) {
+            let _ = std::fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &grandkid.to_string()])
+        .status();
+    let _ = std::fs::remove_file(&marker);
+    panic!("tree survived SIGKILL of amux {amux} — watchdog did not clean up");
+}
