@@ -1598,8 +1598,17 @@ fn run(
     // process dies without running any teardown at all.
     let registry_path = amux::reap::registry_path(std::process::id());
     let mut registered: Vec<u32> = Vec::new();
-    // Held for the whole run: dropping this Child closes the pipe amux uses as
-    // its death signal, which would fire the watchdog early.
+    // Session teardown container: on Windows a kill-on-close Job Object so no pane
+    // tree outlives amux however it dies (TerminateProcess included); a no-op on
+    // unix (the process-group teardown + watchdog below already cover the tree).
+    // Held for the whole run — dropping it (or the process exiting) fires the
+    // guarantee. Panes never inherit its handle, so they live until amux exits.
+    let session_job = amux::reap::SessionJob::create();
+    // Held for the whole run: dropping this Child closes the pipe amux uses as its
+    // death signal, which would fire the watchdog early. Unix only — on Windows
+    // the Job Object replaces it (a watchdog there can't signal a process group
+    // and would block on its pipe forever, R5).
+    #[cfg(unix)]
     let mut watchdog: Option<std::process::Child> = None;
     let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
         (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
@@ -1630,6 +1639,12 @@ fn run(
                 .filter(|p| *p != 0)
                 .collect();
             if cur != registered {
+                // Assign any newly-appeared pane to the session job so its whole
+                // tree is torn down with amux (no-op on unix). Only the new pids,
+                // so a process is never re-assigned.
+                for pid in cur.iter().filter(|p| !registered.contains(p)) {
+                    session_job.assign(*pid);
+                }
                 let _ = amux::reap::write_registry(&registry_path, &cur);
                 registered = cur;
             }
@@ -1639,8 +1654,8 @@ fn run(
             // kernel honours however amux dies. A watchdog on Windows would spawn
             // a second amux that cannot signal a process group (`reap`'s
             // non-unix `signal_group` returns false) and would sit blocked on its
-            // pipe forever. The Job Object attaches here, where the pane set is
-            // already known to have changed.
+            // pipe forever. The Job Object attaches just above (`session_job`),
+            // in this same pane-set-changed block.
             #[cfg(unix)]
             if watchdog.is_none() && !registered.is_empty() {
                 watchdog = amux::reap::spawn_watchdog(&registry_path).ok();

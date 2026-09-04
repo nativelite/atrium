@@ -178,6 +178,214 @@ mod sys {
     pub fn pid_running(pid: u32) -> bool {
         pid_alive(pid)
     }
+
+    // --- Job Object teardown (kill-on-close) --------------------------------
+    //
+    // Windows has no process groups, but a Job Object with
+    // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is strictly stronger than every unix
+    // layer in this module combined: assign each pane process to one job, hold
+    // its handle for amux's lifetime, and the kernel terminates every process in
+    // the job when the last handle closes — however amux died, including
+    // `TerminateProcess`, which nothing can catch. Children of assigned processes
+    // inherit the job automatically, so grandchildren are covered without walking.
+    //
+    // Struct layouts and constants are transcribed from winnt.h. A wrong field
+    // order or width here is silent memory corruption, not a compile error — the
+    // `kill_on_close_*` test is the definitive check that they are right.
+
+    use core::ffi::c_void;
+    type Handle = *mut c_void;
+
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+        fn CloseHandle(h: Handle) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    /// `JobObjectExtendedLimitInformation` information class.
+    const JOB_EXTENDED_LIMIT_INFO: i32 = 9;
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+    const PROCESS_SET_QUOTA: u32 = 0x0100;
+    const PROCESS_TERMINATE: u32 = 0x0001;
+
+    // `usize` is correct for `SIZE_T` / `ULONG_PTR` on both 32- and 64-bit.
+    #[repr(C)]
+    struct IoCounters {
+        read_ops: u64,
+        write_ops: u64,
+        other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+
+    #[repr(C)]
+    struct JobBasicLimitInformation {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct JobExtendedLimitInformation {
+        basic: JobBasicLimitInformation,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    /// One-line warning naming the failing call and its error `code`, only under
+    /// `AMUX_DEBUG` (a TUI can't print to the screen mid-run without corrupting it).
+    /// A job failure degrades the cleanup guarantee; it never blocks a pane (R1).
+    /// The caller captures `code` from `GetLastError` **immediately** after the
+    /// failing FFI call — before any other Rust runs (e.g. `CloseHandle`, which
+    /// would otherwise clobber the thread's last-error).
+    fn debug_warn(what: &str, code: u32) {
+        if std::env::var_os("AMUX_DEBUG").is_some() {
+            eprint!("[amux-dbg job] {what} failed (GetLastError={code})\r\n");
+        }
+    }
+
+    /// Create a Job Object with kill-on-close set. Returns a **null** handle on any
+    /// failure — the caller then runs with the guarantee unavailable, never blocked.
+    pub fn create_job() -> Handle {
+        // `CreateJobObjectW(null, null)` yields a NON-inheritable handle, which is
+        // required: an inherited handle held by a pane would keep the job open past
+        // amux and silently defeat kill-on-close (R2).
+        // SAFETY: FFI call with null attributes and null name.
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job.is_null() {
+            debug_warn("CreateJobObjectW", unsafe { GetLastError() });
+            return job;
+        }
+        // A fully-zeroed extended-limit struct with only the kill-on-close flag.
+        // SAFETY: every field is a plain integer, so all-zero is a valid value.
+        let mut info: JobExtendedLimitInformation = unsafe { core::mem::zeroed() };
+        info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION and `len`
+        // is exactly its size, as the Win32 contract requires.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_EXTENDED_LIMIT_INFO,
+                &mut info as *mut JobExtendedLimitInformation as *mut c_void,
+                core::mem::size_of::<JobExtendedLimitInformation>() as u32,
+            )
+        };
+        if ok == 0 {
+            debug_warn("SetInformationJobObject", unsafe { GetLastError() });
+            // SAFETY: closing the handle we just created.
+            unsafe { CloseHandle(job) };
+            return std::ptr::null_mut();
+        }
+        job
+    }
+
+    /// Assign the process `pid` to `job`; its descendants inherit the job. `false`
+    /// on failure — notably `ERROR_ACCESS_DENIED` when amux is itself inside a
+    /// non-nesting job (R1), which must degrade to a warning, never a refused pane.
+    pub fn assign_to_job(job: Handle, pid: u32) -> bool {
+        if job.is_null() || pid == 0 {
+            return false;
+        }
+        // SAFETY: open the pane child for exactly the two rights
+        // AssignProcessToJobObject needs, assign it, then close our process handle
+        // — the JOB holds the process, not this handle.
+        unsafe {
+            let h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if h.is_null() {
+                debug_warn("OpenProcess", GetLastError());
+                return false;
+            }
+            let ok = AssignProcessToJobObject(job, h) != 0;
+            // Capture the error BEFORE CloseHandle, which would clobber last-error.
+            let err = if ok { 0 } else { GetLastError() };
+            CloseHandle(h);
+            if !ok {
+                debug_warn("AssignProcessToJobObject", err);
+            }
+            ok
+        }
+    }
+
+    /// Close amux's handle to `job`; the kernel then fires kill-on-close.
+    pub fn close_job(job: Handle) {
+        if !job.is_null() {
+            // SAFETY: closing a handle we own; drops amux's reference to the job.
+            unsafe { CloseHandle(job) };
+        }
+    }
+}
+
+/// A session-lifetime container that guarantees no pane tree outlives amux.
+///
+/// On **Windows** it is a Job Object with `KILL_ON_JOB_CLOSE`: every pane assigned
+/// to it — and every descendant, which inherit the job automatically — is
+/// terminated by the kernel when amux's handle closes, however amux exits (normal
+/// quit, panic, or an uncatchable `TerminateProcess`). This is the one death mode
+/// no unix layer in this module can match. On **unix** it is a deliberate no-op:
+/// the process-group teardown and the pipe-EOF watchdog already cover the tree,
+/// and there is no Job Object to use.
+///
+/// Hold one for amux's whole run and [`assign`](SessionJob::assign) each pane
+/// after spawn; dropping it (or the process exiting) fires the guarantee. A
+/// Windows failure to create or configure the job yields an inert handle whose
+/// `assign` is a no-op — panes still spawn, the guarantee is simply unavailable
+/// (R1), never a refused pane.
+pub struct SessionJob {
+    #[cfg(not(unix))]
+    raw: *mut core::ffi::c_void,
+}
+
+impl SessionJob {
+    /// Create the container: a kill-on-close Job Object on Windows, nothing on unix.
+    pub fn create() -> Self {
+        #[cfg(unix)]
+        {
+            SessionJob {}
+        }
+        #[cfg(not(unix))]
+        {
+            SessionJob {
+                raw: sys::create_job(),
+            }
+        }
+    }
+
+    /// Assign a pane process (by pid) so its whole tree is torn down with amux.
+    /// `false` on unix (no-op) and on a Windows assignment failure (kept non-fatal).
+    pub fn assign(&self, pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = pid;
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            sys::assign_to_job(self.raw, pid)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for SessionJob {
+    fn drop(&mut self) {
+        // Closing amux's last handle fires KILL_ON_JOB_CLOSE. On a normal return
+        // this is the clean path; on TerminateProcess the kernel closes it for us
+        // — either way no pane tree is left behind.
+        sys::close_job(self.raw);
+    }
 }
 
 // --- session registry + watchdog -------------------------------------------
@@ -401,5 +609,51 @@ mod tests {
         );
         let _ = child.wait(); // reap it
         assert!(!pid_alive(pid), "a reaped process should be gone");
+    }
+
+    /// The definitive Windows check (acceptance test #1): assign a long-running
+    /// child to a fresh Job Object, close the job's last handle, and the kernel
+    /// must terminate the child. This is what proves the `KILL_ON_JOB_CLOSE` flag
+    /// and — critically — the transcribed struct layout are correct: a wrong field
+    /// order/width is silent memory corruption that only surfaces here, not at
+    /// compile time.
+    #[cfg(not(unix))]
+    #[test]
+    fn kill_on_close_terminates_an_assigned_process() {
+        // `ping -n 601 127.0.0.1` sleeps ~600s without depending on stdin (unlike
+        // `timeout`, which errors when stdin is redirected).
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "601", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = child.id();
+        {
+            let job = SessionJob::create();
+            assert!(
+                job.assign(pid),
+                "assign failed — if ERROR_ACCESS_DENIED, the test runner is inside \
+                 a non-nesting job (R1); otherwise a real bug"
+            );
+            assert!(
+                pid_alive(pid),
+                "child must be running before the job closes"
+            );
+            // `job` drops here → its last handle closes → KILL_ON_JOB_CLOSE fires.
+        }
+        let mut gone = false;
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Belt-and-suspenders so a failed assertion never leaks the sleeper.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(gone, "kill-on-close must terminate the assigned process");
     }
 }

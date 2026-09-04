@@ -1273,8 +1273,19 @@ fn closing_an_overlay_repaints_the_pane() {
     argv.extend(args);
     let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
 
-    // A marker on screen that only amux can bring back.
-    p.write(b"m=repaint; echo \"$m\"\"=marker\"\r\n").unwrap();
+    // A marker on screen that only amux can bring back. Written so `repaint=marker`
+    // appears in the command's OUTPUT but not in the typed line itself, so the
+    // match below can't be satisfied by the input echo: sh uses `$m` indirection;
+    // cmd escapes the `=` with a caret (`repaint^=marker` on the line → `repaint=
+    // marker` in the output). Both shells are covered — the shell is already
+    // branched above, and the marker command must be too (this test shipped
+    // bash-only and could never pass on Windows).
+    let marker_cmd: &[u8] = if cfg!(windows) {
+        b"echo repaint^=marker\r\n"
+    } else {
+        b"m=repaint; echo \"$m\"\"=marker\"\r\n"
+    };
+    p.write(marker_cmd).unwrap();
     let out = read_until(&mut p, b"repaint=marker", Duration::from_secs(15));
     assert!(
         contains(&out, b"repaint=marker"),
@@ -1416,4 +1427,129 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
         .status();
     let _ = std::fs::remove_file(&marker);
     panic!("tree survived SIGKILL of amux {amux} — watchdog did not clean up");
+}
+
+// --- Windows tree teardown (Job Object, kill-on-close) ----------------------
+//
+// The Windows counterparts of the two tests above. There is no process group and
+// no watchdog on Windows; the guarantee is a Job Object with
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` that amux holds for its whole life, so the
+// kernel terminates every pane and everything a pane spawned the instant amux's
+// handle closes — however amux exits.
+
+/// A pane script that spawns a long-lived grandchild (`ping`), records its pid to
+/// `marker`, and waits on it — the Windows analog of `sleep 600 & echo $! ; wait`.
+#[cfg(windows)]
+fn ping_grandchild_argv(marker: &std::path::Path) -> [String; 5] {
+    let mpath = marker.display().to_string().replace('\\', "/");
+    let script = format!(
+        "$p = Start-Process -FilePath ping -ArgumentList @('-n','601','127.0.0.1') \
+         -PassThru -WindowStyle Hidden; Set-Content -Path '{mpath}' -Value $p.Id; \
+         Wait-Process -Id $p.Id"
+    );
+    [
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        script,
+    ]
+}
+
+/// Block until `marker` holds a pid, or panic past `deadline`.
+#[cfg(windows)]
+fn read_marker_pid(marker: &std::path::Path, within: Duration) -> u32 {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(t) = std::fs::read_to_string(marker) {
+            if let Ok(v) = t.trim().parse::<u32>() {
+                return v;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild never reported its pid"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// True once `pid` is gone, polled until `within` elapses.
+#[cfg(windows)]
+fn wait_pid_gone(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if !amux::reap::pid_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    false
+}
+
+/// **A clean `Ctrl+A q` kills the pane's whole tree on Windows** (acceptance #2).
+/// amux exits, its last handle to the session Job Object closes, and
+/// kill-on-close terminates the pane and its grandchild together.
+#[cfg(windows)]
+#[test]
+fn quitting_kills_the_pane_tree_windows() {
+    let marker = std::env::temp_dir().join(format!("amux-wtree-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let argv = ping_grandchild_argv(&marker);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv_ref, 24, 80).unwrap();
+
+    let grandkid = read_marker_pid(&marker, Duration::from_secs(25));
+    assert!(
+        amux::reap::pid_alive(grandkid),
+        "grandchild died before the test began"
+    );
+
+    p.write(b"\x01q").unwrap(); // Ctrl+A q
+    let _ = wait_exit(&mut p, 15);
+
+    let gone = wait_pid_gone(grandkid, Duration::from_secs(10));
+    if !gone {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &grandkid.to_string()])
+            .status();
+    }
+    let _ = std::fs::remove_file(&marker);
+    assert!(gone, "pane grandchild {grandkid} survived a clean quit");
+}
+
+/// **A hard-killed amux still takes its tree down on Windows** (acceptance #3).
+/// `taskkill /F` is `TerminateProcess` — uncatchable, no teardown runs — but the
+/// kernel closes amux's job handle on exit, so kill-on-close fires anyway. This
+/// is the death mode no macOS mechanism can match.
+#[cfg(windows)]
+#[test]
+fn hard_killed_amux_still_takes_its_tree_down_windows() {
+    let marker = std::env::temp_dir().join(format!("amux-wkill-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let argv = ping_grandchild_argv(&marker);
+    let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv_ref, 24, 80).unwrap();
+
+    let grandkid = read_marker_pid(&marker, Duration::from_secs(25));
+    // Give the run loop a tick to register + assign the pane to the job.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let amux = p.pid();
+    assert!(amux != 0, "no amux pid");
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &amux.to_string()])
+        .status();
+
+    let gone = wait_pid_gone(grandkid, Duration::from_secs(12));
+    if !gone {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &grandkid.to_string()])
+            .status();
+    }
+    let _ = std::fs::remove_file(&marker);
+    assert!(
+        gone,
+        "tree survived taskkill /F of amux {amux} — kill-on-close did not fire"
+    );
 }
