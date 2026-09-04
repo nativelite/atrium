@@ -60,11 +60,25 @@ mod sys {
         TERMINATING.store(true, Ordering::Relaxed);
     }
 
+    /// `signal()` reports failure as `SIG_ERR`, which is `(void *) -1`.
+    const SIG_ERR: usize = usize::MAX;
+
     pub fn install() {
         let h = on_term as extern "C" fn(i32) as usize;
         for sig in [SIGHUP, SIGINT, SIGTERM] {
             // SAFETY: installing a handler that only stores to a static atomic.
-            unsafe { signal(sig, h) };
+            let prev = unsafe { signal(sig, h) };
+            if prev == SIG_ERR {
+                // Do not swallow this. A failed install leaves the disposition at
+                // SIG_DFL, so the process dies where it stands and every agent is
+                // orphaned — silently reintroducing the exact bug this module
+                // exists to fix. Warn on stderr: `install()` runs at the top of
+                // main, before raw mode, so the line is readable.
+                eprintln!(
+                    "amux: warning: could not install a handler for signal {sig}; \
+                     agents may survive if this session is terminated"
+                );
+            }
         }
     }
 }
