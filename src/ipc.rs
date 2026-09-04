@@ -524,14 +524,16 @@ mod sys {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     extern "C" {
         fn geteuid() -> u32;
     }
 
     /// The effective uid of the connected peer, if the OS can report it. `None`
-    /// means the credential couldn't be read (caller then does not reject on it).
+    /// means the credential could not be read — which the caller now treats as a
+    /// REFUSAL, not as permission. An unverifiable peer is exactly the one to turn
+    /// away.
     ///
     /// Linux/Android use `SO_PEERCRED`; macOS/BSD use `getpeereid`.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -593,6 +595,13 @@ mod sys {
         listener: UnixListener,
         path: PathBuf,
         cur: Option<UnixStream>,
+        /// Bytes of a request that has arrived so far. A client is under no
+        /// obligation to send its line in one write, and amux must never wait for
+        /// the rest — so the partial lives here across event-loop ticks.
+        pending: Vec<u8>,
+        /// When the in-flight request started, so a client that stalls halfway
+        /// can be dropped instead of holding the channel.
+        pending_since: Option<Instant>,
     }
 
     impl Listener {
@@ -627,38 +636,103 @@ mod sys {
             listener.set_nonblocking(true)?;
             // Owner-only (0600) so the socket file itself is not connectable by
             // other users — defense in depth beneath the per-connection uid check.
+            //
+            // The result used to be discarded. A defense that silently does not
+            // apply is worse than none, because everything above it assumes it
+            // held: if the mode cannot be set, the socket is world-connectable and
+            // amux would have carried on serving on it. Refuse to bind instead,
+            // and take the socket file with us so nothing is left listening.
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                if let Err(e) =
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing to serve on {}: could not restrict it to this user ({e})",
+                            path.display()
+                        ),
+                    ));
+                }
             }
             Ok(Listener {
                 listener,
                 path,
                 cur: None,
+                pending: Vec::new(),
+                pending_since: None,
             })
         }
 
         pub fn poll(&mut self) -> io::Result<Option<String>> {
+            // Resume a connection that has not finished sending. This is the whole
+            // point of the rewrite: the old code set the accepted stream BLOCKING
+            // with a 2s read timeout and read one byte at a time, so the timeout
+            // re-armed per byte and a slow-drip client held amux's single event
+            // loop — freezing every pane. A local denial of service from any
+            // process that can connect. Nothing here may ever wait on a client.
+            if let Some(mut stream) = self.cur.take() {
+                match try_read_line(&mut stream, &mut self.pending) {
+                    Ok(Some(line)) => {
+                        self.pending_since = None;
+                        self.cur = Some(stream); // kept for `respond`
+                        return Ok(Some(line));
+                    }
+                    Ok(None) => {
+                        // Still incomplete. Give up on a client that has held a
+                        // half-sent request too long, so one stalled connection
+                        // cannot wedge the channel against everyone else.
+                        let stale = self
+                            .pending_since
+                            .map(|t: Instant| t.elapsed() > CLIENT_DEADLINE)
+                            .unwrap_or(false);
+                        if stale {
+                            self.pending.clear();
+                            self.pending_since = None;
+                            return Ok(None); // stream dropped here
+                        }
+                        self.cur = Some(stream);
+                        return Ok(None);
+                    }
+                    Err(_) => {
+                        // Closed or unreadable: drop it and carry on.
+                        self.pending.clear();
+                        self.pending_since = None;
+                        return Ok(None);
+                    }
+                }
+            }
+
             match self.listener.accept() {
-                Ok((mut stream, _)) => {
-                    // Peer-cred gate: reject a client owned by a different user
-                    // outright — do not even read its request. The pane token is
-                    // still the primary auth; this closes the cross-user connect
-                    // vector on a shared machine. A credential we can't read (None)
-                    // does not reject (the token remains the gate).
-                    if let Some(peer) = peer_uid(stream.as_raw_fd()) {
-                        if peer != unsafe { geteuid() } {
-                            // Drop the stream (disconnect) and report idle.
+                Ok((stream, _)) => {
+                    // Peer-cred gate, now FAILING CLOSED. It used to reject only a
+                    // credential it could read and disagreed with — so `None`, the
+                    // case where the OS could not vouch for the peer at all, was
+                    // waved through. That is precisely when to refuse. It is also
+                    // reachable in practice: the Linux SO_PEERCRED constant below
+                    // is wrong on some architectures, and a wrong constant used to
+                    // mean "no check" where it now means "no service".
+                    match peer_uid(stream.as_raw_fd()) {
+                        Some(peer) if peer == unsafe { geteuid() } => {}
+                        _ => {
+                            // Drop the stream (disconnect) and report idle. Not
+                            // silent: a cross-user connect attempt is exactly the
+                            // event an operator needs to see afterwards.
+                            eprint!("[amux] ipc: refused a peer amux could not vouch for\r\n");
                             return Ok(None);
                         }
                     }
-                    // The client sends immediately then waits; a short blocking
-                    // read of one line is safe and keeps framing simple.
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-                    let line = read_line(&mut stream)?;
+                    // Non-blocking from here on. A request that arrives in pieces is
+                    // resumed on later ticks by the branch above.
+                    stream.set_nonblocking(true)?;
+                    self.pending.clear();
+                    self.pending_since = Some(Instant::now());
                     self.cur = Some(stream);
-                    Ok(Some(line))
+                    // Try once now so the common case (whole request already in the
+                    // socket buffer) still completes within this tick.
+                    self.poll()
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e),
@@ -684,27 +758,51 @@ mod sys {
         }
     }
 
-    fn read_line(stream: &mut UnixStream) -> io::Result<String> {
-        let mut buf = Vec::with_capacity(256);
-        let mut byte = [0u8; 1];
+    /// How long a client may hold a half-sent request before amux drops it.
+    /// Wall-clock across ticks, not per read — the old per-byte timeout was what
+    /// let a slow drip hold the loop indefinitely.
+    const CLIENT_DEADLINE: Duration = Duration::from_secs(2);
+    /// Refuse an over-long request rather than buffering it without limit.
+    const MAX_REQUEST: usize = 64 * 1024;
+
+    /// Read whatever is available without ever blocking, accumulating into
+    /// `pending` until a newline completes a request.
+    ///
+    /// `Ok(None)` means "not yet, try next tick" — the caller keeps the stream and
+    /// the partial buffer. This is what makes a slow client cost amux nothing.
+    fn try_read_line(stream: &mut UnixStream, pending: &mut Vec<u8>) -> io::Result<Option<String>> {
+        let mut buf = [0u8; 4096];
         loop {
-            match stream.read(&mut byte) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    buf.push(byte[0]);
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "client closed before sending a complete request",
+                    ))
                 }
+                Ok(n) => {
+                    if let Some(pos) = buf[..n].iter().position(|b| *b == b'\n') {
+                        pending.extend_from_slice(&buf[..pos]);
+                        let line = String::from_utf8_lossy(pending).to_string();
+                        pending.clear();
+                        // One request per connection: anything after the newline is
+                        // not ours to interpret, and feeding a tail back as a fresh
+                        // request is how the Windows path grew its own bug.
+                        return Ok(Some(line));
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                    if pending.len() > MAX_REQUEST {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "request exceeded the maximum size",
+                        ));
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
-            if buf.len() > 65536 {
-                break; // never grow unbounded on a malformed client
-            }
         }
-        Ok(String::from_utf8_lossy(&buf)
-            .trim_end_matches('\r')
-            .to_string())
     }
 
     pub fn request(addr: &str, req: &str) -> io::Result<String> {
@@ -716,7 +814,34 @@ mod sys {
         }
         stream.write_all(line.as_bytes())?;
         stream.flush()?;
-        read_line(&mut stream)
+        read_reply(&mut stream)
+    }
+
+    /// Read one reply line, blocking under the socket's read timeout.
+    ///
+    /// Deliberately blocking, unlike the server's [`try_read_line`]: this runs in
+    /// a short-lived `amux ctl` client process whose only job is to wait for this
+    /// answer. Blocking is wrong only on amux's event loop, where it froze every
+    /// pane; here it is exactly right. Reads in chunks rather than byte-at-a-time
+    /// so a large reply is not thousands of syscalls.
+    fn read_reply(stream: &mut UnixStream) -> io::Result<String> {
+        let mut out = Vec::with_capacity(256);
+        let mut buf = [0u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(pos) = buf[..n].iter().position(|b| *b == b'\n') {
+                        out.extend_from_slice(&buf[..pos]);
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(String::from_utf8_lossy(&out).to_string())
     }
 }
 
@@ -795,5 +920,62 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(server.poll().expect("poll"), None);
         }
+    }
+
+    /// **A half-sent request must not stall the event loop** (review #5).
+    ///
+    /// The accepted stream used to be set BLOCKING with a 2s read timeout, read
+    /// one byte at a time — so the timeout re-armed per byte and a client that
+    /// dripped bytes held amux's single event loop for as long as it liked,
+    /// freezing every pane. Any process able to connect could do it.
+    ///
+    /// This drives exactly that shape: connect, send half a line, and require
+    /// `poll()` to come back promptly with "nothing yet" rather than waiting for
+    /// the rest. Then finish the line and require the SAME request to complete —
+    /// proving the partial was resumed across ticks, not discarded.
+    #[cfg(unix)]
+    #[test]
+    fn a_half_sent_request_does_not_block_the_loop() {
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        let addr = test_addr(9021);
+        let mut listener = Listener::bind(&addr).expect("bind");
+
+        let mut client = std::os::unix::net::UnixStream::connect(&addr).expect("connect");
+        client.write_all(br#"{"cmd":"li"#).expect("partial write");
+        client.flush().ok();
+
+        // Poll a few times: each must return promptly and report idle.
+        for _ in 0..3 {
+            let t = Instant::now();
+            let got = listener.poll().expect("poll");
+            assert!(
+                got.is_none(),
+                "a half-sent request must not yield a request"
+            );
+            assert!(
+                t.elapsed() < Duration::from_millis(250),
+                "poll blocked for {:?} on a half-sent request — this is the DoS",
+                t.elapsed()
+            );
+        }
+
+        // Finish it; the buffered head must still be there.
+        client.write_all(b"st\"}\n").expect("rest");
+        client.flush().ok();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let line = loop {
+            if let Some(l) = listener.poll().expect("poll") {
+                break l;
+            }
+            assert!(Instant::now() < deadline, "completed request never arrived");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            line, r#"{"cmd":"list"}"#,
+            "the partial head must be preserved across ticks, not dropped"
+        );
     }
 }
