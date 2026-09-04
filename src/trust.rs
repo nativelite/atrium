@@ -148,12 +148,25 @@ pub enum Outcome {
 /// the dialog appears), never a reason to abort a pane.
 pub fn ensure_trusted(dir: &Path) -> Result<Outcome, String> {
     let path = config_path().ok_or_else(|| "no HOME to locate ~/.claude.json".to_string())?;
+    ensure_trusted_at(&path, dir)
+}
+
+/// [`ensure_trusted`] against an explicit config path.
+///
+/// Split out purely so this can be TESTED. The public entry point resolves
+/// `~/.claude.json` from the environment and writes it, so exercising it in a
+/// test would mutate the developer's real claude config — which is why the one
+/// function here that touches another tool's live state had no coverage at all.
+/// With the path injectable, the guarantees that actually matter — never clobber
+/// a file we could not parse, never write JSON we cannot read back — can be
+/// asserted against a temp file.
+pub fn ensure_trusted_at(path: &Path, dir: &Path) -> Result<Outcome, String> {
     let key = project_key(dir);
 
     // Absent config: claude creates it on launch, but if we create a minimal one
     // first, the trust bit is already set when it reads. Seed just the projects
     // entry; claude fills in the rest on its own read-merge-write.
-    let src = match std::fs::read_to_string(&path) {
+    let src = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::from("{}"),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
@@ -174,7 +187,7 @@ pub fn ensure_trusted(dir: &Path) -> Result<Outcome, String> {
     let out = root.pretty(2);
     // Guard: re-parse our own output; never write JSON we can't read back.
     json::parse(&out).map_err(|e| format!("internal: produced invalid JSON ({e}); not written"))?;
-    write_atomic(&path, &out)?;
+    write_atomic(path, &out)?;
     Ok(Outcome::NowTrusted)
 }
 
@@ -444,5 +457,81 @@ mod tests {
             assert_eq!(project_key(Path::new("/home/u/proj")), "/home/u/proj");
             assert_eq!(project_key(Path::new("/home/u/proj/")), "/home/u/proj");
         }
+    }
+
+    fn tmp(nonce: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("amux-trust-{}-{nonce}", std::process::id()));
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
+    /// Seeds a config that does not exist yet, so the trust bit is already set
+    /// when claude first reads it.
+    #[test]
+    fn ensure_trusted_seeds_a_missing_config() {
+        let d = tmp("fresh");
+        let cfg = d.join(".claude.json");
+        let _ = std::fs::remove_file(&cfg);
+        let out = ensure_trusted_at(&cfg, &d).expect("should seed");
+        assert!(matches!(out, Outcome::NowTrusted));
+        let text = std::fs::read_to_string(&cfg).expect("file written");
+        let root = json::parse(&text).expect("valid JSON written");
+        assert_eq!(trusted(&root, &project_key(&d)), Some(true));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **Never clobber a config we could not parse.** This is the guarantee that
+    /// matters most here: the file belongs to another tool, and amux overwriting
+    /// a config it did not understand would destroy the user's settings. Untested
+    /// until now, on the one function in this module that touches live state.
+    #[test]
+    fn ensure_trusted_refuses_to_touch_unparseable_json() {
+        let d = tmp("bad");
+        let cfg = d.join(".claude.json");
+        let garbage = "{ this is not json at all ";
+        std::fs::write(&cfg, garbage).unwrap();
+        let err = ensure_trusted_at(&cfg, &d).expect_err("must refuse");
+        assert!(err.contains("left untouched"), "unexpected error: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            garbage,
+            "amux overwrote a config it could not parse"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A valid config that is not an object is equally off-limits.
+    #[test]
+    fn ensure_trusted_refuses_a_non_object_config() {
+        let d = tmp("array");
+        let cfg = d.join(".claude.json");
+        std::fs::write(&cfg, "[1,2,3]").unwrap();
+        let err = ensure_trusted_at(&cfg, &d).expect_err("must refuse");
+        assert!(err.contains("left untouched"), "unexpected error: {err}");
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "[1,2,3]");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Existing unrelated settings survive, and a second call is a no-op.
+    #[test]
+    fn ensure_trusted_preserves_other_settings_and_is_idempotent() {
+        let d = tmp("keep");
+        let cfg = d.join(".claude.json");
+        std::fs::write(&cfg, r#"{"theme":"dark","projects":{}}"#).unwrap();
+        assert!(matches!(
+            ensure_trusted_at(&cfg, &d).unwrap(),
+            Outcome::NowTrusted
+        ));
+        let root = json::parse(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            root.get("theme").and_then(Value::as_str),
+            Some("dark"),
+            "an unrelated setting was lost"
+        );
+        assert!(matches!(
+            ensure_trusted_at(&cfg, &d).unwrap(),
+            Outcome::AlreadyTrusted
+        ));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

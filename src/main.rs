@@ -1141,6 +1141,24 @@ fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
 /// `parent == None`, depth 0) — i.e. where the operator sits. A spawned worker
 /// (depth > 0) is scoped to its own subtree.
 fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
+    // Look the caller up, then decide in a pure function so the DECISION can be
+    // tested without constructing panes (each of which needs a live pty). This
+    // gate had no tests at all: when its two `None` arms were flipped from
+    // `true` to `false` — a security fix — nothing in the suite changed, which is
+    // precisely the problem.
+    let pane_parent = caller
+        .and_then(|id| pane_by_agent(windows, id))
+        .map(|p| p.parent);
+    privilege_for(caller, pane_parent)
+}
+
+/// The privilege decision, given only what it needs.
+///
+/// `pane_parent` says what the caller's capability token resolved to:
+/// - `None` — no such live pane (a stale or forged token), or no caller at all
+/// - `Some(None)` — a live pane with no parent: a root pane the human opened
+/// - `Some(Some(_))` — a live pane spawned by another: a worker
+fn privilege_for(caller: Option<usize>, pane_parent: Option<Option<usize>>) -> bool {
     match caller {
         // No authenticated caller is NOT the operator. This arm used to return
         // `true`, which inverted the gate: holding no credential granted strictly
@@ -1149,8 +1167,8 @@ fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
         // self-reported, so `None` means exactly "unauthenticated" and must be
         // the least trusted state, not the most.
         None => false,
-        Some(id) => match pane_by_agent(windows, id) {
-            Some(p) => p.parent.is_none(),
+        Some(_) => match pane_parent {
+            Some(parent) => parent.is_none(),
             // A token resolving to no live pane is stale or forged, not the
             // operator. Same inversion as above.
             None => false,
@@ -4752,6 +4770,41 @@ fn effective_command(command: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::privilege_for;
+
+    /// **Dropping your token must not promote you** (review #1).
+    ///
+    /// `caller` is derived from the capability token and is never self-reported,
+    /// so `None` means exactly "unauthenticated". This arm returned `true`, which
+    /// inverted the gate: holding NO credential granted strictly more than
+    /// holding a worker's, so `env -u AMUX_TOKEN amux ctl ...` promoted you.
+    ///
+    /// This fails against the old code, which is the point — an earlier attempt
+    /// at an integration test for the same fix passed with the fix REVERTED,
+    /// because the elevated spawn was refused earlier by policy and never reached
+    /// this decision at all.
+    #[test]
+    fn an_unauthenticated_caller_is_never_the_operator() {
+        assert!(!privilege_for(None, None));
+        // Even if a pane were somehow associated, no token means no authority.
+        assert!(!privilege_for(None, Some(None)));
+    }
+
+    /// A token that matches no live pane is stale or forged — not the operator.
+    #[test]
+    fn a_token_resolving_to_no_live_pane_is_not_the_operator() {
+        assert!(!privilege_for(Some(7), None));
+    }
+
+    /// The intended rule, unchanged: a root pane is the operator, a spawned
+    /// worker is not. (Whether `-n N` should make every pane a root pane is a
+    /// separate, still-open question — see review finding #1's remainder.)
+    #[test]
+    fn a_root_pane_is_the_operator_and_a_worker_is_not() {
+        assert!(privilege_for(Some(1), Some(None)));
+        assert!(!privilege_for(Some(2), Some(Some(1))));
+    }
+
     use super::*;
 
     /// Strip CSI escapes so a rendered panel can be asserted on its glyphs.
