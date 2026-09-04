@@ -296,16 +296,28 @@ low→high power: `plan < accept < automode < skip`.
   enters auto mode if your plan/model/org allow it, else it falls back to default.)
 - **`--trust skip`** (alias **`--skip-permissions`**) — **full bypass** (below).
 
-**Per-teammate mode, and who may elevate.** By default a `ctl spawn` teammate
-inherits the session policy. Add **`--mode plan|accept|automode|skip`** to a spawn
-to pick a different mode for that teammate. amux governs who may do so: **you — the
-operator, at the root pane — may set any mode** (raising a teammate above the
-policy is you directing the session); a **spawned worker is capped at the policy**
-and may only match or *de*-escalate, never elevate itself. amux also strips raw
-claude permission flags (`--dangerously-skip-permissions`, `--permission-mode`)
-from agent-supplied spawn argv — agents request a mode through `--mode`, so amux's
-policy stays the single source of truth. Anything amux ignores or caps is reported
-in the spawn reply's `note` (never silent).
+**Per-teammate mode.** By default a `ctl spawn` teammate inherits the session
+policy. Add **`--mode plan|accept|automode|skip`** to a spawn to pick a different
+mode for that teammate — but **only downward**. The session policy is a ceiling
+that holds for every caller, with no exception: a spawn may match it or
+*de*-escalate below it, and nothing can elevate past it. To run agents at a higher
+posture, set it at launch with `--trust`, where it is one visible, deliberate
+choice rather than something a pane can ask for mid-session.
+
+> This used to carve out the root pane, on the reading that the root pane is you
+> and you may direct your own session. Two things broke that: `-n N` and `--grid`
+> give *every* pane no parent, so every pane in a mass-spawned session counted as
+> the operator and could request `skip` — a full bypass — in a session set to
+> `plan`; and a ceiling that a pane can exceed is not a ceiling. Since the human
+> issues `ctl` from inside a pane, there was no way to tell "you" from "an agent
+> running where you launched it".
+
+amux also strips raw claude permission flags (`--dangerously-skip-permissions`,
+`--permission-mode`) from agent-supplied spawn argv, and refuses flags a teammate
+may not choose at all (`--mcp-config`, `--plugin-dir`, `--settings` — each reaches
+code execution outside the tool-permission system). Agents request a mode through
+`--mode`, so amux's policy stays the single source of truth. Anything amux ignores,
+caps or refuses is reported in the spawn reply's `note` (never silent).
 
 - **`accept` — the safe default.** Agents launch in claude's **auto-accept-edits**
   mode plus an **allowlist of safe dev commands**, so the edit/build/test loop

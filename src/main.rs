@@ -1152,6 +1152,45 @@ fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
     privilege_for(caller, pane_parent)
 }
 
+/// Resolve a spawn's permission mode against the session policy.
+///
+/// The session policy is a CEILING, and it now holds for everyone — including a
+/// root pane. It used to be bypassed outright for a "privileged" caller
+/// (`Some(req) if privileged => req`), on the reading that the root pane is the
+/// human and the human may elevate. Two things break that:
+///
+/// 1. `-n N` and `--grid` give every pane no parent, so EVERY pane in a
+///    mass-spawned session was classified as the operator. An agent could then
+///    ask for `skip` — a full permission bypass — in a session the human had
+///    deliberately set to `plan`.
+/// 2. amux's own documentation calls `--trust` "the mode spawned agents run in,
+///    and the ceiling they are capped at". A ceiling that a pane can exceed is
+///    not a ceiling, and the human cannot tell from the outside which panes could.
+///
+/// So the bypass is gone. `--mode` may still DE-ESCALATE freely (asking for less
+/// than the policy is always allowed), which is the useful half; it can no longer
+/// escalate. To run agents at a higher posture, the human sets it at launch,
+/// where it is a visible, deliberate choice rather than something a pane can
+/// request. Returns the effective mode and a note when a request was capped.
+fn effective_mode(
+    requested: Option<amux::ctl::TrustMode>,
+    policy: amux::ctl::TrustMode,
+) -> (amux::ctl::TrustMode, Option<String>) {
+    match requested {
+        None => (policy, None),
+        Some(req) if req.rank() <= policy.rank() => (req, None),
+        Some(req) => (
+            policy,
+            Some(format!(
+                "capped to {} (session policy); nothing may elevate itself to {} \
+                 — set the policy at launch with --trust",
+                policy.policy_label(),
+                req.policy_label()
+            )),
+        ),
+    }
+}
+
 /// The privilege decision, given only what it needs.
 ///
 /// `pane_parent` says what the caller's capability token resolved to:
@@ -1336,8 +1375,8 @@ fn main() -> ExitCode {
              \x20               commands with claude's guardrails); `skip` FULL bypass (--dangerously-skip-\n\
              \x20               permissions, no gate — amux confirms it at launch). All pre-accept claude's\n\
              \x20               folder-trust dialog. Extend the accept allowlist with AMUX_TRUST_ALLOW=\"a,b\".\n\
-             \x20               You (the root pane) can elevate a teammate above the policy per-spawn with\n\
-             \x20               `ctl spawn --mode …`; a worker cannot.\n\
+             \x20               The policy is a CEILING for every caller: `ctl spawn --mode …` may match\n\
+             \x20               it or de-escalate, never elevate. Raise it at launch, not mid-session.\n\
              \x20      --skip-permissions: alias for --trust skip.\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
@@ -3690,19 +3729,10 @@ fn dispatch_ctl(
                 ));
             }
             let policy = trust_mode();
-            let effective = match sp.mode {
-                None => policy,
-                Some(req) if privileged => req,
-                Some(req) if req.rank() <= policy.rank() => req,
-                Some(req) => {
-                    notes.push(format!(
-                        "capped teammate to {} (session policy); a worker cannot elevate itself to {}",
-                        policy.policy_label(),
-                        req.policy_label()
-                    ));
-                    policy
-                }
-            };
+            let (effective, cap_note) = effective_mode(sp.mode, policy);
+            if let Some(n) = cap_note {
+                notes.push(n);
+            }
             let note = if notes.is_empty() {
                 None
             } else {
@@ -4794,6 +4824,37 @@ mod tests {
     #[test]
     fn a_token_resolving_to_no_live_pane_is_not_the_operator() {
         assert!(!privilege_for(Some(7), None));
+    }
+
+    /// **The session policy is a ceiling for everyone** (review #1, remainder).
+    ///
+    /// A "privileged" caller used to bypass the cap entirely. But `-n N` gives
+    /// every pane no parent, so every pane in a mass-spawned session counted as
+    /// the operator — and could ask for `skip`, a full permission bypass, in a
+    /// session the human had set to `plan`.
+    #[test]
+    fn the_session_policy_caps_every_request() {
+        use amux::ctl::TrustMode;
+        // Escalation is refused and explained, whoever asks.
+        let (mode, note) = super::effective_mode(Some(TrustMode::Skip), TrustMode::Plan);
+        assert_eq!(mode, TrustMode::Plan, "skip escaped a plan-mode session");
+        assert!(note
+            .expect("a capped request must say so")
+            .contains("capped"));
+    }
+
+    /// De-escalation stays free: asking for LESS than the policy is always fine,
+    /// and is the useful half of `--mode`.
+    #[test]
+    fn a_request_below_the_policy_is_honoured() {
+        use amux::ctl::TrustMode;
+        let (mode, note) = super::effective_mode(Some(TrustMode::Plan), TrustMode::Skip);
+        assert_eq!(mode, TrustMode::Plan);
+        assert!(note.is_none(), "de-escalation should not be flagged");
+        // No request at all inherits the policy.
+        let (mode, note) = super::effective_mode(None, TrustMode::Edits);
+        assert_eq!(mode, TrustMode::Edits);
+        assert!(note.is_none());
     }
 
     /// The intended rule, unchanged: a root pane is the operator, a spawned
