@@ -1299,3 +1299,67 @@ fn closing_an_overlay_repaints_the_pane() {
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+/// **A pane's whole process tree must die with it** (review finding #2).
+///
+/// `Pty::kill` is `SIGKILL` to the direct child only, so everything that child
+/// spawned survives and is reparented to `init`. For an agent pane that means
+/// its MCP servers, language servers and node helpers leak — measured at 23
+/// processes holding 4.6 GB during a fleet review. This is not a signal-handling
+/// edge case: it happens on a **clean** `Ctrl+A q`, and has since day one.
+///
+/// `sleep` stands in for whatever an agent spawns. It is found via `pgrep`
+/// rather than by parsing pane output, so the test does not depend on rendering.
+#[cfg(unix)]
+#[test]
+fn quitting_kills_the_panes_whole_process_tree() {
+    // A NON-interactive shell, deliberately. An interactive `sh -i` runs job
+    // control, which puts each background job in its own process group — the one
+    // arrangement `killpg` cannot follow. A real agent does not background jobs
+    // through a job-control shell; it forks helpers that inherit its group, which
+    // is what this reproduces.
+    //
+    // The grandchild reports its own pid to a file keyed by this test process, so
+    // the test never has to guess which amux is its own. Scanning the process
+    // table for that is racy under the parallel suite and picks somebody else's.
+    let marker = std::env::temp_dir().join(format!("amux-tree-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
+    let mut p =
+        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let grandkid: u32 = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if let Ok(v) = t.trim().parse::<u32>() {
+                break v;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild never reported its pid"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(pid_alive(grandkid), "grandchild died before the test began");
+    let grandkids = vec![grandkid];
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let survivors: Vec<u32> = grandkids
+        .iter()
+        .copied()
+        .filter(|g| pid_alive(*g))
+        .collect();
+    for g in &survivors {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &g.to_string()])
+            .status();
+    }
+    assert!(
+        survivors.is_empty(),
+        "pane grandchildren survived a clean quit: {survivors:?}"
+    );
+}

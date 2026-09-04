@@ -2766,10 +2766,43 @@ fn run(
     }
 
     let dbg = std::env::var_os("AMUX_DEBUG").is_some();
+    // Kill process TREES, not processes. `pty.kill()` is SIGKILL to the direct
+    // child alone, so everything an agent spawned — MCP servers, language
+    // servers, node helpers — outlived amux and was reparented onto init. That
+    // leaked on every clean quit, not just on a signal. See `amux::reap`.
+    let pids: Vec<u32> = windows
+        .iter()
+        .flat_map(|w| w.panes.iter().map(|p| p.pty.pid()))
+        .filter(|p| *p != 0)
+        .collect();
+    for pid in &pids {
+        amux::reap::term_tree(*pid);
+    }
+    if !pids.is_empty() {
+        std::thread::sleep(amux::reap::GRACE);
+    }
+    for pid in &pids {
+        amux::reap::kill_tree(*pid);
+    }
     for w in windows.iter_mut() {
+        // Still reap the direct child, so it does not linger as a zombie.
         for pane in w.panes.iter_mut() {
             let _ = pane.pty.kill();
         }
+    }
+    // Do not claim success if something survived: a teardown that can fail
+    // silently is how 23 agent processes ended up holding 4.6 GB unnoticed.
+    let survivors: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|p| amux::reap::tree_alive(*p))
+        .collect();
+    if !survivors.is_empty() {
+        eprintln!(
+            "amux: warning: {} pane process group(s) survived teardown: {:?}",
+            survivors.len(),
+            survivors
+        );
     }
     if dbg {
         eprint!("[amux-dbg killed]\r\n");

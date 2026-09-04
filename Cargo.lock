@@ -59,7 +59,7 @@ source = "git+https://github.com/nativelite/json-rs?branch=main#bcbbeb7a995a3ae2
 [[package]]
 name = "pty"
 version = "0.3.0"
-source = "git+https://github.com/nativelite/pty-rs?branch=main#408b6ea433fed8447ca470d76e56c85a41915c94"
+source = "git+https://github.com/nativelite/pty-rs?branch=main#e8da3c2964c58640dfae9fd5de5a9eabf86eb3ca"
 
 [[package]]
 name = "rawterm"
