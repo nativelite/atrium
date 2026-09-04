@@ -1,0 +1,4 @@
+# dev.py is executed directly on macOS/Linux (shebang + exec bit), so it MUST keep
+# LF line endings — a CRLF would put a stray \r on the shebang line and the kernel
+# would fail to find the interpreter. Pin it regardless of core.autocrlf.
+dev.py text eol=lf

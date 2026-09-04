@@ -62,6 +62,29 @@ pub fn is_claude_stem(stem: &str) -> bool {
     CLAUDE_STEMS.contains(&stem)
 }
 
+/// Extract a command's **stem** (basename without extension) in a way that is
+/// platform-independent for the path separator.
+///
+/// `std::path::Path::file_stem` only treats `\` as a separator on Windows, so a
+/// Windows-authored fleet command like `C:\tools\claude.cmd` yields the stem
+/// `C:\tools\claude` on macOS/Linux — and the pane is then not recognized as an
+/// agent (no status chrome, no `--session-id`, no identity injection). amux fleet
+/// configs are shared across platforms, so we split on **both** `/` and `\` on
+/// every OS, take the last component, then drop a single trailing extension.
+/// `claude`, `claude.exe`, `claude.cmd`, `C:\x\claude.exe`, and `/usr/bin/claude`
+/// all map to `claude`. A leading-dot name (`.bashrc`) keeps its whole name, like
+/// `file_stem`. On Windows this is byte-identical to the old `file_stem` path.
+pub fn command_stem(cmd: &str) -> String {
+    // Last path component, splitting on either separator regardless of the host OS.
+    let base = cmd.rsplit(['/', '\\']).next().unwrap_or(cmd);
+    // Drop a single trailing extension (…claude.exe → claude); a leading dot is not
+    // an extension (`.bashrc` stays whole), matching `Path::file_stem`.
+    match base.rfind('.') {
+        Some(i) if i > 0 => base[..i].to_string(),
+        _ => base.to_string(),
+    }
+}
+
 /// Did the user already pass a session-selecting flag? If so amux leaves the
 /// command untouched — the user owns that id (a `--resume` reopens a transcript
 /// whose stem is the user's, not one amux minted), so no `--session-id` inject.
@@ -87,10 +110,7 @@ pub fn has_user_session_arg(args: &[String]) -> bool {
 /// session identity. On `Some`, the caller appends `--session-id <uuid>` to the
 /// agent's args and stores `uuid` on the pane for the binder.
 pub fn session_id_for(command: &[String]) -> Option<String> {
-    let stem = std::path::Path::new(&command[0])
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| command[0].clone());
+    let stem = command_stem(&command[0]);
     // `--session-id` is a Claude Code flag; only claude gets an injected id.
     if !is_claude_stem(&stem) {
         return None;
@@ -219,9 +239,38 @@ mod tests {
 
     #[test]
     fn windows_style_path_stem_is_recognized_as_agent() {
-        // amux derives the title from file_stem; the inject decision must too.
+        // amux derives the title from the command stem; the inject decision must
+        // too. Both a Windows-style path and a Unix path resolve to `claude` on
+        // EVERY host (this failed on macOS while the stem used Path::file_stem,
+        // which keeps the backslashes off-Windows).
         assert!(session_id_for(&cmd(&["C:\\tools\\claude.cmd"])).is_some());
         assert!(session_id_for(&cmd(&["/usr/local/bin/claude"])).is_some());
+    }
+
+    #[test]
+    fn command_stem_is_platform_independent() {
+        // Both separators are honored on every OS; a single trailing extension is
+        // dropped; a leading-dot name is kept whole (like Path::file_stem).
+        for (input, want) in [
+            ("claude", "claude"),
+            ("claude.exe", "claude"),
+            ("claude.cmd", "claude"),
+            ("C:\\tools\\claude.cmd", "claude"),
+            ("C:/tools/claude.exe", "claude"),
+            ("/usr/local/bin/claude", "claude"),
+            ("cursor-agent", "cursor-agent"),
+            ("C:\\bin\\cursor-agent.exe", "cursor-agent"),
+            (".bashrc", ".bashrc"),
+            ("codex", "codex"),
+        ] {
+            assert_eq!(command_stem(input), want, "stem of {input:?}");
+        }
+        // The vendor agents are recognized from a Windows path too (the defect: a
+        // Windows-authored fleet config silently losing agent chrome on macOS).
+        for v in ["gemini", "codex", "aider", "cursor-agent"] {
+            let winpath = format!("C:\\Program Files\\{v}\\{v}.exe");
+            assert!(is_agent_stem(&command_stem(&winpath)), "{v} via win path");
+        }
     }
 
     #[test]

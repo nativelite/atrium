@@ -219,10 +219,10 @@ pub fn evaluate_spawn(
     if first.is_empty() {
         return Err(SpawnDenied::EmptyCommand);
     }
-    let stem = std::path::Path::new(first)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| first.clone());
+    // Cross-platform stem (splits on `/` and `\` on every OS) so the allowlist
+    // check holds for a Windows-authored command on macOS/Linux — see
+    // `bind::command_stem`.
+    let stem = bind::command_stem(first);
     let allowed = bind::is_agent_stem(&stem) || extra_allow.iter().any(|s| s == &stem);
     if !allowed {
         return Err(SpawnDenied::NotAllowed(stem));

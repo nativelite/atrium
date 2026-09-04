@@ -1,15 +1,17 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Local dev runner for amux — stdlib Python driving cargo, no task runner.
 
-The same `python dev.py check` gate as every nativelite package, so the muscle
-memory is identical across languages. Here `check` is the zero-dependency guard
-plus `cargo test` (unit + integration + doctests):
+The same `check` gate as every nativelite package, so the muscle memory is
+identical across languages. Here `check` is the zero-dependency guard plus
+`cargo test` (unit + integration + doctests). Invoke it however your platform
+spells Python — `python` is Windows-only, macOS/Linux ship `python3`, and the
+shebang + exec bit make `./dev.py` work everywhere:
 
-  python dev.py check                 # guard + cargo test (what CI runs)
-  python dev.py test                  # cargo test
-  python dev.py build                 # cargo build --release
-  python dev.py fmt                   # cargo fmt --check
-  python dev.py guard                 # zero-dependency guard
+  ./dev.py check      (macOS/Linux)   |   python dev.py check      (Windows)
+  ./dev.py test       # cargo test
+  ./dev.py build      # cargo build --release
+  ./dev.py fmt        # cargo fmt --check
+  ./dev.py guard      # zero-dependency guard
 """
 from __future__ import annotations
 

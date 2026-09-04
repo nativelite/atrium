@@ -3591,12 +3591,7 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
             let stem = sp
                 .argv
                 .first()
-                .map(|a| {
-                    std::path::Path::new(a)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| a.clone())
-                })
+                .map(|a| amux::bind::command_stem(a))
                 .unwrap_or_default();
             (
                 "spawn",
@@ -4029,10 +4024,11 @@ fn spawn_pane_full(
     mode: amux::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
-    let title = std::path::Path::new(&command[0])
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| command[0].clone());
+    // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
+    // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
+    // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This
+    // title feeds is_claude/is_codex/vendor_tag, so the fix must live here.
+    let title = amux::bind::command_stem(&command[0]);
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands

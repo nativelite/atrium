@@ -4,13 +4,29 @@ Thread-2 audit of the platform seams, verifying amux builds and runs on macOS.
 amux is developed on Windows; macOS is reached through the `cfg(unix)` branches,
 which it shares with Linux. This documents what was checked and the result.
 
-## Verdict: amux builds on macOS as-is — no code changes required.
+## Verdict: builds and runs on macOS; one cross-platform code fix was needed.
+
+> **Updated 2026-09-04 after a real-Mac audit** (macOS 26.6.2, Apple_Terminal
+> 470.2, rustc 1.97.1). The original "no code changes required" verdict below came
+> from a **Windows-host `cargo check --target …-apple-darwin`, which type-checks
+> but never links or runs** — so it could not catch a *behavioral* platform
+> difference. The real-Mac run found one: `Path::file_stem` treats `\` as a
+> separator only on Windows, so a Windows-authored fleet command like
+> `C:\tools\claude.cmd` was not recognized as an agent on macOS (no status chrome,
+> no `--session-id`, no identity injection). **Fixed** via a platform-independent
+> `bind::command_stem` (splits on `/` and `\` on every OS), used everywhere a
+> command stem is derived. The other real-Mac findings were packaging/tooling (a
+> UTF-8 BOM on `dev.py`, missing exec bit, `python` vs `python3` docs, brittle
+> byte-layout test assertions) — all addressed. Build green, clippy clean, frames
+> column-exact. **One item stays open:** garbled box-drawing borders in
+> Terminal.app, not yet reproduced — amux does no terminal capability detection
+> (`theme.rs` commits to truecolor; macOS 26 Tahoe added truecolor to Terminal.app,
+> so that is likely not the cause) — a screenshot is needed to discriminate.
 
 The whole tree — amux plus every unix-facing dependency (`rawterm`'s
 `sys_unix.rs`, `pty`, `abus`, `vterm`, …) and all unit + integration test
-targets — compile-checks cleanly for both Apple architectures. This is the
-strongest validation available without a Mac: `cargo check` type-checks the
-exact code a macOS build would compile.
+targets — compile-checks cleanly for both Apple architectures, and now also
+**builds and runs green on a real Mac**.
 
 ```
 cargo check --all-targets                                   # windows host  -> green

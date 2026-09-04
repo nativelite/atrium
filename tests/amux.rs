@@ -460,7 +460,7 @@ fn read_until(p: &mut pty::Pty, needle: &[u8], deadline: Duration) -> Vec<u8> {
             Some(0) => break,
             Some(n) => {
                 out.extend_from_slice(&buf[..n]);
-                if out.windows(needle.len().max(1)).any(|w| w == needle) {
+                if contains(&out, needle) {
                     break;
                 }
             }
@@ -470,8 +470,38 @@ fn read_until(p: &mut pty::Pty, needle: &[u8], deadline: Duration) -> Vec<u8> {
     out
 }
 
+/// Strip CSI escape sequences (`ESC [ … final`) from a byte stream, leaving the
+/// visible glyphs. The painter emits a label like ` 2:sh` interleaved with SGR
+/// color codes and, on a diff frame, cursor-position jumps — so the visible label
+/// is on screen but its bytes are not contiguous. Matching on the CSI-stripped
+/// stream makes the label waits/asserts robust to that (it bit macOS, where a
+/// prompt-driven repaint split the label across a diff; the frame itself is
+/// correct). Every needle these tests search for is visible text, so stripping
+/// the haystack never hides a real match.
+fn strip_csi_bytes(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == 0x1b && i + 1 < s.len() && s[i + 1] == b'[' {
+            i += 2;
+            // Parameters/intermediates (0x20–0x3F) then a final byte (0x40–0x7E).
+            while i < s.len() && !(0x40..=0x7e).contains(&s[i]) {
+                i += 1;
+            }
+            if i < s.len() {
+                i += 1; // consume the final byte
+            }
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack.windows(needle.len().max(1)).any(|w| w == needle)
+    let visible = strip_csi_bytes(haystack);
+    visible.windows(needle.len().max(1)).any(|w| w == needle)
 }
 
 fn wait_exit(p: &mut pty::Pty, secs: u64) -> i32 {

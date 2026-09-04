@@ -559,8 +559,15 @@ cleanly, and literal-prefix delivery.
 ## Development
 
 ```bash
-python dev.py check   # dependency guard + cargo test (the pre-push gate)
+# macOS / Linux:
+./dev.py check          # or: python3 dev.py check
+# Windows:
+python dev.py check     # dependency guard + cargo test (the pre-push gate)
 ```
+
+(`python` is Windows-only; macOS/Linux ship `python3`. `dev.py` carries a
+`#!/usr/bin/env python3` shebang and the executable bit, so `./dev.py check`
+works everywhere.)
 
 No CI runs right now (GitHub Actions are off, 2026-08-30); the local `dev.py
 check` is the gate. A lean CI may return once the nativelite crates are public —

@@ -115,10 +115,9 @@ pub fn wants_env(command: &[String], identity: Option<&str>) -> bool {
     let Some(prog) = command.first() else {
         return false; // no program to run — nothing to credential
     };
-    let stem = std::path::Path::new(prog)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| prog.clone());
+    // Cross-platform stem (splits on `/` and `\` on every OS) so a Windows-authored
+    // fleet path is still recognized on macOS/Linux — see `bind::command_stem`.
+    let stem = crate::bind::command_stem(prog);
     crate::bind::is_agent_stem(&stem)
 }
 
