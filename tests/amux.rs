@@ -1249,3 +1249,53 @@ fn sighup_does_not_orphan_hosted_panes() {
         .status();
     panic!("pane {shell_pid} survived SIGHUP to amux {amux} — orphaned agent");
 }
+
+/// **Closing a full-screen overlay must repaint the pane** (F10).
+///
+/// `repaint_focused` cleared the screen and then asked the hosted app to redraw
+/// by resizing its pty `h-1` then straight back to `h` — ending at the size it
+/// already had. An app that only repaints on a real dimension change (or that
+/// is mid-turn and defers) correctly does nothing, and the operator is left
+/// staring at a blank screen with just the status bar. Reported on macOS after
+/// pressing `g` on a board decision; the fix paints from amux's own emulator
+/// instead of asking the child.
+///
+/// `sh` never redraws on SIGWINCH, which makes it the perfect probe: if the
+/// prompt comes back, amux painted it.
+#[test]
+fn closing_an_overlay_repaints_the_pane() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
+
+    // A marker on screen that only amux can bring back.
+    p.write(b"m=repaint; echo \"$m\"\"=marker\"\r\n").unwrap();
+    let out = read_until(&mut p, b"repaint=marker", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"repaint=marker"),
+        "pane never painted: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    // Open the board overlay, which clears the screen and covers the pane.
+    p.write(b"\x01b").unwrap();
+    read_until(&mut p, b"board", Duration::from_secs(10));
+
+    // Close it. That is a real view transition, so the pane must come back —
+    // painted by amux, because `sh` will not repaint itself.
+    p.write(b"\x01b").unwrap();
+    let back = read_until(&mut p, b"repaint=marker", Duration::from_secs(10));
+    assert!(
+        contains(&back, b"repaint=marker"),
+        "pane not repainted after the overlay closed — blank screen: {:?}",
+        String::from_utf8_lossy(&back)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}

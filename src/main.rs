@@ -2972,20 +2972,32 @@ fn switch_window(
 /// repaints in full (ConPTY always does; Unix full-screen apps redraw on
 /// SIGWINCH). Used on window switch and mode changes into passthrough.
 fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
-    // Re-assert the bar-protecting scroll region (see `switch_window`) before the
-    // repaint nudge, so the refreshed pane stays out of the bar row.
-    let _ = write!(
-        out,
-        "\x1b[1;{}r\x1b[2J\x1b[H",
-        rows.saturating_sub(1).max(1)
-    );
-    let _ = out.flush();
+    // Re-assert the bar-protecting scroll region (see `switch_window`) so the
+    // refreshed pane stays out of the bar row.
     let ar = rows.saturating_sub(1).max(1);
+    let _ = write!(out, "\x1b[1;{ar}r");
     let focus = w.tree.focus();
     if let Some(p) = w.pane_mut(focus) {
-        let _ = p.pty.resize(ar.saturating_sub(1).max(1), cols);
+        // Paint from OUR OWN emulator — never by asking the child to redraw.
+        //
+        // This used to clear the screen and then provoke a repaint by resizing
+        // the pty `h-1` and straight back to `h`. That ends at the size the
+        // child already had, so an app that repaints only on a real dimension
+        // change — or one that is mid-turn and defers — correctly does nothing,
+        // and the operator is left with a cleared screen showing only the bar.
+        // Reported on macOS after pressing `g` on a board decision while that
+        // agent was answering. It never bit Windows, where ConPTY delivers
+        // resize differently and conhost forces a full repaint.
+        //
+        // `render_full` clears and reflects everything fed so far, so the
+        // repaint is ours and cannot be declined. It is the same call the
+        // splash handoff already depends on. The single resize is kept only so
+        // the child's idea of its size stays correct; nothing now hangs on it.
         let _ = p.pty.resize(ar, cols);
+        let full = p.term.screen().render_full();
+        let _ = out.write_all(&full);
     }
+    let _ = out.flush();
 }
 
 /// The `amux fleet …` command family. `fleet up <name>` brings up a saved
