@@ -85,24 +85,40 @@ mod sys {
     const SIGHUP: i32 = 1;
     const SIGINT: i32 = 2;
 
+    /// A running process, not a corpse. `kill(pid, 0)` succeeds on a zombie, so
+    /// process state has to be read to tell them apart. macOS reports an exiting
+    /// or zombie process with `Z`, or an `E` flag, in `ps -o stat=`.
+    /// Signal one process, not its group — used to put down a stuck watchdog,
+    /// which is a lone process and not a pane tree.
+    pub fn signal_pid(pid: u32, sig: i32) -> bool {
+        pid != 0 && unsafe { kill(pid as i32, sig) == 0 }
+    }
+
+    pub fn pid_running(pid: u32) -> bool {
+        if !pid_alive(pid) {
+            return false;
+        }
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            Ok(o) => {
+                let st = String::from_utf8_lossy(&o.stdout);
+                let st = st.trim();
+                !st.is_empty() && !st.starts_with('Z') && !st.contains('E')
+            }
+            // Cannot tell: assume running. Never tear down a live session on a
+            // guess — a missed sweep is recoverable, a wrong kill is not.
+            Err(_) => true,
+        }
+    }
+
     pub fn ignore_hup() {
         // SAFETY: setting a disposition to SIG_IGN.
         unsafe {
             signal(SIGHUP, SIG_IGN);
             signal(SIGINT, SIG_IGN);
         }
-    }
-
-    extern "C" {
-        fn getppid() -> i32;
-    }
-
-    /// Has our parent gone? True once we have been reparented away from it —
-    /// which happens at the parent's death, regardless of zombie state.
-    pub fn parent_changed(original: u32) -> bool {
-        // SAFETY: getppid() takes no arguments and cannot fail.
-        let now = unsafe { getppid() } as u32;
-        now != original || now == 1
     }
 }
 
@@ -151,10 +167,16 @@ mod sys {
     /// and the durable answer there is a Job Object. Nothing to do here.
     pub fn ignore_hup() {}
 
-    /// Windows has no `getppid`, and no zombie state to work around: a handle
-    /// stops being signalled once the process exits, so liveness is exact.
-    pub fn parent_changed(original: u32) -> bool {
-        !pid_alive(original)
+    /// Windows watchdogs are not spawned yet (the Job Object covers this case),
+    /// so there is nothing to put down here.
+    pub fn signal_pid(_pid: u32, _sig: i32) -> bool {
+        false
+    }
+
+    /// No zombie state on Windows — a handle stops being signalled once the
+    /// process exits — so running and alive are the same question.
+    pub fn pid_running(pid: u32) -> bool {
+        pid_alive(pid)
     }
 }
 
@@ -174,8 +196,6 @@ use std::path::{Path, PathBuf};
 
 /// The hidden argv flag that runs amux as its own watchdog.
 pub const WATCHDOG_FLAG: &str = "--reap-watchdog";
-/// How often the watchdog checks whether amux is still alive.
-const WATCH_POLL: Duration = Duration::from_millis(250);
 
 /// Registry path for a session. Lives in the temp dir, keyed by amux's pid, so a
 /// crashed session leaves a file a later `amux reap` can find and act on.
@@ -201,6 +221,17 @@ pub fn read_registry(path: &Path) -> Vec<u32> {
 /// Is a process alive? Used to decide whether a session (or its registry) is stale.
 pub fn pid_alive(pid: u32) -> bool {
     sys::pid_alive(pid)
+}
+
+/// Is a process actually *running*, as opposed to one that has exited and is
+/// waiting to be reaped?
+///
+/// [`pid_alive`] cannot tell the difference: `kill(pid, 0)` succeeds on a zombie.
+/// That is why a crashed session's registry was never swept — the sweep saw the
+/// dead owner as alive and skipped it, precisely in the case the sweep exists
+/// for. Anything deciding "is this session still here" must use this.
+pub fn pid_running(pid: u32) -> bool {
+    sys::pid_running(pid)
 }
 
 /// The watchdog loop: wait for `parent` to disappear, then tear down every group
@@ -243,11 +274,54 @@ pub fn watchdog_main(_parent: u32, registry: &Path) {
 /// Kill the trees of every session whose amux is gone, and remove its registry.
 /// Returns how many registries were cleaned. This is what recovers a machine
 /// after a crash — or after a session that predates the watchdog entirely.
-pub fn reap_stale() -> usize {
+/// Kill watchdogs whose session is gone.
+///
+/// A watchdog blocked on its pipe exits by itself the moment amux dies, so this
+/// should normally find nothing. One still present after its owner has gone is
+/// stuck — an older build that polled liveness, or a pipe that never closed —
+/// and is pure debris holding a process slot.
+fn reap_orphan_watchdogs() -> usize {
+    let out = match std::process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+    let mut killed = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.contains(WATCHDOG_FLAG) {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let Some(pid) = it.next().and_then(|t| t.parse::<u32>().ok()) else {
+            continue;
+        };
+        // `… --reap-watchdog <owner> <registry>`: the owner follows the flag.
+        let owner = line
+            .split_whitespace()
+            .skip_while(|t| *t != WATCHDOG_FLAG)
+            .nth(1)
+            .and_then(|t| t.parse::<u32>().ok());
+        let Some(owner) = owner else { continue };
+        if pid_running(owner) {
+            continue; // its session is still up; leave it alone
+        }
+        if sys::signal_pid(pid, sys::SIGKILL) {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// Clean up after sessions that are already gone: `(sessions, watchdogs)`.
+pub fn reap_stale() -> (usize, usize) {
     let dir = std::env::temp_dir();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
-        Err(_) => return 0,
+        // Cannot read the temp dir: no registries to sweep, but a stuck watchdog
+        // is found through the process table and is still worth clearing.
+        Err(_) => return (0, reap_orphan_watchdogs()),
     };
     let mut cleaned = 0;
     for e in entries.flatten() {
@@ -259,7 +333,7 @@ pub fn reap_stale() -> usize {
             .and_then(|n| n.strip_suffix(".pids"))
             .and_then(|n| n.parse::<u32>().ok());
         let Some(owner) = owner else { continue };
-        if pid_alive(owner) {
+        if pid_running(owner) {
             continue; // a live session owns this one
         }
         for p in read_registry(&path) {
@@ -269,7 +343,7 @@ pub fn reap_stale() -> usize {
         let _ = std::fs::remove_file(&path);
         cleaned += 1;
     }
-    cleaned
+    (cleaned, reap_orphan_watchdogs())
 }
 
 /// Re-exec amux as a detached watchdog for this session.
@@ -298,4 +372,34 @@ pub fn spawn_watchdog(registry: &Path) -> io::Result<std::process::Child> {
 /// Detach the watchdog from the terminal's fate. Called in watchdog mode only.
 pub fn ignore_terminal_signals() {
     sys::ignore_hup();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trap this module hit three times: `kill(pid, 0)` succeeds on a process
+    /// that has already exited but not yet been reaped. Anything asking "is this
+    /// session still alive" with that alone waits forever for a corpse — which is
+    /// how a crashed session's registry survived every sweep.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_is_alive_but_not_running() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        // Let it exit, but deliberately do not reap it: it is now a zombie.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            pid_alive(pid),
+            "kill(pid, 0) is expected to succeed on a zombie"
+        );
+        assert!(
+            !pid_running(pid),
+            "a zombie must not count as a running session"
+        );
+        let _ = child.wait(); // reap it
+        assert!(!pid_alive(pid), "a reaped process should be gone");
+    }
 }

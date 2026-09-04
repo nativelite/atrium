@@ -1342,7 +1342,7 @@ fn quitting_kills_the_panes_whole_process_tree() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(pid_alive(grandkid), "grandchild died before the test began");
-    let grandkids = vec![grandkid];
+    let grandkids = [grandkid];
 
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
@@ -1377,8 +1377,7 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
     let marker = std::env::temp_dir().join(format!("amux-kill9-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
-    let mut p =
-        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let grandkid: u32 = loop {

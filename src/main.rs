@@ -1259,11 +1259,12 @@ fn main() -> ExitCode {
     // `amux reap` cleans up after sessions that are already gone — a crash, or a
     // session from before any of this existed.
     if args.first().map(String::as_str) == Some("reap") {
-        let n = amux::reap::reap_stale();
-        if n == 0 {
-            println!("amux reap: nothing to clean up");
-        } else {
-            println!("amux reap: cleaned up {n} dead session(s)");
+        let (sessions, watchdogs) = amux::reap::reap_stale();
+        match (sessions, watchdogs) {
+            (0, 0) => println!("amux reap: nothing to clean up"),
+            (s, 0) => println!("amux reap: cleaned up {s} dead session(s)"),
+            (0, w) => println!("amux reap: cleaned up {w} stuck watchdog(s)"),
+            (s, w) => println!("amux reap: cleaned up {s} dead session(s), {w} stuck watchdog(s)"),
         }
         return ExitCode::SUCCESS;
     }
