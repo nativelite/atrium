@@ -2,8 +2,9 @@
 """Local dev runner for amux — stdlib Python driving cargo, no task runner.
 
 The same `check` gate as every nativelite package, so the muscle memory is
-identical across languages. Here `check` is the zero-dependency guard plus
-`cargo test` (unit + integration + doctests). Invoke it however your platform
+identical across languages. Here `check` is the zero-dependency guard, then
+`cargo fmt --check`, then `cargo test` (unit + integration + doctests). Invoke it
+however your platform
 spells Python — `python` is Windows-only, macOS/Linux ship `python3`, and the
 shebang + exec bit make `./dev.py` work everywhere:
 
@@ -45,7 +46,8 @@ def guard() -> int:
 
 
 def check() -> int:
-    return guard() or test()
+    # guard (cheap) → fmt (cheap, fail fast on style drift) → test (expensive).
+    return guard() or fmt() or test()
 
 
 COMMANDS = {"test": test, "build": build, "fmt": fmt, "guard": guard, "check": check}
