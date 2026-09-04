@@ -32,6 +32,32 @@ const STRIP: &[&[u8]] = &[
     // win32-input-mode enable / disable (the original hotkey-eating bug).
     b"\x1b[?9001h",
     b"\x1b[?9001l",
+    // Mouse tracking — amux owns the real terminal's mouse state. A hosted app
+    // (claude does this) that turns reporting on would otherwise flip the outer
+    // terminal into it, and the user loses native text selection: click-drag
+    // becomes a mouse report to the app instead of a selection. amux keeps mouse
+    // capture OFF by default precisely so selection works, and `Ctrl+A m` is the
+    // documented way to turn it on — at which point amux enables it on the real
+    // terminal itself and routes events to the pane. The pane's own request is
+    // still observed (the emulator is fed the unfiltered stream, so
+    // `Pane::mouse_wanted` still tracks it); it just no longer reaches the user's
+    // terminal. Both the X10/normal/button/any-event modes and the extended
+    // coordinate encodings are terminated, enable and disable alike, so a pane
+    // can never leave the terminal in a state amux did not set.
+    b"\x1b[?1000h",
+    b"\x1b[?1000l",
+    b"\x1b[?1002h",
+    b"\x1b[?1002l",
+    b"\x1b[?1003h",
+    b"\x1b[?1003l",
+    b"\x1b[?1005h",
+    b"\x1b[?1005l",
+    b"\x1b[?1006h",
+    b"\x1b[?1006l",
+    b"\x1b[?1015h",
+    b"\x1b[?1015l",
+    b"\x1b[?1016h",
+    b"\x1b[?1016l",
     // Alternate screen buffer enter / leave — amux owns the alt screen.
     b"\x1b[?1049h",
     b"\x1b[?1049l",
@@ -196,6 +222,39 @@ mod tests {
         // SGR, cursor moves, erase, and a device query all end in non-`t` finals.
         let input = b"\x1b[0m\x1b[1;44H\x1b[2K\x1b[38;2;70;235;255mhi\x1b[H";
         assert_eq!(feed_all(&[input]), input.to_vec());
+    }
+
+    #[test]
+    fn mouse_tracking_requests_are_terminated_at_amux() {
+        // A hosted agent that turns on mouse reporting must not flip the *real*
+        // terminal into it: that is what stops the user selecting text with the
+        // mouse, which amux documents as working by default. `sh` never asks, so
+        // the symptom appeared only once an agent pane was open.
+        let modes: &[&[u8]] = &[
+            b"\x1b[?1000h",
+            b"\x1b[?1002h",
+            b"\x1b[?1003h",
+            b"\x1b[?1005h",
+            b"\x1b[?1006h",
+            b"\x1b[?1015h",
+            b"\x1b[?1016h",
+        ];
+        for m in modes {
+            let mut chunk = b"a".to_vec();
+            chunk.extend_from_slice(m);
+            chunk.extend_from_slice(b"b");
+            assert_eq!(
+                feed_all(&[&chunk]),
+                b"ab".to_vec(),
+                "not stripped: {:?}",
+                String::from_utf8_lossy(m)
+            );
+        }
+        // The matching disables too, so a pane cannot leave the real terminal in
+        // a state amux did not put it in.
+        assert_eq!(feed_all(&[b"a\x1b[?1006lb"]), b"ab".to_vec());
+        // Chunk-split safe, like every other stripped mode.
+        assert_eq!(feed_all(&[b"a\x1b[?10", b"00hb"]), b"ab".to_vec());
     }
 
     #[test]

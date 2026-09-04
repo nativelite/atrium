@@ -2378,22 +2378,19 @@ fn run(
             force_repaint = true;
         }
 
-        // 4b. Match the OUTER terminal's mouse reporting to the focused pane. A
-        //     mouse app (claude) turns on motion tracking, which passes through to
-        //     the terminal; when you then focus a pane that does NOT want the mouse
-        //     (a shell, WSL), the terminal keeps sending motion events and they get
-        //     forwarded into that pane as literal text (`35;79;16M…`). Force mouse
-        //     reporting OFF for a non-mouse focused pane; a mouse app re-asserts its
-        //     own modes on its next repaint when you switch back. Skipped while the
-        //     global mouse capture (`Ctrl+A m`) is on.
-        let focus_wants_mouse = {
-            let f = windows[active].tree.focus();
-            windows[active]
-                .pane(f)
-                .map(|p| p.mouse_wanted)
-                .unwrap_or(false)
-        };
-        if !mouse_on && !focus_wants_mouse {
+        // 4b. Keep the OUTER terminal's mouse reporting off unless amux itself
+        //     turned it on (`Ctrl+A m`). A pane's own request no longer reaches
+        //     the real terminal — `filter.rs` terminates the mouse modes with the
+        //     other host-level negotiations — so amux's own state is the whole
+        //     truth here, and this only has to re-assert it.
+        //
+        //     This used to defer to the focused pane (`mouse_wanted`), because a
+        //     mouse app's motion tracking DID pass through: focusing a non-mouse
+        //     pane afterwards left the terminal emitting motion events that landed
+        //     in that pane as literal text (`35;79;16M…`). Stripping at the filter
+        //     removes that class outright, and with it the reason an agent pane
+        //     cost the user native text selection.
+        if !mouse_on {
             if !outer_mouse_off {
                 let _ = out.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l");
                 let _ = out.flush();
