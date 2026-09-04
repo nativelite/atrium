@@ -792,13 +792,20 @@ fn mass_spawn_n_four_opens_four_live_panes() {
     let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 40, 160).unwrap();
     let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
 
-    // Four pane labels appear in the tiled frame: " 1:<stem> " .. " 4:<stem> ".
+    // Four pane labels appear in the tiled frame: `1:<stem>` .. `4:<stem>`.
     // Collect output until the fourth label shows (the grid is fully drawn).
-    let mut label4 = b" 4:".to_vec();
+    // The leading blank of ` N:<stem> ` is deliberately NOT part of the needle: an
+    // unfocused pane's border carries the default style, and the painter emits a
+    // cursor jump instead of writing those blank cells, so the space never reaches
+    // the stream at all (a focused pane, being styled, does emit it). Stripping CSI
+    // cannot put back a cell that was never sent — matching from the digit on is
+    // what makes this hold on both platforms. `N:<stem>` still names the label
+    // uniquely.
+    let mut label4 = b"4:".to_vec();
     label4.extend_from_slice(stem);
     let out = read_until(&mut p, &label4, Duration::from_secs(20));
     for i in 1..=4u8 {
-        let mut label = vec![b' ', b'0' + i, b':'];
+        let mut label = vec![b'0' + i, b':'];
         label.extend_from_slice(stem);
         assert!(
             contains(&out, &label),
@@ -885,12 +892,13 @@ fn fleet_up_opens_a_two_agent_window() {
     .unwrap();
 
     let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
-    // Two pane labels appear in the tiled frame: " 1:<stem> " and " 2:<stem> ".
-    let mut label2 = b" 2:".to_vec();
+    // Two pane labels appear in the tiled frame: `1:<stem>` and `2:<stem>` (the
+    // leading blank is not matched — see the note in the mass-spawn test above).
+    let mut label2 = b"2:".to_vec();
     label2.extend_from_slice(stem);
     let out = read_until(&mut p, &label2, Duration::from_secs(20));
     for i in 1..=2u8 {
-        let mut label = vec![b' ', b'0' + i, b':'];
+        let mut label = vec![b'0' + i, b':'];
         label.extend_from_slice(stem);
         assert!(
             contains(&out, &label),
