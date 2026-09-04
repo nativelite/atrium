@@ -31,6 +31,7 @@ pub mod ipc;
 pub mod layout;
 pub mod resolve;
 pub mod resources;
+pub mod signals;
 pub mod spawn;
 pub mod theme;
 pub mod tile;

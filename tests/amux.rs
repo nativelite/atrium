@@ -1170,3 +1170,82 @@ fn ctl_audit_records_requests() {
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+// --- process lifecycle (F13): amux must not orphan its agents ---------------
+
+/// Read a pid the hosted shell prints for itself, so the test can watch that
+/// exact process after amux is gone. Unix-only: the whole property is about
+/// POSIX signal disposition.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// The pid of a process's parent. amux is located this way — as the parent of
+/// the shell it hosts — rather than by scanning for its own binary name: the
+/// integration tests run in parallel, so several amux processes share this test
+/// harness as their parent and a name scan can match somebody else's. (It did:
+/// an earlier version of this test SIGHUP'd another test's amux and made that
+/// test fail instead of this one.)
+#[cfg(unix)]
+fn parent_of(pid: u32) -> Option<u32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// **Closing the terminal window must not orphan the agents.** A terminal that
+/// goes away sends SIGHUP; amux's teardown (which kills every pane) only runs
+/// when the event loop exits normally, so without a handler the default action
+/// kills amux outright and every hosted agent is reparented to init and runs on
+/// — invisibly, and in a real fleet, billably. Observed live on macOS: ten agent
+/// processes still resident 19 minutes after the operator closed the window.
+#[cfg(unix)]
+#[test]
+fn sighup_does_not_orphan_hosted_panes() {
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-i"], 24, 80).unwrap();
+
+    // Have the hosted shell tell us its own pid, so we can watch it directly.
+    // The marker is split across two quoted strings so the shell's echo of the
+    // typed line ("echo \"$m\"\"=$$\"") cannot contain `amuxpid=` — only the
+    // command's actual output does. Without that, read_until matches the echo
+    // and returns before the shell has run anything.
+    p.write(b"m=amuxpid; echo \"$m\"\"=$$\"\r\n").unwrap();
+    let out = read_until(&mut p, b"amuxpid=", Duration::from_secs(15));
+    let text = String::from_utf8_lossy(&out);
+    let shell_pid: u32 = text
+        .split("amuxpid=")
+        .nth(1)
+        .and_then(|s| {
+            let d: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+            d.parse().ok()
+        })
+        .unwrap_or_else(|| panic!("no shell pid in: {text:?}"));
+    assert!(pid_alive(shell_pid), "hosted shell never came up");
+
+    let amux = parent_of(shell_pid).expect("could not locate the amux process");
+    let _ = std::process::Command::new("kill")
+        .args(["-HUP", &amux.to_string()])
+        .status();
+
+    // The pane must go with it. Poll rather than sleep a fixed time.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if !pid_alive(shell_pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &shell_pid.to_string()])
+        .status();
+    panic!("pane {shell_pid} survived SIGHUP to amux {amux} — orphaned agent");
+}

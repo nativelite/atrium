@@ -1235,6 +1235,11 @@ impl Window {
 }
 
 fn main() -> ExitCode {
+    // Before anything else: a closed terminal window (SIGHUP) must reach the
+    // event loop's normal exit, not kill amux where it stands and orphan every
+    // hosted agent onto `init`. Installed here so every path — single pane,
+    // mass-spawn, `fleet up` — is covered.
+    amux::signals::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `amux fleet …` is its own command family (a saved roster of agents), not a
     // hosted program — dispatch it before any of amux's flag parsing so `fleet`
@@ -1562,6 +1567,17 @@ fn run(
     // rewrite can't host the labeled break, so allow it here.
     #[allow(clippy::while_let_loop)]
     'outer: loop {
+        // 0. a termination signal (SIGHUP from a closed terminal window, or a
+        // SIGTERM/SIGINT from outside) exits through this *normal* path, so the
+        // pane teardown after the loop actually runs. Without it the default
+        // action killed amux outright and every hosted agent was orphaned onto
+        // `init` — see `amux::signals`.
+        if amux::signals::terminating() {
+            if std::env::var_os("AMUX_DEBUG").is_some() {
+                eprint!("[amux-dbg signal-quit]\r\n");
+            }
+            break 'outer;
+        }
         // 1. keystrokes -> scanner -> focused pane / commands
         let bytes = match term.read_bytes(Duration::from_millis(15)) {
             Ok(b) => b,
