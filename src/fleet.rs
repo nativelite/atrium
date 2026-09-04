@@ -665,11 +665,18 @@ mod tests {
         // setup, so the test was asserting "no global fleet file exists on this
         // machine" rather than the behaviour it means to cover.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // BOTH variables, not just the unix one. `global_path` reads APPDATA on
+        // Windows and XDG_CONFIG_HOME elsewhere, so overriding only XDG left this
+        // test reading the developer's real %APPDATA%\amux\fleet.json — it was
+        // hermetic on exactly one platform, which is the same class of bug the
+        // previous fix here was meant to close.
+        let prev_appdata = std::env::var_os("APPDATA");
         let prev = std::env::var_os("XDG_CONFIG_HOME");
         let empty = std::env::temp_dir().join(format!("amux-fleet-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &empty);
+        std::env::set_var("APPDATA", &empty);
 
         let td = std::env::temp_dir().join(format!("amux-fleet-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
@@ -679,6 +686,10 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match prev_appdata {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
         }
         let _ = std::fs::remove_dir_all(&empty);
 

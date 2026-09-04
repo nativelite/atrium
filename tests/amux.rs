@@ -455,6 +455,22 @@ fn filter_does_not_eat_a_prefix_that_resolves_to_a_non_strip_sequence() {
 
 // --- end to end: amux inside a pty ------------------------------------------
 
+/// Environment that makes a spawned amux hermetic: point the user-global config
+/// location (both spellings) at a directory we control, so the child cannot read
+/// the developer's real `~/.config/amux/fleet.json` or `%APPDATA%\\amux\\`.
+///
+/// Passing `&[]` inherits the parent environment — it does NOT mean "empty env" —
+/// so a test that means to prove "no fleet file exists" was really proving "this
+/// developer happens to have none". That has already bitten this suite once.
+#[allow(dead_code)]
+fn hermetic_env(dir: &std::path::Path) -> Vec<(String, String)> {
+    let d = dir.to_string_lossy().to_string();
+    vec![
+        ("XDG_CONFIG_HOME".to_string(), d.clone()),
+        ("APPDATA".to_string(), d),
+    ]
+}
+
 fn read_until(p: &mut pty::Pty, needle: &[u8], deadline: Duration) -> Vec<u8> {
     let end = Instant::now() + deadline;
     let mut out = Vec::new();
@@ -886,7 +902,7 @@ fn fleet_up_opens_a_two_agent_window() {
         &["fleet", "up", "test"],
         30,
         120,
-        &[],
+        &hermetic_env(&td),
         Some(&td.to_string_lossy()),
     )
     .unwrap();
@@ -941,7 +957,7 @@ fn fleet_up_unknown_file_is_a_startup_error() {
         &["fleet", "up", "nope"],
         24,
         80,
-        &[],
+        &hermetic_env(&td),
         Some(&td.to_string_lossy()),
     )
     .unwrap();

@@ -178,6 +178,13 @@ pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Sc
         let inner_cols = f.rect.cols.saturating_sub(2);
         let r = f.rect.row + 1 + cr.min(inner_rows.saturating_sub(1));
         let c = f.rect.col + 1 + cc.min(inner_cols.saturating_sub(1));
+        // Clamp into the PANE, not just the screen. With `inner_rows == 0` — a
+        // pane two rows tall or less — `r` lands at `rect.row + 1`, which for a
+        // one-row pane is the row BELOW it. Clamping only to the screen let that
+        // stand, so the real terminal cursor parked inside the sibling pane
+        // underneath: you typed in one pane and the caret blinked in another.
+        let r = r.clamp(f.rect.row, f.rect.row + f.rect.rows.saturating_sub(1));
+        let c = c.clamp(f.rect.col, f.rect.col + f.rect.cols.saturating_sub(1));
         master.cursor = (r.min(rows.saturating_sub(1)), c.min(cols.saturating_sub(1)));
     }
 
@@ -278,10 +285,24 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
         put(master, r, last_col, VERTICAL);
     }
     // Corners (overwrite the runs).
+    //
+    // A pane can legitimately be ONE row or ONE column: `split_span` guarantees
+    // only >= 1, and five horizontal splits on a 24-row window gets you there. In
+    // that degenerate case `last_row == r0`, so writing the bottom corners would
+    // overwrite the top ones and erase the border and its title outright — the
+    // pane would render as a bare line of box characters with no label. Draw the
+    // far edge only when there IS a far edge; a one-row pane keeps its top edge
+    // and title, which is the most useful thing that fits.
     put(master, r0, c0, TOP_LEFT);
-    put(master, r0, last_col, TOP_RIGHT);
-    put(master, last_row, c0, BOTTOM_LEFT);
-    put(master, last_row, last_col, BOTTOM_RIGHT);
+    if last_col > c0 {
+        put(master, r0, last_col, TOP_RIGHT);
+    }
+    if last_row > r0 {
+        put(master, last_row, c0, BOTTOM_LEFT);
+        if last_col > c0 {
+            put(master, last_row, last_col, BOTTOM_RIGHT);
+        }
+    }
 
     // Title in the top edge: "┌ 2:claude ·work ──…──┐". The label sits one cell
     // in from the top-left corner, framed by a space each side, and is truncated
@@ -937,5 +958,77 @@ mod tests {
             .map(|(r, c)| m.cell(r, c).ch)
             .collect();
         assert!(!whole.contains("starting"), "painted pane must not load");
+    }
+
+    /// A one-row pane must keep its border and title (review #10).
+    ///
+    /// `split_span` guarantees only >= 1 row, so this is reachable — five
+    /// horizontal splits on a 24-row window. `last_row == r0` then made the
+    /// bottom corners overwrite the top ones, erasing the border and its label.
+    #[test]
+    fn a_one_row_pane_keeps_its_top_edge_and_title() {
+        let inner = filled(1, 18, 'X');
+        let panes = vec![view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 1,
+                cols: 20,
+            },
+            1,
+            "sh",
+            PaneState::Idle,
+        )];
+        let m = compose(4, 20, &panes, 0);
+        assert_eq!(m.cell(0, 0).ch, '┌', "top-left corner was overwritten");
+        assert_eq!(m.cell(0, 19).ch, '┐', "top-right corner was overwritten");
+        let row: String = (0..20).map(|c| m.cell(0, c).ch).collect();
+        assert!(
+            row.contains("1:sh"),
+            "a one-row pane lost its title: {row:?}"
+        );
+    }
+
+    /// The cursor must never park outside its own pane (review #10).
+    ///
+    /// With `inner_rows == 0` the translated row landed at `rect.row + 1` — below
+    /// a one-row pane — and was clamped only to the screen, so the real caret
+    /// blinked inside the sibling pane below the focused one.
+    #[test]
+    fn the_cursor_stays_inside_the_focused_pane() {
+        let top = filled(1, 18, 'X');
+        let bottom = filled(1, 18, 'Y');
+        let panes = vec![
+            view(
+                &top,
+                Rect {
+                    row: 0,
+                    col: 0,
+                    rows: 1,
+                    cols: 20,
+                },
+                1,
+                "sh",
+                PaneState::Focused,
+            ),
+            view(
+                &bottom,
+                Rect {
+                    row: 1,
+                    col: 0,
+                    rows: 3,
+                    cols: 20,
+                },
+                2,
+                "sh",
+                PaneState::Idle,
+            ),
+        ];
+        let m = compose(4, 20, &panes, 0);
+        assert_eq!(
+            m.cursor.0, 0,
+            "cursor escaped a one-row pane into the sibling below"
+        );
     }
 }
