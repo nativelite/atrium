@@ -81,19 +81,25 @@ pub fn v4() -> String {
 /// unavailable it falls back to folding several [`v4`] identifiers (weaker, but a
 /// spawn must never fail for lack of a token); callers treat the token as a secret
 /// regardless. The fallback path is not expected to run on a healthy system.
-pub fn token() -> String {
+pub fn token() -> Option<String> {
     let mut bytes = [0u8; 32];
-    if os_random(&mut bytes) {
-        let mut s = String::with_capacity(64);
-        for b in bytes {
-            s.push_str(&format!("{b:02x}"));
-        }
-        s
-    } else {
-        // Fallback only: OS entropy failed. Fold four non-crypto ids into 128 hex
-        // chars of best-effort unpredictability rather than refuse to spawn.
-        format!("{}{}{}{}", v4(), v4(), v4(), v4()).replace('-', "")
+    if !os_random(&mut bytes) {
+        // OS entropy failed. This used to fold four non-cryptographic `v4()` ids
+        // together and hand them back as if nothing had happened — silently
+        // substituting a guessable value for the PRIMARY AUTH SECRET, the one
+        // thing standing between a sibling pane and another pane's capability.
+        // A caller could not tell the difference, which is the whole problem.
+        //
+        // There is no safe weak token, so there is no fallback. `None` means the
+        // caller must fail closed: a pane with no ctl access is a working pane,
+        // while a pane with a guessable capability is a hole.
+        return None;
     }
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    Some(s)
 }
 
 /// Fill `buf` with cryptographically-strong bytes from the OS. Returns `false`
@@ -169,7 +175,7 @@ mod tests {
 
     #[test]
     fn token_is_64_hex_chars_from_os_entropy() {
-        let t = token();
+        let t = token().expect("OS entropy must be available in tests");
         // On any supported platform the OS RNG path is taken → 32 bytes → 64 hex.
         // (The v4 fallback would be 128 chars; assert we are NOT on it here.)
         assert_eq!(
@@ -184,7 +190,7 @@ mod tests {
     fn tokens_are_distinct_and_unlike_uuids() {
         let mut seen = HashSet::new();
         for _ in 0..10_000 {
-            let t = token();
+            let t = token().expect("OS entropy must be available in tests");
             assert!(seen.insert(t.clone()), "duplicate token minted");
             // A token is a raw hex secret, not a dashed uuid.
             assert!(!t.contains('-'), "token must not look like a uuid: {t}");

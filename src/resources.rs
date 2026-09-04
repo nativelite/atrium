@@ -10,10 +10,21 @@
 /// Fraction of total RAM we're willing to budget for agents (the rest is the OS,
 /// the terminal, the operator's other work). Deliberately conservative.
 const RAM_FRACTION: f64 = 0.75;
-/// Default assumed resident footprint of one agent CLI process. A Node/Python
-/// agent runtime is commonly a few hundred MB; 768 MiB leaves margin. Tunable via
-/// `AMUX_AGENT_MB`.
-const DEFAULT_AGENT_MB: u64 = 768;
+/// Default assumed resident footprint of one agent CLI process.
+///
+/// Was 768 MiB, a guess. Measured since, on real fleets: ~201 MiB average across
+/// 23 live claude panes, and ~150 MiB across an earlier 10-pane sample. So the
+/// guess was roughly 3.8x high, and since this constant divides the RAM budget it
+/// was capping fleets at about a quarter of what the host could carry.
+///
+/// 384 MiB is deliberately NOT the measured average. This number exists to stop a
+/// fleet exhausting the machine, so it must over-estimate: agents vary with
+/// context size and workload, and the cost of guessing low (a swapping host, an
+/// OOM-killed pane) is far worse than the cost of guessing high (a smaller fleet).
+/// 384 keeps ~1.9x headroom over the measured average while still roughly doubling
+/// the usable fleet size. Tunable via `AMUX_AGENT_MB` for an operator who has
+/// measured their own agents.
+const DEFAULT_AGENT_MB: u64 = 384;
 /// Portable fallback when total RAM can't be detected: agents are mostly idle
 /// (waiting on an API), so several per core is reasonable.
 const AGENTS_PER_CORE: usize = 4;

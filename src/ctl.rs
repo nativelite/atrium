@@ -770,6 +770,19 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .get("mode")
                 .and_then(Value::as_str)
                 .and_then(TrustMode::from_policy_keyword);
+            // An unparseable mode used to collapse to `None`, which is
+            // indistinguishable from "no mode given" — so it INHERITED THE
+            // SESSION POLICY and failed open toward the more permissive setting.
+            // The client rejects unknown modes, so only a hand-rolled or hostile
+            // request reaches here, which is exactly the caller not to be lenient
+            // with. Present-but-unparseable is now an error, not an absence.
+            if mode.is_none() {
+                if let Some(raw) = v.get("mode").and_then(Value::as_str) {
+                    return Err(format!(
+                        "unknown mode {raw:?} (use plan, accept, automode or skip)"
+                    ));
+                }
+            }
             Cmd::Spawn(SpawnReq {
                 role,
                 argv,
@@ -1865,6 +1878,24 @@ mod tests {
             sanitize_spawn_argv(&v(&["claude", "--continue", "--model", "opus"]));
         assert_eq!(clean, v(&["claude", "--continue", "--model", "opus"]));
         assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn an_unparseable_mode_is_an_error_not_an_absence() {
+        // It used to collapse to None — indistinguishable from "not supplied" —
+        // so it inherited the session policy and failed OPEN toward the more
+        // permissive mode. Only a hand-rolled or hostile request gets here.
+        let err =
+            parse_request(r#"{"cmd":"spawn","argv":["claude"],"mode":"definitely-not-a-mode"}"#)
+                .unwrap_err();
+        assert!(
+            err.contains("definitely-not-a-mode"),
+            "the error should name the bad mode, got {err:?}"
+        );
+        // A genuinely absent mode is still fine: it means "inherit the policy".
+        assert!(parse_request(r#"{"cmd":"spawn","argv":["claude"]}"#).is_ok());
+        // And a valid one still parses.
+        assert!(parse_request(r#"{"cmd":"spawn","argv":["claude"],"mode":"plan"}"#).is_ok());
     }
 
     #[test]

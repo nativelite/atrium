@@ -1197,7 +1197,10 @@ struct Pane {
     /// env as `AMUX_TOKEN` and matched by the ctl server to authenticate requests
     /// from this pane (identity comes from the token, not the self-reported
     /// `AMUX_PANE`). Empty for panes spawned before the ctl endpoint existed.
-    token: String,
+    /// The pane's capability token, or `None` when OS entropy was unavailable at
+    /// spawn and amux refused to mint a guessable one. `None` must never
+    /// authenticate: a pane without a token has no ctl access, by construction.
+    token: Option<String>,
     /// The ctl role label this pane was spawned under (`dev_1`), if any. `None`
     /// for the human's own panes and shells.
     role: Option<String>,
@@ -2494,7 +2497,7 @@ fn run(
         //     cost the user native text selection.
         if !mouse_on {
             if !outer_mouse_off {
-                let _ = out.write_all(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l");
+                let _ = out.write_all(MOUSE_OFF.as_bytes());
                 let _ = out.flush();
                 outer_mouse_off = true;
             }
@@ -3514,7 +3517,9 @@ fn apply_ctl(
             windows
                 .iter()
                 .flat_map(|w| &w.panes)
-                .find(|p| p.token == tok)
+                // `as_deref()` so a pane with no token (entropy failure at
+                // spawn) can never match — `None == None` must not authenticate.
+                .find(|p| p.token.as_deref() == Some(tok))
                 .map(|p| p.agent_id)
         });
     let authenticated = authed.is_some();
@@ -4483,9 +4488,20 @@ fn spawn_pane_full(
     // stored on the pane; the ctl server authenticates a request by matching it.
     // Peer-credential binding at the ipc layer (same-user endpoint) is the second
     // gate underneath this token — see `ipc.rs`.
+    // No token means OS entropy failed. Fail CLOSED: this pane gets no ctl
+    // environment at all, so it simply has no control-plane access. The old
+    // behaviour minted a guessable token from non-crypto ids and injected it
+    // anyway, which is strictly worse — a sibling pane could then forge it.
+    // `\r\n` because amux is in raw mode here.
     let token = amux::uid::token();
+    if token.is_none() {
+        eprint!(
+            "amux: warning: OS entropy unavailable; this pane is starting WITHOUT \
+             ctl access rather than with a guessable capability token\r\n"
+        );
+    }
     let mut base_env: Vec<(String, String)> = Vec::new();
-    if let Some(addr) = CTL_ADDRESS.get() {
+    if let (Some(addr), Some(token)) = (CTL_ADDRESS.get(), token.as_ref()) {
         base_env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.clone()));
         base_env.push((amux::ctl::ENV_PANE.to_string(), agent_id.to_string()));
         base_env.push((amux::ctl::ENV_TOKEN.to_string(), token.clone()));
@@ -4575,13 +4591,22 @@ fn spawn_pane_full(
 /// `?1049l` swap so the user's original shell comes back clean. Called on
 /// **every** exit path in `run` (normal quit, last-pane-exit, read error, and
 /// the initial-spawn failure).
+/// Every mouse-reporting mode amux ever turns off, in one place.
+///
+/// This existed twice with DIFFERENT contents: the per-tick suppressor sent
+/// `?1015l` and `cleanup_screen` did not. So a hosted app that enabled
+/// urxvt-style reporting (1015) left the user's real shell emitting escape
+/// garbage on every click after amux exited — the one mode the exit path forgot.
+/// Two lists that must agree will not stay in agreement; there is now one.
+const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
+
 fn cleanup_screen(out: &mut impl Write) {
     let _ = write!(
         out,
-        // Reset SGR; disable mouse reporting (1000/1002/1003/1006); disable
-        // bracketed paste (2004); show the cursor (25); reset the scroll region;
-        // then leave the alt screen (1049) last so the swap-back is the final act.
-        "\x1b[0m\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?25h\x1b[r\x1b[?1049l"
+        // Reset SGR; disable every mouse mode; disable bracketed paste (2004);
+        // show the cursor (25); reset the scroll region; then leave the alt
+        // screen (1049) last so the swap-back is the final act.
+        "\x1b[0m{MOUSE_OFF}\x1b[?2004l\x1b[?25h\x1b[r\x1b[?1049l"
     );
     let _ = out.flush();
 }
