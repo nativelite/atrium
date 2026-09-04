@@ -653,12 +653,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&td);
     }
 
+    /// Serializes the tests that move `XDG_CONFIG_HOME`, since the environment
+    /// is process-wide and the suite runs in parallel.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn discover_missing_names_both_locations() {
+        // Point the *global* location at an empty dir for the duration. Without
+        // this the test reads the developer's real `~/.config/amux/fleet.json`
+        // and fails the moment they have one — which is a supported, documented
+        // setup, so the test was asserting "no global fleet file exists on this
+        // machine" rather than the behaviour it means to cover.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        let empty = std::env::temp_dir().join(format!("amux-fleet-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&empty);
+        std::fs::create_dir_all(&empty).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &empty);
+
         let td = std::env::temp_dir().join(format!("amux-fleet-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(&td).unwrap();
-        let err = discover(&td).unwrap_err();
+        let found = discover(&td);
+
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&empty);
+
+        let err = found.unwrap_err();
         assert!(err.contains(FILE_NAME), "names local: {err}");
         // Names the global location too (the word "then" separates the two).
         assert!(err.contains("then"), "names both: {err}");
