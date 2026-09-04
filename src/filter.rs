@@ -66,9 +66,9 @@ const XT_MAX_PARAMS: usize = 24;
 /// [`Xt::No`] so the normal filter handles it.
 fn xtwinops(rest: &[u8]) -> Xt {
     match rest.get(1) {
-        None => return Xt::Hold,      // lone ESC: could become `ESC [ … t`
-        Some(&b'[') => {}             // a CSI — inspect the params
-        Some(_) => return Xt::No,     // ESC-something-else
+        None => return Xt::Hold,  // lone ESC: could become `ESC [ … t`
+        Some(&b'[') => {}         // a CSI — inspect the params
+        Some(_) => return Xt::No, // ESC-something-else
     }
     let mut j = 2;
     while let Some(&b) = rest.get(j) {
@@ -188,10 +188,7 @@ mod tests {
 
     #[test]
     fn resize_split_across_chunks_is_still_stripped() {
-        assert_eq!(
-            feed_all(&[b"X\x1b[8;", b"68;2", b"80tY"]),
-            b"XY".to_vec()
-        );
+        assert_eq!(feed_all(&[b"X\x1b[8;", b"68;2", b"80tY"]), b"XY".to_vec());
     }
 
     #[test]

@@ -102,12 +102,7 @@ pub fn token() -> String {
 fn os_random(buf: &mut [u8]) -> bool {
     #[link(name = "bcrypt")]
     extern "system" {
-        fn BCryptGenRandom(
-            alg: *mut std::ffi::c_void,
-            buf: *mut u8,
-            len: u32,
-            flags: u32,
-        ) -> i32;
+        fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
     }
     // Use the system-preferred RNG so no algorithm handle is needed.
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
@@ -177,7 +172,11 @@ mod tests {
         let t = token();
         // On any supported platform the OS RNG path is taken → 32 bytes → 64 hex.
         // (The v4 fallback would be 128 chars; assert we are NOT on it here.)
-        assert_eq!(t.len(), 64, "expected 32 bytes of OS entropy hex-encoded: {t}");
+        assert_eq!(
+            t.len(),
+            64,
+            "expected 32 bytes of OS entropy hex-encoded: {t}"
+        );
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()), "not hex: {t}");
     }
 

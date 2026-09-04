@@ -476,7 +476,11 @@ mod tests {
         let m = compose(5, 5, &panes, 0);
         let corner = m.cell(0, 0).style;
         assert!(corner.bold, "focused border should be bold");
-        assert_eq!(corner.fg, crate::theme::FOCUSED, "focused border bright cyan");
+        assert_eq!(
+            corner.fg,
+            crate::theme::FOCUSED,
+            "focused border bright cyan"
+        );
         // The title shares the border style.
         assert_eq!(m.cell(0, 1).style.fg, crate::theme::FOCUSED);
     }
@@ -520,7 +524,11 @@ mod tests {
             PaneState::Idle,
         )];
         let m = compose(5, 5, &panes, 0);
-        assert_eq!(m.cell(0, 0).style.fg, crate::theme::IDLE, "idle border grey");
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            crate::theme::IDLE,
+            "idle border grey"
+        );
     }
 
     #[test]
@@ -695,7 +703,11 @@ mod tests {
             agsess::Status::WaitingApproval,
         )];
         let m = compose(5, 12, &panes, 0);
-        assert_eq!(m.cell(0, 0).style.fg, crate::theme::EXITED, "exited stays red");
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            crate::theme::EXITED,
+            "exited stays red"
+        );
     }
 
     #[test]
@@ -888,7 +900,10 @@ mod tests {
             .flat_map(|r| (0..20).map(move |c| (r, c)))
             .map(|(r, c)| m0.cell(r, c).ch)
             .collect();
-        assert!(whole.contains("starting claude"), "no loading label:\n{whole}");
+        assert!(
+            whole.contains("starting claude"),
+            "no loading label:\n{whole}"
+        );
         assert!(whole.contains('⣾'), "frame 0 spinner missing");
         // The spinner advances with the frame counter (animation).
         let m1 = compose(5, 20, &panes, 1);

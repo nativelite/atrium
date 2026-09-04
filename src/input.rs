@@ -383,11 +383,19 @@ mod scroll_tests {
         // SGR: `ESC [ < 64 ; col ; row M` = wheel up; 65 = wheel down.
         assert_eq!(
             scan(b"\x1b[<64;12;7M"),
-            vec![Action::MouseScroll { up: true, col: 12, row: 7 }]
+            vec![Action::MouseScroll {
+                up: true,
+                col: 12,
+                row: 7
+            }]
         );
         assert_eq!(
             scan(b"\x1b[<65;3;20M"),
-            vec![Action::MouseScroll { up: false, col: 3, row: 20 }]
+            vec![Action::MouseScroll {
+                up: false,
+                col: 3,
+                row: 20
+            }]
         );
     }
 
@@ -396,7 +404,11 @@ mod scroll_tests {
         // Ctrl+wheel-up: button 64 + 0x10 = 80; still a wheel-up.
         assert_eq!(
             scan(b"\x1b[<80;1;1M"),
-            vec![Action::MouseScroll { up: true, col: 1, row: 1 }]
+            vec![Action::MouseScroll {
+                up: true,
+                col: 1,
+                row: 1
+            }]
         );
     }
 

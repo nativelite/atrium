@@ -153,12 +153,18 @@ mod tests {
     #[test]
     fn falls_back_to_cores_when_ram_unknown() {
         assert_eq!(pane_cap(None, None, 8, 768 << 20), 8 * AGENTS_PER_CORE);
-        assert_eq!(pane_cap(None, None, 0, 768 << 20), MIN_CAP.max(AGENTS_PER_CORE));
+        assert_eq!(
+            pane_cap(None, None, 0, 768 << 20),
+            MIN_CAP.max(AGENTS_PER_CORE)
+        );
     }
 
     #[test]
     fn never_caps_below_the_floor() {
         // A pathologically small reported RAM still leaves room to run a couple.
-        assert_eq!(pane_cap(None, Some(100 * 1024 * 1024), 4, 768 * 1024 * 1024), MIN_CAP);
+        assert_eq!(
+            pane_cap(None, Some(100 * 1024 * 1024), 4, 768 * 1024 * 1024),
+            MIN_CAP
+        );
     }
 }

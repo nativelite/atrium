@@ -142,10 +142,14 @@ fn mouse_on_release_and_wheel_and_drag_are_not_clicks() {
     let mut s = PrefixScanner::new();
     s.set_mouse(true);
     assert_eq!(s.feed(b"\x1b[<0;12;7m"), vec![]); // release
-    // Wheel-up is not a click — it scrolls the hovered tile (the scroll feature).
+                                                  // Wheel-up is not a click — it scrolls the hovered tile (the scroll feature).
     assert_eq!(
         s.feed(b"\x1b[<64;1;1M"),
-        vec![Action::MouseScroll { up: true, col: 1, row: 1 }]
+        vec![Action::MouseScroll {
+            up: true,
+            col: 1,
+            row: 1
+        }]
     );
     assert_eq!(s.feed(b"\x1b[<32;1;1M"), vec![]); // motion/drag
 }
@@ -330,7 +334,10 @@ fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
     );
 
     // The `·work` text is present and intact (the load-bearing a11y channel).
-    assert!(painted.contains("·work"), "colored tag text missing: {painted:?}");
+    assert!(
+        painted.contains("·work"),
+        "colored tag text missing: {painted:?}"
+    );
 
     // A fresh absolute SGR reset begins right after the tag text, so neither the
     // color nor any attribute bleeds into the following segment.

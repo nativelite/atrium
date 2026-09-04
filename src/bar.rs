@@ -92,7 +92,10 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
             Some(r) if !r.is_empty() && *r != p.title => format!("{}:{}", p.title, r),
             _ => p.title.clone(),
         };
-        segs.push(seg(format!("| {}:{}{} ", i + 1, name, mark), Role::Entry(state)));
+        segs.push(seg(
+            format!("| {}:{}{} ", i + 1, name, mark),
+            Role::Entry(state),
+        ));
         // The identity name-tag rides next to the window entry — the name only,
         // never the secret. Its own segment so the painter can color it; the
         // `·<name>` text is the load-bearing channel and is always present.
@@ -302,7 +305,10 @@ mod tests {
         let text = bar_text(&[agent, plain], 80, "");
         assert!(text.contains("1:claude:lead"), "persona suffix: {text}");
         assert!(text.contains("2:cmd"), "plain pane keeps its title: {text}");
-        assert!(!text.contains("2:cmd:"), "no dangling colon on a roleless pane: {text}");
+        assert!(
+            !text.contains("2:cmd:"),
+            "no dangling colon on a roleless pane: {text}"
+        );
     }
 
     #[test]

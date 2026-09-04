@@ -107,13 +107,23 @@ pub fn codex_trust_args(mode: TrustMode) -> Vec<String> {
     match mode {
         // Auto-approve, but confined to the working tree — the safe hands-off default.
         TrustMode::Edits | TrustMode::Auto => {
-            vec![s("--ask-for-approval"), s("never"), s("--sandbox"), s("workspace-write")]
+            vec![
+                s("--ask-for-approval"),
+                s("never"),
+                s("--sandbox"),
+                s("workspace-write"),
+            ]
         }
         // Full bypass: no approvals, no sandbox. The human confirmed `skip` at launch.
         TrustMode::Skip => vec![s("--dangerously-bypass-approvals-and-sandbox")],
         // Read-only exploration: codex may inspect but not modify or run mutating cmds.
         TrustMode::Plan => {
-            vec![s("--sandbox"), s("read-only"), s("--ask-for-approval"), s("never")]
+            vec![
+                s("--sandbox"),
+                s("read-only"),
+                s("--ask-for-approval"),
+                s("never"),
+            ]
         }
         // `Off` → no flags, by contract: a caller must not rely on Off producing a
         // posture (the spawn path never calls this with Off — a trusted launch gates
@@ -293,7 +303,10 @@ mod tests {
     use super::*;
 
     fn trusted(root: &Value, key: &str) -> Option<bool> {
-        root.get("projects")?.get(key)?.get(KEY_TRUST).and_then(Value::as_bool)
+        root.get("projects")?
+            .get(key)?
+            .get(KEY_TRUST)
+            .and_then(Value::as_bool)
     }
 
     #[test]
@@ -303,7 +316,11 @@ mod tests {
         assert_eq!(trusted(&root, "D:/x"), Some(true));
         // onboarding set too
         assert_eq!(
-            root.get("projects").unwrap().get("D:/x").unwrap().get(KEY_ONBOARDED),
+            root.get("projects")
+                .unwrap()
+                .get("D:/x")
+                .unwrap()
+                .get(KEY_ONBOARDED),
             Some(&Value::Bool(true))
         );
     }
@@ -316,7 +333,12 @@ mod tests {
         assert_eq!(trusted(&root, "D:/x"), Some(true));
         // sibling data preserved
         assert_eq!(
-            root.get("projects").unwrap().get("D:/x").unwrap().get("lastCost").and_then(Value::as_f64),
+            root.get("projects")
+                .unwrap()
+                .get("D:/x")
+                .unwrap()
+                .get("lastCost")
+                .and_then(Value::as_f64),
             Some(0.5)
         );
     }
@@ -325,7 +347,10 @@ mod tests {
     fn already_trusted_is_a_no_op() {
         let src = r#"{"projects":{"D:/x":{"hasTrustDialogAccepted":true}}}"#;
         let mut root = json::parse(src).unwrap();
-        assert!(!set_trusted_in(&mut root, "D:/x"), "should report no change");
+        assert!(
+            !set_trusted_in(&mut root, "D:/x"),
+            "should report no change"
+        );
     }
 
     #[test]
@@ -359,7 +384,10 @@ mod tests {
         assert!(args.iter().any(|a| a == "Bash(cargo test *)"), "{args:?}");
         assert!(args.iter().any(|a| a == "Bash(just build *)"), "{args:?}");
         // and it does NOT open all of bash
-        assert!(!args.iter().any(|a| a == "Bash" || a == "Bash(*)"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a == "Bash" || a == "Bash(*)"),
+            "{args:?}"
+        );
     }
 
     #[test]
@@ -367,7 +395,16 @@ mod tests {
         // Edits/Auto → never-prompt, workspace-sandboxed autonomy.
         for m in [TrustMode::Edits, TrustMode::Auto] {
             let a = codex_trust_args(m);
-            assert_eq!(a, vec!["--ask-for-approval", "never", "--sandbox", "workspace-write"], "{m:?}");
+            assert_eq!(
+                a,
+                vec![
+                    "--ask-for-approval",
+                    "never",
+                    "--sandbox",
+                    "workspace-write"
+                ],
+                "{m:?}"
+            );
         }
         // Skip → full bypass (parity with claude --dangerously-skip-permissions).
         assert_eq!(
@@ -382,9 +419,18 @@ mod tests {
         // Off → nothing (never applied in a trusted launch).
         assert!(codex_trust_args(TrustMode::Off).is_empty());
         // Crucially, none of these are claude flags (would break codex's launch).
-        for m in [TrustMode::Edits, TrustMode::Auto, TrustMode::Skip, TrustMode::Plan] {
+        for m in [
+            TrustMode::Edits,
+            TrustMode::Auto,
+            TrustMode::Skip,
+            TrustMode::Plan,
+        ] {
             let a = codex_trust_args(m);
-            assert!(!a.iter().any(|x| x == "--permission-mode" || x == "--allowedTools"), "{m:?}");
+            assert!(
+                !a.iter()
+                    .any(|x| x == "--permission-mode" || x == "--allowedTools"),
+                "{m:?}"
+            );
         }
     }
 

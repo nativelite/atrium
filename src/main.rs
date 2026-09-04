@@ -138,9 +138,7 @@ fn term_blank(t: &vterm::Term) -> bool {
 /// scroll, `2J`/`3J` ignore the scroll region and wipe the whole screen — the bar
 /// row included — so amux must repaint the bar after one.
 fn clears_screen(bytes: &[u8]) -> bool {
-    bytes
-        .windows(4)
-        .any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
+    bytes.windows(4).any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
 }
 
 /// Sniff a pty output chunk for the app turning mouse tracking on/off — a
@@ -236,7 +234,13 @@ fn overview_nodes(windows: &[Window], world: &amux::vendors::VendorWorlds) -> Ve
 /// grey idle, red exited.
 fn overview_glyph(node: &OverviewNode) -> (&'static str, String) {
     use amux::theme;
-    let sgr = |c: ansi::Color| ansi::Style { fg: c, ..Default::default() }.sgr();
+    let sgr = |c: ansi::Color| {
+        ansi::Style {
+            fg: c,
+            ..Default::default()
+        }
+        .sgr()
+    };
     if node.exited {
         return ("\u{2717}", sgr(theme::EXITED)); // ✗
     }
@@ -270,7 +274,14 @@ enum OvRow {
 
 /// Status rollup for one window across `nodes`.
 fn window_agg(nodes: &[OverviewNode], window: usize) -> WindowAgg {
-    let mut a = WindowAgg { window, total: 0, working: 0, waiting: 0, idle: 0, exited: 0 };
+    let mut a = WindowAgg {
+        window,
+        total: 0,
+        working: 0,
+        waiting: 0,
+        idle: 0,
+        exited: 0,
+    };
     for n in nodes.iter().filter(|n| n.window == window) {
         a.total += 1;
         if n.exited {
@@ -345,7 +356,9 @@ fn render_overview_panel(
             match n.status {
                 Some(agsess::Status::Working) => working += 1,
                 Some(agsess::Status::WaitingApproval) => waiting += 1,
-                Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) | None => idle += 1,
+                Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) | None => {
+                    idle += 1
+                }
             }
         }
     }
@@ -360,7 +373,10 @@ fn render_overview_panel(
         if decisions.is_empty() {
             String::new()
         } else {
-            format!("   \x1b[1;38;5;11m\u{26A0} {} decisions\x1b[0m", decisions.len())
+            format!(
+                "   \x1b[1;38;5;11m\u{26A0} {} decisions\x1b[0m",
+                decisions.len()
+            )
         }
     ));
     out.push_str(&format!(
@@ -458,7 +474,11 @@ fn render_overview_panel(
                     } else {
                         format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
                     };
-                    let cursor = if selected { "\x1b[1;38;5;37m\u{25B8}\x1b[0m" } else { " " };
+                    let cursor = if selected {
+                        "\x1b[1;38;5;37m\u{25B8}\x1b[0m"
+                    } else {
+                        " "
+                    };
                     // Vendor tag next to the status (claude's tag is "" → identical).
                     let vtag_str = if n.vtag.is_empty() {
                         String::new()
@@ -555,8 +575,16 @@ fn render_board_panel(
         "\x1b[{div_row};1H\x1b[38;5;238m\u{2500}\u{2500} \x1b[0m\x1b[1;38;5;37mbus\x1b[0m \x1b[38;5;238m{}\x1b[0m",
         "\u{2500}".repeat((cols as usize).saturating_sub(7))
     ));
-    let after_decisions = render_decisions_block(&mut out, &decisions, sel, div_row + 1, usable_last);
-    render_fyi_feed(&mut out, bus, &decisions, after_decisions, usable_last, feed_scroll);
+    let after_decisions =
+        render_decisions_block(&mut out, &decisions, sel, div_row + 1, usable_last);
+    render_fyi_feed(
+        &mut out,
+        bus,
+        &decisions,
+        after_decisions,
+        usable_last,
+        feed_scroll,
+    );
 
     if has_detail {
         render_decision_detail(&mut out, decisions.get(sel), content_last, cols);
@@ -583,7 +611,9 @@ fn render_decisions_block(
         let body = feed_line(d);
         let body = body.trim_start(); // drop the leading indent; we add our own marker
         if i == sel {
-            out.push_str(&format!("\x1b[{row};1H \x1b[1;38;5;11m\u{25B6}\x1b[0m \x1b[1m{body}\x1b[0m"));
+            out.push_str(&format!(
+                "\x1b[{row};1H \x1b[1;38;5;11m\u{25B6}\x1b[0m \x1b[1m{body}\x1b[0m"
+            ));
         } else {
             out.push_str(&format!("\x1b[{row};1H   {body}"));
         }
@@ -840,7 +870,12 @@ fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16
         );
         return;
     }
-    let key_w = entries.iter().map(|(k, _)| k.len()).max().unwrap_or(4).clamp(4, 24);
+    let key_w = entries
+        .iter()
+        .map(|(k, _)| k.len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 24);
     let mut row = 3u16;
     let total = entries.len();
     for (i, (key, e)) in entries.iter().enumerate() {
@@ -854,13 +889,19 @@ fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16
         let status = e.fields.get("status").map(String::as_str);
         let color = status.map(status_sgr).unwrap_or("\x1b[0m");
         let glyph = status.map(status_glyph).unwrap_or("\u{00B7}");
-        let status_label = status.map(|st| format!("{color}{st}\x1b[0m  ")).unwrap_or_default();
+        let status_label = status
+            .map(|st| format!("{color}{st}\x1b[0m  "))
+            .unwrap_or_default();
         let mut fields = String::new();
         for (f, v) in &e.fields {
             if f == "status" {
                 continue;
             }
-            let rendered = if is_url(v) { hyperlink(v, v) } else { v.clone() };
+            let rendered = if is_url(v) {
+                hyperlink(v, v)
+            } else {
+                v.clone()
+            };
             fields.push_str(&format!("\x1b[2m{f}=\x1b[0m{rendered}  "));
         }
         let by = e
@@ -955,7 +996,11 @@ fn feed_line(e: &amux::bus::Event) -> String {
         .fields
         .iter()
         .map(|(f, v)| {
-            let rendered = if is_url(v) { hyperlink(v, v) } else { v.clone() };
+            let rendered = if is_url(v) {
+                hyperlink(v, v)
+            } else {
+                v.clone()
+            };
             format!("\x1b[2m{f}=\x1b[0m{rendered}")
         })
         .collect::<Vec<_>>()
@@ -971,7 +1016,10 @@ fn feed_line(e: &amux::bus::Event) -> String {
         Kind::DecisionNeeded => format!("\x1b[38;5;11m#{}\x1b[0m ", e.seq),
         Kind::Fyi => String::new(),
     };
-    format!("  {glyph} {seq_tag}{topic_sgr}{}\x1b[0m  {fields}{from}", e.topic)
+    format!(
+        "  {glyph} {seq_tag}{topic_sgr}{}\x1b[0m  {fields}{from}",
+        e.topic
+    )
 }
 
 fn draw_startup_splash(out: &mut impl std::io::Write, rows: u16, cols: u16, frame: usize) {
@@ -1545,7 +1593,14 @@ fn run(
                             Ok(w) => {
                                 windows.push(w);
                                 let last = windows.len() - 1;
-                                switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
+                                switch_window(
+                                    &mut windows,
+                                    &mut active,
+                                    last,
+                                    rows,
+                                    cols,
+                                    &mut out,
+                                );
                                 prev_master = None;
                             }
                             Err(e) => {
@@ -1659,7 +1714,11 @@ fn run(
                 // scroll the FYI history. PgUp/PgDn always scroll it.
                 let nav = |up: bool, decision_sel: &mut usize, feed_scroll: &mut usize| {
                     if dcount > 0 {
-                        *decision_sel = if up { dsel.saturating_sub(1) } else { (dsel + 1).min(dcount - 1) };
+                        *decision_sel = if up {
+                            dsel.saturating_sub(1)
+                        } else {
+                            (dsel + 1).min(dcount - 1)
+                        };
                     } else if up {
                         *feed_scroll = (*feed_scroll + 1).min(scroll_max);
                     } else {
@@ -1747,7 +1806,10 @@ fn run(
                                 force_repaint = true;
                             } else {
                                 flash = Some((
-                                    format!("no pane for agent {}", sel_from.clone().unwrap_or_default()),
+                                    format!(
+                                        "no pane for agent {}",
+                                        sel_from.clone().unwrap_or_default()
+                                    ),
                                     Instant::now(),
                                 ));
                                 force_repaint = true;
@@ -1853,7 +1915,15 @@ fn run(
                     }
                 }
                 Action::NewPane => {
-                    match spawn_window(command, rows, cols, windows.len(), identity, trust_mode(), &mut flash) {
+                    match spawn_window(
+                        command,
+                        rows,
+                        cols,
+                        windows.len(),
+                        identity,
+                        trust_mode(),
+                        &mut flash,
+                    ) {
                         Ok(w) => {
                             windows.push(w);
                             let last = windows.len() - 1;
@@ -2046,10 +2116,7 @@ fn run(
                         let mx = col.saturating_sub(1) as usize;
                         let my = row.saturating_sub(1) as usize;
                         let hit = w.tree.rects(outer).into_iter().find(|(_, r)| {
-                            my >= r.row
-                                && my < r.row + r.rows
-                                && mx >= r.col
-                                && mx < r.col + r.cols
+                            my >= r.row && my < r.row + r.rows && mx >= r.col && mx < r.col + r.cols
                         });
                         if let Some((id, rect)) = hit {
                             if let Some(p) = w.pane_mut(id) {
@@ -2058,14 +2125,10 @@ fn run(
                                     // 1-based coords: content is inset one cell.
                                     let inner_cols = rect.cols.saturating_sub(2).max(1);
                                     let inner_rows = rect.rows.saturating_sub(2).max(1);
-                                    let cx = mx
-                                        .saturating_sub(rect.col + 1)
-                                        .min(inner_cols - 1)
-                                        + 1;
-                                    let cy = my
-                                        .saturating_sub(rect.row + 1)
-                                        .min(inner_rows - 1)
-                                        + 1;
+                                    let cx =
+                                        mx.saturating_sub(rect.col + 1).min(inner_cols - 1) + 1;
+                                    let cy =
+                                        my.saturating_sub(rect.row + 1).min(inner_rows - 1) + 1;
                                     let seq = format!("\x1b[<{notch};{cx};{cy}M");
                                     let _ = p.pty.write(seq.as_bytes());
                                 }
@@ -2309,7 +2372,10 @@ fn run(
         //     global mouse capture (`Ctrl+A m`) is on.
         let focus_wants_mouse = {
             let f = windows[active].tree.focus();
-            windows[active].pane(f).map(|p| p.mouse_wanted).unwrap_or(false)
+            windows[active]
+                .pane(f)
+                .map(|p| p.mouse_wanted)
+                .unwrap_or(false)
         };
         if !mouse_on && !focus_wants_mouse {
             if !outer_mouse_off {
@@ -2459,8 +2525,11 @@ fn run(
                         if vendor == agsess::Vendor::ClaudeCode {
                             continue;
                         }
-                        let mine: Vec<&agsess::AgentSession> =
-                            sessions.iter().copied().filter(|s| s.vendor == vendor).collect();
+                        let mine: Vec<&agsess::AgentSession> = sessions
+                            .iter()
+                            .copied()
+                            .filter(|s| s.vendor == vendor)
+                            .collect();
                         if let Some(id) =
                             amux::vendors::adopt_session_for(&mine, p.cwd.as_deref(), p.launch_ms)
                         {
@@ -2488,7 +2557,10 @@ fn run(
         let view_key = (
             active,
             windows.get(active).map(|w| w.zoomed).unwrap_or(false),
-            windows.get(active).map(|w| w.tree.focus()).unwrap_or(usize::MAX),
+            windows
+                .get(active)
+                .map(|w| w.tree.focus())
+                .unwrap_or(usize::MAX),
             board_view,
             overview_view,
             log_view,
@@ -2514,7 +2586,10 @@ fn run(
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
-                frame.extend_from_slice(render_board_panel(&board, &bus, rows, cols, feed_scroll, decision_sel).as_bytes());
+                frame.extend_from_slice(
+                    render_board_panel(&board, &bus, rows, cols, feed_scroll, decision_sel)
+                        .as_bytes(),
+                );
             }
         } else if log_view {
             // The activity log overlay: a live time-ordered merge of bus + board
@@ -2523,7 +2598,8 @@ fn run(
             if force_repaint {
                 let now = agsess::sessions::now_ms();
                 frame.extend_from_slice(
-                    render_log_panel(&windows, &world, &board, &bus, rows, cols, log_scroll, now).as_bytes(),
+                    render_log_panel(&windows, &world, &board, &bus, rows, cols, log_scroll, now)
+                        .as_bytes(),
                 );
             }
         } else if windows[active].tiled() {
@@ -2539,7 +2615,10 @@ fn run(
             // boot don't look like a hang; the drain wipes it and takes over on
             // the pane's first bytes. Throttled to the spinner's ~8 fps.
             let fp = windows[active].tree.focus();
-            let unpainted = windows[active].pane(fp).map(|p| !p.painted).unwrap_or(false);
+            let unpainted = windows[active]
+                .pane(fp)
+                .map(|p| !p.painted)
+                .unwrap_or(false);
             if unpainted {
                 if spin_frame != last_splash_frame {
                     draw_startup_splash(&mut frame, rows, cols, spin_frame);
@@ -2619,7 +2698,10 @@ fn run(
         // the line typed so far, cursor left right after it (visible) so you can
         // see what you're launching. Otherwise the normal status bar.
         let painted = if let Some(line) = &prompt {
-            format!("\x1b[{};1H\x1b[2K\x1b[1;38;2;70;235;255m:\x1b[0m{line}\x1b[?25h", rows)
+            format!(
+                "\x1b[{};1H\x1b[2K\x1b[1;38;2;70;235;255m:\x1b[0m{line}\x1b[?25h",
+                rows
+            )
         } else {
             bar_paint(&infos, rows, cols as usize, note)
         };
@@ -2744,7 +2826,8 @@ fn render_tiled(
                 let agent = if *id == focus {
                     None
                 } else {
-                    world.status_for(p.session_id.as_deref())
+                    world
+                        .status_for(p.session_id.as_deref())
                         .map(|status| AgentMark { status })
                 };
                 let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
@@ -2784,7 +2867,15 @@ fn split_focused(
         (cols / 2).saturating_sub(2),
     );
     // Splits inherit the active identity (§4). resolve failure lands in `flash`.
-    match spawn_pane(command, pr.max(1), pc.max(1), new_id, identity, trust_mode(), flash) {
+    match spawn_pane(
+        command,
+        pr.max(1),
+        pc.max(1),
+        new_id,
+        identity,
+        trust_mode(),
+        flash,
+    ) {
         Ok(pane) => {
             w.panes.push(pane);
             w.next_id += 1;
@@ -2852,7 +2943,11 @@ fn switch_window(
     // passthrough app (claude) may have changed or reset the real terminal's
     // scroll region while it ran, and without restoring it the next pane can
     // scroll into the bar row.
-    let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows.saturating_sub(1).max(1));
+    let _ = write!(
+        out,
+        "\x1b[1;{}r\x1b[2J\x1b[H",
+        rows.saturating_sub(1).max(1)
+    );
     let _ = out.flush();
     resize_window(&mut windows[to], rows, cols);
 }
@@ -2863,7 +2958,11 @@ fn switch_window(
 fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut impl Write) {
     // Re-assert the bar-protecting scroll region (see `switch_window`) before the
     // repaint nudge, so the refreshed pane stays out of the bar row.
-    let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows.saturating_sub(1).max(1));
+    let _ = write!(
+        out,
+        "\x1b[1;{}r\x1b[2J\x1b[H",
+        rows.saturating_sub(1).max(1)
+    );
     let _ = out.flush();
     let ar = rows.saturating_sub(1).max(1);
     let focus = w.tree.focus();
@@ -2954,7 +3053,12 @@ fn fleet_ls() -> ExitCode {
 /// and hand it to the run loop. Any error before spawning (no file, bad JSON,
 /// unknown name, empty fleet, a bad grid, a missing `cwd`) is reported and
 /// **nothing is spawned** — never a partial fleet.
-fn fleet_up(name: &str, allow_ctl: bool, max_depth: usize, trust: amux::ctl::TrustMode) -> ExitCode {
+fn fleet_up(
+    name: &str,
+    allow_ctl: bool,
+    max_depth: usize,
+    trust: amux::ctl::TrustMode,
+) -> ExitCode {
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the requested posture.
     set_trust_mode(trust);
@@ -3039,7 +3143,11 @@ fn fleet_up(name: &str, allow_ctl: bool, max_depth: usize, trust: amux::ctl::Tru
     // born with `AMUX_CTL`/`AMUX_PANE` in its env and can drive the board/bus.
     // (The default path binds inside run() after its single spawn; a fleet spawns
     // its whole roster up front, so it must publish the address first.)
-    let ctl_listener = if allow_ctl { bind_ctl(&mut flash) } else { None };
+    let ctl_listener = if allow_ctl {
+        bind_ctl(&mut flash)
+    } else {
+        None
+    };
     let window = match spawn_fleet_window(&fleet, &located.dir, grid, rows, cols, &mut flash) {
         Ok(w) => w,
         Err(e) => {
@@ -3223,13 +3331,17 @@ fn apply_ctl(
     // spawn), so a legitimate caller is never locked out; only an external or
     // token-stripped request is. See §4.1 of the whitepaper for the threat model
     // and the peer-credential hardening that closes the remaining raw-socket vector.
-    let authed = req.token.as_deref().filter(|t| !t.is_empty()).and_then(|tok| {
-        windows
-            .iter()
-            .flat_map(|w| &w.panes)
-            .find(|p| p.token == tok)
-            .map(|p| p.agent_id)
-    });
+    let authed = req
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .and_then(|tok| {
+            windows
+                .iter()
+                .flat_map(|w| &w.panes)
+                .find(|p| p.token == tok)
+                .map(|p| p.agent_id)
+        });
     let authenticated = authed.is_some();
     req.caller = authed;
     // Reads (list/status/audit/board get/list/bus feed) are open; anything that
@@ -3314,10 +3426,8 @@ fn dispatch_ctl(
                 if let Some(deny) = scope_denied(windows, caller, privileged, id) {
                     return deny;
                 }
-                let status = pane_by_agent(windows, id).and_then(|p| {
-                    world.status_for(p.session_id.as_deref())
-                        .map(status_label)
-                });
+                let status = pane_by_agent(windows, id)
+                    .and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label));
                 ctl::reply_status_one(id, status)
             }
         },
@@ -3333,8 +3443,7 @@ fn dispatch_ctl(
             // Queued iff the target is mid-turn now; either way delivery is async
             // and happens when the target is idle.
             let busy = matches!(
-                pane_by_agent(windows, id)
-                    .and_then(|p| world.status_for(p.session_id.as_deref())),
+                pane_by_agent(windows, id).and_then(|p| world.status_for(p.session_id.as_deref())),
                 Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
             );
             pending.push(PendingSend {
@@ -3494,8 +3603,7 @@ fn dispatch_ctl(
                     // board's DEFAULT_LEASE_MS unless the caller set --ttl.
                     let owner = by.as_deref().unwrap_or("operator");
                     let ttl = ttl_ms.unwrap_or(amux::board::DEFAULT_LEASE_MS);
-                    let outcome =
-                        board.claim(&key, owner, ttl, agsess::sessions::now_ms());
+                    let outcome = board.claim(&key, owner, ttl, agsess::sessions::now_ms());
                     ctl::reply_board_claim(&key, &outcome)
                 }
                 ctl::BoardOp::Release { key } => {
@@ -3523,12 +3631,14 @@ fn dispatch_ctl(
                 .unwrap_or_else(|| "operator".to_string());
             let now = agsess::sessions::now_ms();
             match op {
-                ctl::BusOp::Pub { topic, kind, fields } => {
-                    match bus.publish(&topic, kind, Some(&who), &fields, now) {
-                        Ok(e) => ctl::reply_bus_published(amux::bus::event_to_value(&e)),
-                        Err(msg) => ctl::reply_err(&msg),
-                    }
-                }
+                ctl::BusOp::Pub {
+                    topic,
+                    kind,
+                    fields,
+                } => match bus.publish(&topic, kind, Some(&who), &fields, now) {
+                    Ok(e) => ctl::reply_bus_published(amux::bus::event_to_value(&e)),
+                    Err(msg) => ctl::reply_err(&msg),
+                },
                 ctl::BusOp::Sub { topics } => {
                     bus.subscribe(&who, &topics);
                     ctl::reply_bus_subscribed(current_subs(bus, &who))
@@ -3544,9 +3654,7 @@ fn dispatch_ctl(
                     let cursor = events.iter().map(|e| e.seq).max().unwrap_or(since);
                     ctl::reply_bus_feed(amux::bus::events_to_value(&events), cursor)
                 }
-                ctl::BusOp::Resolve { seq } => {
-                    ctl::reply_bus_resolved(seq, bus.resolve(seq))
-                }
+                ctl::BusOp::Resolve { seq } => ctl::reply_bus_resolved(seq, bus.resolve(seq)),
             }
         }
     }
@@ -3621,7 +3729,11 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
         Cmd::Bus(op) => (
             "bus",
             match op {
-                amux::ctl::BusOp::Pub { topic, kind, fields } => {
+                amux::ctl::BusOp::Pub {
+                    topic,
+                    kind,
+                    fields,
+                } => {
                     format!("pub {topic} {} fields={}", kind.as_str(), fields.len())
                 }
                 amux::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
@@ -3693,7 +3805,11 @@ fn audit_reply(
 
 /// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
 /// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
-fn reply_tree(windows: &[Window], world: &amux::vendors::VendorWorlds, root: Option<usize>) -> String {
+fn reply_tree(
+    windows: &[Window],
+    world: &amux::vendors::VendorWorlds,
+    root: Option<usize>,
+) -> String {
     let parents = ctl_parents(windows);
     let mut panes: Vec<&Pane> = windows
         .iter()
@@ -3712,8 +3828,7 @@ fn reply_tree(windows: &[Window], world: &amux::vendors::VendorWorlds, root: Opt
             role: p.role.as_deref(),
             title: &p.title,
             depth: p.depth,
-            status: world.status_for(p.session_id.as_deref())
-                .map(status_label),
+            status: world.status_for(p.session_id.as_deref()).map(status_label),
         })
         .collect();
     amux::ctl::reply_list(&nodes)
@@ -3967,7 +4082,15 @@ fn spawn_window_grid(
     let cell_cols = ((cols as usize / grid.cols.max(1)).saturating_sub(2)).max(1) as u16;
     let mut panes: Vec<Pane> = Vec::with_capacity(n);
     for id in 0..n {
-        match spawn_pane(command, cell_rows, cell_cols, id, identity, trust_mode(), flash) {
+        match spawn_pane(
+            command,
+            cell_rows,
+            cell_cols,
+            id,
+            identity,
+            trust_mode(),
+            flash,
+        ) {
             Ok(pane) => panes.push(pane),
             Err(e) => {
                 // Tear down whatever we already started — a partial grid is not
@@ -4057,7 +4180,9 @@ fn spawn_pane_full(
         if is_claude {
             match mode {
                 amux::ctl::TrustMode::Edits => {
-                    v.extend(amux::trust::accept_edits_args(&amux::trust::extra_allow_from_env()));
+                    v.extend(amux::trust::accept_edits_args(
+                        &amux::trust::extra_allow_from_env(),
+                    ));
                 }
                 amux::ctl::TrustMode::Auto => {
                     v.push("--permission-mode".to_string());
@@ -4127,7 +4252,11 @@ fn spawn_pane_full(
     if let Ok(path) = std::env::var("AMUX_SPAWN_LOG") {
         if !path.is_empty() {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
                 let _ = writeln!(f, "[{title}] {}", effective.join(" "));
             }
         }
@@ -4192,7 +4321,11 @@ fn spawn_pane_full(
                 format!(
                     "identity {:?} unresolved — running without {}",
                     failed.join(","),
-                    if merged.len() == base_env.len() { "credentials" } else { "those" }
+                    if merged.len() == base_env.len() {
+                        "credentials"
+                    } else {
+                        "those"
+                    }
                 ),
                 Instant::now(),
             ));
@@ -4431,8 +4564,8 @@ mod tests {
             ov_node(0, Some(Working), false),
             ov_node(0, Some(WaitingApproval), false),
             ov_node(0, Some(Idle), false),
-            ov_node(0, None, false),        // unbound → idle bucket
-            ov_node(0, Some(Working), true), // exited wins over status
+            ov_node(0, None, false),          // unbound → idle bucket
+            ov_node(0, Some(Working), true),  // exited wins over status
             ov_node(1, Some(Working), false), // other window — excluded
         ];
         let a = window_agg(&nodes, 0);
@@ -4501,12 +4634,12 @@ mod tests {
         // One window: no "window 1" group header.
         let one = vec![ov_node(0, None, false), ov_node(0, None, false)];
         let r1 = strip_csi(&render_overview_panel(&[], &bus, &one, 0, 24, 100));
-        assert!(!r1.contains("window 1"), "single fleet must not show a group header");
+        assert!(
+            !r1.contains("window 1"),
+            "single fleet must not show a group header"
+        );
         // Two windows: both group headers appear.
-        let two = vec![
-            ov_node(0, None, false),
-            ov_node(1, None, false),
-        ];
+        let two = vec![ov_node(0, None, false), ov_node(1, None, false)];
         let r2 = strip_csi(&render_overview_panel(&[], &bus, &two, 0, 24, 100));
         assert!(r2.contains("window 1"), "multi-fleet must group window 1");
         assert!(r2.contains("window 2"), "multi-fleet must group window 2");
@@ -4538,15 +4671,24 @@ mod tests {
         assert!(!top.contains("e1"), "oldest hidden at scroll 0: {top}");
         // Scrolled back two: the window slides to older events.
         let back = render(2);
-        assert!(back.contains("e4") && back.contains("e3"), "scroll 2: {back}");
-        assert!(!back.contains("e6"), "newest scrolled off at scroll 2: {back}");
+        assert!(
+            back.contains("e4") && back.contains("e3"),
+            "scroll 2: {back}"
+        );
+        assert!(
+            !back.contains("e6"),
+            "newest scrolled off at scroll 2: {back}"
+        );
     }
 
     #[test]
     fn wrap_to_wraps_within_width_and_marks_overflow() {
         // Fits: two short lines, each within the width.
         let w = wrap_to("alpha beta gamma delta", 11, 3);
-        assert!(w.iter().all(|l| l.chars().count() <= 11), "within width: {w:?}");
+        assert!(
+            w.iter().all(|l| l.chars().count() <= 11),
+            "within width: {w:?}"
+        );
         assert_eq!(w.join(" "), "alpha beta gamma delta");
         // Overflows the line budget: the last line ends with an ellipsis.
         let long = "aaa bbb ccc ddd eee fff ggg hhh iii jjj";
@@ -4571,9 +4713,15 @@ mod tests {
         let decisions = bus.pending_decisions();
         let mut out = String::new();
         render_decision_detail(&mut out, decisions.first(), 24, 80);
-        let flat: String = strip_csi(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat: String = strip_csi(&out)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(flat.contains(q), "full question visible: {flat}");
-        assert!(flat.contains("#1") && flat.contains("grace"), "seq + source shown: {flat}");
+        assert!(
+            flat.contains("#1") && flat.contains("grace"),
+            "seq + source shown: {flat}"
+        );
     }
 
     #[test]
@@ -4582,9 +4730,13 @@ mod tests {
         // Reads are servable to an unauthenticated caller…
         assert!(ctl_is_read_only(&Cmd::List));
         assert!(ctl_is_read_only(&Cmd::Board(BoardOp::List)));
-        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::Get { key: "auth".into() })));
+        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::Get {
+            key: "auth".into()
+        })));
         // …while anything that mutates the fleet or shared state is gated.
-        assert!(!ctl_is_read_only(&Cmd::Kill(KillReq { target: "w".into() })));
+        assert!(!ctl_is_read_only(&Cmd::Kill(KillReq {
+            target: "w".into()
+        })));
         assert!(!ctl_is_read_only(&Cmd::Board(BoardOp::Set {
             key: "t".into(),
             fields: vec![],
@@ -4624,8 +4776,13 @@ mod tests {
         let world = amux::vendors::VendorWorlds::new(); // no sessions (unrefreshed)
         let rows = collect_log(&[], &world, &board, &bus);
         assert!(rows.len() >= 2, "bus + board rows present");
-        assert!(rows.windows(2).all(|w| w[0].ts <= w[1].ts), "sorted ascending by ts");
-        assert!(rows.iter().any(|r| r.who == "lead" && r.text.contains("title")));
+        assert!(
+            rows.windows(2).all(|w| w[0].ts <= w[1].ts),
+            "sorted ascending by ts"
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.who == "lead" && r.text.contains("title")));
         assert!(rows.iter().any(|r| r.who == "ada" && r.text.contains("ui")));
     }
 

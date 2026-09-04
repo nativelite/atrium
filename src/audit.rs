@@ -38,7 +38,10 @@ impl Entry {
     /// `ctl audit` reply. Stable key order for readable logs.
     pub fn to_json(&self) -> Value {
         Value::Object(vec![
-            ("seq".to_string(), Value::Number(Number::Int(self.seq as i64))),
+            (
+                "seq".to_string(),
+                Value::Number(Number::Int(self.seq as i64)),
+            ),
             (
                 "caller".to_string(),
                 self.caller
@@ -76,7 +79,11 @@ impl Audit {
     /// [`Audit::take_error`]; the log still runs in memory.
     pub fn new(cap: usize, path: Option<&str>) -> Self {
         let (file, file_error) = match path {
-            Some(p) => match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            Some(p) => match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
                 Ok(f) => (Some(f), None),
                 Err(e) => (None, Some(format!("audit log {p:?}: {e}"))),
             },

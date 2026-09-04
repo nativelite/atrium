@@ -140,7 +140,10 @@ impl Tree {
             start += take;
         }
         let root = Self::join(Dir::Horizontal, row_nodes);
-        Tree { root, focus: ids[0] }
+        Tree {
+            root,
+            focus: ids[0],
+        }
     }
 
     /// Fold `nodes` (non-empty) into a single left-leaning line of `dir` splits —
@@ -788,8 +791,16 @@ mod tests {
         assert_eq!(area, OUTER.rows * OUTER.cols);
         // Every pane is ~ a 4-col × 3-row cell: width ~20 (80/4), height ~8 (24/3).
         for (_, r) in &rects {
-            assert!(r.cols.abs_diff(80 / 4) <= 1, "col {} not ~20 ({r:?})", r.cols);
-            assert!(r.rows.abs_diff(24 / 3) <= 1, "row {} not ~8 ({r:?})", r.rows);
+            assert!(
+                r.cols.abs_diff(80 / 4) <= 1,
+                "col {} not ~20 ({r:?})",
+                r.cols
+            );
+            assert!(
+                r.rows.abs_diff(24 / 3) <= 1,
+                "row {} not ~8 ({r:?})",
+                r.rows
+            );
         }
     }
 

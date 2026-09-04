@@ -200,7 +200,11 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
                         std::env::var("XDG_DATA_HOME")
                             .map(|d| PathBuf::from(d).join("goose").join("sessions"))
                             .unwrap_or_else(|_| {
-                                home().join(".local").join("share").join("goose").join("sessions")
+                                home()
+                                    .join(".local")
+                                    .join("share")
+                                    .join("goose")
+                                    .join("sessions")
                             })
                     }
                 }),
@@ -374,7 +378,7 @@ pub fn adopt_session_for(
 ///   chosen to be recognisable without being verbose.
 pub fn vendor_tag(vendor: Vendor) -> &'static str {
     match vendor {
-        Vendor::ClaudeCode => "",    // keep claude's appearance unchanged
+        Vendor::ClaudeCode => "", // keep claude's appearance unchanged
         Vendor::Gemini => "gem",
         Vendor::Codex => "cdx",
         Vendor::Aider => "aid",
@@ -410,17 +414,27 @@ mod tests {
     fn only_supported_vendors_get_a_world() {
         assert_eq!(SUPPORTED_VENDORS, &[Vendor::ClaudeCode, Vendor::Codex]);
         // Google's CLIs are deliberately excluded (non-tailable storage).
-        assert!(!SUPPORTED_VENDORS.contains(&Vendor::Gemini), "Gemini must not be tracked");
+        assert!(
+            !SUPPORTED_VENDORS.contains(&Vendor::Gemini),
+            "Gemini must not be tracked"
+        );
         let worlds = VendorWorlds::new();
         // Claude + Codex both have a known root → two worlds.
-        assert_eq!(worlds.worlds.len(), 2, "exactly the supported two build a world");
+        assert_eq!(
+            worlds.worlds.len(),
+            2,
+            "exactly the supported two build a world"
+        );
     }
 
     #[test]
     fn claude_stem_and_root_are_wired() {
         assert_eq!(vendor_for_stem("claude"), Some(Vendor::ClaudeCode));
         assert_eq!(vendor_for_stem("definitely-not-an-agent"), None);
-        assert_eq!(vendor_root(Vendor::ClaudeCode), Some(agsess::default_root()));
+        assert_eq!(
+            vendor_root(Vendor::ClaudeCode),
+            Some(agsess::default_root())
+        );
     }
 
     // --- detect: vendor_for_stem ---
@@ -451,8 +465,19 @@ mod tests {
     fn vendor_for_stem_negative_cases() {
         // Shells, editors, partial matches, and case variants must all return None.
         for stem in &[
-            "bash", "zsh", "sh", "fish", "nvim", "vim", "python", "",
-            "CLAUDE", "Gemini", "cursor", "cursor_agent", "open-code",
+            "bash",
+            "zsh",
+            "sh",
+            "fish",
+            "nvim",
+            "vim",
+            "python",
+            "",
+            "CLAUDE",
+            "Gemini",
+            "cursor",
+            "cursor_agent",
+            "open-code",
         ] {
             assert_eq!(
                 vendor_for_stem(stem),
@@ -467,11 +492,20 @@ mod tests {
         // Every Vendor in ALL_VENDORS must be reachable through some known stem so
         // no vendor is silently orphaned from the map.
         let known_stems = [
-            "claude", "gemini", "codex", "aider", "cursor-agent",
-            "copilot", "qwen", "opencode", "goose",
+            "claude",
+            "gemini",
+            "codex",
+            "aider",
+            "cursor-agent",
+            "copilot",
+            "qwen",
+            "opencode",
+            "goose",
         ];
         for &vendor in ALL_VENDORS {
-            let found = known_stems.iter().any(|&s| vendor_for_stem(s) == Some(vendor));
+            let found = known_stems
+                .iter()
+                .any(|&s| vendor_for_stem(s) == Some(vendor));
             assert!(found, "{vendor:?} has no stem that maps to it");
         }
     }
@@ -535,7 +569,10 @@ mod tests {
     #[test]
     fn vendor_root_claude_is_default_root() {
         // ClaudeCode is the only verified root; it must equal agsess::default_root().
-        assert_eq!(vendor_root(Vendor::ClaudeCode), Some(agsess::default_root()));
+        assert_eq!(
+            vendor_root(Vendor::ClaudeCode),
+            Some(agsess::default_root())
+        );
     }
 
     #[test]
@@ -543,9 +580,17 @@ mod tests {
         // Aider: per-cwd .aider.chat.history.md, no centralised home root.
         assert_eq!(vendor_root(Vendor::Aider), None, "Aider has no home root");
         // OpenCode: SQLite store, no tailable JSONL root.
-        assert_eq!(vendor_root(Vendor::OpenCode), None, "OpenCode is SQLite-backed");
+        assert_eq!(
+            vendor_root(Vendor::OpenCode),
+            None,
+            "OpenCode is SQLite-backed"
+        );
         // Copilot: path is hypothetical (no real CLI JSONL today).
-        assert_eq!(vendor_root(Vendor::Copilot), None, "Copilot root is hypothetical");
+        assert_eq!(
+            vendor_root(Vendor::Copilot),
+            None,
+            "Copilot root is hypothetical"
+        );
     }
 
     #[test]
@@ -559,7 +604,10 @@ mod tests {
             None => std::env::remove_var("CODEX_HOME"),
         }
         // CODEX_HOME replaces ~/.codex; sessions subdir is appended.
-        assert_eq!(result, Some(std::path::PathBuf::from("/tmp/my_codex/sessions")));
+        assert_eq!(
+            result,
+            Some(std::path::PathBuf::from("/tmp/my_codex/sessions"))
+        );
     }
 
     #[test]
@@ -586,8 +634,8 @@ mod tests {
             use std::sync::atomic::{AtomicU64, Ordering};
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
-            let p = std::env::temp_dir()
-                .join(format!("amux-adopt-{tag}-{}-{n}", std::process::id()));
+            let p =
+                std::env::temp_dir().join(format!("amux-adopt-{tag}-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)
@@ -658,7 +706,12 @@ mod tests {
     #[test]
     fn adopt_cwd_mismatch_falls_back_to_newest() {
         let td = TempDir::new("cwd-fallback");
-        write_adopt_session(&td.0, "proj", "sess1", &[&claude_user_with_cwd("/projects/other")]);
+        write_adopt_session(
+            &td.0,
+            "proj",
+            "sess1",
+            &[&claude_user_with_cwd("/projects/other")],
+        );
         let mut w = agsess::World::new(td.0.clone());
         w.refresh();
         let sessions: Vec<_> = w.sessions.iter().collect();
@@ -671,8 +724,18 @@ mod tests {
     fn adopt_cwd_match_wins_over_non_matching() {
         let td = TempDir::new("prefer-cwd");
         let target = "/projects/target";
-        write_adopt_session(&td.0, "proj", "target-sess", &[&claude_user_with_cwd(target)]);
-        write_adopt_session(&td.0, "proj", "other-sess", &[&claude_user_with_cwd("/projects/other")]);
+        write_adopt_session(
+            &td.0,
+            "proj",
+            "target-sess",
+            &[&claude_user_with_cwd(target)],
+        );
+        write_adopt_session(
+            &td.0,
+            "proj",
+            "other-sess",
+            &[&claude_user_with_cwd("/projects/other")],
+        );
         let mut w = agsess::World::new(td.0.clone());
         w.refresh();
         let sessions: Vec<_> = w.sessions.iter().collect();
@@ -717,8 +780,7 @@ mod tests {
 
     /// A Codex rollout line (event_msg/agent_message) — no `cwd`, so the discovered
     /// session's `cwd` stays `None`, matching a pane launched with unknown cwd.
-    const CODEX_LINE: &str =
-        r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}"#;
+    const CODEX_LINE: &str = r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}"#;
 
     /// End-to-end chain (the DoD for this feature): the exact sequence the run
     /// loop drives — a `VendorWorlds` built the way the app builds it discovers a

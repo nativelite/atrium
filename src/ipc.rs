@@ -554,7 +554,11 @@ mod sys {
         }
         const SOL_SOCKET: i32 = 1;
         const SO_PEERCRED: i32 = 17;
-        let mut cred = Ucred { pid: 0, uid: 0, gid: 0 };
+        let mut cred = Ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut len = std::mem::size_of::<Ucred>() as u32;
         let r = unsafe {
             getsockopt(

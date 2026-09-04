@@ -461,7 +461,14 @@ mod tests {
         let argv = a.args(&["/ctx".to_string()]);
         assert_eq!(
             argv,
-            s(&["claude", "--add-dir", "/ctx", "--append-system-prompt", "P", "go now"])
+            s(&[
+                "claude",
+                "--add-dir",
+                "/ctx",
+                "--append-system-prompt",
+                "P",
+                "go now"
+            ])
         );
     }
 

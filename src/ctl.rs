@@ -492,7 +492,8 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
     let mut max_depth = DEFAULT_MAX_DEPTH;
     // `None` until a trust flag is seen; a second, different one is a conflict.
     let mut trust: Option<TrustMode> = None;
-    let dup = || "set the session trust policy once (--trust <policy> or --skip-permissions)".to_string();
+    let dup =
+        || "set the session trust policy once (--trust <policy> or --skip-permissions)".to_string();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -507,7 +508,10 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
                 // Optional policy keyword: `--trust automode|accept|plan`. If the
                 // next token is a known policy it is consumed; otherwise `--trust`
                 // is bare (= accept) and the token is the hosted command.
-                match args.get(i + 1).and_then(|n| TrustMode::from_policy_keyword(n)) {
+                match args
+                    .get(i + 1)
+                    .and_then(|n| TrustMode::from_policy_keyword(n))
+                {
                     Some(m) => {
                         trust = Some(m);
                         i += 2;
@@ -658,7 +662,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             };
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
-            let identity = v.get("identity").and_then(Value::as_str).map(str::to_string);
+            let identity = v
+                .get("identity")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let mode = v
                 .get("mode")
                 .and_then(Value::as_str)
@@ -724,7 +731,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    BoardOp::Set { key: key()?, fields }
+                    BoardOp::Set {
+                        key: key()?,
+                        fields,
+                    }
                 }
                 Some("get") => BoardOp::Get { key: key()? },
                 Some("list") => BoardOp::List,
@@ -735,7 +745,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                         .and_then(Value::as_i64)
                         .filter(|n| *n > 0)
                         .map(|n| n as u64);
-                    BoardOp::Claim { key: key()?, ttl_ms }
+                    BoardOp::Claim {
+                        key: key()?,
+                        ttl_ms,
+                    }
                 }
                 Some("release") => BoardOp::Release { key: key()? },
                 other => {
@@ -770,13 +783,21 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    BusOp::Pub { topic, kind, fields }
+                    BusOp::Pub {
+                        topic,
+                        kind,
+                        fields,
+                    }
                 }
                 Some("sub") | Some("unsub") => {
                     let topics = v
                         .get("topics")
                         .and_then(Value::as_array)
-                        .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|t| t.as_str().map(str::to_string))
+                                .collect()
+                        })
                         .unwrap_or_default();
                     if v.get("op").and_then(Value::as_str) == Some("sub") {
                         BusOp::Sub { topics }
@@ -865,7 +886,10 @@ pub fn reply_board_claim(key: &str, claim: &crate::board::Claim) -> String {
     let (granted, holder, lease_ms, entry) = match claim {
         Claim::Granted(e) => (
             true,
-            e.claimed_by.clone().map(Value::String).unwrap_or(Value::Null),
+            e.claimed_by
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
             e.lease_ms,
             entry_to_value(e),
         ),
@@ -970,7 +994,11 @@ pub fn reply_sent(target: usize, queued: bool) -> String {
 /// vanished between resolve and teardown.
 pub fn reply_killed(killed: &[usize]) -> String {
     let arr = killed.iter().map(|id| i(*id)).collect();
-    obj(vec![("ok", Value::Bool(true)), ("killed", Value::Array(arr))]).to_string()
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("killed", Value::Array(arr)),
+    ])
+    .to_string()
 }
 
 /// `{"ok":true,"audit":[<entry>,…]}` — the (already-serialized, already-scoped)
@@ -1041,7 +1069,11 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     // `--json` prints the raw reply (for scripting); otherwise a `board` view
     // renders as a colored table with clickable links.
     let raw_json = args.iter().any(|a| a == "--json");
-    let filtered: Vec<String> = args.iter().filter(|a| a.as_str() != "--json").cloned().collect();
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| a.as_str() != "--json")
+        .cloned()
+        .collect();
     let args = &filtered[..];
 
     let request = match build_request(args, caller) {
@@ -1147,7 +1179,11 @@ fn render_board(reply: &str) -> Option<String> {
         let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
         return Some(format!(
             "  {key}: {}",
-            if released { "released" } else { "was not on the board" }
+            if released {
+                "released"
+            } else {
+                "was not on the board"
+            }
         ));
     }
     // get/set → one entry (or "not on the board").
@@ -1175,8 +1211,14 @@ fn render_bus(reply: &str) -> Option<String> {
             return Some("  (no new events)".to_string());
         }
         let cursor = v.get("cursor").and_then(Value::as_i64).unwrap_or(0);
-        let mut body = arr.iter().map(render_event_line).collect::<Vec<_>>().join("\n");
-        body.push_str(&format!("\n\x1b[2m  — cursor {cursor} (next: bus feed --since {cursor})\x1b[0m"));
+        let mut body = arr
+            .iter()
+            .map(render_event_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push_str(&format!(
+            "\n\x1b[2m  — cursor {cursor} (next: bus feed --since {cursor})\x1b[0m"
+        ));
         return Some(body);
     }
     // pub → the single stored event.
@@ -1200,7 +1242,11 @@ fn render_bus(reply: &str) -> Option<String> {
         let seq = v.get("seq").and_then(Value::as_i64).unwrap_or(0);
         return Some(format!(
             "  decision #{seq}: {}",
-            if resolved { "resolved" } else { "was not an open decision" }
+            if resolved {
+                "resolved"
+            } else {
+                "was not an open decision"
+            }
         ));
     }
     None
@@ -1220,7 +1266,10 @@ fn render_event_line(event: &Value) -> String {
         ("\x1b[2m·\x1b[0m", "\x1b[1m") // dim dot, bold topic
     };
     let empty: &[(String, Value)] = &[];
-    let fields = event.get("fields").and_then(Value::as_object).unwrap_or(empty);
+    let fields = event
+        .get("fields")
+        .and_then(Value::as_object)
+        .unwrap_or(empty);
     let field_str = fields
         .iter()
         .map(|(k, v)| {
@@ -1246,7 +1295,10 @@ fn render_event_line(event: &Value) -> String {
 /// inline, get/set entries don't).
 fn render_entry_line(key: &str, entry: &Value) -> String {
     let empty: &[(String, Value)] = &[];
-    let fields = entry.get("fields").and_then(Value::as_object).unwrap_or(empty);
+    let fields = entry
+        .get("fields")
+        .and_then(Value::as_object)
+        .unwrap_or(empty);
     let status = fields
         .iter()
         .find(|(k, _)| k == "status")
@@ -1356,7 +1408,12 @@ fn absorb_field_token(fields: &mut Vec<(String, String)>, tok: &str) -> Result<(
 
 /// Convert accumulated `(field, value)` string pairs into a JSON object value.
 fn fields_to_value(fields: Vec<(String, String)>) -> Value {
-    Value::Object(fields.into_iter().map(|(f, v)| (f, Value::String(v))).collect())
+    Value::Object(
+        fields
+            .into_iter()
+            .map(|(f, v)| (f, Value::String(v)))
+            .collect(),
+    )
 }
 
 /// Turn `amux ctl` argv (after the `ctl` word) + caller id into a JSON request
@@ -1388,9 +1445,9 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             while i < args.len() {
                 match args[i].as_str() {
                     "--mode" => {
-                        let k = args
-                            .get(i + 1)
-                            .ok_or_else(|| "--mode needs a value (plan, accept, or automode)".to_string())?;
+                        let k = args.get(i + 1).ok_or_else(|| {
+                            "--mode needs a value (plan, accept, or automode)".to_string()
+                        })?;
                         mode = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
                             format!("--mode: unknown {k:?} (use plan, accept, or automode)")
                         })?);
@@ -1573,16 +1630,16 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                                 // lead). Sugar for a `to=<role>` field: an
                                 // agent-addressed decision routes to that agent
                                 // instead of firing the human's urgent bar.
-                                let role = args
-                                    .get(i + 1)
-                                    .ok_or_else(|| "--to needs a role (e.g. --to lead)".to_string())?;
+                                let role = args.get(i + 1).ok_or_else(|| {
+                                    "--to needs a role (e.g. --to lead)".to_string()
+                                })?;
                                 fields.push(("to".to_string(), role.clone()));
                                 i += 2;
                             }
                             "--kind" => {
-                                let k = args
-                                    .get(i + 1)
-                                    .ok_or_else(|| "--kind needs fyi or decision_needed".to_string())?;
+                                let k = args.get(i + 1).ok_or_else(|| {
+                                    "--kind needs fyi or decision_needed".to_string()
+                                })?;
                                 kind = crate::bus::Kind::from_keyword(k).ok_or_else(|| {
                                     format!("--kind: unknown {k:?} (use fyi or decision_needed)")
                                 })?;
@@ -1597,7 +1654,8 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                     }
                     if fields.is_empty() {
                         return Err(
-                            "bus pub needs at least one field=value (e.g. msg=merged the PR)".to_string(),
+                            "bus pub needs at least one field=value (e.g. msg=merged the PR)"
+                                .to_string(),
                         );
                     }
                     pairs.push(("kind", s(kind.as_str())));
@@ -1674,7 +1732,8 @@ mod tests {
 
     #[test]
     fn sanitize_strips_dangerous_bypass_flag() {
-        let (clean, stripped) = sanitize_spawn_argv(&v(&["claude", "--dangerously-skip-permissions"]));
+        let (clean, stripped) =
+            sanitize_spawn_argv(&v(&["claude", "--dangerously-skip-permissions"]));
         assert_eq!(clean, v(&["claude"]));
         assert_eq!(stripped, v(&["--dangerously-skip-permissions"]));
     }
@@ -1682,8 +1741,12 @@ mod tests {
     #[test]
     fn sanitize_strips_permission_mode_and_its_value() {
         // `--flag value` form: both the flag and its value token go.
-        let (clean, stripped) =
-            sanitize_spawn_argv(&v(&["claude", "--permission-mode", "bypassPermissions", "-r"]));
+        let (clean, stripped) = sanitize_spawn_argv(&v(&[
+            "claude",
+            "--permission-mode",
+            "bypassPermissions",
+            "-r",
+        ]));
         assert_eq!(clean, v(&["claude", "-r"]));
         assert_eq!(stripped, v(&["--permission-mode"]));
     }
@@ -1698,7 +1761,8 @@ mod tests {
 
     #[test]
     fn sanitize_leaves_benign_argv_untouched() {
-        let (clean, stripped) = sanitize_spawn_argv(&v(&["claude", "--continue", "--model", "opus"]));
+        let (clean, stripped) =
+            sanitize_spawn_argv(&v(&["claude", "--continue", "--model", "opus"]));
         assert_eq!(clean, v(&["claude", "--continue", "--model", "opus"]));
         assert!(stripped.is_empty());
     }
@@ -1788,13 +1852,23 @@ mod tests {
     #[test]
     fn build_bus_pub_roundtrips_through_parse() {
         let line = build_request(
-            &v(&["bus", "pub", "deploy", "msg=shipping v2", "url=https://x/pr/9"]),
+            &v(&[
+                "bus",
+                "pub",
+                "deploy",
+                "msg=shipping v2",
+                "url=https://x/pr/9",
+            ]),
             Some(0),
         )
         .unwrap();
         let req = parse_request(&line).unwrap();
         match req.cmd {
-            Cmd::Bus(BusOp::Pub { topic, kind, fields }) => {
+            Cmd::Bus(BusOp::Pub {
+                topic,
+                kind,
+                fields,
+            }) => {
                 assert_eq!(topic, "deploy");
                 assert_eq!(kind, crate::bus::Kind::Fyi, "defaults to fyi");
                 assert!(fields.contains(&("msg".to_string(), "shipping v2".to_string())));
@@ -1806,8 +1880,11 @@ mod tests {
 
     #[test]
     fn build_bus_pub_decision_flag_sets_kind() {
-        let line =
-            build_request(&v(&["bus", "pub", "release", "--decision", "q=ship now?"]), None).unwrap();
+        let line = build_request(
+            &v(&["bus", "pub", "release", "--decision", "q=ship now?"]),
+            None,
+        )
+        .unwrap();
         let req = parse_request(&line).unwrap();
         match req.cmd {
             Cmd::Bus(BusOp::Pub { kind, .. }) => {
@@ -1825,7 +1902,8 @@ mod tests {
 
     #[test]
     fn build_bus_sub_and_feed_roundtrip() {
-        let sub = parse_request(&build_request(&v(&["bus", "sub", "deploy", "*"]), None).unwrap()).unwrap();
+        let sub = parse_request(&build_request(&v(&["bus", "sub", "deploy", "*"]), None).unwrap())
+            .unwrap();
         assert_eq!(
             sub.cmd,
             Cmd::Bus(BusOp::Sub {
@@ -1833,7 +1911,8 @@ mod tests {
             })
         );
         let feed =
-            parse_request(&build_request(&v(&["bus", "feed", "--since", "5"]), None).unwrap()).unwrap();
+            parse_request(&build_request(&v(&["bus", "feed", "--since", "5"]), None).unwrap())
+                .unwrap();
         assert_eq!(feed.cmd, Cmd::Bus(BusOp::Feed { since: 5 }));
     }
 
@@ -1848,7 +1927,15 @@ mod tests {
         // The shell splits `msg=merged the PR` into three tokens; the parser must
         // rejoin the continuation words into one value (no quoting needed).
         let line = build_request(
-            &v(&["bus", "pub", "deploy", "msg=merged", "the", "PR", "url=https://x/pr/42"]),
+            &v(&[
+                "bus",
+                "pub",
+                "deploy",
+                "msg=merged",
+                "the",
+                "PR",
+                "url=https://x/pr/42",
+            ]),
             None,
         )
         .unwrap();
@@ -1863,9 +1950,19 @@ mod tests {
 
     #[test]
     fn bus_pub_decision_keeps_spaced_value() {
-        let line =
-            build_request(&v(&["bus", "pub", "release", "--decision", "q=ship", "v2", "now?"]), None)
-                .unwrap();
+        let line = build_request(
+            &v(&[
+                "bus",
+                "pub",
+                "release",
+                "--decision",
+                "q=ship",
+                "v2",
+                "now?",
+            ]),
+            None,
+        )
+        .unwrap();
         match parse_request(&line).unwrap().cmd {
             Cmd::Bus(BusOp::Pub { kind, fields, .. }) => {
                 assert_eq!(kind, crate::bus::Kind::DecisionNeeded);
@@ -2055,16 +2152,22 @@ mod tests {
 
     #[test]
     fn flags_trust_and_skip_permissions_conflict() {
-        assert!(parse_flags(&v(&["--trust", "--skip-permissions", "claude"]))
-            .unwrap_err()
-            .contains("once"));
-        assert!(parse_flags(&v(&["--skip-permissions", "--trust", "claude"]))
-            .unwrap_err()
-            .contains("once"));
+        assert!(
+            parse_flags(&v(&["--trust", "--skip-permissions", "claude"]))
+                .unwrap_err()
+                .contains("once")
+        );
+        assert!(
+            parse_flags(&v(&["--skip-permissions", "--trust", "claude"]))
+                .unwrap_err()
+                .contains("once")
+        );
         // Two policy spellings at once is also a conflict.
-        assert!(parse_flags(&v(&["--trust", "plan", "--trust", "automode", "claude"]))
-            .unwrap_err()
-            .contains("once"));
+        assert!(
+            parse_flags(&v(&["--trust", "plan", "--trust", "automode", "claude"]))
+                .unwrap_err()
+                .contains("once")
+        );
     }
 
     #[test]
@@ -2095,8 +2198,11 @@ mod tests {
     fn build_spawn_mode_roundtrips_through_parse() {
         // `ctl spawn --mode automode` reaches the server as SpawnReq.mode = Auto
         // (auto mode) — NOT Skip (full bypass); they are separate.
-        let line =
-            build_request(&v(&["spawn", "--mode", "automode", "--", "claude"]), Some(0)).unwrap();
+        let line = build_request(
+            &v(&["spawn", "--mode", "automode", "--", "claude"]),
+            Some(0),
+        )
+        .unwrap();
         match parse_request(&line).unwrap().cmd {
             Cmd::Spawn(sp) => assert_eq!(sp.mode, Some(TrustMode::Auto)),
             _ => panic!("expected spawn"),
@@ -2114,9 +2220,11 @@ mod tests {
             _ => panic!("expected spawn"),
         }
         // An unknown --mode is a clear client error.
-        assert!(build_request(&v(&["spawn", "--mode", "yolo", "--", "claude"]), None)
-            .unwrap_err()
-            .contains("--mode"));
+        assert!(
+            build_request(&v(&["spawn", "--mode", "yolo", "--", "claude"]), None)
+                .unwrap_err()
+                .contains("--mode")
+        );
     }
 
     #[test]
@@ -2161,7 +2269,15 @@ mod tests {
         // `--to lead` becomes a `to=lead` field, so the server/surfacing can route
         // the decision to that teammate instead of the human.
         let line = build_request(
-            &v(&["bus", "pub", "build", "--decision", "--to", "lead", "q=wire order?"]),
+            &v(&[
+                "bus",
+                "pub",
+                "build",
+                "--decision",
+                "--to",
+                "lead",
+                "q=wire order?",
+            ]),
             Some(0),
         )
         .unwrap();
@@ -2174,9 +2290,11 @@ mod tests {
             other => panic!("expected bus pub, got {other:?}"),
         }
         // `--to` without a role is a clear client error.
-        assert!(build_request(&v(&["bus", "pub", "t", "--decision", "--to"]), None)
-            .unwrap_err()
-            .contains("--to"));
+        assert!(
+            build_request(&v(&["bus", "pub", "t", "--decision", "--to"]), None)
+                .unwrap_err()
+                .contains("--to")
+        );
     }
 
     #[test]
@@ -2211,9 +2329,11 @@ mod tests {
             Cmd::Board(BoardOp::Release { key }) if key == "cli"
         ));
         // A malformed --ttl is a clear client error, not a silent default.
-        assert!(build_request(&v(&["board", "claim", "cli", "--ttl", "soon"]), Some(0))
-            .unwrap_err()
-            .contains("--ttl"));
+        assert!(
+            build_request(&v(&["board", "claim", "cli", "--ttl", "soon"]), Some(0))
+                .unwrap_err()
+                .contains("--ttl")
+        );
     }
 
     #[test]
@@ -2243,7 +2363,10 @@ mod tests {
         // A denied claim renders the current holder so a loser knows to move on.
         let reply = reply_board_claim(
             "cli",
-            &crate::board::Claim::Denied { holder: "scout".to_string(), lease_ms: 1100 },
+            &crate::board::Claim::Denied {
+                holder: "scout".to_string(),
+                lease_ms: 1100,
+            },
         );
         let view = render_board(&reply).expect("claim reply renders");
         assert!(view.contains("held by scout"), "view was: {view}");
@@ -2267,7 +2390,10 @@ mod tests {
         assert!(view.contains("owner=Max"));
         assert!(view.contains("\x1b[38;5;10m"), "DONE is green");
         // The url is wrapped as an OSC-8 hyperlink, not shown as bare text only.
-        assert!(view.contains("\x1b]8;;https://x.io\x1b\\"), "url is clickable");
+        assert!(
+            view.contains("\x1b]8;;https://x.io\x1b\\"),
+            "url is clickable"
+        );
         assert!(view.contains("(by dev_1)"));
     }
 
@@ -2301,9 +2427,11 @@ mod tests {
         assert!(build_request(&v(&["board", "set", "auth"]), None)
             .unwrap_err()
             .contains("field=value"));
-        assert!(build_request(&v(&["board", "set", "auth", "nofieldeq"]), None)
-            .unwrap_err()
-            .contains("field=value"));
+        assert!(
+            build_request(&v(&["board", "set", "auth", "nofieldeq"]), None)
+                .unwrap_err()
+                .contains("field=value")
+        );
     }
 
     #[test]
@@ -2331,7 +2459,15 @@ mod tests {
     #[test]
     fn build_spawn_with_identity_roundtrips() {
         let line = build_request(
-            &v(&["spawn", "--role", "dev_1", "--identity", "work", "--", "claude"]),
+            &v(&[
+                "spawn",
+                "--role",
+                "dev_1",
+                "--identity",
+                "work",
+                "--",
+                "claude",
+            ]),
             Some(0),
         )
         .unwrap();
@@ -2433,7 +2569,12 @@ mod tests {
         assert!(matches!(v.get("note"), Some(Value::Null)));
 
         // With a note, it rides along as a string field.
-        let noted = reply_spawned(3, None, None, Some("stripped --dangerously-skip-permissions"));
+        let noted = reply_spawned(
+            3,
+            None,
+            None,
+            Some("stripped --dangerously-skip-permissions"),
+        );
         let nv = json::parse(&noted).unwrap();
         assert_eq!(
             nv.get("note").and_then(Value::as_str),
