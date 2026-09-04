@@ -1133,10 +1133,18 @@ fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
 /// (depth > 0) is scoped to its own subtree.
 fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
     match caller {
-        None => true,
+        // No authenticated caller is NOT the operator. This arm used to return
+        // `true`, which inverted the gate: holding no credential granted strictly
+        // more than holding a worker's, so `env -u AMUX_TOKEN amux ctl ...`
+        // promoted you. `caller` is derived from the capability token, never
+        // self-reported, so `None` means exactly "unauthenticated" and must be
+        // the least trusted state, not the most.
+        None => false,
         Some(id) => match pane_by_agent(windows, id) {
             Some(p) => p.parent.is_none(),
-            None => true, // unknown caller (e.g. run from outside a pane) = operator
+            // A token resolving to no live pane is stale or forged, not the
+            // operator. Same inversion as above.
+            None => false,
         },
     }
 }
@@ -1625,6 +1633,15 @@ fn run(
                 let _ = amux::reap::write_registry(&registry_path, &cur);
                 registered = cur;
             }
+            // The watchdog is the unix answer to a death no handler can catch.
+            // Windows does not need it and must not run it: the durable fix there
+            // is a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, which the
+            // kernel honours however amux dies. A watchdog on Windows would spawn
+            // a second amux that cannot signal a process group (`reap`'s
+            // non-unix `signal_group` returns false) and would sit blocked on its
+            // pipe forever. The Job Object attaches here, where the pane set is
+            // already known to have changed.
+            #[cfg(unix)]
             if watchdog.is_none() && !registered.is_empty() {
                 watchdog = amux::reap::spawn_watchdog(&registry_path).ok();
             }
@@ -2377,7 +2394,17 @@ fn run(
                 continue;
             }
             for pane in w.panes.iter_mut() {
-                while let Ok(Some(n)) = pane.pty.read_timeout(&mut buf, Duration::ZERO) {
+                // Bounded exactly like the focused drain above. This used to be
+                // an unbounded `while let`, so one noisy background agent could
+                // hold the loop for as long as it kept producing output —
+                // starving keystrokes, signal handling and ctl for the whole
+                // session. A fleet makes that likely rather than theoretical.
+                let mut reads = 0usize;
+                while reads < DRAIN_READS_PER_TICK {
+                    let Ok(Some(n)) = pane.pty.read_timeout(&mut buf, Duration::ZERO) else {
+                        break;
+                    };
+                    reads += 1;
                     if n == 0 {
                         pane.exited = true;
                         break;
@@ -3430,7 +3457,19 @@ fn apply_ctl(
         Ok(r) => r,
         Err(e) => {
             let reply = ctl::reply_err(&e);
-            audit.record(None, "bad-request", &truncate(line, 80), false, &e);
+            // NEVER log the raw request. `build_request` emits
+            // `{"caller":N,"token":"` - a 21-character prefix - so an 80-char
+            // truncation wrote 59 of a 64-character token into a log that
+            // `ctl audit` hands to an unauthenticated reader. Record the shape
+            // and the parse error, which is what debugging actually needs, and
+            // nothing that was in the payload.
+            audit.record(
+                None,
+                "bad-request",
+                &format!("<unparseable, {} bytes>", line.len()),
+                false,
+                &e,
+            );
             return reply;
         }
     };
