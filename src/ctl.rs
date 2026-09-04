@@ -250,6 +250,106 @@ const GOVERNED_FLAGS: [&str; 3] = [
     "--allowedTools",
 ];
 
+/// Flags a *worker-supplied* argv may carry, per vendor.
+///
+/// This is an **allowlist**, and that inversion is the point. The governed-flag
+/// list below is a denylist of three names, and a denylist guarding a surface
+/// this large fails by omission: `--allowed-tools` (claude's own documented
+/// alias of `--allowedTools`) sailed through it, and so did `--mcp-config`,
+/// `--plugin-dir`, `--plugin-url` and `--settings` — each of which reaches code
+/// execution *outside* the tool-permission system entirely. An stdio MCP server
+/// is a command claude launches at startup; a plugin carries hooks. None of
+/// those names appears anywhere else in amux, so a worker could pass one
+/// verbatim in **every** mode, `plan` included.
+///
+/// So: name what a teammate is allowed to choose, and refuse the rest. The set
+/// is deliberately small — a spawn request selects a model and a session to
+/// resume, and nothing that changes what the agent is permitted to do. amux
+/// supplies the posture flags itself.
+fn worker_allowed_flags(stem: &str) -> Option<&'static [&'static str]> {
+    match stem {
+        // Model/effort selection and session continuation only.
+        "claude" => Some(&["--model", "--effort", "--continue", "-c", "--resume", "-r"]),
+        // codex takes `--model`; its approval flags are amux's to set (see
+        // `trust::codex_trust_args`), never the caller's.
+        "codex" => Some(&["--model", "-m"]),
+        // Any other AGENT stem — gemini, aider, cursor-agent — is one amux will
+        // bind but has no trust posture for, so it cannot cap what the agent may
+        // do. Refuse rather than guess.
+        _ => None,
+    }
+}
+
+/// The result of vetting a worker-supplied spawn argv.
+pub enum ArgvVerdict {
+    /// Safe to spawn. `stripped` names governed flags removed (surfaced in the
+    /// reply's `note` — never silent).
+    Ok {
+        argv: Vec<String>,
+        stripped: Vec<String>,
+    },
+    /// Refused, with the reason to hand back to the caller.
+    Refused(String),
+}
+
+/// Vet a ctl-spawn argv: refuse an unknown vendor or an unlisted flag, then
+/// strip the governed permission flags amux sets itself.
+///
+/// Pure, so the whole policy is unit-testable without spawning anything.
+pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
+    let Some(program) = argv.first() else {
+        return ArgvVerdict::Refused("spawn needs a command".to_string());
+    };
+    // Match the stem the way the rest of amux does, so a path or a `.cmd` shim
+    // resolves identically here and at bind time.
+    let stem = std::path::Path::new(program)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| program.clone());
+    let stem = stem.rsplit(['/', '\\']).next().unwrap_or(&stem).to_string();
+
+    let allowed = match worker_allowed_flags(&stem) {
+        Some(a) => a,
+        // Not an agent CLI at all — a shell, a build tool. There are no
+        // permission flags here to escape through, and whether the command may be
+        // spawned in the first place is the spawn allowlist's job, not this
+        // function's. Defer to it rather than duplicating (and disagreeing with)
+        // that policy here.
+        None if !crate::bind::is_agent_stem(&stem) => {
+            let (argv, stripped) = sanitize_spawn_argv(argv);
+            return ArgvVerdict::Ok { argv, stripped };
+        }
+        // An agent stem amux will bind but has no posture for: it would run
+        // uncapped, so a teammate must not be able to start one.
+        None => {
+            return ArgvVerdict::Refused(format!(
+                "refusing to spawn {stem:?}: no trust posture is defined for it, so amux \
+                 cannot cap what it may do"
+            ))
+        }
+    };
+
+    for a in argv.iter().skip(1) {
+        if !a.starts_with('-') {
+            continue; // a positional value (a prompt, a model name)
+        }
+        let head = a.split('=').next().unwrap_or(a);
+        if GOVERNED_FLAGS.contains(&head) {
+            continue; // governed: stripped below, and reported
+        }
+        if !allowed.contains(&head) {
+            return ArgvVerdict::Refused(format!(
+                "refusing to spawn {stem:?}: flag {head:?} is not one a teammate may \
+                 choose (allowed: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+
+    let (argv, stripped) = sanitize_spawn_argv(argv);
+    ArgvVerdict::Ok { argv, stripped }
+}
+
 /// Strip amux-governed permission flags (and their values) from a ctl-spawn
 /// argv, returning `(cleaned, stripped)` where `stripped` names the flags removed
 /// (surfaced in the spawn reply's `note` — never silent, per the guardrails).
@@ -1765,6 +1865,75 @@ mod tests {
             sanitize_spawn_argv(&v(&["claude", "--continue", "--model", "opus"]));
         assert_eq!(clean, v(&["claude", "--continue", "--model", "opus"]));
         assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn vet_refuses_the_flags_the_denylist_missed() {
+        // Each of these reaches code execution outside the tool-permission
+        // system, and none was in GOVERNED_FLAGS: an MCP server is a command
+        // claude launches at startup, a plugin carries hooks, a settings file
+        // can carry both.
+        for bad in [
+            "--mcp-config",
+            "--plugin-dir",
+            "--plugin-url",
+            "--settings",
+            "--allowed-tools", // claude's own alias of the governed --allowedTools
+        ] {
+            match vet_spawn_argv(&v(&["claude", bad, "x"])) {
+                ArgvVerdict::Refused(why) => assert!(
+                    why.contains(bad),
+                    "refusal should name the flag, got {why:?}"
+                ),
+                ArgvVerdict::Ok { .. } => panic!("{bad} was accepted"),
+            }
+        }
+    }
+
+    #[test]
+    fn vet_allows_what_a_teammate_may_legitimately_choose() {
+        match vet_spawn_argv(&v(&["claude", "--model", "opus", "--continue"])) {
+            ArgvVerdict::Ok { argv, stripped } => {
+                assert_eq!(argv, v(&["claude", "--model", "opus", "--continue"]));
+                assert!(stripped.is_empty());
+            }
+            ArgvVerdict::Refused(why) => panic!("legitimate spawn refused: {why}"),
+        }
+    }
+
+    #[test]
+    fn vet_still_strips_governed_flags_rather_than_refusing() {
+        // A governed flag is amux's to set, so asking for it is not an attack —
+        // it is reported and removed, exactly as before.
+        match vet_spawn_argv(&v(&["claude", "--dangerously-skip-permissions"])) {
+            ArgvVerdict::Ok { argv, stripped } => {
+                assert_eq!(argv, v(&["claude"]));
+                assert_eq!(stripped, v(&["--dangerously-skip-permissions"]));
+            }
+            ArgvVerdict::Refused(why) => panic!("governed flag should strip, not refuse: {why}"),
+        }
+    }
+
+    #[test]
+    fn vet_refuses_a_vendor_with_no_posture_mapping() {
+        // aider and cursor-agent are agent stems amux will bind, but it has no
+        // way to cap what they may do, so a teammate must not be able to spawn one.
+        for stem in ["aider", "cursor-agent", "gemini"] {
+            assert!(
+                matches!(vet_spawn_argv(&v(&[stem])), ArgvVerdict::Refused(_)),
+                "{stem} is an agent stem with no posture mapping and should be refused"
+            );
+        }
+        // A non-agent command is NOT this function's business: it carries no
+        // permission flags to escape through, and whether it may be spawned at
+        // all is the spawn allowlist's decision. Spawning a shell as a worker is
+        // a supported, tested use.
+        for stem in ["sh", "cmd", "bash"] {
+            assert!(
+                matches!(vet_spawn_argv(&v(&[stem])), ArgvVerdict::Ok { .. }),
+                "{stem} should be left to the spawn allowlist"
+            );
+        }
     }
 
     #[test]

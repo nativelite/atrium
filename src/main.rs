@@ -1075,7 +1075,16 @@ struct PendingSend {
     /// When the send was accepted — a fallback so a target that never yields a
     /// derivable status (a shell, a not-yet-bound agent) still gets it.
     queued_at: Instant,
-    /// `Some(t)` once the text has been written; `t` gates the follow-up Enter.
+    /// How many bytes of `text` the target's pty has actually accepted.
+    ///
+    /// `write(2)` returns a COUNT and may legitimately take less than offered —
+    /// a pty's input buffer is finite, and in canonical mode a single line is
+    /// capped near 1 KB. The old code discarded that count, marked the send
+    /// delivered, and submitted Enter regardless, so a long task arrived as a
+    /// fragment while `ctl` had already replied `ok:true`.
+    written: usize,
+    /// `Some(t)` once the text has been written IN FULL; `t` gates the follow-up
+    /// Enter. Never set on a partial write — Enter must not submit a fragment.
     text_written_at: Option<Instant>,
 }
 
@@ -3616,6 +3625,7 @@ fn dispatch_ctl(
                 target: id,
                 text: sr.text,
                 queued_at: Instant::now(),
+                written: 0,
                 text_written_at: None,
             });
             ctl::reply_sent(id, busy)
@@ -3633,8 +3643,18 @@ fn dispatch_ctl(
             //     ANY mode (elevation is the human directing); a non-operator
             //     **worker** is capped at the policy — it may match or de-escalate
             //     but never elevate itself. No `--mode` ⇒ inherit the policy.
-            let (cleaned_argv, stripped) = ctl::sanitize_spawn_argv(&sp.argv);
-            sp.argv = cleaned_argv;
+            // Vet before anything else: an unknown vendor or a flag a teammate
+            // may not choose is refused outright, not quietly cleaned. Stripping
+            // only ever covered three names, and the surface it guards — MCP
+            // servers, plugin dirs, settings files, all of which execute code at
+            // startup — is far larger than that.
+            let stripped = match ctl::vet_spawn_argv(&sp.argv) {
+                ctl::ArgvVerdict::Refused(why) => return ctl::reply_err(&why),
+                ctl::ArgvVerdict::Ok { argv, stripped } => {
+                    sp.argv = argv;
+                    stripped
+                }
+            };
             let mut notes: Vec<String> = Vec::new();
             if !stripped.is_empty() {
                 notes.push(format!(
@@ -4171,9 +4191,28 @@ fn flush_sends(
                 };
                 if ready {
                     if let Some(p) = pane_by_agent_mut(windows, ps.target) {
-                        let _ = p.pty.write(ps.text.as_bytes());
-                        ps.text_written_at = Some(now);
-                        wrote = true;
+                        // Write from where we left off and advance by what was
+                        // actually accepted. A short write is normal, not an
+                        // error: the pty's buffer is finite. Resuming across
+                        // ticks — rather than looping here until the whole thing
+                        // lands — is deliberate, because this runs on the single
+                        // event loop and a blocking write into a full buffer
+                        // would freeze every pane until the target drained it.
+                        let bytes = ps.text.as_bytes();
+                        match p.pty.write(&bytes[ps.written..]) {
+                            Ok(0) => {} // took nothing this tick; try the next
+                            Ok(n) => {
+                                ps.written += n;
+                                wrote = true;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => return false, // target unwritable — drop it
+                        }
+                        // Only now is the send real. Enter waits for the last byte.
+                        if ps.written >= bytes.len() {
+                            ps.text_written_at = Some(now);
+                        }
                     } else {
                         return false;
                     }
