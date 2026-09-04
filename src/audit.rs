@@ -151,6 +151,23 @@ impl Audit {
         filtered[start..].iter().map(|e| e.to_json()).collect()
     }
 
+    /// The lowest sequence number still in the ring, if any.
+    ///
+    /// The ring is bounded and evicts SILENTLY, so a reader had no way to tell a
+    /// quiet period from a rolled log. That matters: `list` is cheap and
+    /// recorded, so roughly `DEFAULT_CAP` calls push everything older out — an
+    /// attacker could exfiltrate the log and then erase what came before by
+    /// making noise. Reporting the oldest surviving seq lets a consumer notice
+    /// the gap (`oldest > 1` means entries are already gone).
+    pub fn oldest_seq(&self) -> Option<u64> {
+        self.ring.front().map(|e| e.seq)
+    }
+
+    /// The highest sequence number ever assigned, including entries since evicted.
+    pub fn latest_seq(&self) -> u64 {
+        self.seq
+    }
+
     /// Take and clear any pending file error, to surface it once in the bar.
     pub fn take_error(&mut self) -> Option<String> {
         self.file_error.take()
@@ -231,5 +248,33 @@ mod tests {
             note: String::new(),
         };
         assert_eq!(e.to_json().get("caller"), Some(&Value::Null));
+    }
+
+    /// Eviction must be VISIBLE (review #7).
+    ///
+    /// The ring is bounded and drops its tail silently, and `list` is both cheap
+    /// and recorded — so roughly `cap` calls push everything older out. Combined
+    /// with an unauthenticated read that was the erase half of "exfiltrate, then
+    /// cover your tracks". A consumer could not tell a quiet log from a rolled
+    /// one; now `oldest_seq() > 1` says so plainly.
+    #[test]
+    fn a_rolled_ring_reports_that_entries_are_gone() {
+        let mut a = Audit::new(4, None);
+        assert_eq!(a.oldest_seq(), None, "an empty log has no oldest entry");
+        for i in 0..4 {
+            a.record(Some(i), "list", "", true, "");
+        }
+        assert_eq!(a.oldest_seq(), Some(1), "nothing evicted yet");
+        assert_eq!(a.latest_seq(), 4);
+
+        // Two more push the first two out.
+        a.record(Some(9), "list", "", true, "");
+        a.record(Some(9), "list", "", true, "");
+        assert_eq!(
+            a.oldest_seq(),
+            Some(3),
+            "seq 1 and 2 were evicted and the log must admit it"
+        );
+        assert_eq!(a.latest_seq(), 6, "latest counts everything ever assigned");
     }
 }

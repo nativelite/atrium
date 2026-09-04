@@ -1117,10 +1117,22 @@ pub fn reply_killed(killed: &[usize]) -> String {
 /// `{"ok":true,"audit":[<entry>,…]}` — the (already-serialized, already-scoped)
 /// audit entries, oldest-first. The caller builds each entry `Value` from its
 /// own log so this crate stays free of the log's storage type.
-pub fn reply_audit(entries: Vec<Value>) -> String {
+pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> String {
+    // `oldest`/`latest` make eviction VISIBLE. The ring is bounded and drops the
+    // tail without saying so, so a consumer could not distinguish "nothing
+    // happened before this" from "the log has already rolled". `oldest > 1` means
+    // entries are gone for good.
     obj(vec![
         ("ok", Value::Bool(true)),
         ("audit", Value::Array(entries)),
+        (
+            "oldest_seq",
+            match oldest {
+                Some(n) => Value::Number(Number::Int(n as i64)),
+                None => Value::Null,
+            },
+        ),
+        ("latest_seq", Value::Number(Number::Int(latest as i64))),
     ])
     .to_string()
 }

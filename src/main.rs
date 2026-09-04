@@ -3537,10 +3537,14 @@ fn apply_ctl(
     let caller = req.caller;
     let privileged = caller_privileged(windows, caller);
 
-    // `audit` is served here (it reads the log) and is not itself recorded — a
-    // query of the log shouldn't pollute the log. It is subtree-scoped like any
-    // read: a worker sees only its own subtree's entries.
+    // `audit` reads the log, and IS recorded. It used to be exempt on the
+    // reasoning that a query shouldn't pollute what it queries — but that made
+    // the most sensitive read the only one leaving no trace, so exfiltrating the
+    // log was invisible after the fact. The entry is written before the reply is
+    // built, so a reader sees its own access: self-documenting, not hidden.
+    // Subtree-scoped like any read: a worker sees only its own subtree.
     if let Cmd::Audit(ar) = &req.cmd {
+        audit.record(caller, "audit", "read", true, "");
         return audit_reply(audit, windows, caller, privileged, ar.tail);
     }
 
@@ -3991,7 +3995,7 @@ fn audit_reply(
     } else {
         audit.view(tail, |_| true)
     };
-    amux::ctl::reply_audit(entries)
+    amux::ctl::reply_audit(entries, audit.oldest_seq(), audit.latest_seq())
 }
 
 /// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
