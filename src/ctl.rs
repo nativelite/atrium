@@ -170,7 +170,8 @@ pub struct SpawnReq {
     /// may only pass down an identity it itself holds. `None` = no identity
     /// (ambient env), the default.
     pub identity: Option<String>,
-    /// The permission mode this spawn requested (`--mode plan|accept|automode`),
+    /// The permission mode this spawn requested
+    /// (`--mode plan|accept|automode|skip`),
     /// if any. `None` ⇒ inherit the session policy (the launch `--trust`). When
     /// set, amux honors it for the operator (root pane) and, for a non-operator
     /// worker, caps it at the session policy — a worker may match or de-escalate
@@ -480,7 +481,22 @@ pub const ENV_ALLOW: &str = "AMUX_CTL_ALLOW";
 
 /// Read [`ENV_ALLOW`] into the extra-allow list (trimmed, empties dropped).
 pub fn extra_allow_from_env() -> Vec<String> {
-    std::env::var(ENV_ALLOW)
+    parse_allow_list(ENV_ALLOW)
+}
+
+/// Parse a comma-separated allowlist from an environment variable.
+///
+/// Shared by [`extra_allow_from_env`] here and [`crate::trust::extra_allow_from_env`],
+/// which read DIFFERENT variables gating DIFFERENT security postures — the ctl
+/// spawn allowlist and claude's own tool allowlist. The two functions had
+/// byte-identical bodies, and a review flagged that as duplication to merge.
+///
+/// Do NOT merge them. They are deliberately separate policies, and collapsing
+/// them would let one variable widen the other's gate — a security bug, not a
+/// cleanup. What was actually worth sharing is the PARSING, so the two cannot
+/// drift on how they split, trim, or treat empties.
+pub fn parse_allow_list(var: &str) -> Vec<String> {
+    std::env::var(var)
         .ok()
         .map(|v| {
             v.split(',')

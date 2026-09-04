@@ -53,16 +53,11 @@ const DEFAULT_ALLOW: &[&str] = &[
 
 /// Read [`ENV_TRUST_ALLOW`] into extra allow prefixes (trimmed, empties dropped).
 pub fn extra_allow_from_env() -> Vec<String> {
-    std::env::var(ENV_TRUST_ALLOW)
-        .ok()
-        .map(|v| {
-            v.split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    // Shares only the PARSING with `ctl::extra_allow_from_env`. The two read
+    // different variables and gate different postures — this one widens claude's
+    // own tool allowlist, that one the ctl spawn allowlist — so they must stay
+    // separate functions even though their bodies once looked identical.
+    crate::ctl::parse_allow_list(ENV_TRUST_ALLOW)
 }
 
 /// Build the claude CLI args for the safe hands-off `--trust` posture:
