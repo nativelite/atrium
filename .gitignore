@@ -3,3 +3,6 @@
 # reproducible dependency graph is checked in for outsider builds. (Library
 # crates in the org still gitignore theirs.) Updating an org-crate dep now means
 # `cargo update -p <crate>` + committing the refreshed Cargo.lock.
+
+# Workflow worktrees and agent scratch — never part of the tree.
+.claude/

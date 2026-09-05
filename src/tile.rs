@@ -198,7 +198,7 @@ const SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '�
 /// is entirely default cells. Short-circuits on the first non-blank cell, so a
 /// pane that has painted (the common case) is cheap; the full scan only runs
 /// while a pane is still blank (its brief loading phase).
-pub fn screen_is_blank(s: &Screen) -> bool {
+fn screen_is_blank(s: &Screen) -> bool {
     let blank = Cell::default();
     for r in 0..s.rows() {
         for c in 0..s.cols() {
