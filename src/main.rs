@@ -3442,6 +3442,10 @@ fn fleet_up(
     // Still a request, not an override: `set_trust_mode` publishes it, and the
     // ancestry cap has already lowered `trust` if this amux is nested, so a fleet
     // asking for `skip` inside a `plan` session does not get it.
+    // The file may switch the control plane on, as `--allow-ctl` does. A
+    // coordinating fleet without ctl fails silently — panes come up and publish
+    // into nothing — and that has already cost a run.
+    let allow_ctl = allow_ctl || fleet.allow_ctl.unwrap_or(false);
     let trust = match (trust, fleet.trust.as_deref()) {
         (amux::ctl::TrustMode::Off, Some(declared)) => {
             match amux::ctl::TrustMode::from_policy_keyword(declared) {
@@ -3473,9 +3477,10 @@ fn fleet_up(
     // and skimmed by a human; a line naming what everything is about to run under
     // is the difference between reviewing it and assuming it.
     eprintln!(
-        "amux fleet: {name} starting {} agent(s) at trust {}",
+        "amux fleet: {name} starting {} agent(s) at trust {}{}",
         fleet.agents.len(),
-        trust.policy_label()
+        trust.policy_label(),
+        if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.

@@ -225,6 +225,10 @@ The file is read **read-only** — amux never writes it.
 
 - **`grid`** (optional) — an `RxC` layout that must fit the agent count; omit it
   and the window auto-grids from the number of agents.
+- **`allow_ctl`** (optional) — bring the control plane up, as `--allow-ctl`
+  does. A fleet whose agents coordinate is dead without it, and silently so: the
+  panes come up and publish into a bus that is not there. If the file is the
+  complete definition of a spin-up, this belongs in it.
 - **`trust`** (optional) — the posture the whole fleet runs at (`plan`,
   `accept`, `automode`, `skip`). A fleet is launched to run hands-off, so it needs
   one; declaring it here keeps it with the roster it applies to and out of a flag

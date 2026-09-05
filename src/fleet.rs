@@ -74,6 +74,16 @@ pub struct Fleet {
     /// ceiling still caps it, so a fleet file asking for `skip` inside a `plan`
     /// session gets `plan`.
     pub trust: Option<String>,
+    /// Optional: bring the control plane up for this fleet, as `--allow-ctl`
+    /// does. `true` in the file is equivalent to passing the flag.
+    ///
+    /// A fleet whose agents coordinate — the whole reason to run one — is dead
+    /// without ctl, and silently so: the panes come up, the kickoffs tell them to
+    /// publish to a bus that is not there, and nothing happens. That failure has
+    /// already been hit in practice. If the file is meant to be the complete,
+    /// reviewable definition of a spin-up, the control plane belongs in it rather
+    /// than in a flag the operator has to remember.
+    pub allow_ctl: Option<bool>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -201,6 +211,13 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         ),
         None => None,
     };
+    let allow_ctl = match get("allow_ctl") {
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("fleet {name:?}: \"allow_ctl\" must be true or false"))?,
+        ),
+        None => None,
+    };
     let trust = match get("trust") {
         Some(v) => Some(
             v.as_str()
@@ -234,6 +251,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
     Ok(Fleet {
         grid,
         trust,
+        allow_ctl,
         identity,
         agents,
     })
@@ -661,6 +679,29 @@ mod tests {
     }
 
     // --- discovery -----------------------------------------------------------
+
+    #[test]
+    fn a_fleet_can_declare_the_control_plane() {
+        // A coordinating fleet without ctl fails SILENTLY: panes come up, the
+        // kickoffs tell them to publish to a bus that does not exist, and nothing
+        // happens. Declaring it in the file removes a flag that has to be
+        // remembered every launch.
+        let f = parse(
+            r#"{ "fleets": { "a": { "allow_ctl": true,
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(f.get("a").unwrap().allow_ctl, Some(true));
+    }
+
+    #[test]
+    fn a_non_bool_allow_ctl_is_a_clear_error() {
+        let err = parse(
+            r#"{ "fleets": { "a": { "allow_ctl": "yes", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("allow_ctl"), "unhelpful error: {err}");
+    }
 
     #[test]
     fn a_fleet_can_declare_its_own_trust_posture() {
