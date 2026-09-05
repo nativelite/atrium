@@ -468,6 +468,12 @@ fn hermetic_env(dir: &std::path::Path) -> Vec<(String, String)> {
     vec![
         ("XDG_CONFIG_HOME".to_string(), d.clone()),
         ("APPDATA".to_string(), d),
+        // `fleet up` holds for an Enter before handing the screen to the TUI, so
+        // the operator actually sees what the roster granted — the banner is
+        // otherwise drawn and then wiped by the alt-screen switch on the next
+        // line. A test's stdin IS a tty (it runs under a pty), so without this it
+        // waits for a keypress nobody sends.
+        ("AMUX_YES".to_string(), "1".to_string()),
     ]
 }
 

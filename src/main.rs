@@ -1536,6 +1536,35 @@ fn main() -> ExitCode {
     )
 }
 
+/// Wait for the operator to acknowledge a fleet's banner before the TUI takes the
+/// screen. Returns false if they decline.
+///
+/// Non-interactive callers (no tty on stdin, or `AMUX_YES=1`) proceed without
+/// asking - there is nobody to answer, and blocking a scripted launch forever is
+/// worse than not confirming it. The banner is still printed either way, so a log
+/// records what was granted.
+fn fleet_ack() -> bool {
+    if std::env::var_os("AMUX_YES").is_some() {
+        return true;
+    }
+    // SAFETY: isatty on a borrowed fd, no ownership taken.
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn isatty(fd: i32) -> i32;
+        }
+        if unsafe { isatty(0) } == 0 {
+            return true;
+        }
+    }
+    eprint!("amux fleet: press Enter to start, or Ctrl+C to abort... ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    // A read error (closed stdin) is not consent, but it is also not a reason to
+    // hang: treat it as the non-interactive case we already allow.
+    std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line).is_ok()
+}
+
 /// Plain-English confirmation gate for `--skip-permissions` (full bypass). Prints
 /// what it does and the risk, then reads one line from stdin: only an explicit
 /// `y`/`yes` proceeds. Any other input, EOF, or a non-interactive stdin aborts,
@@ -3549,6 +3578,25 @@ fn fleet_up(
             format!(" ({})", spawners.join(", "))
         }
     );
+    // Hold here until the operator acknowledges.
+    //
+    // Everything above is printed to the NORMAL screen buffer, and the run loop's
+    // first act is `\x1b[?1049h\x1b[2J\x1b[H` - switch to the alternate screen and
+    // clear. Nothing blocked in between, so the banner was drawn and hidden in the
+    // same breath: an operator never saw the posture, the control plane state, or
+    // who may spawn. The entire argument for putting those in the file rather than
+    // in flags was that they would be VISIBLE at approval time, and they were not.
+    //
+    // A fleet file can be written by an agent and run by a human, and the running
+    // IS the approval - so the approval should be an act, not an assumption. One
+    // keypress is proportionate to starting N agents with filesystem access.
+    //
+    // Skipped when stdin is not a terminal (a script, CI) or `AMUX_YES=1`, since
+    // there is nobody to ask; the banner still prints for the log.
+    if !fleet_ack() {
+        eprintln!("amux fleet: aborted.");
+        return ExitCode::SUCCESS;
+    }
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.
     set_trust_mode(trust);
