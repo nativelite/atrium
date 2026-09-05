@@ -36,6 +36,18 @@ pub const ENV_TRUST_ALLOW: &str = "AMUX_TRUST_ALLOW";
 /// not extended via [`ENV_TRUST_ALLOW`]) still surfaces as a visible approval
 /// prompt in the pane — that is the safety of this mode.
 const DEFAULT_ALLOW: &[&str] = &[
+    // amux itself. Without this a coordinating fleet cannot use the coordination
+    // layer: every `amux ctl bus pub` / `board claim` in an agent's kickoff
+    // surfaces an approval prompt, so the operator is asked to approve the very
+    // messages the fleet exists to exchange. Seven agents then queue up asking
+    // permission to do their jobs.
+    //
+    // Safe to allow now in a way it was not before: a nested `amux --trust skip`
+    // is capped to this session's policy by the ancestry check, `fleet up` is
+    // gated the same way, and `ctl spawn` is separately governed by the spawn
+    // allowlist and the trust ceiling. So the dangerous things amux can be asked
+    // to do are already bounded, and what remains is talking to its own bus.
+    "amux",
     "python",
     "python3",
     "pytest",
