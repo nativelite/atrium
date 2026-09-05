@@ -62,6 +62,18 @@ pub struct Fleet {
     /// Optional default identity applied to every agent that does not name its
     /// own. `None` → agents run under their own identity or ambient creds.
     pub identity: Option<String>,
+    /// Optional trust posture for the whole fleet (`"plan"`, `"accept"`,
+    /// `"automode"`, `"skip"`), used when the command line does not pass
+    /// `--trust`.
+    ///
+    /// A fleet is exactly the case where a CLI flag is the wrong home for this:
+    /// you launch it to run hands-off, so it needs a posture, and typing one
+    /// every time is a flag you will eventually get wrong. Declared here it lives
+    /// with the roster it applies to, is reviewable in a diff, and different
+    /// fleets can differ. It remains a REQUEST, not an override — the session
+    /// ceiling still caps it, so a fleet file asking for `skip` inside a `plan`
+    /// session gets `plan`.
+    pub trust: Option<String>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -189,6 +201,14 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         ),
         None => None,
     };
+    let trust = match get("trust") {
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| format!("fleet {name:?}: \"trust\" must be a string"))?
+                .to_string(),
+        ),
+        None => None,
+    };
     let identity = match get("identity") {
         Some(v) => Some(
             v.as_str()
@@ -213,6 +233,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
 
     Ok(Fleet {
         grid,
+        trust,
         identity,
         agents,
     })
@@ -640,6 +661,36 @@ mod tests {
     }
 
     // --- discovery -----------------------------------------------------------
+
+    #[test]
+    fn a_fleet_can_declare_its_own_trust_posture() {
+        // A fleet is launched to run hands-off, so it needs a posture — and a CLI
+        // flag typed on every launch is one you eventually get wrong. Declared in
+        // the file it lives with the roster and shows up in a diff.
+        let f = parse(
+            r#"{ "fleets": { "a": { "trust": "accept",
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(f.get("a").unwrap().trust.as_deref(), Some("accept"));
+    }
+
+    #[test]
+    fn a_fleet_without_a_trust_key_declares_nothing() {
+        let f =
+            parse(r#"{ "fleets": { "a": { "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#)
+                .unwrap();
+        assert_eq!(f.get("a").unwrap().trust, None);
+    }
+
+    #[test]
+    fn a_non_string_trust_is_a_clear_error() {
+        let err = parse(
+            r#"{ "fleets": { "a": { "trust": 3, "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("trust"), "unhelpful error: {err}");
+    }
 
     #[test]
     fn discover_finds_the_local_file_first() {

@@ -46,6 +46,11 @@ static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
 /// decision on the first loop tick - an agent quietly launching its own amux is
 /// something the operator should be asked about, not just told once on stderr.
 static CAP_NOTICE: OnceLock<String> = OnceLock::new();
+/// The amux session this one is nested under, if any. Recorded in our registry
+/// so the parent's warden can tell a legitimate nested session from one that
+/// double-forked to escape its ceiling - without it, both look like "a
+/// descendant appeared" and enforcement would kill the innocent one.
+static NESTED_UNDER: OnceLock<u32> = OnceLock::new();
 /// How often the warden re-reads what it snapshotted. Slow on purpose: a
 /// tripwire that costs the event loop is a tripwire that gets removed.
 const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
@@ -1433,6 +1438,9 @@ fn main() -> ExitCode {
     // parent. A double-fork still erases the trail - that case belongs to the
     // warden, which watches for sessions the cap could not account for.
     if let Some(parent) = amux::warden::amux_ancestor() {
+        // Declare the relationship even when no cap was needed: the parent's
+        // warden reads this to know we are accounted for.
+        let _ = NESTED_UNDER.set(parent);
         let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
             .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
         if let Some(ceiling) = inherited {
@@ -1760,8 +1768,12 @@ fn run(
                 for pid in cur.iter().filter(|p| !registered.contains(p)) {
                     session_job.assign(*pid);
                 }
-                let _ =
-                    amux::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
+                let _ = amux::reap::write_registry(
+                    &registry_path,
+                    &cur,
+                    trust_mode().policy_label(),
+                    NESTED_UNDER.get().copied(),
+                );
                 warden.registry_rewritten();
                 registered = cur;
             }
@@ -3379,9 +3391,6 @@ fn fleet_up(
     max_depth: usize,
     trust: amux::ctl::TrustMode,
 ) -> ExitCode {
-    // Publish the trust policy before the fleet's panes are spawned (they read it
-    // via `trust_mode()`), so every agent comes up under the requested posture.
-    set_trust_mode(trust);
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let located = match amux::fleet::discover(&cwd) {
         Ok(l) => l,
@@ -3412,6 +3421,33 @@ fn fleet_up(
             return ExitCode::FAILURE;
         }
     };
+
+    // A fleet may declare its own posture, and the command line wins when it says
+    // anything. A fleet exists to run hands-off, so it NEEDS a posture — and
+    // typing one on every launch is a flag you eventually get wrong. Declared in
+    // the file it lives with the roster it applies to and is reviewable in a diff.
+    //
+    // Still a request, not an override: `set_trust_mode` publishes it, and the
+    // ancestry cap has already lowered `trust` if this amux is nested, so a fleet
+    // asking for `skip` inside a `plan` session does not get it.
+    let trust = match (trust, fleet.trust.as_deref()) {
+        (amux::ctl::TrustMode::Off, Some(declared)) => {
+            match amux::ctl::TrustMode::from_policy_keyword(declared) {
+                Some(m) => m,
+                None => {
+                    eprintln!(
+                        "amux fleet: fleet {name:?} declares trust {declared:?}, which is not \
+                         one of plan, accept, automode, skip"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        (cli, _) => cli,
+    };
+    // Publish the trust policy before the fleet's panes are spawned (they read it
+    // via `trust_mode()`), so every agent comes up under the resolved posture.
+    set_trust_mode(trust);
 
     // Grid: explicit `RxC` (must fit the agent count) or an auto balanced grid.
     let n = fleet.agents.len();

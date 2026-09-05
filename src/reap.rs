@@ -413,7 +413,12 @@ pub fn registry_path(pid: u32) -> PathBuf {
 
 /// Record this session's pane process groups. Rewritten whenever the set
 /// changes, so a watchdog started early still learns about panes spawned later.
-pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()> {
+pub fn write_registry(
+    path: &Path,
+    pgids: &[u32],
+    policy: &str,
+    capped_by: Option<u32>,
+) -> io::Result<()> {
     // The `policy=` line is what a NESTED amux reads to learn the ceiling it must
     // cap itself at. It lives on disk rather than in the environment on purpose:
     // an agent owns its own environment and can `env -u` any marker away, but it
@@ -422,10 +427,29 @@ pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()
     // `read_registry` parses lines as pids and drops anything unparseable, so this
     // line is invisible to it and older readers are unaffected.
     let mut body = format!("policy={policy}\n");
+    // Declaring which session capped us is what lets a parent tell a LEGITIMATE
+    // nested amux from one that double-forked to escape. Without it the warden
+    // sees only "a descendant appeared" and cannot tell the two apart - which is
+    // how enforcement would have killed a nested session that behaved perfectly.
+    if let Some(parent) = capped_by {
+        body.push_str(&format!("capped_by={parent}\n"));
+    }
+
     for p in pgids {
         body.push_str(&format!("{p}\n"));
     }
     std::fs::write(path, body)
+}
+
+/// The session that capped this one, if it declared one.
+pub fn read_capped_by(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok().and_then(|t| {
+        t.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("capped_by=")
+                .and_then(|v| v.parse().ok())
+        })
+    })
 }
 
 /// The trust policy a session recorded, if any. Read by a nested amux to find

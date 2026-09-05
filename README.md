@@ -225,6 +225,12 @@ The file is read **read-only** — amux never writes it.
 
 - **`grid`** (optional) — an `RxC` layout that must fit the agent count; omit it
   and the window auto-grids from the number of agents.
+- **`trust`** (optional) — the posture the whole fleet runs at (`plan`,
+  `accept`, `automode`, `skip`). A fleet is launched to run hands-off, so it needs
+  one; declaring it here keeps it with the roster it applies to and out of a flag
+  you retype every launch. `--trust` on the command line wins when given. It is a
+  **request, not an override**: if this amux is itself running inside another
+  amux, the outer session's policy still caps it.
 - **`identity`** (optional) — a default `akey` identity for every agent; a
   per-agent `identity` overrides it. Resolved via `akey` and injected per pane
   exactly as `--identity` does — the pane shows the `·<name>` tag (the **name**

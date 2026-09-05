@@ -44,6 +44,19 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long a newly-seen descendant has to declare that it accepted our ceiling
+/// before the warden treats it as an escapee. A legitimately nested amux writes
+/// that record on its first loop tick; this is slack for the race, not patience
+/// with evasion.
+const ESCAPEE_GRACE: Duration = Duration::from_secs(5);
+
+/// Does this pid still exist? A session that has already gone needs neither an
+/// alert nor a kill.
+fn pid_exists(pid: u32) -> bool {
+    crate::reap::pid_alive(pid)
+}
 
 /// Something the warden noticed. Never fatal on its own — the operator decides.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +100,8 @@ pub struct Warden {
     /// New sessions that are descendants of ours: the escape the ancestry cap
     /// could not catch, and the only thing enforcement acts on.
     escapees: HashSet<u32>,
+    /// Descendants seen but not yet judged - see `ESCAPEE_GRACE`.
+    pending: std::collections::HashMap<u32, Instant>,
 }
 
 impl Warden {
@@ -103,6 +118,7 @@ impl Warden {
             registry,
             known_sessions,
             escapees: HashSet::new(),
+            pending: std::collections::HashMap::new(),
         }
     }
 
@@ -168,11 +184,39 @@ impl Warden {
             if !is_descendant_of(pid, std::process::id()) {
                 continue;
             }
+            // A descendant is not yet an escapee. A legitimately nested amux caps
+            // itself against our policy and records `capped_by=<us>`; one that
+            // double-forked to evade never does. Judging on descent ALONE would
+            // condemn the well-behaved case — and under enforcement, kill it.
+            //
+            // The record is written on the child's first loop tick, so a session
+            // seen moments ago may simply not have got there yet. Hold it in
+            // `pending` and decide after the grace period rather than racing it.
+            self.pending.entry(pid).or_insert_with(Instant::now);
+        }
+
+        // Now judge anything whose grace period has expired.
+        let me = std::process::id();
+        let ripe: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, seen)| seen.elapsed() >= ESCAPEE_GRACE)
+            .map(|(pid, _)| *pid)
+            .collect();
+        for pid in ripe {
+            self.pending.remove(&pid);
+            if crate::reap::read_capped_by(&crate::reap::registry_path(pid)) == Some(me) {
+                continue; // capped against our policy: behaving exactly as intended
+            }
+            if !pid_exists(pid) {
+                continue; // gone already; nothing to report or act on
+            }
             self.escapees.insert(pid);
             out.push(Alert {
                 kind: "warden-session-appeared",
                 detail: format!(
-                    "an amux session (pid {pid}) started underneath this one without being capped"
+                    "an amux session (pid {pid}) is running underneath this one without \
+                     accepting its ceiling"
                 ),
             });
         }
@@ -206,10 +250,17 @@ impl Warden {
         acted
     }
 
-    /// Is enforcement switched on?
+    /// Is enforcement switched on? Yes, unless explicitly asked to only report.
+    ///
+    /// It was opt-in while "escapee" meant merely "a descendant appeared", which
+    /// would have killed a perfectly well-behaved nested amux. Now that an
+    /// escapee is one that failed to declare it accepted our ceiling — after a
+    /// grace period, and only if it still exists — the finding is specific
+    /// enough to act on: nothing reaches it by accident. `AMUX_WARDEN=report`
+    /// turns it back down to alerts.
     pub fn enforcing() -> bool {
-        std::env::var("AMUX_WARDEN")
-            .map(|v| v.eq_ignore_ascii_case("enforce"))
+        !std::env::var("AMUX_WARDEN")
+            .map(|v| v.eq_ignore_ascii_case("report"))
             .unwrap_or(false)
     }
 
