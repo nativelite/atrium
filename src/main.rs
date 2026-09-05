@@ -3409,6 +3409,18 @@ fn fleet_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// Defang a fleet-file string before it reaches the terminal.
+///
+/// Every string in `amux.fleet.json` is attacker-shaped in the workflow this
+/// feature is built for - an agent writes the roster, a human reads the banner
+/// and presses Enter - and the `json` parser decodes `\u001b`, so an agent name
+/// or a path can carry a real ESC. Unfiltered it can clear the screen and
+/// repaint a forged "every agent dir resolves inside" line over the disclosure
+/// the human is about to approve.
+fn fsan(s: &str) -> String {
+    amux::fleet::sanitize(s)
+}
+
 /// List the fleet names in the discovered fleet file, in file order. A missing
 /// file or a malformed one is a clear error on stderr (non-zero exit).
 fn fleet_ls() -> ExitCode {
@@ -3438,8 +3450,13 @@ fn fleet_ls() -> ExitCode {
     if names.is_empty() {
         println!("(no fleets defined in {})", located.path.display());
     } else {
+        // Defanged: the fleet file supplies these and the `json` parser decodes
+        // `\u001b`, so a fleet name can carry a real ESC and clear the terminal
+        // this is being read on. `fsan` escapes control characters and nothing
+        // else - no truncation, no backslash doubling - so an ordinary name
+        // still round-trips through `amux fleet ls | xargs amux fleet up`.
         for name in names {
-            println!("{name}");
+            println!("{}", fsan(name));
         }
     }
     ExitCode::SUCCESS
@@ -3481,8 +3498,16 @@ fn fleet_up(
     let fleet = match fleets.get(name) {
         Some(f) => f.clone(),
         None => {
-            let available = fleets.names().join(", ");
-            eprintln!("amux fleet: no fleet named {name:?} (available: {available})");
+            let available = fleets
+                .names()
+                .iter()
+                .map(|n| fsan(n))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "amux fleet: no fleet named \"{}\" (available: {available})",
+                fsan(name)
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -3526,15 +3551,6 @@ fn fleet_up(
         eprintln!("amux fleet: aborted.");
         return ExitCode::SUCCESS;
     }
-    // Always say the posture out loud. A fleet file can be authored by an agent
-    // and skimmed by a human; a line naming what everything is about to run under
-    // is the difference between reviewing it and assuming it.
-    eprintln!(
-        "amux fleet: {name} starting {} agent(s) at trust {}{}",
-        fleet.agents.len(),
-        trust.policy_label(),
-        if allow_ctl { ", ctl on" } else { ", ctl OFF" }
-    );
     // Vet every agent's argv exactly as `ctl spawn` does. A fleet file's `cmd` was
     // spawned VERBATIM, so it could embed `--dangerously-skip-permissions`,
     // `--mcp-config`, `--plugin-dir` - the flags the spawn vetting exists to
@@ -3544,29 +3560,119 @@ fn fleet_up(
     // That matters most in the workflow this file is built for: an agent writes
     // the roster, a human reviews and runs it. A flag buried in `cmd` that a skim
     // misses defeats the review, and no ceiling downstream can undo it.
+    //
+    // Its notes are collected rather than printed here: everything the operator
+    // must weigh has to be on the screen at the Enter prompt, so the printing
+    // order is chosen once, below.
+    let mut notes: Vec<String> = Vec::new();
     for a in &fleet.agents {
         match amux::ctl::vet_spawn_argv(&a.cmd) {
             amux::ctl::ArgvVerdict::Refused(why) => {
-                eprintln!("amux fleet: agent {:?}: {why}", a.name);
+                eprintln!("amux fleet: agent \"{}\": {why}", fsan(&a.name));
                 return ExitCode::FAILURE;
             }
             amux::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
-                eprintln!(
-                    "amux fleet: agent {:?}: ignoring {} — set the posture with \"trust\" instead",
-                    a.name,
-                    stripped.join(", ")
-                );
+                notes.push(format!(
+                    "agent \"{}\": ignoring {} — set the posture with \"trust\" instead",
+                    fsan(&a.name),
+                    fsan(&stripped.join(", "))
+                ));
             }
             amux::ctl::ArgvVerdict::Ok { .. } => {}
         }
     }
 
+    // Grid: explicit `RxC` (must fit the agent count) or an auto balanced grid.
+    // Checked BEFORE the banner: never ask a human to approve a launch that
+    // cannot happen anyway.
+    let n = fleet.agents.len();
+    let grid = match &fleet.grid {
+        Some(spec) => match amux::spawn::Grid::parse_spec(spec) {
+            Ok(g) if g.total() >= n => g,
+            Ok(g) => {
+                eprintln!(
+                    "amux fleet: grid {:?} has {} cells but fleet \"{}\" has {n} agents",
+                    fsan(spec),
+                    g.total(),
+                    fsan(name)
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                eprintln!("amux fleet: fleet \"{}\": {e}", fsan(name));
+                return ExitCode::FAILURE;
+            }
+        },
+        None => amux::spawn::Grid::balanced(n.max(2)),
+    };
+
+    // Resolve every directory this roster grants — ONCE. `plan` is what the
+    // banner prints and what `spawn_fleet_window` launches with, so the two
+    // cannot drift: resolving a second time inside the spawn is how an
+    // acknowledged "inside" became a live grant on a credential store when a
+    // symlink was re-pointed during the operator's Enter window.
+    let anchor = amux::fleet::anchor_for(
+        &located.dir,
+        &cwd,
+        located.global,
+        amux::fleet::home_dir().as_deref(),
+    );
+    let plan = amux::fleet::Plan::build(
+        &fleet,
+        &located.path,
+        &located.dir,
+        anchor,
+        &amux::fleet::Stores::live(),
+    );
+
+    // Validate every agent's cwd *before* spawning anything, so a bad path never
+    // leaves a half-open fleet. `is_dir`, not "exists": a cwd naming a regular
+    // file passes an existence check, then fails in the pty spawn with ENOTDIR
+    // after raw mode is on and panes are already up.
+    for ap in &plan.agents {
+        if let Some(g) = &ap.cwd {
+            if !g.given.is_dir() {
+                eprintln!(
+                    "amux fleet: agent \"{}\": cwd {} is not a directory",
+                    ap.label,
+                    amux::fleet::show_path(&g.given)
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // The disclosure, then the posture, then the verdict, then the Enter.
+    //
+    // Order is load-bearing and was measured: a six-agent roster's banner is
+    // taller than a 24-row terminal, so whatever prints FIRST is what scrolls
+    // away. The per-grant lines are the long, skimmable part; the posture, the
+    // spawn capability and the verdict are the short, decisive part, so they go
+    // last and are still on screen when the prompt appears.
+    for line in plan.banner_lines() {
+        eprintln!("amux fleet: {line}");
+    }
+    for note in &notes {
+        eprintln!("amux fleet: {note}");
+    }
+    // Always say the posture out loud. A fleet file can be authored by an agent
+    // and skimmed by a human; a line naming what everything is about to run under
+    // is the difference between reviewing it and assuming it.
+    eprintln!(
+        "amux fleet: \"{}\" starting {} agent(s) at trust {}{}",
+        fsan(name),
+        fleet.agents.len(),
+        trust.policy_label(),
+        if allow_ctl { ", ctl on" } else { ", ctl OFF" }
+    );
+
     // Who may create teammates is part of what the human approves, so say it.
-    let spawners: Vec<&str> = fleet
+    let spawners: Vec<String> = plan
         .agents
         .iter()
-        .filter(|a| a.can_spawn.unwrap_or(false))
-        .map(|a| a.name.as_str())
+        .zip(fleet.agents.iter())
+        .filter(|(_, a)| a.can_spawn.unwrap_or(false))
+        .map(|(ap, _)| ap.label.clone())
         .collect();
     eprintln!(
         "amux fleet: {} of {} may spawn teammates{}",
@@ -3578,6 +3684,11 @@ fn fleet_up(
             format!(" ({})", spawners.join(", "))
         }
     );
+    // The last line before the block, so it cannot scroll: it NAMES the
+    // destinations rather than counting them. A surviving summary line that
+    // omits the payload is the one thing an operator is guaranteed to read and
+    // the one thing that tells them nothing.
+    eprintln!("amux fleet: {}", plan.verdict());
     // Hold here until the operator acknowledges.
     //
     // Everything above is printed to the NORMAL screen buffer, and the run loop's
@@ -3601,42 +3712,6 @@ fn fleet_up(
     // via `trust_mode()`), so every agent comes up under the resolved posture.
     set_trust_mode(trust);
 
-    // Grid: explicit `RxC` (must fit the agent count) or an auto balanced grid.
-    let n = fleet.agents.len();
-    let grid = match &fleet.grid {
-        Some(spec) => match amux::spawn::Grid::parse_spec(spec) {
-            Ok(g) if g.total() >= n => g,
-            Ok(g) => {
-                eprintln!(
-                    "amux fleet: grid {spec:?} has {} cells but fleet {name:?} has {n} agents",
-                    g.total()
-                );
-                return ExitCode::FAILURE;
-            }
-            Err(e) => {
-                eprintln!("amux fleet: fleet {name:?}: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => amux::spawn::Grid::balanced(n.max(2)),
-    };
-
-    // Validate every agent's cwd *before* spawning anything, so a bad path never
-    // leaves a half-open fleet.
-    for a in &fleet.agents {
-        if let Some(dir) = &a.cwd {
-            let resolved = amux::fleet::resolve_dir(&located.dir, dir);
-            if !resolved.is_dir() {
-                eprintln!(
-                    "amux fleet: agent {:?}: cwd {} does not exist",
-                    a.name,
-                    resolved.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
@@ -3656,10 +3731,10 @@ fn fleet_up(
     } else {
         None
     };
-    let window = match spawn_fleet_window(&fleet, &located.dir, grid, rows, cols, &mut flash) {
+    let window = match spawn_fleet_window(&fleet, &plan, grid, rows, cols, &mut flash) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("amux fleet: cannot start fleet {name:?}: {e}");
+            eprintln!("amux fleet: cannot start fleet \"{}\": {e}", fsan(name));
             return ExitCode::FAILURE;
         }
     };
@@ -3682,6 +3757,38 @@ fn fleet_up(
     )
 }
 
+/// The argv and working directory one fleet agent is actually spawned with.
+///
+/// Split out as a pure seam because this is the join between what the operator
+/// approved and what runs. The directories come from the disclosed plan - the
+/// paths already resolved through symlinks - NOT from the file's strings
+/// re-resolved here. Re-resolving was a second, independent computation of the
+/// same question, and a symlink re-pointed between the banner and the spawn made
+/// the two answers differ: the operator acknowledged "inside" and the child got
+/// a credential store. `spawn_fleet_window` is no longer handed the fleet
+/// directory at all, so it cannot resolve anything a second time even by
+/// accident.
+fn fleet_launch(
+    agent: &amux::fleet::Agent,
+    disclosed: &amux::fleet::AgentPlan,
+) -> (Vec<String>, Option<String>, String) {
+    let dirs: Vec<String> = disclosed
+        .add_dirs
+        .iter()
+        .map(|g| g.given.to_string_lossy().into_owned())
+        .collect();
+    let cwd = disclosed
+        .cwd
+        .as_ref()
+        .map(|g| g.given.to_string_lossy().into_owned());
+    // The role label comes from the plan too, and for the same reason it is
+    // defanged there: `role` is painted straight into the status bar and the
+    // overview by a painter that filters nothing, so an agent name carrying an
+    // ESC would repaint the live TUI - the crossing the banner closes one screen
+    // earlier.
+    (agent.args(&dirs), cwd, disclosed.label.clone())
+}
+
 /// Build the fleet's tiled window: one pane per agent, laid out on `grid`
 /// (agents fill leaf ids `0..n` row-major). Each pane runs the agent's `cmd`
 /// plus its fleet args (`--add-dir`/`--append-system-prompt`/`--model`/
@@ -3690,7 +3797,7 @@ fn fleet_up(
 /// killed and the whole window is abandoned — never a partial fleet.
 fn spawn_fleet_window(
     fleet: &amux::fleet::Fleet,
-    base_dir: &std::path::Path,
+    plan: &amux::fleet::Plan,
     grid: amux::spawn::Grid,
     rows: u16,
     cols: u16,
@@ -3704,30 +3811,17 @@ fn spawn_fleet_window(
     let cell_cols = ((cols as usize / grid.cols.max(1)).saturating_sub(2)).max(1) as u16;
 
     let mut panes: Vec<Pane> = Vec::with_capacity(fleet.agents.len());
-    for (id, agent) in fleet.agents.iter().enumerate() {
+    // Zipped, not indexed: `plan` holds exactly one entry per agent in the same
+    // order, and zipping makes that structural instead of a subscript that a
+    // later edit can knock out of alignment.
+    for ((id, agent), disclosed) in fleet.agents.iter().enumerate().zip(plan.agents.iter()) {
         // A fleet agent may NOT create teammates unless its entry says so. The
         // roster is the definition of the run, so the capability belongs in it -
         // and the safe default is the one that surprises nobody.
         let can_spawn = agent.can_spawn.unwrap_or(false);
-        // Resolve add_dirs against the fleet file's directory (absolute as-is).
-        let resolved_dirs: Vec<String> = agent
-            .add_dirs
-            .iter()
-            .map(|d| {
-                amux::fleet::resolve_dir(base_dir, d)
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        let command = agent.args(&resolved_dirs);
+        let (command, cwd, role) = fleet_launch(agent, disclosed);
         // Per-agent identity else the fleet default.
         let identity = agent.identity.as_deref().or(fleet.identity.as_deref());
-        // cwd resolved against the fleet dir (validated to exist by the caller).
-        let cwd = agent.cwd.as_ref().map(|d| {
-            amux::fleet::resolve_dir(base_dir, d)
-                .to_string_lossy()
-                .into_owned()
-        });
         match spawn_pane_full(
             &command,
             cell_rows,
@@ -3742,7 +3836,7 @@ fn spawn_fleet_window(
                 // Tag the pane with the agent's fleet name as its role, so the
                 // board/bus attribution (`by`/`from`), the overview, and the bar
                 // all show the persona (`lead`, `ada`) instead of `pane N`.
-                pane.role = Some(agent.name.clone());
+                pane.role = Some(role.clone());
                 // Capability, from the roster. `spawn_pane_full` defaults to the
                 // human-pane behaviour (true); a fleet agent gets only what its
                 // entry declares.
@@ -5137,6 +5231,52 @@ mod tests {
         assert!(!privilege_for(None, None));
         // Even if a pane were somehow associated, no token means no authority.
         assert!(!privilege_for(None, Some(None)));
+    }
+
+    /// The child is launched with the paths that were DISCLOSED, not with the
+    /// file's strings resolved a second time.
+    ///
+    /// Reverting this (mapping `Grant::raw` back through `resolve_dir`) is the
+    /// change that reopens the drift between the banner and the launch, and it
+    /// is invisible to every unit test of the classifier itself - the
+    /// classification stays correct while the spawn ignores it.
+    #[test]
+    fn a_fleet_agent_is_launched_with_the_paths_that_were_disclosed() {
+        use amux::fleet::{Agent, AgentPlan, Field, Grant, Reach};
+        let g = |raw: &str, given: &str, field| Grant {
+            field,
+            raw: raw.to_string(),
+            given: std::path::PathBuf::from(given),
+            real: Some(std::path::PathBuf::from(given)),
+            exists: true,
+            reach: Reach::Outside,
+            holds: None,
+        };
+        let agent = Agent {
+            name: "lead\u{1b}[2J".to_string(),
+            cmd: vec!["claude".to_string()],
+            cwd: Some("./work".to_string()),
+            add_dirs: vec!["./ctx".to_string()],
+            ..Default::default()
+        };
+        let disclosed = AgentPlan {
+            label: "lead".to_string(),
+            identity: None,
+            opaque: None,
+            cwd: Some(g("./work", "/real/work", Field::Cwd)),
+            add_dirs: vec![g("./ctx", "/real/ctx", Field::AddDir)],
+        };
+        let (argv, cwd, role) = super::fleet_launch(&agent, &disclosed);
+        assert_eq!(
+            cwd.as_deref(),
+            Some("/real/work"),
+            "cwd must be the resolved one"
+        );
+        assert_eq!(argv, vec!["claude", "--add-dir", "/real/ctx"]);
+        // The pane label is the DEFANGED one from the plan, not the raw name:
+        // `role` is painted into the status bar and the overview unfiltered.
+        assert_eq!(role, "lead");
+        assert!(!role.chars().any(|c| c.is_control()));
     }
 
     /// A token that matches no live pane is stale or forged — not the operator.

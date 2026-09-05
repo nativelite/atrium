@@ -8,6 +8,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A fleet file could point an agent anywhere on the filesystem and nothing said
+  so.** `cwd` and `add_dirs` were joined onto the fleet file's directory with no
+  resolution and no disclosure, and `add_dirs` becomes `claude --add-dir` — read
+  access to `~/.ssh`, `/etc` or a sibling checkout, granted by a file an *agent*
+  may have written and a human approves by running it. `fleet up` now resolves
+  every one of those entries **through symlinks** before the blocking Enter (see
+  31774f0) and names, on that screen: each directory that is not a plain
+  subdirectory of the anchor, where it really lands, whether it exists, and
+  whether it is or contains a known credential store — plus the identity each
+  agent comes up on, which was disclosed nowhere. Nothing is refused: a sibling
+  checkout is a documented, legitimate use, and the README example is unchanged.
+- **The banner and the launch were two different computations.** `cwd`/`add_dirs`
+  were resolved once for validation and again inside the spawn, so a symlink
+  re-pointed during the operator's Enter window turned an acknowledged path into
+  a different grant. The child is now spawned with the *resolved* paths that were
+  disclosed. (This narrows the race; it does not close it — re-pointing a
+  directory component of the resolved path between the ack and the spawn would
+  still move it.)
+- **A fleet file could repaint the screen it was being approved on.** The JSON
+  parser decodes `\u001b`, so an agent name, path or identity could carry a real
+  ESC into the banner, `fleet ls`, the unknown-fleet-name list, or — through
+  `pane.role` — the live status bar and overview. All of those are now defanged
+  (controls, DEL, C1 and the bidi/invisible formatting characters rendered as
+  visible `\u{..}`; backslashes deliberately left alone so Windows paths stay
+  legible).
+- **A `cwd` naming a regular file is now refused before the terminal is taken**
+  (it is checked with `is_dir`, not existence), instead of failing in the pty
+  spawn with panes already up.
 - **The nested-session detector was dead code on macOS, and so was crash
   recovery.** `warden::session_pids` and `reap::reap_stale` scanned
   `std::env::temp_dir()` while registries are written to the fixed

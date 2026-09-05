@@ -971,6 +971,200 @@ fn fleet_up_unknown_file_is_a_startup_error() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+// --- fleet disclosure: what the roster grants, on the screen it is approved on
+
+/// A fleet fixture plus the amux run over it, WITHOUT a pty.
+///
+/// `fleet up` is deliberately driven with a non-terminal stdin here: the ack is
+/// skipped (there is nobody to ask), the whole banner is still printed, and the
+/// launch then stops at `rawterm::Terminal::raw()`. That gives an exact,
+/// non-flaky assertion on the real binary's approval-time output on a host whose
+/// pty table is finite — and, crucially, it exercises the WIRING. The same
+/// classification once ran green in unit tests while the loader ignored its
+/// verdict; only a test that runs the binary catches that.
+struct FleetLab {
+    root: std::path::PathBuf,
+}
+
+impl FleetLab {
+    fn new(tag: &str) -> FleetLab {
+        let root = std::env::temp_dir().join(format!("amux-disc-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        std::fs::create_dir_all(root.join("cfg")).unwrap();
+        FleetLab { root }
+    }
+    fn proj(&self) -> std::path::PathBuf {
+        self.root.join("proj")
+    }
+    fn dir(&self, rel: &str) -> std::path::PathBuf {
+        let p = self.root.join(rel);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn file(&self, json: &str) {
+        std::fs::write(self.proj().join("amux.fleet.json"), json).unwrap();
+    }
+    /// Run `amux <args…>` in the fixture project with a fixture HOME and a
+    /// fixture global-config location, and return `(exit code, stdout, stderr)`.
+    fn run(&self, args: &[&str]) -> (i32, String, String) {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_amux"))
+            .args(args)
+            .current_dir(self.proj())
+            .env("HOME", self.root.join("home"))
+            .env("USERPROFILE", self.root.join("home"))
+            .env("XDG_CONFIG_HOME", self.root.join("cfg"))
+            .env("APPDATA", self.root.join("cfg"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+}
+
+impl Drop for FleetLab {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A `cwd` / `add_dirs` that leaves the tree is NAMED on the banner the operator
+/// acknowledges, resolved through the symlink, by the real binary.
+#[test]
+#[cfg(unix)]
+fn fleet_up_discloses_a_symlink_that_leaves_the_tree() {
+    let lab = FleetLab::new("symlink");
+    let secrets = lab.dir("secrets");
+    std::os::unix::fs::symlink(&secrets, lab.proj().join("context")).unwrap();
+    lab.file(
+        r#"{"fleets":{"t":{"agents":[
+            {"name":"one","cmd":["claude"],"add_dirs":["./context"]},
+            {"name":"two","cmd":["claude"]}]}}}"#,
+    );
+    let (_code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert!(err.contains("OUTSIDE"), "no disclosure in: {err}");
+    assert!(
+        err.contains("./context") && err.contains("secrets"),
+        "the line must name the entry AND where it really lands: {err}"
+    );
+    // It got all the way past the reach check to the tty handoff — the
+    // disclosure is a banner, not a refusal.
+    assert!(err.contains("must be a terminal"), "{err}");
+}
+
+/// A roster pointed at a credential store says which store, in words.
+#[test]
+#[cfg(unix)]
+fn fleet_up_names_the_credential_store_a_roster_points_at() {
+    let lab = FleetLab::new("creds");
+    let ssh = lab.dir("home/.ssh");
+    std::fs::write(ssh.join("id_rsa"), "k").unwrap();
+    std::os::unix::fs::symlink(&ssh, lab.proj().join("ctx")).unwrap();
+    lab.file(
+        r#"{"fleets":{"t":{"agents":[{"name":"one","cmd":["claude"],"add_dirs":["./ctx"]}]}}}"#,
+    );
+    let (_code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert!(
+        err.contains("SSH private keys"),
+        "a credential store must be named as one: {err}"
+    );
+    assert!(err.contains("CREDENTIALS"), "{err}");
+}
+
+/// The fleet file cannot repaint the screen it is being approved on.
+#[test]
+fn a_fleet_file_cannot_write_escape_sequences_into_the_approval_banner() {
+    let lab = FleetLab::new("inject");
+    // `\u001b` in the file, decoded to a real ESC by the JSON parser — the
+    // crossing this defends.
+    lab.file(
+        r#"{"fleets":{"t":{"agents":[
+            {"name":"ev\u001b[2J\u001b[1;31mil","cmd":["claude"],
+             "add_dirs":["./\u001b[2Kx"]}]}}}"#,
+    );
+    let (_code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert!(
+        !err.contains('\u{1b}'),
+        "a raw ESC from the fleet file reached the terminal: {err:?}"
+    );
+    assert!(
+        err.contains("\\u{1b}"),
+        "and it is still shown, defanged: {err}"
+    );
+}
+
+/// `fleet ls` prints file-supplied names at a terminal too.
+#[test]
+fn fleet_ls_defangs_a_name_from_the_file() {
+    let lab = FleetLab::new("ls");
+    lab.file(r#"{"fleets":{"pro\u001b[2Jd":{"agents":[{"name":"a","cmd":["claude"]}]}}}"#);
+    let (code, out, _err) = lab.run(&["fleet", "ls"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains('\u{1b}'), "raw ESC on stdout: {out:?}");
+    assert!(out.contains("\\u{1b}"), "{out}");
+}
+
+/// A `cwd` naming a regular FILE fails before the screen is taken.
+///
+/// `exists()` is true for a file: an existence check passes it through the
+/// banner, through raw mode and through `bind_ctl`, and it dies in the pty spawn
+/// with ENOTDIR after panes are already up — the half-open fleet this check is
+/// there to prevent.
+#[test]
+fn a_cwd_that_names_a_regular_file_is_refused_before_the_terminal_is_taken() {
+    let lab = FleetLab::new("filecwd");
+    std::fs::write(lab.proj().join("notadir"), "hi").unwrap();
+    lab.file(r#"{"fleets":{"t":{"agents":[{"name":"a","cmd":["claude"],"cwd":"./notadir"}]}}}"#);
+    let (code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert_ne!(code, 0, "must be a startup error: {err}");
+    assert!(err.contains("is not a directory"), "{err}");
+    assert!(
+        !err.contains("must be a terminal"),
+        "it must stop BEFORE the tty handoff: {err}"
+    );
+}
+
+/// The decisive lines are the LAST lines: on a 24-row terminal whatever prints
+/// first is what scrolls away before the Enter is asked for.
+#[test]
+fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
+    let lab = FleetLab::new("order");
+    lab.dir("shared");
+    let agents: Vec<String> = (0..8)
+        .map(|i| format!(r#"{{"name":"a{i}","cmd":["claude"],"add_dirs":["../shared","./s{i}"]}}"#))
+        .collect();
+    for i in 0..8 {
+        lab.dir(&format!("proj/s{i}"));
+    }
+    lab.file(&format!(
+        r#"{{"fleets":{{"t":{{"agents":[{}]}}}}}}"#,
+        agents.join(",")
+    ));
+    let (_code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    let at = |needle: &str| {
+        err.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {err}"))
+    };
+    assert!(at("OUTSIDE") < at("starting 8 agent(s)"), "{err}");
+    assert!(
+        at("starting 8 agent(s)") < at("may spawn teammates"),
+        "{err}"
+    );
+    assert!(at("may spawn teammates") < at("GRANTS"), "{err}");
+    // Deduplicated: eight agents naming ONE sibling checkout is one line.
+    assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
+    // And the banner as a whole still fits a terminal.
+    assert!(
+        err.lines().filter(|l| l.starts_with("amux fleet:")).count() <= 8,
+        "banner too tall: {err}"
+    );
+}
+
 /// A literal Ctrl+A goes through with the doubled prefix.
 #[test]
 fn double_prefix_reaches_the_child() {

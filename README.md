@@ -253,9 +253,37 @@ The file is read **read-only** — amux never writes it.
   agent-aware chrome binds each pane independently.
 - **Errors spawn nothing.** No file (the message names both locations), malformed
   JSON, an unknown fleet name, a fleet with zero agents, a grid that does not fit,
-  or a `cwd` that does not exist — each is a clear startup error, never a partial
-  fleet. Unknown fields are ignored, so the format can grow without breaking
-  older files.
+  or a `cwd` that is not a directory — each is a clear startup error, never a
+  partial fleet. Unknown fields are ignored, so the format can grow without
+  breaking older files.
+- **Every directory the roster grants is on the screen you approve.** `add_dirs`
+  becomes `claude --add-dir`, i.e. read access, and a fleet file is often written
+  by an agent and approved by a human *by running it* — so before `fleet up`
+  blocks for your Enter it resolves every `cwd`/`add_dirs` entry **through
+  symlinks** and names the ones that are not plain subdirectories of the anchor:
+  where each really lands, whether it exists yet, whether amux could not resolve
+  it at all, and whether it is (or contains) a known credential store such as
+  `~/.ssh`. The identity each agent comes up on is named too. Identical grants
+  across agents are printed once, and the last line before the prompt names the
+  destinations, so a tall roster cannot scroll the point away. The child is then
+  spawned with exactly the resolved paths that were shown.
+  - The **anchor** — what "outside" is measured against — is the repository the
+    fleet file is checked into, else the file's own directory; for the
+    user-global file it is the directory you ran `amux` in, since
+    `~/.config/amux` holds no project.
+  - **Nothing here refuses.** A sibling checkout (`"../shared"` above) is a
+    legitimate, documented use; a gate that blocks ordinary work is one people
+    route around invisibly. This makes the reach *visible*, and the Enter is the
+    approval.
+  - **What it does not cover**, plainly: a symlink *inside* a granted directory
+    (`--add-dir d` grants `d`'s whole subtree, including links out of it);
+    anything a `cmd` does for itself (`["sh","-c","claude --add-dir ~/.ssh"]` is a
+    shell command amux does not parse — an agent whose `cmd` is not an agent CLI
+    is flagged as unreadable for exactly this reason); the `prompt`/`kickoff`
+    text; and a directory component of a resolved path re-pointed between the ack
+    and the spawn. amux is not a sandbox — at the same uid an agent can read
+    anything amux can (see `warden`'s notes). This bounds and discloses what amux
+    *hands over*.
 
 ## The ctl control plane (0.8–0.11)
 
