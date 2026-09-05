@@ -29,6 +29,7 @@ pub mod identity;
 pub mod input;
 pub mod ipc;
 pub mod layout;
+pub mod orphan;
 pub mod reap;
 pub mod resolve;
 pub mod resources;

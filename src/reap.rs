@@ -474,6 +474,32 @@ pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()
     std::fs::rename(&tmp, path)
 }
 
+/// Settle the registry at the end of a teardown: delete it only if the teardown
+/// was genuinely clean, otherwise rewrite it down to the groups that survived.
+///
+/// The bug this replaces was one unconditional `remove_file`. Teardown computed
+/// which pane groups were still alive, deleted the registry anyway, printed a
+/// warning to a terminal it was about to tear down, and exited. The watchdog
+/// then woke on pipe EOF, called [`read_registry`] on a path that no longer
+/// existed, got an empty vec out of `unwrap_or_default`, killed nothing, and
+/// exited too. amux destroyed the recovery record at the exact moment it had
+/// just PROVED that record was needed.
+///
+/// Rewriting rather than leaving the file as-is matters as much as keeping it:
+/// a pane that did exit frees its pgid for reuse, so a stale full list is a
+/// list of process groups that may later belong to somebody else.
+///
+/// Returns whether anything was left on disk for a later sweep to act on.
+pub fn settle_registry(path: &Path, survivors: &[u32], policy: &str) -> bool {
+    if survivors.is_empty() {
+        let _ = std::fs::remove_file(path);
+        false
+    } else {
+        let _ = write_registry(path, survivors, policy);
+        true
+    }
+}
+
 /// The trust policy a session recorded, if any. Read by a nested amux to find
 /// the ceiling it inherits.
 pub fn read_policy(path: &Path) -> Option<String> {
@@ -510,7 +536,13 @@ pub fn pid_running(pid: u32) -> bool {
 /// The watchdog loop: wait for `parent` to disappear, then tear down every group
 /// the registry names. Runs in a re-executed amux, detached from the terminal so
 /// a closed window cannot take it down with the session it is meant to outlive.
-pub fn watchdog_main(_parent: u32, registry: &Path) {
+/// `session` is the owner's [`crate::orphan::SessionKey`], passed down its argv
+/// at spawn. It is the half of the teardown that does not depend on a file: the
+/// registry is a record amux writes and can delete (and DID delete, on the one
+/// path where it had just proved panes survived), whereas the session key is
+/// stamped on the panes themselves and cannot be taken away by anything the
+/// dying amux does or fails to do.
+pub fn watchdog_main(_parent: u32, registry: &Path, session: Option<crate::orphan::SessionKey>) {
     // Wait on a PIPE, not on the parent's liveness.
     //
     // Two earlier attempts were wrong in instructive ways. `kill(parent, 0)`
@@ -542,6 +574,21 @@ pub fn watchdog_main(_parent: u32, registry: &Path) {
         kill_tree(*p);
     }
     let _ = std::fs::remove_file(registry);
+    // AND THEN sweep for our own session key, whatever the registry said.
+    //
+    // This is the point of the whole exercise. The registry is amux's own
+    // bookkeeping, and the failure that stranded 75 processes was amux deleting
+    // it on the one path that had just PROVED panes survived teardown: this
+    // function then woke on pipe EOF, read a file that was no longer there, got
+    // an empty list out of `unwrap_or_default`, killed nothing and exited. A
+    // marker on the panes themselves is not something the dying process can take
+    // away by mistake.
+    //
+    // Restricted to OUR key: a watchdog collecting some other session's
+    // orphans, however dead they look, is a kill primitive nobody asked it to be.
+    if let Some(key) = session.as_ref() {
+        let _ = crate::orphan::sweep(Some(key));
+    }
 }
 
 /// Kill the trees of every session whose amux is gone, and remove its registry.
@@ -587,9 +634,20 @@ fn reap_orphan_watchdogs() -> usize {
     killed
 }
 
-/// Clean up after sessions that are already gone: `(sessions, watchdogs)`.
-pub fn reap_stale() -> (usize, usize) {
-    (sweep_dir(&registry_dir()), reap_orphan_watchdogs())
+/// Clean up after sessions that are already gone: registries swept, watchdogs
+/// put down, and the pane groups the registries never mentioned.
+///
+/// The third element is the point of the sweep and the reason this is the
+/// operator's self-heal: a registry only lists what amux wrote down and kept,
+/// so a session whose registry was deleted — the exact bug that stranded 75
+/// processes against a 511-slot machine-wide pty pool — leaves nothing here for
+/// the first two numbers to find. The marker on the panes themselves does not
+/// depend on any of that. Unrestricted: every dead owner, which is what an
+/// operator running `amux reap` is asking for.
+pub fn reap_stale() -> (usize, usize, Vec<crate::orphan::Victim>) {
+    let sessions = sweep_dir(&registry_dir());
+    let watchdogs = reap_orphan_watchdogs();
+    (sessions, watchdogs, crate::orphan::sweep(None))
 }
 
 /// Sweep one directory of session registries. Split out from [`reap_stale`] so
@@ -655,6 +713,16 @@ pub fn spawn_watchdog(registry: &Path) -> io::Result<std::process::Child> {
         .arg(WATCHDOG_FLAG)
         .arg(std::process::id().to_string())
         .arg(registry)
+        // The session key, so the watchdog can sweep for our panes by their own
+        // marker and not only by a file we might have deleted. Appended LAST so
+        // an older watchdog binary (or a build where the key is unavailable —
+        // Windows) still parses the first two arguments exactly as before.
+        .args(
+            crate::orphan::session_key()
+                .map(|k| k.encode())
+                .into_iter()
+                .collect::<Vec<_>>(),
+        )
         // The death signal: amux keeps the write end of this pipe for its whole
         // life and never writes to it. The caller MUST hold the returned Child
         // (and thus its stdin) alive, or the pipe closes immediately and the
@@ -731,6 +799,39 @@ mod tests {
             mine.exists(),
             "a live session's registry must be left alone"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The registry must survive exactly the teardown that proved it is needed.
+    ///
+    /// This was one unconditional `remove_file`: amux computed `survivors`,
+    /// deleted the file anyway, and the watchdog woke to an empty list. Revert
+    /// `settle_registry` to that (`let _ = fs::remove_file(path); !survivors
+    /// .is_empty()`) and the second half of this test fails — the file is gone
+    /// and `read_registry` hands the watchdog nothing to kill.
+    #[test]
+    fn a_teardown_with_survivors_keeps_the_record_the_watchdog_needs() {
+        let dir = std::env::temp_dir().join(format!("amux-settle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("amux-session-1.pids");
+
+        // Clean teardown: nothing survived, so nothing is left behind.
+        write_registry(&path, &[101, 102], "plan").unwrap();
+        assert!(!settle_registry(&path, &[], "plan"));
+        assert!(!path.exists(), "a clean teardown leaves no registry");
+
+        // Survivors: the record stays, trimmed to exactly what is still alive.
+        // 102 exited, and a dead pane's pgid can be reused - keeping it would
+        // aim a later sweep at whatever inherits the number.
+        write_registry(&path, &[101, 102], "plan").unwrap();
+        assert!(settle_registry(&path, &[101], "plan"));
+        assert!(path.exists(), "the watchdog's only record must survive");
+        assert_eq!(
+            read_registry(&path),
+            vec![101],
+            "and must name exactly the groups that survived"
+        );
+        assert_eq!(read_policy(&path).as_deref(), Some("plan"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

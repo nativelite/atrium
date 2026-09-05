@@ -591,6 +591,41 @@ the hard way):
   (full-screen TUIs do; bare shells won't repaint their prompt). Windows —
   where ConPTY guarantees repaints — is the reference platform today.
 
+## Orphaned panes — `amux reap` and `--reap-orphans`
+
+A pane child is a session leader (`setsid`), so amux tears down whole process
+**groups**, and a pipe-EOF watchdog does it again if amux dies in a way no
+handler can catch. That is the unix reconstruction of what Windows gets from a
+Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, kernel-enforced). The
+reconstruction is weaker in a way worth stating: a process group is advisory —
+a child can `setsid()` out of one — and the watchdog can only kill what the
+crash registry names.
+
+So every pane also carries `AMUX_SESSION=<owner pid>:<owner start time>`,
+injected whether or not the control channel is on, plus a small stamp file for
+the case where a pane clears its own environment. A pane is collected only when
+**all three** hold, and any ambiguity means *skip*:
+
+1. it carries the marker;
+2. it is its own process-group leader (a pane root amux created, not a
+   descendant that wandered into the group — the group is what gets killed);
+3. its owner is provably gone — not merely unreachable. `kill(pid, 0)` succeeds
+   on a zombie, so liveness uses `pid_running`; the start time defeats pid
+   reuse; and the identity check is `proc_pidpath` + `(dev, ino)`, never
+   `argv[0]`, which is forgeable on macOS.
+
+The obvious cheap test — "orphan means `ppid == 1`" — is wrong, and amux does
+not use it. A child is reparented only when its parent *finishes* exiting; an
+amux stuck mid-exit never gets there, so its panes keep pointing at a corpse and
+`ppid == 1` never becomes true. That is exactly the population that strands
+ptys.
+
+`amux reap` sweeps every dead owner and names each victim and why. Concurrent
+sessions are safe by construction: a live session's panes fail condition 3.
+`amux --reap-orphans` runs the same sweep before starting; it is opt-in for now
+and always prints what it killed. On Windows none of this is compiled — the Job
+Object already gives the guarantee, kernel-enforced.
+
 ## Diagnostics
 
 `amux --stdin-probe` prints the hex of whatever your terminal actually

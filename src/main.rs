@@ -1419,11 +1419,14 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some(amux::reap::WATCHDOG_FLAG) {
         let parent: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let registry = args.get(2).map(std::path::PathBuf::from);
+        // The owner's session key, optional so an argv from an older build still
+        // starts a watchdog (it just has nothing but the registry to go on).
+        let session = args.get(3).and_then(|s| amux::orphan::SessionKey::parse(s));
         match (parent, registry) {
             (0, _) | (_, None) => return ExitCode::FAILURE,
             (parent, Some(reg)) => {
                 amux::reap::ignore_terminal_signals();
-                amux::reap::watchdog_main(parent, &reg);
+                amux::reap::watchdog_main(parent, &reg, session);
                 return ExitCode::SUCCESS;
             }
         }
@@ -1431,12 +1434,28 @@ fn main() -> ExitCode {
     // `amux reap` cleans up after sessions that are already gone — a crash, or a
     // session from before any of this existed.
     if args.first().map(String::as_str) == Some("reap") {
-        let (sessions, watchdogs) = amux::reap::reap_stale();
-        match (sessions, watchdogs) {
-            (0, 0) => println!("amux reap: nothing to clean up"),
-            (s, 0) => println!("amux reap: cleaned up {s} dead session(s)"),
-            (0, w) => println!("amux reap: cleaned up {w} stuck watchdog(s)"),
-            (s, w) => println!("amux reap: cleaned up {s} dead session(s), {w} stuck watchdog(s)"),
+        let (sessions, watchdogs, orphans) = amux::reap::reap_stale();
+        // Never silent about a kill: name every process group collected, and say
+        // which owner it was orphaned by. An operator who runs this after losing
+        // a machine's pty pool needs to see what it actually did.
+        for v in &orphans {
+            println!("amux reap: killed orphaned pane group {v}");
+        }
+        match (sessions, watchdogs, orphans.len()) {
+            (0, 0, 0) => println!("amux reap: nothing to clean up"),
+            (s, w, o) => {
+                let mut parts = Vec::new();
+                if s > 0 {
+                    parts.push(format!("{s} dead session(s)"));
+                }
+                if w > 0 {
+                    parts.push(format!("{w} stuck watchdog(s)"));
+                }
+                if o > 0 {
+                    parts.push(format!("{o} orphaned pane group(s)"));
+                }
+                println!("amux reap: cleaned up {}", parts.join(", "));
+            }
         }
         return ExitCode::SUCCESS;
     }
@@ -1459,9 +1478,26 @@ fn main() -> ExitCode {
     // *first* so amux's own meta-flags (`--help`, `--stdin-probe`) are still
     // recognized when they follow an identity (`amux --identity work --help`).
     let (identity, rest) = amux::identity::parse(&args);
+    // `--reap-orphans`: sweep this machine for pane groups whose amux is gone,
+    // BEFORE taking the terminal, and print every one collected.
+    //
+    // Opt-in for this first release, deliberately. The sweep kills process
+    // groups on evidence gathered from the machine, and the fail-safe direction
+    // is already "do not kill" (see `amux::orphan`), but a launch flag is not
+    // where a wrong rule should first meet a user's machine. It also must never
+    // be silent: a startup path that kills things without saying so is how the
+    // last teardown bug stayed invisible for so long.
+    let (reap_orphans, rest) = amux::orphan::parse_flag(&rest);
+    if reap_orphans {
+        for v in amux::orphan::sweep(None) {
+            eprintln!("amux: reaped orphaned pane group {v}");
+        }
+    }
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+            "usage: amux [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      --reap-orphans: before starting, kill pane process groups whose amux is gone (prints each\n\
+             \x20               one). Off by default; `amux reap` does the same thing on its own.\n\
              \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
              \x20               ceiling they are capped at (low→high: plan < accept < automode < skip):\n\
              \x20               `plan` read-only plan mode; `accept` (bare --trust) auto-accept edits + a safe\n\
@@ -3133,15 +3169,32 @@ fn run(
         .copied()
         .filter(|p| amux::reap::tree_alive(*p))
         .collect();
-    // A clean teardown leaves nothing for the watchdog: emptying the registry
+    // A CLEAN teardown leaves nothing for the watchdog: emptying the registry
     // before it notices is what makes a normal quit silent.
-    let _ = std::fs::remove_file(&registry_path);
-    if !survivors.is_empty() {
+    //
+    // A teardown with survivors is the opposite case, and this used to delete
+    // the registry there too — unconditionally, on the one path where amux had
+    // just PROVED that pane groups outlived it. It then printed a warning to a
+    // terminal `cleanup_screen` was about to tear down and exited; the watchdog
+    // woke on pipe EOF, read a file that no longer existed, got an empty list
+    // out of `read_registry`'s `unwrap_or_default`, and killed nothing. The
+    // record was destroyed at exactly the moment it was needed.
+    //
+    // So: survivors mean the registry is REWRITTEN down to just those groups —
+    // the watchdog then TERMs and KILLs precisely what is left, and a later
+    // `amux reap` finds the same short list rather than a stale full one. Panes
+    // that did die are dropped from it, because a dead pane's pgid can be reused.
+    if amux::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
         eprintln!(
             "amux: warning: {} pane process group(s) survived teardown: {:?}",
             survivors.len(),
             survivors
         );
+    }
+    // Panes that are genuinely gone leave no stamp behind. A survivor keeps
+    // its stamp — that is the marker the sweep needs to collect it later.
+    for pid in pids.iter().filter(|p| !survivors.contains(p)) {
+        amux::orphan::unstamp(*pid);
     }
     if dbg {
         eprint!("[amux-dbg killed]\r\n");
@@ -4799,6 +4852,38 @@ fn spawn_pane(
     spawn_pane_full(command, rows, cols, id, identity, None, mode, flash)
 }
 
+/// The non-secret environment every pane is born with.
+///
+/// Split out from [`spawn_pane_full`] so the one rule that matters here can be
+/// asserted directly: **the session marker does not depend on ctl.** It used to,
+/// and that was the first of the two holes that stranded 75 processes holding
+/// 526 ptys against a machine-wide limit of 511. `AMUX_CTL`/`AMUX_PANE`/
+/// `AMUX_TOKEN` were pushed inside `if let (Some(addr), Some(token)) = …`, so a
+/// pane launched without `--allow-ctl` — the default — carried no amux
+/// environment whatsoever. Nothing on the process said it was ours, so once amux
+/// was gone nothing could find it, and they had to be cleared by hand.
+///
+/// `AMUX_SESSION` is deliberately NOT one of those credentials. `AMUX_TOKEN` is
+/// a capability that must not leak; this is a label that is *meant* to be read —
+/// by the watchdog, by `amux reap`, by a human with `ps`. Holding it authorises
+/// nothing, and forging it can only nominate the forger's own process group for
+/// collection, and then only once the amux it names is already dead.
+fn pane_base_env(
+    session: Option<&amux::orphan::SessionKey>,
+    ctl: Option<(&str, &str, &str)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::new();
+    if let Some(key) = session {
+        env.push((amux::orphan::ENV_SESSION.to_string(), key.encode()));
+    }
+    if let Some((addr, pane, token)) = ctl {
+        env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.to_string()));
+        env.push((amux::ctl::ENV_PANE.to_string(), pane.to_string()));
+        env.push((amux::ctl::ENV_TOKEN.to_string(), token.to_string()));
+    }
+    env
+}
+
 /// The shared spawn core: build the agent's launch (session-id inject, Windows
 /// shim wrapping, identity env resolution), then spawn it on a pty of the given
 /// size in the given working directory. Every pane amux hosts — the initial one,
@@ -4964,12 +5049,14 @@ fn spawn_pane_full(
              ctl access rather than with a guessable capability token\r\n"
         );
     }
-    let mut base_env: Vec<(String, String)> = Vec::new();
-    if let (Some(addr), Some(token)) = (CTL_ADDRESS.get(), token.as_ref()) {
-        base_env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.clone()));
-        base_env.push((amux::ctl::ENV_PANE.to_string(), agent_id.to_string()));
-        base_env.push((amux::ctl::ENV_TOKEN.to_string(), token.clone()));
-    }
+    let pane_id = agent_id.to_string();
+    let base_env = pane_base_env(
+        amux::orphan::session_key().as_ref(),
+        match (CTL_ADDRESS.get(), token.as_ref()) {
+            (Some(addr), Some(tok)) => Some((addr.as_str(), pane_id.as_str(), tok.as_str())),
+            _ => None,
+        },
+    );
 
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge
@@ -5019,6 +5106,13 @@ fn spawn_pane_full(
     } else {
         pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
     };
+    // The second marker, on disk. Measured on macOS 26: `ps -E` prints the
+    // environment of ordinary binaries but NOTHING for a SIP/platform binary,
+    // and `/bin/sh` — what a default pane runs, and the exact population that
+    // stranded — is one of those. So the env marker alone is blind to shells
+    // here; the stamp covers every pane. It records the pane's own start token,
+    // so a stale file cannot become a kill order against a recycled pid.
+    amux::orphan::stamp(pty.pid());
     Ok(Pane {
         id,
         pty,
@@ -5213,7 +5307,50 @@ fn effective_command(command: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::privilege_for;
+    use super::{pane_base_env, privilege_for};
+
+    /// **A pane must carry the session marker whether or not ctl is on.**
+    ///
+    /// The marker used to be pushed inside the ctl block, so the DEFAULT launch
+    /// (no `--allow-ctl`) produced a pane with no amux environment at all —
+    /// nothing identified the process as ours, so nothing could ever find it
+    /// again. Move the `AMUX_SESSION` push back inside the `if let Some((addr,
+    /// …)) = ctl` arm and the first assertion here fails, which is exactly the
+    /// shipped bug.
+    #[test]
+    fn every_pane_is_marked_even_with_no_control_channel() {
+        let key = amux::orphan::SessionKey {
+            owner: 17686,
+            started: 99,
+        };
+        let bare = pane_base_env(Some(&key), None);
+        assert_eq!(
+            bare,
+            vec![("AMUX_SESSION".to_string(), "17686:99".to_string())],
+            "a pane without ctl must still be findable"
+        );
+
+        // With ctl on, the marker is still there, still first, and the three ctl
+        // variables are unchanged.
+        let full = pane_base_env(Some(&key), Some(("/tmp/sock", "3", "deadbeef")));
+        let names: Vec<&str> = full.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["AMUX_SESSION", "AMUX_CTL", "AMUX_PANE", "AMUX_TOKEN"]
+        );
+        assert_eq!(full[3].1, "deadbeef");
+    }
+
+    /// No key (Windows, where the Job Object makes the whole sweep unnecessary)
+    /// means no marker — never a bare pid, which would be a marker that points at
+    /// a live unrelated process after the pid is reused.
+    #[test]
+    fn a_pane_is_never_marked_with_a_key_we_could_not_compute() {
+        assert!(pane_base_env(None, None).is_empty());
+        let ctl_only = pane_base_env(None, Some(("/tmp/sock", "3", "deadbeef")));
+        assert!(!ctl_only.iter().any(|(k, _)| k == "AMUX_SESSION"));
+        assert_eq!(ctl_only.len(), 3);
+    }
 
     /// **Dropping your token must not promote you** (review #1).
     ///

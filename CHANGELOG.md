@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`amux reap` collects orphaned pane groups, and the watchdog no longer
+  depends on a file to find them.** Every pane now carries
+  `AMUX_SESSION=<owner pid>:<owner start time>` — injected unconditionally,
+  where the ctl env was injected only under `--allow-ctl`, so a pane in a plain
+  session carried no marker at all and nothing could recognise it afterwards.
+  A pane is collected only when it carries the marker, is its own
+  process-group leader, and its owner is provably gone; anything ambiguous is
+  skipped, so concurrent sessions are safe by construction. Liveness uses
+  `pid_running` (`kill(pid, 0)` succeeds on a zombie), the start time defeats
+  pid reuse, and identity is `proc_pidpath` + `(dev, ino)` rather than the
+  forgeable `argv[0]`. `amux --reap-orphans` runs the same sweep at startup,
+  opt-in, printing every victim. Unix only: on Windows the Job Object already
+  enforces this in the kernel.
+
 ### Fixed
+- **A clean teardown deleted the crash registry even when panes had survived
+  it.** The `remove_file` ran unconditionally, immediately after the check that
+  had just proved survivors existed — so on the one path where recovery was
+  needed, amux destroyed the only record of what to kill, downgraded the
+  failure to a warning printed to a terminal it was about to tear down, and
+  exited. The watchdog then woke on pipe EOF, read an empty registry, and
+  killed nothing. The registry is now rewritten with exactly the surviving
+  groups (dead pgids are dropped, since a dead pane's pgid can be reused), and
+  a survivor keeps the stamp the sweep needs to collect it later.
 - **A fleet file could point an agent anywhere on the filesystem and nothing said
   so.** `cwd` and `add_dirs` were joined onto the fleet file's directory with no
   resolution and no disclosure, and `add_dirs` becomes `claude --add-dir` — read

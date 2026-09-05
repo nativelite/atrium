@@ -683,6 +683,27 @@ impl ExeIds {
     }
 }
 
+/// Is the process at `pid` running the **same executable file** as this one?
+///
+/// `None` means "cannot tell" — a vanished process, a denied read — and callers
+/// must treat it as exactly that, never as "not amux". This is the module's
+/// identity check, exported so the orphan sweep
+/// ([`crate::orphan::classify_owner`]) asks the same question the ancestry walk
+/// does rather than reinventing it as a name comparison: `ps -o comm=` is
+/// `argv[0]` on macOS and `(exec -a amux /bin/sleep 40)` forges it in one line,
+/// verified on this host.
+#[cfg(unix)]
+pub fn same_binary(pid: u32) -> Option<bool> {
+    ExeIds::new().is_amux(pid)
+}
+
+/// Windows has no ancestry or identity plumbing here yet — see [`amux_ancestor`]
+/// — and the Job Object makes the sweep that asks this question unnecessary.
+#[cfg(not(unix))]
+pub fn same_binary(_pid: u32) -> Option<bool> {
+    None
+}
+
 /// `(st_dev, st_ino)` of the executable the kernel says `pid` is running.
 ///
 /// `None` on any failure — a vanished process, a denied read — which callers

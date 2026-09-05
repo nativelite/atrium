@@ -1645,6 +1645,135 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
     panic!("tree survived SIGKILL of amux {amux} — watchdog did not clean up");
 }
 
+/// The same SIGKILL, with the registry taken away first — which is what amux
+/// itself used to do.
+///
+/// Teardown computed which pane groups had survived and then deleted the
+/// registry *unconditionally*, on the one path where it had just proved the
+/// record was needed. The watchdog woke on pipe EOF, read a file that was no
+/// longer there, got an empty list, killed nothing, and exited. Here the file is
+/// removed by hand so the same hole is reproduced deterministically rather than
+/// waiting for a teardown to lose the race.
+///
+/// What must collect the tree instead is the marker on the pane itself. Note
+/// which marker: the pane is `/bin/sh`, and macOS will not disclose a SIP
+/// binary's environment to `ps` at all, so this passes through the stamp file —
+/// the same path every default shell pane takes on this platform.
+///
+/// Revert check: drop the `orphan::sweep` call at the end of
+/// `reap::watchdog_main` and this fails with "tree survived", while
+/// `a_sigkilled_amux_still_takes_its_tree_down` above keeps passing, because
+/// that one still has its registry.
+#[cfg(unix)]
+#[test]
+fn a_sigkilled_amux_takes_its_tree_down_even_with_no_registry() {
+    let marker = std::env::temp_dir().join(format!("amux-noreg-{}.pid", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let grandkid: u32 = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if let Ok(v) = t.trim().parse::<u32>() {
+                break v;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "grandchild never reported its pid"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Let the loop register the pane, write the registry and start the watchdog.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let amux = p.pid();
+    assert!(amux != 0, "no amux pid");
+    let registry = amux::reap::registry_path(amux);
+    assert!(
+        registry.exists(),
+        "amux should have written {} before we take it away",
+        registry.display()
+    );
+    std::fs::remove_file(&registry).expect("remove the registry");
+
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &amux.to_string()])
+        .status();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if !pid_alive(grandkid) {
+            let _ = std::fs::remove_file(&marker);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", &grandkid.to_string()])
+        .status();
+    let _ = std::fs::remove_file(&marker);
+    panic!("tree survived SIGKILL of amux {amux} with its registry deleted");
+}
+
+/// Every pane is born marked, whether or not the control channel is on.
+///
+/// The default launch has no `--allow-ctl`, and that is exactly the case that
+/// used to produce a pane with no amux environment at all. Read back from inside
+/// the pane rather than from `ps`, because on macOS `ps -E` will not show a
+/// shell's environment to anyone — which is a fact about `ps`, not about whether
+/// the variable is there.
+///
+/// Revert check: move the `AMUX_SESSION` push in `pane_base_env` back inside the
+/// `if let Some((addr, …)) = ctl` arm and this fails — the pane echoes an empty
+/// line where the key should be.
+#[cfg(unix)]
+#[test]
+fn a_pane_launched_without_ctl_still_carries_the_session_marker() {
+    let out = std::env::temp_dir().join(format!("amux-mark-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let script = format!(
+        "printf '[%s]\\n' \"$AMUX_SESSION\" > {} ; sleep 600",
+        out.display()
+    );
+    // No --allow-ctl: the default posture, and the one that used to be unmarked.
+    let mut p =
+        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+    let amux = p.pid();
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&out) {
+            if t.contains('\n') {
+                break t.trim().to_string();
+            }
+        }
+        assert!(Instant::now() < deadline, "pane never reported its marker");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Quit the way a human does — Ctrl+A q — so the pane's tree is torn down
+    // through the normal path and nothing is left holding a pty.
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+    let _ = std::fs::remove_file(&out);
+
+    let key = seen
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or("");
+    assert!(
+        !key.is_empty(),
+        "a pane spawned without --allow-ctl carried no AMUX_SESSION (got {seen:?})"
+    );
+    let parsed = amux::orphan::SessionKey::parse(key)
+        .unwrap_or_else(|| panic!("AMUX_SESSION is not a well-formed key: {key:?}"));
+    assert_eq!(
+        parsed.owner, amux,
+        "the marker must name the amux that spawned the pane"
+    );
+}
+
 // --- Windows tree teardown (Job Object, kill-on-close) ----------------------
 //
 // The Windows counterparts of the two tests above. There is no process group and
