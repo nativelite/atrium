@@ -1659,3 +1659,53 @@ fn a_nested_fleet_up_is_capped_like_a_pane() {
     let _ = wait_exit(&mut p, 15);
     let _ = std::fs::remove_dir_all(&td);
 }
+
+/// **A redirected `$TMPDIR` must not lift the ceiling** (re-review, critical).
+///
+/// The cap reads the parent's policy from a registry on disk — deliberately, so
+/// it is not an environment variable an agent can `env -u`. But the registry was
+/// addressed through `std::env::temp_dir()`, i.e. `$TMPDIR`, which the agent also
+/// owns. So `TMPDIR=/tmp/x amux --trust skip` walked the ancestry correctly, then
+/// looked for the parent's file under the CHILD's TMPDIR, found nothing, and
+/// capped nothing. One variable, no double-fork.
+///
+/// Moving the ceiling out of the environment is pointless if the PATH to it is
+/// still in the environment.
+#[cfg(unix)]
+#[test]
+fn a_redirected_tmpdir_does_not_lift_the_ceiling() {
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let decoy = std::env::temp_dir().join(format!("amux-decoy-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&decoy);
+
+    let mut p = pty::Pty::spawn(
+        amux,
+        &["--allow-ctl", "--trust", "plan", "sh", "-i"],
+        24,
+        80,
+    )
+    .unwrap();
+    p.write(b"m=outer; echo \"$m\"\"=up\"\r\n").unwrap();
+    read_until(&mut p, b"outer=up", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(700));
+
+    // The escape, exactly as reported.
+    p.write(
+        format!(
+            "TMPDIR={} \"{amux}\" --trust skip sh -i\r\n",
+            decoy.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"capped to"),
+        "a redirected TMPDIR lifted the session ceiling: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&decoy);
+}

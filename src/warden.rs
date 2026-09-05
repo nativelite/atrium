@@ -55,7 +55,13 @@ const ESCAPEE_GRACE: Duration = Duration::from_secs(5);
 /// Does this pid still exist? A session that has already gone needs neither an
 /// alert nor a kill.
 fn pid_exists(pid: u32) -> bool {
-    crate::reap::pid_alive(pid)
+    // `pid_running`, not `pid_alive`. reap.rs documents that `kill(pid, 0)`
+    // succeeds on a ZOMBIE and says outright that anything deciding "is this
+    // session still here" must use the former - and this is exactly that
+    // decision. Using the latter meant an exited-but-unreaped nested amux was
+    // still judged an escapee, and under enforcement its already-dead session
+    // pid was signalled again.
+    crate::reap::pid_running(pid)
 }
 
 /// Something the warden noticed. Never fatal on its own — the operator decides.
@@ -237,17 +243,27 @@ impl Warden {
     /// opt-in via `AMUX_WARDEN=enforce`, so the default stays "tell the human"
     /// and the human keeps the decision the bus already puts in front of them.
     pub fn enforce(&mut self, pid: u32) -> bool {
-        let mut acted = false;
-        for p in crate::reap::read_registry(&crate::reap::registry_path(pid)) {
-            crate::reap::term_tree(p);
-            crate::reap::kill_tree(p);
-            acted = true;
+        // TERM, wait once, then KILL - the policy every other teardown path here
+        // follows. Firing both back to back made the SIGTERM decorative, so a
+        // judged session never got the chance to reap its own children.
+        let pgids = crate::reap::read_registry(&crate::reap::registry_path(pid));
+        for p in &pgids {
+            crate::reap::term_tree(*p);
+        }
+        crate::reap::term_tree(pid);
+        std::thread::sleep(crate::reap::GRACE);
+        for p in &pgids {
+            crate::reap::kill_tree(*p);
         }
         // The session process itself, not only its panes.
-        crate::reap::term_tree(pid);
         crate::reap::kill_tree(pid);
         self.escapees.remove(&pid);
-        acted
+        // Always true: the session pid is signalled unconditionally above, so it
+        // dies whether or not its registry listed any panes. Returning false when
+        // the registry happened to be empty meant the caller skipped the audit
+        // entry and the bus decision - a kill that left no trace, which is the
+        // exact opposite of what enforcement is for.
+        true
     }
 
     /// Is enforcement switched on? NO by default - `AMUX_WARDEN=enforce` opts in.
@@ -348,7 +364,13 @@ pub fn amux_ancestor() -> Option<u32> {
 #[cfg(unix)]
 fn proc_table() -> std::collections::HashMap<u32, (u32, String)> {
     let mut out = std::collections::HashMap::new();
-    let Ok(o) = std::process::Command::new("ps")
+    // Absolute path, not `ps`. `Command::new("ps")` resolves through `$PATH`,
+    // which the agent owns - so a pane could put its own `ps` first and have the
+    // ancestry walk report whatever it liked, or simply make the lookup fail.
+    // Both failed OPEN: an empty table means "no amux ancestor", which means no
+    // ceiling. The ceiling must not be reachable only through a tool the
+    // constrained party can replace.
+    let Ok(o) = std::process::Command::new("/bin/ps")
         .args(["-eo", "pid=,ppid=,comm="])
         .output()
     else {
@@ -362,8 +384,13 @@ fn proc_table() -> std::collections::HashMap<u32, (u32, String)> {
         let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
             continue;
         };
-        let comm = it.next().unwrap_or_default();
-        let name = Path::new(comm)
+        // `comm` on macOS is the FULL executable path and may contain spaces
+        // (verified: 29 of 628 live processes on the review host, e.g.
+        // `/…/Application Support/iTerm2/iTermServer-3.6.11`). Taking only the
+        // first token truncated those to a wrong name - and a name is what the
+        // ancestry walk matches on. Take the whole remainder.
+        let comm = it.collect::<Vec<_>>().join(" ");
+        let name = Path::new(comm.trim())
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();

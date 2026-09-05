@@ -408,7 +408,31 @@ pub const WATCHDOG_FLAG: &str = "--reap-watchdog";
 /// Registry path for a session. Lives in the temp dir, keyed by amux's pid, so a
 /// crashed session leaves a file a later `amux reap` can find and act on.
 pub fn registry_path(pid: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("amux-session-{pid}.pids"))
+    registry_dir().join(format!("amux-session-{pid}.pids"))
+}
+
+/// Where session registries live.
+///
+/// NOT `std::env::temp_dir()`, which reads `$TMPDIR` - a variable the agent owns.
+/// A nested amux resolves its PARENT's registry through this path to learn the
+/// ceiling it must accept, so an env-derived location meant the ceiling was one
+/// variable away from gone: `TMPDIR=/tmp/x amux --trust skip` walked the ancestry
+/// correctly, then looked for the parent's registry under the CHILD's TMPDIR,
+/// found nothing, and capped nothing. No double-fork required.
+///
+/// The whole point of moving the ceiling out of the environment onto disk is lost
+/// if the PATH to that disk location is itself in the environment. A fixed
+/// location cannot be redirected.
+#[cfg(unix)]
+fn registry_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+/// Windows has no `$TMPDIR` redirection of the same shape, and the Job Object
+/// bounds a pane's tree there regardless of what the registry says.
+#[cfg(not(unix))]
+fn registry_dir() -> PathBuf {
+    std::env::temp_dir()
 }
 
 /// Record this session's pane process groups. Rewritten whenever the set
@@ -438,7 +462,14 @@ pub fn write_registry(
     for p in pgids {
         body.push_str(&format!("{p}\n"));
     }
-    std::fs::write(path, body)
+    // Write-then-rename. `fs::write` truncates in place, so a crash partway
+    // through leaves a half-written final line - and `read_registry` parses
+    // tolerantly, so a truncated pid can still parse as a DIFFERENT, valid pid.
+    // A later sweep would then killpg an unrelated process group. A rename is
+    // atomic, so a reader sees either the old file or the new one.
+    let tmp = path.with_extension("pids.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// The session that capped this one, if it declared one.
@@ -587,9 +618,19 @@ pub fn reap_stale() -> (usize, usize) {
         if pid_running(owner) {
             continue; // a live session owns this one
         }
-        for p in read_registry(&path) {
-            term_tree(p);
-            kill_tree(p);
+        // TERM every group, wait once, then KILL - the same policy as
+        // `watchdog_main` and the main teardown. Firing both back to back made
+        // the SIGTERM decorative on the one path that exists for crash recovery,
+        // so nothing ever got the chance to exit cleanly.
+        let pgids = read_registry(&path);
+        for p in &pgids {
+            term_tree(*p);
+        }
+        if !pgids.is_empty() {
+            std::thread::sleep(GRACE);
+        }
+        for p in &pgids {
+            kill_tree(*p);
         }
         let _ = std::fs::remove_file(&path);
         cleaned += 1;

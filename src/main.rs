@@ -3492,6 +3492,32 @@ fn fleet_up(
         trust.policy_label(),
         if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
+    // Vet every agent's argv exactly as `ctl spawn` does. A fleet file's `cmd` was
+    // spawned VERBATIM, so it could embed `--dangerously-skip-permissions`,
+    // `--mcp-config`, `--plugin-dir` - the flags the spawn vetting exists to
+    // refuse - and the launch bypassed the trust system entirely, whatever the
+    // fleet declared and whatever the banner printed.
+    //
+    // That matters most in the workflow this file is built for: an agent writes
+    // the roster, a human reviews and runs it. A flag buried in `cmd` that a skim
+    // misses defeats the review, and no ceiling downstream can undo it.
+    for a in &fleet.agents {
+        match amux::ctl::vet_spawn_argv(&a.cmd) {
+            amux::ctl::ArgvVerdict::Refused(why) => {
+                eprintln!("amux fleet: agent {:?}: {why}", a.name);
+                return ExitCode::FAILURE;
+            }
+            amux::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
+                eprintln!(
+                    "amux fleet: agent {:?}: ignoring {} — set the posture with \"trust\" instead",
+                    a.name,
+                    stripped.join(", ")
+                );
+            }
+            amux::ctl::ArgvVerdict::Ok { .. } => {}
+        }
+    }
+
     // Who may create teammates is part of what the human approves, so say it.
     let spawners: Vec<&str> = fleet
         .agents
@@ -4265,7 +4291,13 @@ fn audit_reply(
             None => false, // operator actions are hidden from a worker
         })
     } else {
-        audit.view(tail, |_| true)
+        // An UNAUTHENTICATED caller (no token, so `caller == None`) used to land
+        // here, and this branch was byte-identical to the privileged one - so
+        // holding no credential returned the entire fleet-wide audit trail,
+        // including the operator actions the branch above deliberately hides
+        // from a worker. That is the same "absent means most trusted" inversion
+        // `privilege_for` was fixed to remove, left standing in one call site.
+        Vec::new()
     };
     amux::ctl::reply_audit(entries, audit.oldest_seq(), audit.latest_seq())
 }
