@@ -1569,3 +1569,46 @@ fn hard_killed_amux_still_takes_its_tree_down_windows() {
         "tree survived taskkill /F of amux {amux} — kill-on-close did not fire"
     );
 }
+
+/// **A pane cannot raise its own posture by launching its own amux.**
+///
+/// The trust ceiling governs `ctl spawn`, but an agent that can run commands can
+/// sidestep ctl entirely: `amux --trust skip claude` is just a shell command, and
+/// a fresh amux session sets its own policy. That escape made the ceiling half a
+/// ceiling.
+///
+/// The cap hangs off process ANCESTRY rather than the environment, because an
+/// agent owns its environment — an `AMUX_AGENT=1` marker or an inherited policy
+/// variable dies to `env -u`. It cannot unset its own parent.
+///
+/// Here the outer session is `plan`; the inner launch asks for `skip` and must be
+/// refused down to `plan`, saying so.
+#[cfg(unix)]
+#[test]
+fn a_nested_amux_cannot_raise_its_own_trust() {
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let mut p = pty::Pty::spawn(
+        amux,
+        &["--allow-ctl", "--trust", "plan", "sh", "-i"],
+        24,
+        80,
+    )
+    .unwrap();
+    // Let the outer session record its policy in the registry the cap reads.
+    p.write(b"m=outer; echo \"$m\"\"=up\"\r\n").unwrap();
+    read_until(&mut p, b"outer=up", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(600));
+
+    // The escape attempt, exactly as an agent would make it.
+    p.write(format!("\"{amux}\" --trust skip sh -i\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"capped to"),
+        "a nested amux was allowed to elevate itself: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}

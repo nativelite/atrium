@@ -41,6 +41,14 @@ static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
 /// agent inside can drive `amux ctl`. `None` (unset) ⇒ ctl is off and every
 /// spawn is byte-identical to pre-ctl amux.
 static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
+/// Set when the ancestry cap lowered this session's posture. The cap runs in
+/// `main`, before the bus exists, so the notice is parked here and raised as a
+/// decision on the first loop tick - an agent quietly launching its own amux is
+/// something the operator should be asked about, not just told once on stderr.
+static CAP_NOTICE: OnceLock<String> = OnceLock::new();
+/// How often the warden re-reads what it snapshotted. Slow on purpose: a
+/// tripwire that costs the event loop is a tripwire that gets removed.
+const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Bind the per-process ctl endpoint and publish its address to [`CTL_ADDRESS`]
 /// so every pane spawned afterward is born with `AMUX_CTL`/`AMUX_PANE` in its
@@ -1391,7 +1399,7 @@ fn main() -> ExitCode {
     // are stripped next — after `--identity`, before mass-spawn flags and the
     // hosted command. A bad `--max-depth` is a startup error, never a silent
     // fallback.
-    let (allow_ctl, max_depth, trust, rest) = match amux::ctl::parse_flags(&rest) {
+    let (allow_ctl, max_depth, mut trust, rest) = match amux::ctl::parse_flags(&rest) {
         Ok(quad) => quad,
         Err(msg) => {
             eprintln!("amux: {msg}");
@@ -1416,6 +1424,36 @@ fn main() -> ExitCode {
     // `--skip-permissions` is full bypass — a conscious, dangerous choice. Make
     // the human confirm it once, in plain terms, *before* the TUI takes the
     // terminal (this reads stdin normally; the run loop takes raw mode after).
+    // A pane cannot escape its session's posture by launching its own amux.
+    //
+    // The ceiling hangs off process ANCESTRY, not the environment. An agent owns
+    // its environment, so an `AMUX_AGENT=1` marker or an inherited policy var
+    // dies to `env -u`; and it owns a spawned child's stdin, so it can answer the
+    // skip confirmation just below on its own behalf. It cannot unset its own
+    // parent. A double-fork still erases the trail - that case belongs to the
+    // warden, which watches for sessions the cap could not account for.
+    if let Some(parent) = amux::warden::amux_ancestor() {
+        let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
+            .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
+        if let Some(ceiling) = inherited {
+            if trust.rank() > ceiling.rank() {
+                eprintln!(
+                    "amux: capped to {} - running inside another amux (pid {}) whose \
+                     session policy is {}. A pane cannot raise its own posture; set \
+                     it at the outer launch.",
+                    ceiling.policy_label(),
+                    parent,
+                    ceiling.policy_label()
+                );
+                let _ = CAP_NOTICE.set(format!(
+                    "a pane launched its own amux (pid {}) and was capped to {}",
+                    parent,
+                    ceiling.policy_label()
+                ));
+                trust = ceiling;
+            }
+        }
+    }
     if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
         eprintln!("amux: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
         return ExitCode::SUCCESS;
@@ -1666,6 +1704,14 @@ fn run(
     // The crash registry: the pane process groups a watchdog should kill if this
     // process dies without running any teardown at all.
     let registry_path = amux::reap::registry_path(std::process::id());
+    // The warden: tripwires, not gates. amux cannot stop an agent that can run
+    // commands from launching an unconstrained one (it could run claude directly
+    // with no amux at all), so what it CAN do is notice - its own binary being
+    // edited to remove the ceiling, the registry that ceiling is read from being
+    // tampered with, or a session appearing that the ancestry cap did not explain.
+    let mut warden = amux::warden::Warden::new(registry_path.clone());
+    let mut last_warden_check = Instant::now();
+    let mut cap_notice_raised = false;
     let mut registered: Vec<u32> = Vec::new();
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
     // tree outlives amux however it dies (TerminateProcess included); a no-op on
@@ -1714,8 +1760,37 @@ fn run(
                 for pid in cur.iter().filter(|p| !registered.contains(p)) {
                     session_job.assign(*pid);
                 }
-                let _ = amux::reap::write_registry(&registry_path, &cur);
+                let _ =
+                    amux::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
+                warden.registry_rewritten();
                 registered = cur;
+            }
+            if last_warden_check.elapsed() >= WARDEN_INTERVAL {
+                last_warden_check = Instant::now();
+                let mut alerts = warden.check();
+                // The ancestry cap fired before the bus existed; raise it once now.
+                if let Some(note) = CAP_NOTICE.get() {
+                    if !cap_notice_raised {
+                        cap_notice_raised = true;
+                        alerts.push(amux::warden::Alert {
+                            kind: "warden-nested-amux",
+                            detail: note.clone(),
+                        });
+                    }
+                }
+                for alert in alerts {
+                    ctl_audit.record(None, alert.kind, &alert.detail, false, "");
+                    // A decision, not an FYI: these are exactly the events that
+                    // should stop the operator rather than scroll past them.
+                    let _ = bus.publish(
+                        "warden",
+                        amux::bus::Kind::DecisionNeeded,
+                        None,
+                        &[("msg".to_string(), alert.detail.clone())],
+                        agsess::sessions::now_ms(),
+                    );
+                    force_repaint = true;
+                }
             }
             // The watchdog is the unix answer to a death no handler can catch.
             // Windows does not need it and must not run it: the durable fix there

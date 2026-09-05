@@ -39,3 +39,4 @@ pub mod tile;
 pub mod trust;
 pub mod uid;
 pub mod vendors;
+pub mod warden;
