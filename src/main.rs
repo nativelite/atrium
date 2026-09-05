@@ -1791,6 +1791,28 @@ fn run(
                     );
                     force_repaint = true;
                 }
+                // Enforcement is opt-in. By default the warden tells you and stops
+                // there: its judgement is a heuristic over a process table, and
+                // killing on a heuristic can destroy work you wanted. With
+                // AMUX_WARDEN=enforce an uncapped descendant is torn down, and the
+                // kill is itself recorded and raised - enforcement is never the
+                // quiet option.
+                if amux::warden::Warden::enforcing() {
+                    for pid in warden.escapees() {
+                        if warden.enforce(pid) {
+                            let detail = format!("killed uncapped nested amux (pid {pid})");
+                            ctl_audit.record(None, "warden-enforced", &detail, true, "");
+                            let _ = bus.publish(
+                                "warden",
+                                amux::bus::Kind::DecisionNeeded,
+                                None,
+                                &[("msg".to_string(), detail)],
+                                agsess::sessions::now_ms(),
+                            );
+                            force_repaint = true;
+                        }
+                    }
+                }
             }
             // The watchdog is the unix answer to a death no handler can catch.
             // Windows does not need it and must not run it: the durable fix there

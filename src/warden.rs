@@ -84,6 +84,9 @@ pub struct Warden {
     /// Session registries present when we started, plus our own — anything new
     /// is a session that appeared alongside us.
     known_sessions: HashSet<u32>,
+    /// New sessions that are descendants of ours: the escape the ancestry cap
+    /// could not catch, and the only thing enforcement acts on.
+    escapees: HashSet<u32>,
 }
 
 impl Warden {
@@ -99,6 +102,7 @@ impl Warden {
             registry_digest: digest_file(&registry),
             registry,
             known_sessions,
+            escapees: HashSet::new(),
         }
     }
 
@@ -149,14 +153,64 @@ impl Warden {
         }
 
         for pid in session_pids() {
-            if self.known_sessions.insert(pid) {
-                out.push(Alert {
-                    kind: "warden-session-appeared",
-                    detail: format!("another amux session (pid {pid}) started alongside this one"),
-                });
+            if !self.known_sessions.insert(pid) {
+                continue;
             }
+            // Only a DESCENDANT is interesting. Any new amux registry used to
+            // alert here, which meant opening amux in a second terminal fired a
+            // decision at the first - normal use reported as an intrusion. A
+            // tripwire that cries at legitimate behaviour is worse than none,
+            // because you learn to dismiss it.
+            //
+            // A session nested under us is what the ancestry cap exists for; one
+            // that is nested but did NOT get capped is the double-fork escape,
+            // which is exactly what is worth interrupting for.
+            if !is_descendant_of(pid, std::process::id()) {
+                continue;
+            }
+            self.escapees.insert(pid);
+            out.push(Alert {
+                kind: "warden-session-appeared",
+                detail: format!(
+                    "an amux session (pid {pid}) started underneath this one without being capped"
+                ),
+            });
         }
         out
+    }
+
+    /// Sessions judged to be uncapped descendants - the only thing enforcement
+    /// will ever act on.
+    pub fn escapees(&self) -> Vec<u32> {
+        self.escapees.iter().copied().collect()
+    }
+
+    /// Tear down an escapee's whole process tree.
+    ///
+    /// Deliberately NOT automatic. The warden's judgement is a heuristic over a
+    /// process table, and killing on a heuristic can destroy work the operator
+    /// wanted - a legitimately nested amux, or a misread ancestry. Enforcement is
+    /// opt-in via `AMUX_WARDEN=enforce`, so the default stays "tell the human"
+    /// and the human keeps the decision the bus already puts in front of them.
+    pub fn enforce(&mut self, pid: u32) -> bool {
+        let mut acted = false;
+        for p in crate::reap::read_registry(&crate::reap::registry_path(pid)) {
+            crate::reap::term_tree(p);
+            crate::reap::kill_tree(p);
+            acted = true;
+        }
+        // The session process itself, not only its panes.
+        crate::reap::term_tree(pid);
+        crate::reap::kill_tree(pid);
+        self.escapees.remove(&pid);
+        acted
+    }
+
+    /// Is enforcement switched on?
+    pub fn enforcing() -> bool {
+        std::env::var("AMUX_WARDEN")
+            .map(|v| v.eq_ignore_ascii_case("enforce"))
+            .unwrap_or(false)
     }
 
     /// Called after amux rewrites its own registry, so a legitimate write is not
@@ -196,17 +250,21 @@ fn session_pids() -> HashSet<u32> {
 /// unaccounted-session check is for.
 #[cfg(unix)]
 pub fn amux_ancestor() -> Option<u32> {
-    let me = std::process::id();
-    let mut cur = parent_of(me)?;
-    // Bounded: a pathological or looping tree must not hang startup.
+    let table = proc_table();
+    let mut cur = std::process::id();
+    // Check each PARENT's name, never our own — the first version compared the
+    // current entry's name while carrying the parent's pid, so amux matched
+    // itself on the first hop and reported its own parent as the ancestor.
     for _ in 0..64 {
-        if cur <= 1 {
+        let (ppid, _) = *table.get(&cur)?;
+        if ppid <= 1 {
             return None;
         }
-        if is_amux(cur) {
-            return Some(cur);
+        let (_, parent_name) = table.get(&ppid)?;
+        if parent_name == "amux" {
+            return Some(ppid);
         }
-        cur = parent_of(cur)?;
+        cur = ppid;
     }
     None
 }
@@ -219,29 +277,65 @@ pub fn amux_ancestor() -> Option<u32> {
     None
 }
 
+/// One snapshot of the process table: pid -> (ppid, command name).
+///
+/// Taken with a SINGLE `ps` call. The first version walked ancestry with one
+/// `ps -p <pid>` per hop — up to 64 subprocesses per lookup, per new session,
+/// every few seconds. That is a process storm, and it showed up immediately as
+/// timing flakiness in the test suite, which runs many amux instances at once. A
+/// watchdog that loads the machine it is watching is a bad watchdog.
 #[cfg(unix)]
-fn parent_of(pid: u32) -> Option<u32> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "ppid=", "-p", &pid.to_string()])
+fn proc_table() -> std::collections::HashMap<u32, (u32, String)> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(o) = std::process::Command::new("ps")
+        .args(["-eo", "pid=,ppid=,comm="])
         .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            continue;
+        };
+        let comm = it.next().unwrap_or_default();
+        let name = Path::new(comm)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.insert(pid, (ppid, name));
+    }
+    out
 }
 
+/// Is `pid` a descendant of `ancestor`? Tells an amux nested under us (the escape
+/// worth interrupting for) from one started in another terminal (normal, and not
+/// the warden's business).
 #[cfg(unix)]
-fn is_amux(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-        .ok()
-        .map(|o| {
-            let comm = String::from_utf8_lossy(&o.stdout);
-            Path::new(comm.trim())
-                .file_name()
-                .map(|n| n == "amux")
-                .unwrap_or(false)
-        })
-        .unwrap_or(false)
+fn is_descendant_of(pid: u32, ancestor: u32) -> bool {
+    let table = proc_table();
+    let mut cur = pid;
+    for _ in 0..64 {
+        let Some((ppid, _)) = table.get(&cur) else {
+            return false;
+        };
+        if *ppid == ancestor {
+            return true;
+        }
+        if *ppid <= 1 {
+            return false;
+        }
+        cur = *ppid;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn is_descendant_of(_pid: u32, _ancestor: u32) -> bool {
+    false
 }
 
 #[cfg(test)]
