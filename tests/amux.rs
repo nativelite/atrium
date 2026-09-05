@@ -1660,6 +1660,91 @@ fn a_nested_fleet_up_is_capped_like_a_pane() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// **An `exec -a amux` shim must not shadow the real parent** (same-uid escape).
+///
+/// The ancestry walk decided "is this hop an amux?" by comparing `ps -eo comm=`
+/// against the string `"amux"`. Measured on macOS 25.6.0, `ps -o comm=` prints
+/// **argv[0]**, which the watched process chooses: `exec -a amux /bin/sh` reports
+/// `comm=amux` while the kernel's `proc_pidpath` still says `/bin/sh`. So a pane
+/// could interpose a fake "amux" between itself and the session it is nested in;
+/// the walk stopped at the fake, read the fake's (nonexistent, or agent-authored)
+/// registry, and applied no ceiling. One line, no double-fork.
+///
+/// Identity is now the executable FILE the kernel reports — `(st_dev, st_ino)` —
+/// so a shim has to actually *be* the amux binary, which caps by itself.
+#[cfg(unix)]
+#[test]
+fn an_argv0_shim_does_not_shadow_the_real_parent() {
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let mut p = pty::Pty::spawn(
+        amux,
+        &["--allow-ctl", "--trust", "plan", "sh", "-i"],
+        24,
+        80,
+    )
+    .unwrap();
+    p.write(b"m=outer; echo \"$m\"\"=up\"\r\n").unwrap();
+    read_until(&mut p, b"outer=up", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(700));
+
+    // Replace the pane shell with one that LOOKS like amux to `ps`, then launch
+    // the real amux underneath it. The trailing `; :` matters: with a single
+    // command `sh -c` execs it in place, which would leave the shim out of the
+    // chain entirely and quietly turn this into a test of nothing.
+    p.write(format!("exec -a amux /bin/sh -c '\"{amux}\" --trust skip sh -i; :'\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"capped to"),
+        "an argv[0] shim shadowed the real amux parent and lifted the ceiling: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// **Deleting the parent's registry must not lift the ceiling** (fail-closed).
+///
+/// The cap read the parent's policy from disk and, finding nothing, applied no
+/// ceiling at all. The registry is mode 0644 at a fixed path owned by the same
+/// uid the agent runs as, so `rm -f /tmp/amux-session-$PPID.pids` turned the
+/// ceiling off — one command, no double-fork, no forgery.
+///
+/// The kernel still says we are nested, and that half cannot be deleted. An
+/// unreadable policy is now "cap to the safe floor", not "no ceiling".
+#[cfg(unix)]
+#[test]
+fn deleting_the_parents_registry_does_not_lift_the_ceiling() {
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let mut p = pty::Pty::spawn(
+        amux,
+        &["--allow-ctl", "--trust", "plan", "sh", "-i"],
+        24,
+        80,
+    )
+    .unwrap();
+    p.write(b"m=outer; echo \"$m\"\"=up\"\r\n").unwrap();
+    read_until(&mut p, b"outer=up", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(700));
+
+    // The pane shell's parent IS the outer amux, so its registry is one `rm`
+    // away. Then make the escape attempt.
+    p.write(b"rm -f /tmp/amux-session-$PPID.pids\r\n").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    p.write(format!("\"{amux}\" --trust skip sh -i\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"capped to"),
+        "deleting the parent's registry lifted the session ceiling: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// **A redirected `$TMPDIR` must not lift the ceiling** (re-review, critical).
 ///
 /// The cap reads the parent's policy from a registry on disk — deliberately, so

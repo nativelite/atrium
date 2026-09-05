@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The nested-session detector was dead code on macOS, and so was crash
+  recovery.** `warden::session_pids` and `reap::reap_stale` scanned
+  `std::env::temp_dir()` while registries are written to the fixed
+  `reap::registry_dir()` (`/tmp` on unix, chosen precisely so `$TMPDIR` cannot
+  move the ceiling). On macOS `$TMPDIR` is a per-user `/var/folders/…/T/`, so the
+  two never met: the warden enumerated zero sessions on every tick, and a crashed
+  session's pane trees were never swept while its registry accumulated on disk.
+  Both now ask `reap` where registries live.
+- **An `exec -a amux` shim could lift the session ceiling in one line.** The
+  ancestry walk decided "is this hop an amux?" from `ps -eo comm=`, which on macOS
+  prints **argv[0]** — chosen by the watched process. A pane could interpose a
+  fake "amux" between itself and its session; the walk stopped at the fake, read
+  the fake's registry (nonexistent, or agent-authored), and applied no ceiling. No
+  double-fork required. A hop now counts as amux only when the *kernel's*
+  executable for that pid is the same file as ours, by `(st_dev, st_ino)` —
+  `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux.
+- **Deleting the parent's registry no longer removes the ceiling.** The cap read
+  the parent's policy from disk and, finding nothing, capped nothing — so
+  `rm -f /tmp/amux-session-$PPID.pids` from a pane turned it off. An unreadable
+  policy now caps to `plan`: the kernel still says we are nested, and that half
+  cannot be deleted.
+- **An unreadable process table no longer means "no ceiling".** `amux_ancestor`
+  mapped every failure onto "no ancestor", which the caller read as "not nested".
+  It now reports four states, and a walk that did not complete is *unproven* — the
+  posture is left alone and the operator is told, rather than the ceiling
+  silently disappearing.
+- **A deleted session registry is reported.** Only a *changed* file alerted, so
+  the stronger tamper — deleting it — was silent.
+
+### Changed
+- **`capped_by=` is gone from the session registry, and nothing self-declares any
+  more.** It was a self-declaration in a mode-0644 file at a fixed path owned by
+  the same uid the agent runs as. A parent now derives the same answer itself,
+  from the process table and executable identity, applying the identical
+  predicate the child applies. It also fixes the mismatch that made a correctly
+  nested *grandchild* look like an escapee: `capped_by` recorded the nearest
+  ancestor while descent was walked 64 hops.
+- **A second descent signal: the pty session id.** A plain double-fork moves ppid
+  to 1 but leaves the session id untouched, so an amux launched that way inside a
+  pane is now visible where the ancestry walk lost it. One `setsid()` still sheds
+  it — the same act that already defeats process-group teardown.
+
+### Removed
+- **`AMUX_WARDEN=enforce`.** The warden no longer kills anything. Under a correct
+  ancestry rule the enforceable set is empty by construction, and the only
+  sessions left to accuse are indistinguishable from an ordinary reparenting — a
+  pane's launcher shell exiting is the same shape as a deliberate double-fork.
+  Worse, the kill was steerable by its target: `enforce` read the *suspect's own*
+  registry and signalled every process group it listed, so one `printf` into a
+  file at a predictable path turned the warden into an agent-directed kill
+  primitive. `warden`'s module docs carry the full reasoning, including the part
+  that has not changed: at the same uid nothing proves a descendant is *honouring*
+  a ceiling, and this is a tripwire, not a boundary.
+
 ## [0.23.0] - 2026-09-01
 
 ### Fixed

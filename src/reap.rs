@@ -98,7 +98,13 @@ mod sys {
         if !pid_alive(pid) {
             return false;
         }
-        match std::process::Command::new("ps")
+        // Absolute path, not `ps`. `Command::new("ps")` resolves through `$PATH`,
+        // which an agent in a pane owns - and `warden` refuses to do exactly this
+        // for exactly that reason. Here the failure is quieter but still real: a
+        // shimmed `ps` that always prints `Z` makes every live session look gone,
+        // which is what the crash sweep uses to decide a registry's pane groups
+        // may be killed.
+        match std::process::Command::new("/bin/ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
         {
@@ -424,25 +430,20 @@ pub fn registry_path(pid: u32) -> PathBuf {
 /// if the PATH to that disk location is itself in the environment. A fixed
 /// location cannot be redirected.
 #[cfg(unix)]
-fn registry_dir() -> PathBuf {
+pub fn registry_dir() -> PathBuf {
     PathBuf::from("/tmp")
 }
 
 /// Windows has no `$TMPDIR` redirection of the same shape, and the Job Object
 /// bounds a pane's tree there regardless of what the registry says.
 #[cfg(not(unix))]
-fn registry_dir() -> PathBuf {
+pub fn registry_dir() -> PathBuf {
     std::env::temp_dir()
 }
 
 /// Record this session's pane process groups. Rewritten whenever the set
 /// changes, so a watchdog started early still learns about panes spawned later.
-pub fn write_registry(
-    path: &Path,
-    pgids: &[u32],
-    policy: &str,
-    capped_by: Option<u32>,
-) -> io::Result<()> {
+pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()> {
     // The `policy=` line is what a NESTED amux reads to learn the ceiling it must
     // cap itself at. It lives on disk rather than in the environment on purpose:
     // an agent owns its own environment and can `env -u` any marker away, but it
@@ -450,15 +451,16 @@ pub fn write_registry(
     //
     // `read_registry` parses lines as pids and drops anything unparseable, so this
     // line is invisible to it and older readers are unaffected.
+    //
+    // There is deliberately NO `capped_by=<parent pid>` line any more. It was
+    // meant to let a parent tell a legitimate nested amux from one that
+    // double-forked to escape, but it is a self-declaration: this file is mode
+    // 0644 at a fixed path owned by the same uid the agent runs as, so any
+    // process - including one that never capped, and one that is not amux at all
+    // - could write it and look accounted for. The parent now derives that answer
+    // itself from the kernel's process table and executable identity (see
+    // `warden::Warden::judge_session`) and consults nothing written here.
     let mut body = format!("policy={policy}\n");
-    // Declaring which session capped us is what lets a parent tell a LEGITIMATE
-    // nested amux from one that double-forked to escape. Without it the warden
-    // sees only "a descendant appeared" and cannot tell the two apart - which is
-    // how enforcement would have killed a nested session that behaved perfectly.
-    if let Some(parent) = capped_by {
-        body.push_str(&format!("capped_by={parent}\n"));
-    }
-
     for p in pgids {
         body.push_str(&format!("{p}\n"));
     }
@@ -470,17 +472,6 @@ pub fn write_registry(
     let tmp = path.with_extension("pids.tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
-}
-
-/// The session that capped this one, if it declared one.
-pub fn read_capped_by(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok().and_then(|t| {
-        t.lines().find_map(|l| {
-            l.trim()
-                .strip_prefix("capped_by=")
-                .and_then(|v| v.parse().ok())
-        })
-    })
 }
 
 /// The trust policy a session recorded, if any. Read by a nested amux to find
@@ -598,12 +589,26 @@ fn reap_orphan_watchdogs() -> usize {
 
 /// Clean up after sessions that are already gone: `(sessions, watchdogs)`.
 pub fn reap_stale() -> (usize, usize) {
-    let dir = std::env::temp_dir();
-    let entries = match std::fs::read_dir(&dir) {
+    (sweep_dir(&registry_dir()), reap_orphan_watchdogs())
+}
+
+/// Sweep one directory of session registries. Split out from [`reap_stale`] so
+/// it can be tested against a scratch directory - running the real sweep from a
+/// test would `killpg` whatever process groups happen to be listed in the live
+/// registries on the machine.
+///
+/// This read `std::env::temp_dir()` while [`registry_path`] writes to
+/// [`registry_dir`], which on unix is the fixed `/tmp` precisely so that an agent
+/// cannot move it with `$TMPDIR`. On macOS `$TMPDIR` is a per-user
+/// `/var/folders/.../T/`, so the sweep never looked where the files were: a
+/// crashed session's pane trees were never cleaned up, and its registry stayed on
+/// disk for days. The one path that exists for crash recovery did not run.
+fn sweep_dir(dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        // Cannot read the temp dir: no registries to sweep, but a stuck watchdog
-        // is found through the process table and is still worth clearing.
-        Err(_) => return (0, reap_orphan_watchdogs()),
+        // Cannot read the directory: no registries to sweep. A stuck watchdog is
+        // found through the process table and is handled by the caller.
+        Err(_) => return 0,
     };
     let mut cleaned = 0;
     for e in entries.flatten() {
@@ -635,7 +640,7 @@ pub fn reap_stale() -> (usize, usize) {
         let _ = std::fs::remove_file(&path);
         cleaned += 1;
     }
-    (cleaned, reap_orphan_watchdogs())
+    cleaned
 }
 
 /// Re-exec amux as a detached watchdog for this session.
@@ -693,6 +698,40 @@ mod tests {
         );
         let _ = child.wait(); // reap it
         assert!(!pid_alive(pid), "a reaped process should be gone");
+    }
+
+    /// The registry path and the sweep must agree on a directory. They did not:
+    /// `registry_path` uses the fixed [`registry_dir`] (`/tmp` on unix, chosen so
+    /// `$TMPDIR` cannot move the ceiling) while the sweep read
+    /// `std::env::temp_dir()`. On macOS those are different directories, so crash
+    /// recovery swept an empty directory forever.
+    #[test]
+    fn the_sweep_looks_where_registries_are_written() {
+        assert_eq!(registry_path(1234).parent(), Some(registry_dir().as_path()));
+    }
+
+    /// A registry whose owner is long gone is debris and must be removed. Driven
+    /// through `sweep_dir` against a scratch directory: the real `reap_stale`
+    /// would signal the process groups named by every live registry on the host.
+    #[test]
+    fn a_dead_owners_registry_is_swept() {
+        let dir = std::env::temp_dir().join(format!("amux-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No pgid lines, so nothing is signalled - this test is about the file.
+        let dead = std::process::id() + 1_000_000; // never a live pid
+        let stale = dir.join(format!("amux-session-{dead}.pids"));
+        std::fs::write(&stale, "policy=plan\n").unwrap();
+        // A live owner's registry must survive the same sweep.
+        let mine = dir.join(format!("amux-session-{}.pids", std::process::id()));
+        std::fs::write(&mine, "policy=plan\n").unwrap();
+
+        assert_eq!(sweep_dir(&dir), 1, "exactly the dead owner's registry");
+        assert!(!stale.exists(), "a dead owner's registry must be removed");
+        assert!(
+            mine.exists(),
+            "a live session's registry must be left alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The definitive Windows check (acceptance test #1): assign a long-running

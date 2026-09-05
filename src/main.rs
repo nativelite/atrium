@@ -46,11 +46,6 @@ static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
 /// decision on the first loop tick - an agent quietly launching its own amux is
 /// something the operator should be asked about, not just told once on stderr.
 static CAP_NOTICE: OnceLock<String> = OnceLock::new();
-/// The amux session this one is nested under, if any. Recorded in our registry
-/// so the parent's warden can tell a legitimate nested session from one that
-/// double-forked to escape its ceiling - without it, both look like "a
-/// descendant appeared" and enforcement would kill the innocent one.
-static NESTED_UNDER: OnceLock<u32> = OnceLock::new();
 /// How often the warden re-reads what it snapshotted. Slow on purpose: a
 /// tripwire that costs the event loop is a tripwire that gets removed.
 const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
@@ -1181,20 +1176,32 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
     // skip confirmation just below on its own behalf. It cannot unset its own
     // parent. A double-fork still erases the trail - that case belongs to the
     // warden, which watches for sessions the cap could not account for.
-    if let Some(parent) = amux::warden::amux_ancestor() {
-        // Declare the relationship even when no cap was needed: the parent's
-        // warden reads this to know we are accounted for.
-        let _ = NESTED_UNDER.set(parent);
-        let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
-            .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
-        if let Some(ceiling) = inherited {
+    match amux::warden::amux_ancestor() {
+        amux::warden::Ancestry::Amux(parent) => {
+            let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
+                .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
+            // An UNREADABLE policy is not an absent ceiling. We know from the
+            // kernel that we are nested; if the parent's registry has been deleted
+            // or corrupted we still must not exceed a ceiling we cannot see. This
+            // used to fall through with no cap at all, so `rm
+            // /tmp/amux-session-<parent>.pids` - one command, no double-fork, from
+            // a pane running as the same uid - turned the ceiling off. Plan is the
+            // safest posture that still leaves the session usable, and the warden
+            // reports the deletion separately.
+            let (ceiling, why) = match inherited {
+                Some(c) => (c, "whose session policy is"),
+                None => (
+                    amux::ctl::TrustMode::Plan,
+                    "whose session policy could not be read, so the safe floor is",
+                ),
+            };
             if trust.rank() > ceiling.rank() {
                 eprintln!(
-                    "amux: capped to {} - running inside another amux (pid {}) whose \
-                     session policy is {}. A pane cannot raise its own posture; set \
-                     it at the outer launch.",
+                    "amux: capped to {} - running inside another amux (pid {}) {} {}. \
+                     A pane cannot raise its own posture; set it at the outer launch.",
                     ceiling.policy_label(),
                     parent,
+                    why,
                     ceiling.policy_label()
                 );
                 let _ = CAP_NOTICE.set(format!(
@@ -1205,6 +1212,27 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
                 trust = ceiling;
             }
         }
+        // The walk did not complete: no process table, or a hop whose executable
+        // could not be identified. We cannot invent a ceiling - there may be no
+        // parent at all, and capping every launch on an unreadable table would
+        // break amux in a bare terminal on any host where the probe fails. So the
+        // posture is left alone and the operator is told, which is the difference
+        // between "cannot read a known parent's policy" (cap, above) and "cannot
+        // tell whether a parent exists" (report, here).
+        amux::warden::Ancestry::Unknown => {
+            eprintln!(
+                "amux: could not determine whether this session is nested inside \
+                 another amux; no ceiling was applied."
+            );
+            let _ = CAP_NOTICE.set(
+                "could not determine whether this session is nested inside another \
+                 amux, so no ceiling was applied"
+                    .to_string(),
+            );
+        }
+        // A top-level session, or a platform with no implementation (Windows -
+        // see `warden::amux_ancestor`, where that gap is written down).
+        amux::warden::Ancestry::NoneFound | amux::warden::Ancestry::Unsupported => {}
     }
     trust
 }
@@ -1790,18 +1818,18 @@ fn run(
                 for pid in cur.iter().filter(|p| !registered.contains(p)) {
                     session_job.assign(*pid);
                 }
-                let _ = amux::reap::write_registry(
-                    &registry_path,
-                    &cur,
-                    trust_mode().policy_label(),
-                    NESTED_UNDER.get().copied(),
-                );
+                let _ =
+                    amux::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
                 warden.registry_rewritten();
                 registered = cur;
             }
             if last_warden_check.elapsed() >= WARDEN_INTERVAL {
                 last_warden_check = Instant::now();
-                let mut alerts = warden.check();
+                // The live pane pids double as the second descent signal: `pty`
+                // makes each pane a session leader, so anything the agent spawns
+                // in a pane carries that session id even after a double-fork has
+                // erased its parent link.
+                let mut alerts = warden.check(&registered);
                 // The ancestry cap fired before the bus existed; raise it once now.
                 if let Some(note) = CAP_NOTICE.get() {
                     if !cap_notice_raised {
@@ -1825,28 +1853,14 @@ fn run(
                     );
                     force_repaint = true;
                 }
-                // Enforcement is opt-in. By default the warden tells you and stops
-                // there: its judgement is a heuristic over a process table, and
-                // killing on a heuristic can destroy work you wanted. With
-                // AMUX_WARDEN=enforce an uncapped descendant is torn down, and the
-                // kill is itself recorded and raised - enforcement is never the
-                // quiet option.
-                if amux::warden::Warden::enforcing() {
-                    for pid in warden.escapees() {
-                        if warden.enforce(pid) {
-                            let detail = format!("killed uncapped nested amux (pid {pid})");
-                            ctl_audit.record(None, "warden-enforced", &detail, true, "");
-                            let _ = bus.publish(
-                                "warden",
-                                amux::bus::Kind::DecisionNeeded,
-                                None,
-                                &[("msg".to_string(), detail)],
-                                agsess::sessions::now_ms(),
-                            );
-                            force_repaint = true;
-                        }
-                    }
-                }
+                // There is no enforcement branch here any more, and that is a
+                // decision rather than an omission: `AMUX_WARDEN=enforce` used to
+                // tear down anything judged an escapee, and both the judgement and
+                // the kill were unsound. `warden`'s module docs carry the full
+                // reasoning; the short version is that under a correct ancestry
+                // rule the enforceable set is empty, the only sessions left to
+                // accuse are indistinguishable from an ordinary reparenting, and
+                // the kill target was read out of a file the accused could write.
             }
             // The watchdog is the unix answer to a death no handler can catch.
             // Windows does not need it and must not run it: the durable fix there
