@@ -250,17 +250,27 @@ impl Warden {
         acted
     }
 
-    /// Is enforcement switched on? Yes, unless explicitly asked to only report.
+    /// Is enforcement switched on? NO by default - `AMUX_WARDEN=enforce` opts in.
     ///
-    /// It was opt-in while "escapee" meant merely "a descendant appeared", which
-    /// would have killed a perfectly well-behaved nested amux. Now that an
-    /// escapee is one that failed to declare it accepted our ceiling — after a
-    /// grace period, and only if it still exists — the finding is specific
-    /// enough to act on: nothing reaches it by accident. `AMUX_WARDEN=report`
-    /// turns it back down to alerts.
+    /// It was briefly the default, on the argument that an escapee was specific
+    /// enough to act on. A review showed it is not, and killing was reaching the
+    /// wrong targets:
+    ///
+    /// - `capped_by` records only the NEAREST amux ancestor while descent is
+    ///   walked up to 64 hops, so a correctly-capped GRANDCHILD looks like an
+    ///   escapee to its grandparent and its whole tree dies ~5s in. No attacker,
+    ///   default config, and reachable in the exact shape of a fleet whose agents
+    ///   run amux.
+    /// - The judgement itself rests on paths the agent owns: the registry is
+    ///   addressed via `$TMPDIR` and the ancestry walk shells out to a
+    ///   `$PATH`-resolved `ps`, both failing open.
+    ///
+    /// Killing on a heuristic is only defensible when the heuristic is sound.
+    /// This one is not yet, so the default returns to telling the human, who
+    /// already has the decision on the bus.
     pub fn enforcing() -> bool {
-        !std::env::var("AMUX_WARDEN")
-            .map(|v| v.eq_ignore_ascii_case("report"))
+        std::env::var("AMUX_WARDEN")
+            .map(|v| v.eq_ignore_ascii_case("enforce"))
             .unwrap_or(false)
     }
 

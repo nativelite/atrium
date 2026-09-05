@@ -36,18 +36,27 @@ pub const ENV_TRUST_ALLOW: &str = "AMUX_TRUST_ALLOW";
 /// not extended via [`ENV_TRUST_ALLOW`]) still surfaces as a visible approval
 /// prompt in the pane — that is the safety of this mode.
 const DEFAULT_ALLOW: &[&str] = &[
-    // amux itself. Without this a coordinating fleet cannot use the coordination
-    // layer: every `amux ctl bus pub` / `board claim` in an agent's kickoff
-    // surfaces an approval prompt, so the operator is asked to approve the very
-    // messages the fleet exists to exchange. Seven agents then queue up asking
-    // permission to do their jobs.
+    // `amux ctl` - the coordination layer, and ONLY that.
     //
-    // Safe to allow now in a way it was not before: a nested `amux --trust skip`
-    // is capped to this session's policy by the ancestry check, `fleet up` is
-    // gated the same way, and `ctl spawn` is separately governed by the spawn
-    // allowlist and the trust ceiling. So the dangerous things amux can be asked
-    // to do are already bounded, and what remains is talking to its own bus.
-    "amux",
+    // Every agent needs it: `bus pub`, `board claim`, `ctl list` are how a fleet
+    // works at all, and without this each one surfaces an approval prompt, so the
+    // operator is asked to approve the very messages the fleet exists to exchange.
+    //
+    // But this is deliberately `amux ctl`, NOT `amux`. Starting a NEW amux session
+    // from inside a pane has no legitimate use for any agent, lead or worker, and
+    // it is the escape route: `amux --trust skip` is a fresh session that sets its
+    // own policy. That is supposed to be caught by the ancestry cap, but a review
+    // found the cap reachable only through paths the agent itself owns - the
+    // registry is addressed via $TMPDIR and the ancestry walk shells out to a
+    // $PATH-resolved `ps`, both fail-open. So the cap is defence in depth, not a
+    // wall, and it must not be the only thing standing between an agent and a new
+    // uncapped session.
+    //
+    // Narrowing the prefix means launching one is simply not hands-off: under
+    // `accept` it surfaces as a visible approval prompt. (Under `automode` claude
+    // runs commands on its own guardrails and this allowlist does not apply -
+    // that gap is real and is not closed by this.)
+    "amux ctl",
     "python",
     "python3",
     "pytest",
