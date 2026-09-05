@@ -245,7 +245,11 @@ The file is read **read-only** — amux never writes it.
   the fleet file's directory, absolute paths as-is), **`add_dirs`**
   (→ `claude --add-dir …`, so it can read other trees), **`prompt`**
   (→ `--append-system-prompt`), **`model`** (→ `--model`), **`effort`**
-  (→ `--effort`). Each agent still gets its own `--session-id`, so the
+  (→ `--effort`), and **`can_spawn`** — may this agent create teammates with
+  `ctl spawn`? **Defaults to `false`.** Creating teammates is a capability the
+  roster grants, not something implied by having ctl access: a depth cap bounds
+  how far a fan-out goes, but never says who may start one. Each agent still gets
+  its own `--session-id`, so the
   agent-aware chrome binds each pane independently.
 - **Errors spawn nothing.** No file (the message names both locations), malformed
   JSON, an unknown fleet name, a fleet with zero agents, a grid that does not fit,
