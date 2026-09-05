@@ -1165,6 +1165,50 @@ fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
     privilege_for(caller, pane_parent)
 }
 
+/// Lower `trust` to the ceiling of the amux session this one is nested under.
+///
+/// Used by EVERY entry point that starts a session. It first lived inline in the
+/// single-pane path, which meant `amux fleet up X --trust skip` sailed straight
+/// past it: `fleet` is dispatched before that code ever runs. An agent in a pane
+/// could escape the ceiling by launching a fleet instead of a pane - the ceiling
+/// held for one door and not the other.
+fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMode {
+    // A pane cannot escape its session's posture by launching its own amux.
+    //
+    // The ceiling hangs off process ANCESTRY, not the environment. An agent owns
+    // its environment, so an `AMUX_AGENT=1` marker or an inherited policy var
+    // dies to `env -u`; and it owns a spawned child's stdin, so it can answer the
+    // skip confirmation just below on its own behalf. It cannot unset its own
+    // parent. A double-fork still erases the trail - that case belongs to the
+    // warden, which watches for sessions the cap could not account for.
+    if let Some(parent) = amux::warden::amux_ancestor() {
+        // Declare the relationship even when no cap was needed: the parent's
+        // warden reads this to know we are accounted for.
+        let _ = NESTED_UNDER.set(parent);
+        let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
+            .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
+        if let Some(ceiling) = inherited {
+            if trust.rank() > ceiling.rank() {
+                eprintln!(
+                    "amux: capped to {} - running inside another amux (pid {}) whose \
+                     session policy is {}. A pane cannot raise its own posture; set \
+                     it at the outer launch.",
+                    ceiling.policy_label(),
+                    parent,
+                    ceiling.policy_label()
+                );
+                let _ = CAP_NOTICE.set(format!(
+                    "a pane launched its own amux (pid {}) and was capped to {}",
+                    parent,
+                    ceiling.policy_label()
+                ));
+                trust = ceiling;
+            }
+        }
+    }
+    trust
+}
+
 /// Resolve a spawn's permission mode against the session policy.
 ///
 /// The session policy is a CEILING, and it now holds for everyone — including a
@@ -1429,39 +1473,7 @@ fn main() -> ExitCode {
     // `--skip-permissions` is full bypass — a conscious, dangerous choice. Make
     // the human confirm it once, in plain terms, *before* the TUI takes the
     // terminal (this reads stdin normally; the run loop takes raw mode after).
-    // A pane cannot escape its session's posture by launching its own amux.
-    //
-    // The ceiling hangs off process ANCESTRY, not the environment. An agent owns
-    // its environment, so an `AMUX_AGENT=1` marker or an inherited policy var
-    // dies to `env -u`; and it owns a spawned child's stdin, so it can answer the
-    // skip confirmation just below on its own behalf. It cannot unset its own
-    // parent. A double-fork still erases the trail - that case belongs to the
-    // warden, which watches for sessions the cap could not account for.
-    if let Some(parent) = amux::warden::amux_ancestor() {
-        // Declare the relationship even when no cap was needed: the parent's
-        // warden reads this to know we are accounted for.
-        let _ = NESTED_UNDER.set(parent);
-        let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
-            .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
-        if let Some(ceiling) = inherited {
-            if trust.rank() > ceiling.rank() {
-                eprintln!(
-                    "amux: capped to {} - running inside another amux (pid {}) whose \
-                     session policy is {}. A pane cannot raise its own posture; set \
-                     it at the outer launch.",
-                    ceiling.policy_label(),
-                    parent,
-                    ceiling.policy_label()
-                );
-                let _ = CAP_NOTICE.set(format!(
-                    "a pane launched its own amux (pid {}) and was capped to {}",
-                    parent,
-                    ceiling.policy_label()
-                ));
-                trust = ceiling;
-            }
-        }
-    }
+    trust = cap_trust_to_ancestor(trust);
     if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
         eprintln!("amux: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
         return ExitCode::SUCCESS;
@@ -3445,6 +3457,26 @@ fn fleet_up(
         }
         (cli, _) => cli,
     };
+    // The SAME two gates the single-pane path applies. `fleet` is dispatched
+    // before those, so without this a pane could escape its ceiling simply by
+    // launching a fleet instead of a pane, and a fleet file declaring `skip`
+    // would take full bypass with no confirmation shown to the human running it.
+    // That matters most in the workflow this file is built for: an agent writes
+    // the roster, a human reviews and runs it. The review is the approval, so the
+    // posture must be impossible to slip past it.
+    let trust = cap_trust_to_ancestor(trust);
+    if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
+        eprintln!("amux fleet: aborted.");
+        return ExitCode::SUCCESS;
+    }
+    // Always say the posture out loud. A fleet file can be authored by an agent
+    // and skimmed by a human; a line naming what everything is about to run under
+    // is the difference between reviewing it and assuming it.
+    eprintln!(
+        "amux fleet: {name} starting {} agent(s) at trust {}",
+        fleet.agents.len(),
+        trust.policy_label()
+    );
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.
     set_trust_mode(trust);

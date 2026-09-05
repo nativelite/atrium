@@ -1612,3 +1612,50 @@ fn a_nested_amux_cannot_raise_its_own_trust() {
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+/// **`fleet up` is gated exactly like a single pane** (nesting escape).
+///
+/// `fleet` is dispatched before the single-pane path's ancestry cap, so for a
+/// while an agent could escape its session's ceiling simply by launching a fleet
+/// instead of a pane — the ceiling held for one door and not the other. Worse in
+/// the workflow the fleet file is built for: an agent writes the roster, a human
+/// reviews and runs it, so a posture that slips past the review defeats the
+/// review.
+#[cfg(unix)]
+#[test]
+fn a_nested_fleet_up_is_capped_like_a_pane() {
+    let amux = env!("CARGO_BIN_EXE_amux");
+    let td = std::env::temp_dir().join(format!("amux-nestfleet-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    // A fleet file that asks for full bypass — as an agent-authored one might.
+    std::fs::write(
+        td.join("amux.fleet.json"),
+        r#"{"fleets":{"esc":{"trust":"skip","agents":[{"name":"a","cmd":["sh","-i"]}]}}}"#,
+    )
+    .unwrap();
+
+    let mut p = pty::Pty::spawn(
+        amux,
+        &["--allow-ctl", "--trust", "plan", "sh", "-i"],
+        24,
+        80,
+    )
+    .unwrap();
+    p.write(b"m=outer; echo \"$m\"\"=up\"\r\n").unwrap();
+    read_until(&mut p, b"outer=up", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(600));
+
+    p.write(format!("cd {} && \"{amux}\" fleet up esc\r\n", td.display()).as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"capped to"),
+        "a nested `fleet up` escaped the session ceiling: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&td);
+}
