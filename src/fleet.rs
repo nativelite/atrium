@@ -112,6 +112,19 @@ pub struct Agent {
     pub model: Option<String>,
     /// The reasoning effort (→ `--effort <effort>`).
     pub effort: Option<String>,
+    /// May this agent create teammates with `amux ctl spawn`? Defaults to
+    /// **false** for a fleet agent.
+    ///
+    /// Spawning was never a capability an agent had or lacked - it was implied by
+    /// having ctl access at all, then bounded after the fact by a depth cap, the
+    /// spawn allowlist and the trust ceiling. So in a seven-agent review fleet
+    /// every reviewer could create teammates; none should, and nothing said so.
+    ///
+    /// Declaring it per agent puts the answer in the file the human approves,
+    /// rather than leaving it inferred from a depth cap three layers down. It
+    /// composes with the existing checks instead of replacing them: an agent with
+    /// `can_spawn` still cannot exceed the trust ceiling or the depth cap.
+    pub can_spawn: Option<bool>,
     /// An initial **user** prompt appended as the final positional argument, so
     /// the agent starts working the moment the fleet comes up instead of waiting
     /// for the human to type. For claude this is `claude … "<kickoff>"`, which
@@ -305,6 +318,13 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
     let prompt = str_field("prompt")?;
     let model = str_field("model")?;
     let effort = str_field("effort")?;
+    let can_spawn =
+        match get("can_spawn") {
+            Some(v) => Some(v.as_bool().ok_or_else(|| {
+                format!("fleet agent {name:?}: \"can_spawn\" must be true or false")
+            })?),
+            None => None,
+        };
     let kickoff = str_field("kickoff")?;
 
     let add_dirs = match get("add_dirs") {
@@ -338,6 +358,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         prompt,
         model,
         effort,
+        can_spawn,
         kickoff,
     })
 }
@@ -679,6 +700,26 @@ mod tests {
     }
 
     // --- discovery -----------------------------------------------------------
+
+    #[test]
+    fn spawning_is_a_declared_capability_defaulting_to_off() {
+        // Creating teammates used to be implied by having ctl access at all, so
+        // every agent in a fleet could do it. In a seven-agent review fleet that
+        // meant all seven, when only the lead should.
+        let f = parse(
+            r#"{ "fleets": { "a": { "agents": [
+                 { "name": "lead", "cmd": ["claude"], "can_spawn": true },
+                 { "name": "worker", "cmd": ["claude"] }
+               ] } } }"#,
+        )
+        .unwrap();
+        let a = f.get("a").unwrap();
+        assert_eq!(a.agents[0].can_spawn, Some(true), "the lead declared it");
+        assert_eq!(
+            a.agents[1].can_spawn, None,
+            "a worker that says nothing must not silently get it"
+        );
+    }
 
     #[test]
     fn a_fleet_can_declare_the_control_plane() {

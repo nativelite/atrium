@@ -1325,6 +1325,16 @@ struct Pane {
     /// ctl-spawned worker. The `--max-depth` recursion guard is checked against
     /// this.
     depth: usize,
+    /// May this pane create teammates with `amux ctl spawn`?
+    ///
+    /// A capability, not an inference. It used to be implied by having ctl access
+    /// at all, so every agent in a fleet could spawn - in a seven-agent review
+    /// fleet, all seven, when only the lead should. A fleet declares it per agent
+    /// (default FALSE); a pane the human opened directly keeps the old behaviour,
+    /// because there the human IS the caller.
+    ///
+    /// Checked before the depth cap and the trust ceiling, not instead of them.
+    can_spawn: bool,
     /// True once the pane's process has produced any output. Until then, a
     /// *passthrough* (single/zoomed) pane shows the animated startup splash
     /// instead of a blank screen (the tiled path uses a per-pane blank check in
@@ -3482,6 +3492,23 @@ fn fleet_up(
         trust.policy_label(),
         if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
+    // Who may create teammates is part of what the human approves, so say it.
+    let spawners: Vec<&str> = fleet
+        .agents
+        .iter()
+        .filter(|a| a.can_spawn.unwrap_or(false))
+        .map(|a| a.name.as_str())
+        .collect();
+    eprintln!(
+        "amux fleet: {} of {} may spawn teammates{}",
+        spawners.len(),
+        fleet.agents.len(),
+        if spawners.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", spawners.join(", "))
+        }
+    );
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.
     set_trust_mode(trust);
@@ -3590,6 +3617,10 @@ fn spawn_fleet_window(
 
     let mut panes: Vec<Pane> = Vec::with_capacity(fleet.agents.len());
     for (id, agent) in fleet.agents.iter().enumerate() {
+        // A fleet agent may NOT create teammates unless its entry says so. The
+        // roster is the definition of the run, so the capability belongs in it -
+        // and the safe default is the one that surprises nobody.
+        let can_spawn = agent.can_spawn.unwrap_or(false);
         // Resolve add_dirs against the fleet file's directory (absolute as-is).
         let resolved_dirs: Vec<String> = agent
             .add_dirs
@@ -3624,6 +3655,10 @@ fn spawn_fleet_window(
                 // board/bus attribution (`by`/`from`), the overview, and the bar
                 // all show the persona (`lead`, `ada`) instead of `pane N`.
                 pane.role = Some(agent.name.clone());
+                // Capability, from the roster. `spawn_pane_full` defaults to the
+                // human-pane behaviour (true); a fleet agent gets only what its
+                // entry declares.
+                pane.can_spawn = can_spawn;
                 panes.push(pane);
             }
             Err(e) => {
@@ -3867,6 +3902,25 @@ fn dispatch_ctl(
             ctl::reply_sent(id, busy)
         }
         Cmd::Spawn(mut sp) => {
+            // Capability check, FIRST. Creating teammates used to be implied by
+            // having ctl access at all - so every agent in a fleet could do it,
+            // and in a seven-agent review fleet all seven could, when only the
+            // lead should. A depth cap bounds how FAR fan-out goes; it never says
+            // who may start it.
+            //
+            // Before the depth cap and the trust ceiling, not instead of them: a
+            // pane that may spawn is still capped on both.
+            if let Some(c) = caller {
+                let allowed = pane_by_agent(windows, c)
+                    .map(|p| p.can_spawn)
+                    .unwrap_or(false);
+                if !allowed {
+                    return ctl::reply_err(
+                        "this agent is not permitted to create teammates \
+                         (set \"can_spawn\": true for it in the fleet file)",
+                    );
+                }
+            }
             // amux owns the permission posture. Two layers, both surfaced (never
             // silent) in the reply `note`:
             //
@@ -4800,6 +4854,7 @@ fn spawn_pane_full(
         role: None,
         parent: None,
         depth: 0,
+        can_spawn: true,
         painted: false,
         mouse_wanted: false,
     })
