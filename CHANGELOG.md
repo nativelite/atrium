@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A hung test can no longer wedge the machine that ran it.** `cargo test` has
+  no per-test timeout and this project has no CI to kill a stuck job, so a test
+  that deadlocked produced no failing line and no end — the last one was found
+  only because someone noticed the terminal had not moved. `./dev.py test` now
+  runs each invocation under a wall-clock budget (`AMUX_TEST_TIMEOUT`, default
+  300 s; the suite takes ~15 s), kills the whole **process tree** on expiry —
+  cargo alone would leave the panes, ptys and `ctl` clients a hung test spawned
+  parked forever — and exits `124`, the code `timeout(1)` uses, so a hang is
+  distinguishable from a failure. It then re-runs the suite serially to name the
+  culprit: in parallel mode libtest prints a test's name only when it *finishes*,
+  but under `--test-threads=1` it prints the name first, so the last
+  unterminated line is the test that never came back (`!! THE HANG IS: …`). If
+  the serial re-run passes, that is reported too — an intermittent hang, or one
+  that needs parallelism, is a different bug and says so. Ctrl-C now kills the
+  tree as well.
+
 ## [0.30.0] - 2026-09-06
 
 ### Added
