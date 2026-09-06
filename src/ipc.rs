@@ -42,16 +42,22 @@
 //! defense in depth *beneath* the per-pane capability token (`AMUX_TOKEN`), which
 //! remains the primary authenticator.
 //!
-//! **What none of that stops.** Peer-cred, mode 0600 and the SDDL all admit a
-//! process running as the *same user* — which is exactly what a hosted agent
-//! is. Every mitigation in this file is bounded damage, not prevention: a
-//! same-uid process can still replace the unix endpoint (amux detects it and
-//! says so; see [`Listener::take_security_event`]) and can still create an
-//! additional Windows pipe instance under the same name and race amux for
-//! clients (amux cannot currently detect that at all — an open parity gap).
-//! Closing either one needs the server to *authenticate* itself to its clients,
-//! which is a separate decision and is deliberately not faked here with a
-//! non-cryptographic keyed hash.
+//! **What none of that stops — and why that is by design.** Peer-cred, mode 0600
+//! and the SDDL all admit a process running as the *same user* — which is exactly
+//! what a hosted agent is. That is deliberate: **defending against a same-user
+//! attacker is an explicit non-goal.** amux's security scope is fleet/agent safety
+//! (a pane cannot impersonate a sibling or claim operator; credentials stay
+//! scoped; a *different* user on a shared box is kept out). A process already
+//! running as you has won by far easier paths — it can read your env, your files,
+//! `~/.claude.json`, your OS vault — so there is nothing this channel can protect
+//! that such an attacker does not already hold. Concretely: a same-uid process can
+//! replace the unix endpoint (amux raises a tripwire it happens to have there; see
+//! [`Listener::take_security_event`]) or create an additional Windows pipe instance
+//! under the same name and race amux for clients (no tripwire on Windows — a named
+//! pipe has no `(dev,ino)` to re-stat). Both are the same **same-user non-goal**,
+//! not open defects. Truly closing them needs the server to *authenticate* itself
+//! to its clients — real crypto, out of scope for a single-user local tool, and
+//! deliberately not faked here with a non-cryptographic keyed hash.
 
 use std::io;
 
@@ -1261,7 +1267,8 @@ mod sys {
             }
         }
 
-        /// Always `None` on Windows — and that is a **gap, not an all-clear**.
+        /// Always `None` on Windows — by design, because the threat it would
+        /// report is a **same-user non-goal**, not an unguarded hole.
         ///
         /// `FILE_FLAG_FIRST_PIPE_INSTANCE` is real and worth having: it makes
         /// amux's own `bind` fail loudly if the name already exists, so amux can
@@ -1272,10 +1279,15 @@ mod sys {
         /// `\\.\pipe\amux-ctl-<pid>` *without* the flag once amux holds the
         /// name, and race amux for connecting clients.
         ///
-        /// A named pipe has no `(dev, ino)` to re-`stat`, so the unix tripwire has
-        /// no analogue here and amux currently cannot detect that at all. Closing
-        /// it needs the server to authenticate itself to its clients — a separate
-        /// decision, and not one to fake with a non-cryptographic keyed hash.
+        /// A named pipe has no `(dev, ino)` to re-`stat`, so the unix path's
+        /// tripwire has no analogue here. But this is the **same-user** case, which
+        /// is outside amux's threat model (a process running as you has already won
+        /// by easier paths — env, files, `~/.claude.json`, the OS vault). So this
+        /// is a documented non-goal, not an open defect: `None` is the honest,
+        /// intended answer. The unix side merely *happens* to have a cheap tripwire
+        /// (path re-stat) and uses it; the absence of one here changes nothing about
+        /// what amux is defending. Truly closing it needs server-authenticates-to-
+        /// client crypto — over-engineering for a single-user local tool.
         pub fn take_security_event(&mut self) -> Option<String> {
             None
         }
