@@ -911,6 +911,15 @@ mod sys {
     const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
     const PIPE_NOWAIT: u32 = 0x0000_0001;
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    /// The per-instance pipe buffer, both directions (passed to `CreateNamedPipeW`).
+    /// **Load-bearing for every write.** `PIPE_NOWAIT` writes are *all-or-nothing*:
+    /// a `WriteFile` whose length exceeds the free buffer space writes ZERO bytes,
+    /// not a partial. So every write must be capped to this so it can fit once the
+    /// reader has drained — otherwise any request or reply larger than one buffer
+    /// writes nothing forever and the exchange deadlocks (measured on Windows: the
+    /// failure was a hard wall at exactly 8192 bytes). Readers drain the whole
+    /// buffer each pass, so a capped chunk always fits after a drain.
+    const PIPE_BUF: u32 = 8192;
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const OPEN_EXISTING: u32 = 3;
@@ -960,12 +969,17 @@ mod sys {
         }
 
         fn send(&mut self, buf: &[u8]) -> Sent {
+            // Cap to one pipe buffer: PIPE_NOWAIT writes are all-or-nothing, so a
+            // larger request would write zero into a buffer that cannot hold it and
+            // the reply would never leave (see PIPE_BUF). pump_write loops, so the
+            // rest goes out on the following passes as the client drains.
+            let take = (buf.len() as u32).min(PIPE_BUF);
             let mut written = 0u32;
             let ok = unsafe {
                 WriteFile(
                     self.handle,
                     buf.as_ptr(),
-                    buf.len() as u32,
+                    take,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -1059,8 +1073,8 @@ mod sys {
                     open_mode,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
                     PIPE_UNLIMITED_INSTANCES,
-                    8192,
-                    8192,
+                    PIPE_BUF,
+                    PIPE_BUF,
                     0,
                     sec_ptr,
                 )
@@ -1331,7 +1345,12 @@ mod sys {
         let mut off = 0usize;
         while off < line.len() {
             let mut written = 0u32;
-            let chunk = &line.as_bytes()[off..];
+            // Cap to one pipe buffer: a PIPE_NOWAIT write larger than the free
+            // buffer space writes ZERO (all-or-nothing), so a request over one
+            // buffer would never send. Chunking to PIPE_BUF lets each write fit
+            // once the server has drained the previous chunk (see PIPE_BUF).
+            let end = (off + PIPE_BUF as usize).min(line.len());
+            let chunk = &line.as_bytes()[off..end];
             let ok = unsafe {
                 WriteFile(
                     h,
@@ -3686,7 +3705,15 @@ mod tests {
     fn shipping_source() -> &'static str {
         static ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         ONCE.get_or_init(|| {
+            // Normalize CRLF → LF FIRST. `include_str!` embeds the file's bytes
+            // verbatim, and on a Windows checkout (autocrlf) this file is CRLF —
+            // so the `"…\nmod tests {"` needle below (an LF literal) would never
+            // match, `.split().next()` would return the ENTIRE file, and every
+            // guard would then trip on the test module's own code and messages
+            // instead of the shipping source. (Found on Windows; the author ran
+            // this on a mac, where the file is LF and the bug is invisible.)
             include_str!("ipc.rs")
+                .replace("\r\n", "\n")
                 .split("#[cfg(test)]\nmod tests {")
                 .next()
                 .expect("the source above the tests")
