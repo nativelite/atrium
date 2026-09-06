@@ -462,3 +462,290 @@ fn q3b_a_non_reading_client_does_not_block_the_loop() {
         "respond() to a non-reading client took {after_respond:?} — it blocked (D2)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// D5 / D6 / D7 — the Windows counterparts of the unix-only exploit tests.
+//   D6/D7 need a MALICIOUS SERVER (amux is the client, via request());
+//   D5 needs silent CLIENTS against amux's real Listener.
+// Extra care on the 8 KiB pipe-buffer boundary: the reply path crosses the same
+// edge D4 deadlocked on, so a truncated LARGE reply is where a silent bug hides.
+// ---------------------------------------------------------------------------
+mod exploits {
+    use super::{addr, request, Listener};
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::time::{Duration, Instant};
+
+    type Handle = *mut c_void;
+    const INVALID: Handle = usize::MAX as Handle;
+    const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
+    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
+    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
+    const PIPE_UNLIMITED_INSTANCES: u32 = 255;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const OPEN_EXISTING: u32 = 3;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateNamedPipeW(
+            n: *const u16,
+            o: u32,
+            m: u32,
+            mx: u32,
+            ob: u32,
+            ib: u32,
+            t: u32,
+            s: *mut c_void,
+        ) -> Handle;
+        fn ConnectNamedPipe(h: Handle, ov: *mut c_void) -> i32;
+        fn DisconnectNamedPipe(h: Handle) -> i32;
+        fn CreateFileW(
+            n: *const u16,
+            a: u32,
+            sh: u32,
+            s: *mut c_void,
+            d: u32,
+            f: u32,
+            t: Handle,
+        ) -> Handle;
+        fn ReadFile(h: Handle, b: *mut u8, l: u32, r: *mut u32, ov: *mut c_void) -> i32;
+        fn WriteFile(h: Handle, b: *const u8, l: u32, w: *mut u32, ov: *mut c_void) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+        fn GetLastError() -> u32;
+        fn FlushFileBuffers(h: Handle) -> i32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
+    }
+
+    /// Block (on the TEST peer only — never amux's loop) until the client has read
+    /// everything we sent, so a following disconnect can't discard unread bytes.
+    /// This makes the truncation tests test "got the partial then EOF" and the
+    /// control test test "got the whole honest reply".
+    unsafe fn flush_to_client(server: Handle) {
+        FlushFileBuffers(server);
+    }
+
+    /// A BLOCKING byte-mode named-pipe server — a scripted test peer, not amux's
+    /// NOWAIT run loop, so it may block on its own thread. Returns the handle as a
+    /// `usize` so it can cross a thread boundary (a raw pointer is not `Send`).
+    fn blocking_server(a: &str) -> usize {
+        let w = wide(a);
+        let h = unsafe {
+            CreateNamedPipeW(
+                w.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE,
+                PIPE_UNLIMITED_INSTANCES,
+                65536,
+                65536,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(h != INVALID, "CreateNamedPipeW failed: {}", unsafe {
+            GetLastError()
+        });
+        h as usize
+    }
+
+    /// Accept one client and drain its request line (`\n`-terminated).
+    unsafe fn accept_and_read_request(server: Handle) {
+        ConnectNamedPipe(server, std::ptr::null_mut()); // blocks for a client / ERROR_PIPE_CONNECTED
+        let mut buf = [0u8; 8192];
+        loop {
+            let mut n = 0u32;
+            let ok = ReadFile(
+                server,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut n,
+                std::ptr::null_mut(),
+            );
+            if ok == 0 || n == 0 {
+                break;
+            }
+            if buf[..n as usize].contains(&b'\n') {
+                break;
+            }
+        }
+    }
+
+    /// Write all of `bytes`; `false` once the peer is gone.
+    unsafe fn send_all(h: Handle, bytes: &[u8]) -> bool {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let mut w = 0u32;
+            let ok = WriteFile(
+                h,
+                bytes[off..].as_ptr(),
+                (bytes.len() - off) as u32,
+                &mut w,
+                std::ptr::null_mut(),
+            );
+            if ok == 0 || w == 0 {
+                return false;
+            }
+            off += w as usize;
+        }
+        true
+    }
+
+    /// D7 core: a malicious server sends `reply_len` bytes with **no** trailing
+    /// newline, then closes. `request()` must return an ERROR (`UnexpectedEof`),
+    /// never a truncated `Ok`.
+    fn truncated_reply_must_err(reply_len: usize, label: &str) {
+        let a = format!(r"\\.\pipe\amux-d7-{}-{label}", std::process::id());
+        let sh = blocking_server(&a);
+        let srv = std::thread::spawn(move || unsafe {
+            let server = sh as Handle;
+            accept_and_read_request(server);
+            let body = vec![b'R'; reply_len];
+            let _ = send_all(server, &body); // partial: no '\n'
+            flush_to_client(server); // client provably receives the partial bytes…
+            DisconnectNamedPipe(server); // …then EOF with no newline
+            CloseHandle(server);
+        });
+        let got = request(&a, "hi");
+        let _ = srv.join();
+        println!(
+            "[D7:{label}] reply_len={reply_len} -> {:?}",
+            got.as_ref().map(String::len).map_err(std::io::Error::kind)
+        );
+        assert!(
+            got.is_err(),
+            "[D7:{label}] a {reply_len}B reply with no newline must be an ERROR, not Ok({:?})",
+            got.ok().map(|s| s.len())
+        );
+    }
+
+    #[test]
+    fn d7_small_truncated_reply_is_an_error() {
+        truncated_reply_must_err(20, "small");
+    }
+
+    #[test]
+    fn d7_large_truncated_reply_across_the_buffer_is_an_error() {
+        // 12 KiB crosses the 8 KiB pipe buffer — the exact edge D4 deadlocked on.
+        // A truncated large reply must still error, not return the fragment as Ok.
+        truncated_reply_must_err(12 * 1024, "large");
+    }
+
+    #[test]
+    fn d7_control_a_full_large_reply_is_ok() {
+        // Guard against a false-positive: a large HONEST reply (WITH newline) must
+        // succeed intact, so the truncation checks above aren't just "large=error".
+        let a = format!(r"\\.\pipe\amux-d7-{}-ctrl", std::process::id());
+        let sh = blocking_server(&a);
+        let srv = std::thread::spawn(move || unsafe {
+            let server = sh as Handle;
+            accept_and_read_request(server);
+            let mut body = vec![b'R'; 12 * 1024];
+            body.push(b'\n');
+            let _ = send_all(server, &body);
+            flush_to_client(server); // wait for the client to read the whole reply
+            DisconnectNamedPipe(server);
+            CloseHandle(server);
+        });
+        let got = request(&a, "hi").expect("a full large reply must succeed");
+        let _ = srv.join();
+        assert_eq!(
+            got.len(),
+            12 * 1024,
+            "[D7 control] an honest 12 KiB reply must arrive intact"
+        );
+    }
+
+    /// D6: a malicious server streams a reply past `MAX_REPLY` (8 MiB) with no
+    /// newline. `request()` must refuse it (`InvalidData`), never accumulate
+    /// forever or OOM.
+    #[test]
+    fn d6_an_unbounded_reply_is_refused() {
+        let a = format!(r"\\.\pipe\amux-d6-{}", std::process::id());
+        let sh = blocking_server(&a);
+        let srv = std::thread::spawn(move || unsafe {
+            let server = sh as Handle;
+            accept_and_read_request(server);
+            let chunk = vec![b'R'; 64 * 1024];
+            let mut sent = 0usize;
+            while sent < 10 * 1024 * 1024 {
+                if !send_all(server, &chunk) {
+                    break; // client gave up and closed — the cap fired
+                }
+                sent += chunk.len();
+            }
+            DisconnectNamedPipe(server);
+            CloseHandle(server);
+        });
+        let got = request(&a, "hi");
+        let _ = srv.join();
+        println!(
+            "[D6] unbounded reply -> {:?}",
+            got.as_ref().map(String::len).map_err(std::io::Error::kind)
+        );
+        assert!(
+            got.is_err(),
+            "[D6] an unbounded reply must be refused, got Ok({:?})",
+            got.ok().map(|s| s.len())
+        );
+    }
+
+    /// D5: silent clients must not lock out a real one. They fill the bounded
+    /// instance pool, but each is capped by `CLIENT_DEADLINE`, so a real client is
+    /// still served (within the deadline, not never).
+    #[test]
+    fn d5_silent_clients_cannot_lock_out_a_real_one() {
+        let a = addr("d5");
+        let mut server = Listener::bind(&a).expect("bind");
+        // Stage more silent clients than the pool holds; each connects and says
+        // nothing. Pump so the server parks them in Reading slots.
+        let mut silent: Vec<Handle> = Vec::new();
+        for _ in 0..12 {
+            let w = wide(&a);
+            let h = unsafe {
+                CreateFileW(
+                    w.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null_mut(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if h != INVALID {
+                silent.push(h);
+            }
+            for _ in 0..3 {
+                let _ = server.poll();
+            }
+        }
+        // A real client must still be served — within the client deadline.
+        let a2 = a.clone();
+        let good = std::thread::spawn(move || request(&a2, "healthy"));
+        let mut served = false;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Ok(Some(_req)) = server.poll() {
+                let _ = server.respond("ok");
+                served = true;
+                break;
+            }
+        }
+        let drain = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < drain {
+            let _ = server.poll();
+        }
+        let reply = good.join().expect("good client thread");
+        for h in silent {
+            unsafe { CloseHandle(h) };
+        }
+        println!("[D5] staged silent clients; real client served={served} reply={reply:?}");
+        assert!(
+            served && reply.is_ok(),
+            "[D5] silent clients locked out a real client (served={served}, reply={reply:?})"
+        );
+    }
+}
