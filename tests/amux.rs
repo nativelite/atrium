@@ -547,6 +547,34 @@ fn wait_exit(p: &mut pty::Pty, secs: u64) -> i32 {
     }
 }
 
+/// `amux --version` answers on stdout with a zero exit, with no terminal.
+///
+/// It is the first thing typed into a bug report, and until it existed an
+/// unrecognized flag fell through to "the command to host" — so `amux --version`
+/// died on "stdin/stdout must be a terminal" the moment anyone piped it. Both
+/// spellings, and after an `--identity`, since identity is stripped first.
+#[test]
+fn version_prints_without_a_terminal() {
+    let expected = format!("amux {}", env!("CARGO_PKG_VERSION"));
+    for args in [
+        vec!["--version"],
+        vec!["-V"],
+        vec!["--identity", "work", "--version"],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_amux"))
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "exit for {args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected,
+            "stdout for {args:?}"
+        );
+    }
+}
+
 /// amux hosting a one-shot command: output passes through, and when the
 /// only pane's child exits, amux itself exits cleanly.
 #[test]

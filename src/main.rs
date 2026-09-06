@@ -1493,6 +1493,17 @@ fn main() -> ExitCode {
             eprintln!("amux: reaped orphaned pane group {v}");
         }
     }
+    // `--version` / `-V`: the first thing anyone types when filing a bug, and
+    // the last thing a release wants missing. It answers BEFORE the terminal is
+    // taken — an unrecognized flag is otherwise treated as the command to host,
+    // so `amux --version` used to die on "stdin is not a terminal" when piped.
+    if matches!(
+        rest.first().map(String::as_str),
+        Some("--version") | Some("-V")
+    ) {
+        println!("amux {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
             "usage: amux [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
@@ -1509,6 +1520,7 @@ fn main() -> ExitCode {
              \x20               The policy is a CEILING for every caller: `ctl spawn --mode …` may match\n\
              \x20               it or de-escalate, never elevate. Raise it at launch, not mid-session.\n\
              \x20      --skip-permissions: alias for --trust skip.\n\
+             \x20      --version, -V: print the version and exit.\n\
              \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
              \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (mouse capture is OFF by default so text selection works; Ctrl+A m turns it on: click focuses a pane, wheel scrolls the hovered tile)"

@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`amux --version` (and `-V`).** There was none: an unrecognized flag falls
+  through to "the command to host", so `amux --version` reached the terminal
+  check and died with `stdin/stdout must be a terminal` — the first thing anyone
+  types into a bug report, answering with an unrelated error. It now prints
+  `amux <version>` on stdout and exits 0, before the terminal is taken, and works
+  after an `--identity` (which is stripped first).
 - **A hung test can no longer wedge the machine that ran it.** `cargo test` has
   no per-test timeout and this project has no CI to kill a stuck job, so a test
   that deadlocked produced no failing line and no end — the last one was found
