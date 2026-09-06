@@ -720,17 +720,38 @@ mod winmap {
 }
 
 // ---------------------------------------------------------------------------
-// Windows: a single named-pipe instance, reused per client. Connection detection
-// and reads are non-blocking (`PIPE_NOWAIT`); the reply write flushes before the
-// disconnect so the client always sees it. Mirrors the verified C0 spike.
+// Windows: a small pool of named-pipe instances, each an independent state
+// machine over the shared `chan` core.
+//
+// Three things changed here, all of them parity with the unix side:
+//   * `FlushFileBuffers` is gone. On the server end of a named pipe it does not
+//     return until the client has read everything — an unbounded block on the
+//     single run loop, triggerable by any client that simply stops reading (a
+//     debugger-suspended `amux ctl` does it by accident). The invariant it was
+//     protecting (`DisconnectNamedPipe` discards unread data) is now held by
+//     state: after the last byte is written the instance sits in `Draining`
+//     until a non-blocking `ReadFile` reports ERROR_BROKEN_PIPE (the client
+//     closed, so it read everything) or DRAIN_DEADLINE expires.
+//   * The pipe is BYTE mode, not MESSAGE mode. The protocol frames on `\n`, so
+//     message mode bought nothing and was the sole source of ERROR_MORE_DATA —
+//     the code path that used to discard the head of any request over 8 KiB.
+//     The ERROR_MORE_DATA mapping is kept anyway, and now keeps the bytes.
+//   * One instance is no longer the whole channel: a client that connects and
+//     says nothing occupies one slot with its own deadline, not the endpoint.
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
 mod sys {
+    use super::chan::{Channel, Conn, ReadOutcome, Recv, Sent, WriteOutcome};
+    use super::winmap::{self, Accepted};
+    use super::wire::{
+        expired, reply_too_large, CLIENT_POLL, DRAIN_DEADLINE, MAX_REPLY, MAX_SLOTS,
+        OVERSIZE_REPLY, REPLY_DEADLINE, REPLY_STALL, TOO_LARGE_REPLY,
+    };
     use std::ffi::c_void;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     type Handle = *mut c_void;
 
@@ -777,7 +798,6 @@ mod sys {
             max_collect: *mut u32,
             collect_timeout: *mut u32,
         ) -> i32;
-        fn FlushFileBuffers(handle: Handle) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetCurrentProcess() -> Handle;
         fn LocalFree(mem: *mut c_void) -> *mut c_void;
@@ -879,8 +899,16 @@ mod sys {
     }
 
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
-    const PIPE_TYPE_MESSAGE: u32 = 0x0000_0004;
-    const PIPE_READMODE_MESSAGE: u32 = 0x0000_0002;
+    /// Only the *first* instance may claim the name: a second process that tries
+    /// to add an instance to `\\.\pipe\amux-ctl-<pid>` fails instead of quietly
+    /// serving amux's clients. This is the Windows answer to the unix endpoint
+    /// hijack — prevention rather than the after-the-fact detection a filesystem
+    /// path can offer.
+    const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
+    /// BYTE mode both ways: the wire is `\n`-framed, and message mode's only
+    /// contribution was ERROR_MORE_DATA.
+    const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
+    const PIPE_READMODE_BYTE: u32 = 0x0000_0000;
     const PIPE_NOWAIT: u32 = 0x0000_0001;
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const GENERIC_READ: u32 = 0x8000_0000;
@@ -889,10 +917,13 @@ mod sys {
     const ERROR_FILE_NOT_FOUND: i32 = 2;
     const ERROR_PIPE_BUSY: i32 = 231;
     const ERROR_NO_DATA: i32 = 232;
-    const ERROR_PIPE_NOT_CONNECTED: i32 = 233;
     const ERROR_BROKEN_PIPE: i32 = 109;
-    const ERROR_PIPE_CONNECTED: i32 = 535;
     const INVALID_HANDLE_VALUE: Handle = usize::MAX as Handle;
+
+    /// How many pipe instances serve the endpoint at once. One instance meant one
+    /// silent client could hold the entire control plane; this is the Windows
+    /// half of the bounded slot pool.
+    const INSTANCES: usize = MAX_SLOTS;
 
     fn wide(s: &str) -> Vec<u16> {
         std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
@@ -906,16 +937,92 @@ mod sys {
         format!(r"\\.\pipe\amux-ctl-{pid}")
     }
 
-    pub struct Listener {
+    /// The syscall half of one pipe instance: calls the OS, classifies the
+    /// result with [`winmap`], decides nothing.
+    struct PipeConn {
         handle: Handle,
-        connected: bool,
     }
 
-    // The handle is owned solely by this Listener, used only from the run loop.
+    impl Conn for PipeConn {
+        fn recv(&mut self, buf: &mut [u8]) -> Recv {
+            let mut n = 0u32;
+            let ok = unsafe {
+                ReadFile(
+                    self.handle,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
+            let err = if ok == 0 { last() } else { 0 };
+            winmap::read_outcome(ok, n as usize, err)
+        }
+
+        fn send(&mut self, buf: &[u8]) -> Sent {
+            let mut written = 0u32;
+            let ok = unsafe {
+                WriteFile(
+                    self.handle,
+                    buf.as_ptr(),
+                    buf.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            let err = if ok == 0 { last() } else { 0 };
+            winmap::write_outcome(ok, written as usize, err)
+        }
+
+        fn peer_gone(&mut self) -> bool {
+            let mut scratch = [0u8; 64];
+            let mut n = 0u32;
+            let ok = unsafe {
+                ReadFile(
+                    self.handle,
+                    scratch.as_mut_ptr(),
+                    scratch.len() as u32,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
+            let err = if ok == 0 { last() } else { 0 };
+            winmap::drain_outcome(ok, n as usize, err)
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        /// Not connected; `ConnectNamedPipe` is retried each tick.
+        Idle,
+        /// A client is attached and its request is being assembled.
+        Reading,
+        /// Its request was handed to the run loop; awaiting `respond`.
+        Serving,
+        /// A reply is queued and partially written.
+        Writing,
+        /// Every byte is in the pipe; waiting for the client to close so the
+        /// disconnect cannot discard it.
+        Draining,
+    }
+
+    struct Instance {
+        handle: Handle,
+        phase: Phase,
+        chan: Channel<PipeConn>,
+    }
+
+    pub struct Listener {
+        instances: Vec<Instance>,
+        /// Index of the instance whose request the caller still owes a reply.
+        serving: Option<usize>,
+    }
+
+    // The handles are owned solely by this Listener, used only from the run loop.
     unsafe impl Send for Listener {}
 
     impl Listener {
-        fn create_instance(addr: &[u16]) -> io::Result<Handle> {
+        fn create_instance(addr: &[u16], first: bool) -> io::Result<Handle> {
             // Restrict the endpoint to the current user (+SYSTEM): another user's
             // process cannot open the control pipe even on a shared machine. This
             // is the Windows analog of the unix peer-uid check. If the descriptor
@@ -942,11 +1049,15 @@ mod sys {
                     sec_ptr = &mut sa as *mut SecurityAttributes as *mut c_void;
                 }
             }
+            let mut open_mode = PIPE_ACCESS_DUPLEX;
+            if first {
+                open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+            }
             let h = unsafe {
                 CreateNamedPipeW(
                     addr.as_ptr(),
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_NOWAIT,
+                    open_mode,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
                     PIPE_UNLIMITED_INSTANCES,
                     8192,
                     8192,
@@ -967,141 +1078,214 @@ mod sys {
 
         pub fn bind(addr: &str) -> io::Result<Listener> {
             let addr = wide(addr);
-            let handle = Self::create_instance(&addr)?;
+            let now = Instant::now();
+            // The first instance must succeed (it also claims the name); the rest
+            // are capacity, so a failure there costs throughput, not the bind.
+            let mut instances = Vec::with_capacity(INSTANCES);
+            for i in 0..INSTANCES {
+                match Self::create_instance(&addr, i == 0) {
+                    Ok(handle) => instances.push(Instance {
+                        handle,
+                        phase: Phase::Idle,
+                        chan: Channel::new(PipeConn { handle }, now),
+                    }),
+                    Err(e) if i == 0 => return Err(e),
+                    Err(_) => break,
+                }
+            }
             Ok(Listener {
-                handle,
-                connected: false,
+                instances,
+                serving: None,
             })
         }
 
+        /// Drop the current client and re-arm this instance to listen again.
+        fn recycle(&mut self, i: usize, now: Instant) {
+            unsafe {
+                DisconnectNamedPipe(self.instances[i].handle);
+            }
+            self.instances[i].phase = Phase::Idle;
+            self.instances[i].chan.reset(now);
+        }
+
+        /// Move every instance that owes bytes (or is waiting to be released) one
+        /// step forward. Never waits on a client.
+        fn service_writes(&mut self, now: Instant) {
+            for i in 0..self.instances.len() {
+                match self.instances[i].phase {
+                    Phase::Writing => match self.instances[i].chan.pump_write(now) {
+                        WriteOutcome::Flushed => self.instances[i].phase = Phase::Draining,
+                        WriteOutcome::Failed => self.recycle(i, now),
+                        WriteOutcome::Pending => {
+                            // Two ways out, and the cheap one first.
+                            //
+                            // `write_outcome` maps ERROR_NO_DATA (232) at
+                            // WriteFile to WouldBlock rather than to Failed,
+                            // deliberately: 232 is documented as "the pipe is
+                            // being closed", but a NOWAIT pipe also reports a
+                            // full buffer through the same code path, and
+                            // guessing "closed" there would DROP a reply the
+                            // client is still owed. Guessing "full" instead only
+                            // costs time — so the ambiguity is resolved by
+                            // asking, not by choosing: `peer_gone` is a NOWAIT
+                            // ReadFile whose ERROR_BROKEN_PIPE is unambiguous.
+                            //
+                            // Without it, eight clients that connect, ask and
+                            // die would each hold a pipe instance for the full
+                            // WRITE_STALL, which is the whole pool for 5 s.
+                            if self.instances[i].chan.peer_gone()
+                                || self.instances[i].chan.write_stalled(now)
+                            {
+                                self.recycle(i, now);
+                            }
+                        }
+                    },
+                    Phase::Draining => {
+                        let gone = self.instances[i].chan.peer_gone();
+                        if gone || expired(self.instances[i].chan.since(), now, DRAIN_DEADLINE) {
+                            self.recycle(i, now);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         pub fn poll(&mut self) -> io::Result<Option<String>> {
-            if !self.connected {
-                // NOWAIT: returns immediately. A waiting client shows up as
-                // ERROR_PIPE_CONNECTED; ERROR_PIPE_LISTENING / no-data means
-                // "still nobody", which is the common idle path.
-                let r = unsafe { ConnectNamedPipe(self.handle, std::ptr::null_mut()) };
-                if r != 0 {
-                    self.connected = true;
-                } else {
-                    let e = last();
-                    if e == ERROR_PIPE_CONNECTED {
-                        self.connected = true;
-                    } else {
-                        return Ok(None);
+            let now = Instant::now();
+            // The contract says the caller responds before polling again. If it
+            // did not, release the instance instead of latching the endpoint
+            // shut: a latch only `respond` can clear turns one missed reply into
+            // a control plane that is dead for the life of the process. The
+            // client sees the pipe close, which its `read_reply` reports as an
+            // error rather than as a truncated success.
+            if let Some(i) = self.serving.take() {
+                self.recycle(i, now);
+            }
+            self.service_writes(now);
+            debug_assert!(self.serving.is_none(), "released above");
+
+            // One request outstanding at a time: the instance that carries it
+            // leaves `Phase::Reading`, so the loop below cannot hand out a
+            // second. The other instances keep their clients and deadlines.
+
+            // Attach any waiting client to a free instance.
+            for i in 0..self.instances.len() {
+                if self.instances[i].phase != Phase::Idle {
+                    continue;
+                }
+                let r = unsafe { ConnectNamedPipe(self.instances[i].handle, std::ptr::null_mut()) };
+                let err = if r == 0 { last() } else { 0 };
+                match winmap::connect_outcome(r, err) {
+                    Accepted::Connected => {
+                        self.instances[i].chan.reset(now);
+                        self.instances[i].phase = Phase::Reading;
+                    }
+                    Accepted::Recycle => self.recycle(i, now),
+                    Accepted::Listening => {}
+                }
+            }
+
+            // Read from every attached client; hand back the first complete line.
+            let mut buf = [0u8; 8192];
+            for i in 0..self.instances.len() {
+                if self.instances[i].phase != Phase::Reading {
+                    continue;
+                }
+                match self.instances[i].chan.pump_read(&mut buf, now) {
+                    ReadOutcome::Ready(line) => {
+                        self.instances[i].phase = Phase::Serving;
+                        self.serving = Some(i);
+                        return Ok(Some(line));
+                    }
+                    ReadOutcome::Oversize => {
+                        // Answer, then close — a fragment must never reach the
+                        // run loop, and a refusal must never be silent.
+                        self.instances[i].chan.queue(OVERSIZE_REPLY, now);
+                        self.instances[i].phase = Phase::Writing;
+                    }
+                    ReadOutcome::Closed => self.recycle(i, now),
+                    ReadOutcome::Pending => {
+                        if self.instances[i].chan.read_expired(now) {
+                            self.recycle(i, now);
+                        }
                     }
                 }
             }
-            // Connected: try one non-blocking read.
-            let mut buf = [0u8; 8192];
-            let mut n = 0u32;
-            let ok = unsafe {
-                ReadFile(
-                    self.handle,
-                    buf.as_mut_ptr(),
-                    buf.len() as u32,
-                    &mut n,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok != 0 && n > 0 {
-                let line = String::from_utf8_lossy(&buf[..n as usize])
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
-                Ok(Some(line))
-            } else {
-                let e = last();
-                if e == ERROR_BROKEN_PIPE || e == ERROR_PIPE_NOT_CONNECTED {
-                    // Client vanished before sending; recycle the instance.
-                    self.recycle();
-                }
-                Ok(None) // ERROR_NO_DATA: connected but nothing yet — try next tick.
-            }
+            Ok(None)
         }
 
         pub fn respond(&mut self, reply: &str) -> io::Result<()> {
-            let mut line = reply.to_string();
-            if !line.ends_with('\n') {
-                line.push('\n');
-            }
-            let bytes = line.as_bytes();
-            let mut written = 0u32;
-            let ok = unsafe {
-                WriteFile(
-                    self.handle,
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                )
+            let now = Instant::now();
+            let Some(i) = self.serving.take() else {
+                return Ok(());
             };
-            unsafe {
-                FlushFileBuffers(self.handle);
+            // The size limit is the SERVER's too — see the unix `respond`.
+            if reply.len() > MAX_REPLY {
+                self.instances[i].chan.queue(TOO_LARGE_REPLY, now);
+                self.instances[i].phase = Phase::Writing;
+                let _ = self.instances[i].chan.pump_write(now);
+                return Err(reply_too_large(reply.len()));
             }
-            self.recycle();
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
+            self.instances[i].chan.queue(reply, now);
+            match self.instances[i].chan.pump_write(now) {
+                WriteOutcome::Flushed => {
+                    self.instances[i].phase = Phase::Draining;
+                    Ok(())
+                }
+                WriteOutcome::Pending => {
+                    // Parked: later polls flush the rest. The old code called
+                    // FlushFileBuffers here and blocked the whole multiplexer.
+                    self.instances[i].phase = Phase::Writing;
+                    Ok(())
+                }
+                WriteOutcome::Failed => {
+                    let e = io::Error::last_os_error();
+                    self.recycle(i, now);
+                    Err(e)
+                }
             }
-            // Under `PIPE_NOWAIT` a *successful* `WriteFile` may still have taken
-            // fewer bytes than it was offered — including zero — and the
-            // remainder is simply dropped. `recycle()` has already disconnected
-            // the client, so there is nothing left to retry: the only honest
-            // move is to report that the reply did not go out whole, rather than
-            // return `Ok` over a truncated line the caller believes was sent.
-            if (written as usize) != bytes.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    format!(
-                        "ctl reply truncated: {} of {} bytes written",
-                        written,
-                        bytes.len()
-                    ),
-                ));
-            }
-            Ok(())
         }
 
-        /// Always `None` on Windows, and that is a **gap, not an all-clear**.
+        /// Always `None` on Windows — and that is a **gap, not an all-clear**.
         ///
-        /// The unix side records the ctl socket's `(dev, ino)` at bind time and
-        /// re-`stat`s it, so a same-uid process that unlinks the path and binds
-        /// its own socket over it is at least seen. A named pipe has no such
-        /// identity to compare against, and this module does not pass
-        /// `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it will also attach as a *second*
-        /// instance of a name an attacker created first — inheriting that
-        /// attacker's DACL and pipe type without complaint.
+        /// `FILE_FLAG_FIRST_PIPE_INSTANCE` is real and worth having: it makes
+        /// amux's own `bind` fail loudly if the name already exists, so amux can
+        /// never silently attach as a second instance of an attacker's pipe,
+        /// inheriting the attacker's DACL and pipe type. What it does **not** do
+        /// is stop the reverse: the flag only fails *the caller's* create, so a
+        /// same-user process can create additional instances of
+        /// `\\.\pipe\amux-ctl-<pid>` *without* the flag once amux holds the
+        /// name, and race amux for connecting clients.
         ///
-        /// Neither half is addressed here. The first needs the flag; the second
-        /// needs the server to authenticate itself to its clients. Both are held
-        /// for the Windows machine, and neither is a thing to fake with a
-        /// non-cryptographic keyed hash.
+        /// A named pipe has no `(dev, ino)` to re-`stat`, so the unix tripwire has
+        /// no analogue here and amux currently cannot detect that at all. Closing
+        /// it needs the server to authenticate itself to its clients — a separate
+        /// decision, and not one to fake with a non-cryptographic keyed hash.
         pub fn take_security_event(&mut self) -> Option<String> {
             None
-        }
-
-        /// Drop the current client and re-arm the same instance to listen again.
-        fn recycle(&mut self) {
-            unsafe {
-                DisconnectNamedPipe(self.handle);
-            }
-            self.connected = false;
         }
     }
 
     impl Drop for Listener {
         fn drop(&mut self) {
-            unsafe {
-                DisconnectNamedPipe(self.handle);
-                CloseHandle(self.handle);
+            for inst in &self.instances {
+                unsafe {
+                    DisconnectNamedPipe(inst.handle);
+                    CloseHandle(inst.handle);
+                }
             }
         }
     }
 
     pub fn request(addr: &str, req: &str) -> io::Result<String> {
         let name = wide(addr);
-        // The server serves one client at a time; a brief busy/absent window
-        // between clients is normal — retry a bounded number of times.
+        // One budget for the whole exchange, from `wire`, the same constant the
+        // unix client uses — not a literal that happens to be five.
+        let start = Instant::now();
+        let deadline = start + REPLY_DEADLINE;
         let mut h = INVALID_HANDLE_VALUE;
-        for _ in 0..100 {
+        while Instant::now() < deadline {
             h = unsafe {
                 CreateFileW(
                     name.as_ptr(),
@@ -1118,7 +1302,7 @@ mod sys {
             }
             let e = last();
             if e == ERROR_PIPE_BUSY || e == ERROR_FILE_NOT_FOUND {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(CLIENT_POLL);
                 continue;
             }
             return Err(io::Error::from_raw_os_error(e));
@@ -1130,7 +1314,12 @@ mod sys {
             ));
         }
 
-        let mut mode = PIPE_READMODE_MESSAGE;
+        // Byte mode, matching the server: the framing is the newline. NOWAIT as
+        // well, so `read_reply`'s deadlines are real — the handle `CreateFileW`
+        // returns is a *blocking* one by default, which is why the old
+        // ERROR_NO_DATA retry loop could never fire and a server that answered
+        // nothing hung `amux ctl` for as long as it liked.
+        let mut mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
         unsafe {
             SetNamedPipeHandleState(h, &mut mode, std::ptr::null_mut(), std::ptr::null_mut());
         }
@@ -1139,27 +1328,56 @@ mod sys {
         if !line.ends_with('\n') {
             line.push('\n');
         }
-        let bytes = line.as_bytes();
-        let mut written = 0u32;
-        let ok = unsafe {
-            WriteFile(
-                h,
-                bytes.as_ptr(),
-                bytes.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let e = last();
-            unsafe { CloseHandle(h) };
-            return Err(io::Error::from_raw_os_error(e));
+        let mut off = 0usize;
+        while off < line.len() {
+            let mut written = 0u32;
+            let chunk = &line.as_bytes()[off..];
+            let ok = unsafe {
+                WriteFile(
+                    h,
+                    chunk.as_ptr(),
+                    chunk.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            };
+            let e = if ok == 0 { last() } else { 0 };
+            if ok == 0 && e != ERROR_NO_DATA {
+                unsafe { CloseHandle(h) };
+                return Err(io::Error::from_raw_os_error(e));
+            }
+            if written == 0 {
+                if Instant::now() >= deadline {
+                    unsafe { CloseHandle(h) };
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "amux control channel would not accept the request",
+                    ));
+                }
+                thread::sleep(CLIENT_POLL);
+                continue;
+            }
+            off += written as usize;
         }
 
-        // Read the reply, tolerating the small window before the server writes.
+        let out = read_reply(h, start, REPLY_STALL, REPLY_DEADLINE);
+        unsafe { CloseHandle(h) };
+        out
+    }
+
+    /// Read one reply line: bounded by [`MAX_REPLY`], deadlined on *stall* (so a
+    /// large honest reply is not cut off) with an absolute ceiling, and an error
+    /// — never a truncated success — if the pipe ends before the newline.
+    fn read_reply(
+        h: Handle,
+        start: Instant,
+        stall: Duration,
+        hard: Duration,
+    ) -> io::Result<String> {
+        let mut last_progress = start;
+        let mut out: Vec<u8> = Vec::with_capacity(256);
         let mut buf = [0u8; 8192];
-        let mut out = String::new();
-        for _ in 0..600 {
+        loop {
             let mut n = 0u32;
             let ok = unsafe {
                 ReadFile(
@@ -1170,28 +1388,49 @@ mod sys {
                     std::ptr::null_mut(),
                 )
             };
-            if ok != 0 && n > 0 {
-                out = String::from_utf8_lossy(&buf[..n as usize])
-                    .trim_end_matches(['\r', '\n'])
-                    .to_string();
-                break;
-            }
-            let e = last();
-            if e == ERROR_NO_DATA {
-                thread::sleep(Duration::from_millis(5));
+            let e = if ok == 0 { last() } else { 0 };
+            let n = n as usize;
+            if n > 0 {
+                if let Some(pos) = buf[..n].iter().position(|b| *b == b'\n') {
+                    out.extend_from_slice(&buf[..pos]);
+                    return Ok(String::from_utf8_lossy(&out)
+                        .trim_end_matches('\r')
+                        .to_string());
+                }
+                out.extend_from_slice(&buf[..n]);
+                if out.len() > MAX_REPLY {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "amux control channel sent an oversize reply",
+                    ));
+                }
+                last_progress = Instant::now();
                 continue;
             }
-            unsafe { CloseHandle(h) };
-            return Err(io::Error::from_raw_os_error(e));
+            if ok == 0 && (e == ERROR_BROKEN_PIPE || e == super::winmap::ERROR_PIPE_NOT_CONNECTED) {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "amux control channel closed before a complete reply",
+                ));
+            }
+            if ok == 0 && e != ERROR_NO_DATA && e != super::winmap::ERROR_MORE_DATA {
+                return Err(io::Error::from_raw_os_error(e));
+            }
+            let now = Instant::now();
+            if expired(last_progress, now, stall) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no reply from amux control channel",
+                ));
+            }
+            if expired(start, now, hard) {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "amux control channel never finished its reply",
+                ));
+            }
+            thread::sleep(CLIENT_POLL);
         }
-        unsafe { CloseHandle(h) };
-        if out.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "no reply from amux control channel",
-            ));
-        }
-        Ok(out)
     }
 }
 
@@ -2174,56 +2413,31 @@ mod tests {
         assert!(!winmap::drain_outcome(0, 0, ERROR_NO_DATA));
     }
 
-    /// **D2 is HELD — and this guards the trap in holding it.**
+    /// **D2, guarded where a mac can guard it.** `FlushFileBuffers` on a handle
+    /// to the SERVER end of a named pipe "does not return until the client has
+    /// read all buffered data from the pipe", and `PIPE_NOWAIT` does not cover
+    /// it — the wait mode affects only ReadFile, WriteFile and ConnectNamedPipe.
+    /// It sat on the run-loop thread in `respond`, so any process that wrote a
+    /// request and never read the reply froze EVERY pane, with no ceiling; a
+    /// debugger-suspended client did it by accident.
     ///
-    /// `FlushFileBuffers` on a handle to the SERVER end of a named pipe "does
-    /// not return until the client has read all buffered data from the pipe",
-    /// and `PIPE_NOWAIT` does not cover it: the wait mode affects only ReadFile,
-    /// WriteFile and ConnectNamedPipe. It sits on the run-loop thread in
-    /// `respond`, so any process that writes a request and never reads the reply
-    /// freezes EVERY pane, with no ceiling. That is a live CRITICAL defect and
-    /// it is still here, deliberately — see WINDOWS-HELD.md.
-    ///
-    /// The reason it cannot simply be deleted is the line after it. `respond`
-    /// writes, flushes, then `recycle()`s, and `DisconnectNamedPipe` DISCARDS
-    /// data the client has not read. The blocking flush is what guarantees the
-    /// reply landed before the disconnect. Remove it on its own and the hang
-    /// becomes silent reply loss — a worse defect, and a quieter one.
-    ///
-    /// So the invariant is not "the flush is present". It is: *if the flush
-    /// goes, something must defer the disconnect.* Whoever lands the drain state
-    /// machine satisfies this guard by landing it; whoever deletes one line
-    /// trips it.
+    /// The behaviour cannot be executed here, but its cause is a single call
+    /// that must never come back. `drain_outcome` and the instance state machine
+    /// above are what replaced it.
     #[test]
-    fn windows_respond_may_not_drop_the_flush_without_deferring_the_disconnect() {
+    fn the_run_loop_never_calls_flushfilebuffers() {
         // The BARE identifier, not `…(`: a reintroduced `extern "system"`
-        // declaration has no call parenthesis. Assembled at compile time so it
-        // cannot match itself. Comments are stripped first — this file explains
-        // at length *why* the call is there, and that prose must not be what the
-        // guard reads.
-        // Scoped to `respond`'s own body, NOT the whole module: the `extern
-        // "system"` block declares the symbol too, so a module-wide search stays
-        // green while the call — the only part that matters — is deleted. That
-        // is the exact edit this guard exists to catch, and a bare-identifier
-        // needle sails straight past it.
-        let win = windows_sys_source();
-        let respond = win
-            .split("pub fn respond")
-            .nth(1)
-            .expect("the Windows respond()")
-            .split("fn recycle")
-            .next()
-            .expect("up to recycle");
-        if !respond.contains(concat!("Flush", "FileBuffers(")) {
-            assert!(
-                respond.contains("Phase::Draining") || win.contains("Phase::Draining"),
-                "FlushFileBuffers is gone from the Windows respond(), but \
-                 nothing defers the disconnect: DisconnectNamedPipe discards \
-                 unread data, so the reply is now silently dropped instead of \
-                 blocking. Removing the flush needs the drain state machine \
-                 held in WINDOWS-HELD.md — both halves, or neither."
-            );
-        }
+        // declaration has no call parenthesis and would sail past the narrower
+        // needle. Assembled at compile time so it cannot match itself. Comments
+        // are stripped first — the file explains at length *why* the call is
+        // gone, and that prose must not be what the guard trips over.
+        let name = concat!("Flush", "FileBuffers");
+        assert!(
+            !code_only().contains(name),
+            "FlushFileBuffers blocks the single event loop on an unread pipe — \
+             the drain state machine exists so it never has to be called, and \
+             not even the extern declaration should come back"
+        );
     }
 
     /// A pipe whose scripted `ReadFile`/`WriteFile` results are the documented
@@ -2324,20 +2538,19 @@ mod tests {
         // `win_writing_gives_up` is a LIFT of a decision that lives in
         // cfg(windows) code this mac cannot execute — so on its own it would
         // stay green while the shipping code drifted away from it, which is
-        // precisely the "test that passes with the fix reverted" shape. The
-        // original anchor read the shipping `Phase::Writing` arm and required
-        // the same `peer_gone()` call.
-        //
-        // That arm does not exist yet: the Windows state machine this replica
-        // mirrors is HELD (WINDOWS-HELD.md), so the assertions above currently
-        // prove something about `chan` alone. Pin THAT, so the day the rewrite
-        // lands this test fails and says what to put back — an un-anchored
-        // replica quietly rotting is the shape being guarded against.
+        // precisely the "test that passes with the fix reverted" shape. Anchor
+        // it: the shipping Writing arm must make the same call.
+        let writing = windows_sys_source()
+            .split("Phase::Writing => match")
+            .nth(1)
+            .expect("the Writing arm of service_writes")
+            .split("Phase::Draining =>")
+            .next()
+            .expect("up to the Draining arm");
         assert!(
-            !windows_sys_source().contains("Phase::Writing => match"),
-            "the Windows drain state machine has landed — restore the real \
-             anchor here: split the shipping Writing arm out of \
-             `windows_sys_source()` and assert it calls `peer_gone()`"
+            writing.contains("peer_gone()"),
+            "the shipping Windows Writing arm must ask whether the peer hung up, \
+             not wait out WRITE_STALL on every ambiguous WriteFile result"
         );
     }
 
@@ -3245,12 +3458,10 @@ mod tests {
     /// the platform.
     #[test]
     fn the_transport_budgets_live_in_one_place() {
-        // Unix only, for now. The Windows row is HELD with the Windows rewrite
-        // (WINDOWS-HELD.md): the shipping Windows module still carries its own
-        // `from_secs(5)` at connect and its own stall/hard pair in `read_reply`,
-        // which is the very split this guard exists to close. Restoring
-        // `("windows", windows_sys_source())` here is part of landing that work.
-        for (what, src) in [("unix", unix_sys_source())] {
+        for (what, src) in [
+            ("unix", unix_sys_source()),
+            ("windows", windows_sys_source()),
+        ] {
             assert!(
                 !src.contains(concat!("Duration::", "from_secs(")),
                 "{what} sys grew a hard-coded seconds literal again; the budgets \
@@ -3484,6 +3695,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         })
+    }
+
+    /// All shipping code, comments stripped.
+    fn code_only() -> &'static str {
+        shipping_source()
     }
 
     /// The unix `sys` module's shipping code.
