@@ -11,7 +11,7 @@ pub(crate) struct OverviewNode {
     pub(crate) identity: Option<String>,
     pub(crate) exited: bool,
     pub(crate) action: String,
-    /// True if amux launched this pane as an agent (it has a session id). Lets the
+    /// True if atrium launched this pane as an agent (it has a session id). Lets the
     /// overview show an as-yet-unbound agent as "starting" rather than "shell".
     pub(crate) is_agent: bool,
     /// Short vendor tag from the pane's command stem (`""` for claude, so its
@@ -26,7 +26,7 @@ pub(crate) struct OverviewNode {
 /// cursor indexes into — the same list at 3 agents and 300.
 pub(crate) fn overview_nodes(
     windows: &[Window],
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
 ) -> Vec<OverviewNode> {
     let mut nodes = Vec::new();
     for (wi, w) in windows.iter().enumerate() {
@@ -48,8 +48,8 @@ pub(crate) fn overview_nodes(
                 exited: p.exited,
                 action,
                 is_agent: p.session_id.is_some(),
-                vtag: amux::vendors::vendor_for_stem(&p.title)
-                    .map(amux::vendors::vendor_tag)
+                vtag: atrium::vendors::vendor_for_stem(&p.title)
+                    .map(atrium::vendors::vendor_tag)
                     .unwrap_or(""),
             });
         }
@@ -61,7 +61,7 @@ pub(crate) fn overview_nodes(
 /// language: green working, amber waiting-on-you, cyan waiting-for-a-message,
 /// grey idle, red exited.
 pub(crate) fn overview_glyph(node: &OverviewNode) -> (&'static str, String) {
-    use amux::theme;
+    use atrium::theme;
     let sgr = |c: ansi::Color| {
         ansi::Style {
             fg: c,
@@ -164,7 +164,7 @@ pub(crate) fn overview_scroll_start(total: usize, sel_row: usize, list_rows: usi
 /// handled by the caller. Absolute CUP per line; the bar row is left for the bar.
 pub(crate) fn render_overview_panel(
     windows: &[Window],
-    bus: &amux::bus::Bus,
+    bus: &atrium::bus::Bus,
     nodes: &[OverviewNode],
     sel: usize,
     rows: u16,

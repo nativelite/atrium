@@ -6,8 +6,8 @@ use crate::*;
 /// Hides the cursor, clears, and positions every line with absolute CUP (no
 /// scrolling); the bar row is left for the status bar.
 pub(crate) fn render_board_panel(
-    board: &amux::board::Board,
-    bus: &amux::bus::Bus,
+    board: &atrium::board::Board,
+    bus: &atrium::bus::Bus,
     rows: u16,
     cols: u16,
     feed_scroll: usize,
@@ -82,7 +82,7 @@ pub(crate) fn render_board_panel(
 /// bar still shows the selected one in full.
 pub(crate) fn render_decisions_block(
     out: &mut String,
-    decisions: &[&amux::bus::Event],
+    decisions: &[&atrium::bus::Event],
     sel: usize,
     first_row: u16,
     last_row: u16,
@@ -111,7 +111,7 @@ pub(crate) fn render_decisions_block(
 /// question that truncates in the list is always fully readable here.
 pub(crate) fn render_decision_detail(
     out: &mut String,
-    decision: Option<&&amux::bus::Event>,
+    decision: Option<&&atrium::bus::Event>,
     last_row: u16,
     cols: u16,
 ) {
@@ -202,15 +202,15 @@ pub(crate) struct LogRow {
 /// persona via the pane that owns its session.
 pub(crate) fn collect_log(
     windows: &[Window],
-    world: &amux::vendors::VendorWorlds,
-    board: &amux::board::Board,
-    bus: &amux::bus::Bus,
+    world: &atrium::vendors::VendorWorlds,
+    board: &atrium::board::Board,
+    bus: &atrium::bus::Bus,
 ) -> Vec<LogRow> {
     let mut rows: Vec<LogRow> = Vec::new();
-    for e in bus.tail(amux::bus::RING_CAP) {
+    for e in bus.tail(atrium::bus::RING_CAP) {
         let glyph = match e.kind {
-            amux::bus::Kind::DecisionNeeded => "\x1b[1;38;5;11m!\x1b[0m",
-            amux::bus::Kind::Fyi => "\x1b[38;5;37m\u{00B7}\x1b[0m",
+            atrium::bus::Kind::DecisionNeeded => "\x1b[1;38;5;11m!\x1b[0m",
+            atrium::bus::Kind::Fyi => "\x1b[38;5;37m\u{00B7}\x1b[0m",
         };
         let fields = e
             .fields
@@ -278,9 +278,9 @@ pub(crate) fn ago(now_ms: u64, ts_ms: u64) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_log_panel(
     windows: &[Window],
-    world: &amux::vendors::VendorWorlds,
-    board: &amux::board::Board,
-    bus: &amux::bus::Bus,
+    world: &atrium::vendors::VendorWorlds,
+    board: &atrium::board::Board,
+    bus: &atrium::bus::Bus,
     rows: u16,
     cols: u16,
     scroll: usize,
@@ -345,12 +345,12 @@ pub(crate) fn render_log_panel(
 
 /// Draw the board entries into `out`, from row 3 down to `last_row` (inclusive),
 /// with an overflow hint if there are more than fit.
-pub(crate) fn render_board_rows(out: &mut String, board: &amux::board::Board, last_row: u16) {
-    use amux::ctl::{hyperlink, is_url, status_glyph, status_sgr};
+pub(crate) fn render_board_rows(out: &mut String, board: &atrium::board::Board, last_row: u16) {
+    use atrium::ctl::{hyperlink, is_url, status_glyph, status_sgr};
     let entries = board.list();
     if entries.is_empty() {
         out.push_str(
-            "\x1b[3;1H  \x1b[2m(board empty — set one:  amux ctl board set launch status=WIP owner=you)\x1b[0m",
+            "\x1b[3;1H  \x1b[2m(board empty — set one:  atrium ctl board set launch status=WIP owner=you)\x1b[0m",
         );
         return;
     }
@@ -407,8 +407,8 @@ pub(crate) fn render_board_rows(out: &mut String, board: &amux::board::Board, la
 /// hint shows the scroll offset when the history overflows.
 pub(crate) fn render_fyi_feed(
     out: &mut String,
-    bus: &amux::bus::Bus,
-    decisions: &[&amux::bus::Event],
+    bus: &atrium::bus::Bus,
+    decisions: &[&atrium::bus::Event],
     first_row: u16,
     last_row: u16,
     scroll: usize,
@@ -422,7 +422,7 @@ pub(crate) fn render_fyi_feed(
     // The scrollable FYI history: every non-decision event, newest first (open
     // decisions are shown in their own block above and excluded here).
     let fyi: Vec<String> = bus
-        .tail(amux::bus::RING_CAP)
+        .tail(atrium::bus::RING_CAP)
         .into_iter()
         .rev()
         .filter(|e| !open_seqs.contains(&e.seq))
@@ -454,7 +454,7 @@ pub(crate) fn render_fyi_feed(
 
     if shown.is_empty() && decisions.is_empty() {
         out.push_str(&format!(
-            "\x1b[{first_row};1H  \x1b[2m(no events — publish one:  amux ctl bus pub deploy msg=shipping)\x1b[0m"
+            "\x1b[{first_row};1H  \x1b[2m(no events — publish one:  atrium ctl bus pub deploy msg=shipping)\x1b[0m"
         ));
         return;
     }
@@ -469,9 +469,9 @@ pub(crate) fn render_fyi_feed(
 
 /// One bus event as a panel line: `! deploy  msg=ship it?  (from dev_1)`. A
 /// `decision_needed` event gets an amber `!` and bold topic; an FYI a dim `·`.
-pub(crate) fn feed_line(e: &amux::bus::Event) -> String {
-    use amux::bus::Kind;
-    use amux::ctl::{hyperlink, is_url};
+pub(crate) fn feed_line(e: &atrium::bus::Event) -> String {
+    use atrium::bus::Kind;
+    use atrium::ctl::{hyperlink, is_url};
     let (glyph, topic_sgr) = match e.kind {
         Kind::DecisionNeeded => ("\x1b[1;38;5;11m!\x1b[0m", "\x1b[1;38;5;11m"),
         Kind::Fyi => ("\x1b[2m·\x1b[0m", "\x1b[1m"),
@@ -528,7 +528,7 @@ pub(crate) fn draw_startup_splash(
         if i > 0 {
             brand_colored.push_str("\x1b[0m "); // plain space between letters
         }
-        let (r, g, b) = amux::theme::SPLASH_GRADIENT[i];
+        let (r, g, b) = atrium::theme::SPLASH_GRADIENT[i];
         brand_colored.push_str(&format!("\x1b[1;38;2;{r};{g};{b}m{ch}"));
     }
     brand_colored.push_str("\x1b[0m");

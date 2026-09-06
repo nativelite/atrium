@@ -1,6 +1,6 @@
 //! The status bar: one themed line at the bottom of the real terminal, drawn
 //! around the passthrough stream (cursor saved/restored), naming every pane and
-//! flagging activity. A dark slate with a cyan `amux` signature chip and entries
+//! flagging activity. A dark slate with a cyan `atrium` signature chip and entries
 //! colored by pane state in the shared [`crate::theme`] language (the same colors
 //! the tile borders use). Pure string building — testable without a terminal.
 
@@ -34,7 +34,7 @@ pub struct PaneInfo {
 /// SGR differs, and escapes never count toward `cols`.
 #[derive(Clone)]
 enum Role {
-    /// The `amux` wordmark — the cyan signature chip.
+    /// The `atrium` wordmark — the cyan signature chip.
     Brand,
     /// A window entry, colored by the pane's state.
     Entry(State),
@@ -67,7 +67,7 @@ struct Segment {
 /// Build the bar as an ordered list of roled segments.
 fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
     let seg = |text: String, role: Role| Segment { text, role };
-    let mut segs = vec![seg(String::from(" amux "), Role::Brand)];
+    let mut segs = vec![seg(String::from(" atrium "), Role::Brand)];
     for (i, p) in panes.iter().enumerate() {
         // Marker priority (§4.2): a dead child, then a waiting agent (it needs
         // you), then active, then background activity, then idle. `?` slots in
@@ -150,7 +150,7 @@ pub fn bar_text(panes: &[PaneInfo], cols: usize, note: &str) -> String {
 
 /// The [`Style`] for a segment's color role — the themed statusline palette.
 /// Every style sets the bar background explicitly (so it fills the whole line
-/// with no reverse-video gaps), with a per-role foreground; the `amux` brand is a
+/// with no reverse-video gaps), with a per-role foreground; the `atrium` brand is a
 /// filled cyan chip, and identity tags keep their per-identity color.
 fn role_style(role: &Role) -> Style {
     use crate::theme;

@@ -1,4 +1,4 @@
-//! amux — tmux for agents, on the nativelite stack alone (`pty` +
+//! atrium — tmux for agents, on the nativelite stack alone (`pty` +
 //! `rawterm` + `ansi`; zero third-party dependencies).
 //!
 //! A multi-agent terminal: each pane hosts one of *your own* CLIs — a
@@ -12,7 +12,7 @@
 //! outer terminal does the emulation), and your keystrokes go straight
 //! back, undecoded. On Windows, ConPTY maintains each pane's screen
 //! itself and repaints in full on resize, so switching panes is a resize
-//! nudge, not a rebuilt frame. amux hosts programs; it never inspects,
+//! nudge, not a rebuilt frame. atrium hosts programs; it never inspects,
 //! modifies, or credentials them.
 
 pub mod audit;
@@ -20,7 +20,7 @@ pub mod bar;
 pub mod bind;
 pub mod ctl;
 // The coordination layer (board + bus) now lives in the `abus` org crate;
-// re-exported here so `amux::board` / `amux::bus` (and `crate::bus` inside the
+// re-exported here so `atrium::board` / `atrium::bus` (and `crate::bus` inside the
 // crate) keep resolving unchanged.
 pub use abus::{board, bus};
 pub mod filter;

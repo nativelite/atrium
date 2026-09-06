@@ -1,18 +1,18 @@
 //! The warden: make evasion visible, since it cannot be made impossible.
 //!
-//! amux is **not a sandbox**, and this module exists because pretending
-//! otherwise would be the more dangerous mistake. amux sets a permission
+//! atrium is **not a sandbox**, and this module exists because pretending
+//! otherwise would be the more dangerous mistake. atrium sets a permission
 //! posture; claude enforces it. An agent that can execute commands can run
-//! `claude --dangerously-skip-permissions` directly, with no amux involved — so
-//! "stop an agent escaping through amux" is a subset of "the agent can run
-//! anything", which amux has no power to solve.
+//! `claude --dangerously-skip-permissions` directly, with no atrium involved — so
+//! "stop an agent escaping through atrium" is a subset of "the agent can run
+//! anything", which atrium has no power to solve.
 //!
-//! What amux *can* do is refuse the easy path and notice the hard one.
+//! What atrium *can* do is refuse the easy path and notice the hard one.
 //!
 //! # The same-uid ceiling, stated once and plainly
 //!
-//! A pane's agent runs as the **same unix user** as amux. Every file amux can
-//! read, the agent can read; every file a nested amux can write, the agent can
+//! A pane's agent runs as the **same unix user** as atrium. Every file atrium can
+//! read, the agent can read; every file a nested atrium can write, the agent can
 //! forge; and one process cannot constrain or attest another's future behaviour
 //! at the same uid without an OS boundary (a second uid, a container, a Job
 //! Object). So **there is no mechanism here that proves a descendant is
@@ -31,15 +31,15 @@
 //!
 //! # Why the cap hangs off ancestry, not the environment
 //!
-//! The obvious design — mark every pane with `AMUX_AGENT=1`, or inherit the
-//! session policy through an env var, and have amux refuse to elevate when it
+//! The obvious design — mark every pane with `ATRIUM_AGENT=1`, or inherit the
+//! session policy through an env var, and have atrium refuse to elevate when it
 //! sees the marker — does not work. The agent owns its own environment:
-//! `env -u AMUX_AGENT amux --trust skip` defeats it in one command. That is the
+//! `env -u ATRIUM_AGENT atrium --trust skip` defeats it in one command. That is the
 //! same bug class as a privilege gate that grants authority when a token is
 //! *absent*: it trusts the untrusted party to leave evidence in place.
 //!
 //! A launch confirmation fares no better. `--trust skip` does prompt, but an
-//! agent spawning amux owns that child's stdin and can answer its own prompt.
+//! agent spawning atrium owns that child's stdin and can answer its own prompt.
 //!
 //! Process ancestry is the one signal with teeth: a process cannot unset its own
 //! parent. It is still escapable — double-fork and you are reparented to init,
@@ -49,63 +49,63 @@
 //!
 //! # Identity is the kernel's, not `ps`
 //!
-//! An ancestry walk is only as good as its answer to "is that hop an amux?".
-//! This used to be `ps -eo comm=` compared against the string `"amux"`. Measured
+//! An ancestry walk is only as good as its answer to "is that hop an atrium?".
+//! This used to be `ps -eo comm=` compared against the string `"atrium"`. Measured
 //! on macOS 25.6.0: `ps -o comm=` prints **argv[0]**, which the watched process
-//! chooses. `(exec -a amux /bin/sleep 40)` from a pane shows up as `comm=amux`
-//! with `args=amux 40` while `proc_pidpath` reports `/bin/sleep`. That is a
+//! chooses. `(exec -a atrium /bin/sleep 40)` from a pane shows up as `comm=atrium`
+//! with `args=atrium 40` while `proc_pidpath` reports `/bin/sleep`. That is a
 //! one-line ceiling bypass with no double-fork: the shim shadows the real parent,
-//! the nested amux reads the *shim's* registry (which the agent also writes),
+//! the nested atrium reads the *shim's* registry (which the agent also writes),
 //! and inherits whatever ceiling the agent put there — or none at all.
 //!
-//! So a hop counts as amux only when the **kernel's** executable for that pid is
+//! So a hop counts as atrium only when the **kernel's** executable for that pid is
 //! the same file as ours, compared by `(st_dev, st_ino)`:
 //! `proc_pidpath` + `stat` on macOS, `stat("/proc/<pid>/exe")` on Linux. A fake
-//! intermediate must then *be* the real amux binary — in which case it applies
+//! intermediate must then *be* the real atrium binary — in which case it applies
 //! the cap itself, which is the outcome we wanted. Two limits, both real:
-//! a differently-built amux (`./target/release/amux` hosting a pane in which
-//! `~/.cargo/bin/amux` is launched) is **not** recognised, so no ceiling is
+//! a differently-built atrium (`./target/release/atrium` hosting a pane in which
+//! `~/.cargo/bin/atrium` is launched) is **not** recognised, so no ceiling is
 //! applied — that case is now reported rather than silently ignored; and
 //! rewriting the binary in place keeps the inode, which is what the startup
 //! digest below exists for and is the only thing that speaks to it.
 //!
 //! # What the warden watches
 //!
-//! - **amux's own binary.** The sharpest attack is not evading the restrictions
-//!   but *removing* them: edit amux, rebuild, and the ceiling is whatever you
+//! - **atrium's own binary.** The sharpest attack is not evading the restrictions
+//!   but *removing* them: edit atrium, rebuild, and the ceiling is whatever you
 //!   say it is. A digest taken at startup catches that.
 //! - **The session registry.** It is what the ancestry cap reads to learn the
 //!   parent's policy, so tampering with it — or deleting it — is tampering with
 //!   the ceiling.
-//! - **Nested sessions it cannot account for.** An amux inside one of our pty
+//! - **Nested sessions it cannot account for.** An atrium inside one of our pty
 //!   sessions whose ancestry does not lead back to us is the double-fork case.
 //!
 //! None of these are gates. They are tripwires, and they report through the
 //! machinery that already exists: the audit log, a `decision_needed` on the bus,
 //! and the status bar. If you want true isolation, that is an OS-level boundary —
-//! a separate uid per agent, or a container — not something amux can provide.
+//! a separate uid per agent, or a container — not something atrium can provide.
 //!
 //! # Why there is no enforcement any more
 //!
-//! `AMUX_WARDEN=enforce` used to tear down the tree of anything judged an
+//! `ATRIUM_WARDEN=enforce` used to tear down the tree of anything judged an
 //! escapee. It is gone, for two reasons that are not going to be fixed by a
 //! better heuristic.
 //!
 //! First, under a correct ancestry rule **the enforceable set is empty by
 //! construction.** Walk up from any process whose ppid chain still reaches us:
-//! either we are its nearest amux ancestor — in which case it ran our cap — or
-//! some intermediate amux is, in which case it is that session's business, not
+//! either we are its nearest atrium ancestor — in which case it ran our cap — or
+//! some intermediate atrium is, in which case it is that session's business, not
 //! ours. (Judging it anyway is precisely the shipped bug that SIGKILLed
 //! correctly-nested grandchildren ~5s in.) The only sessions left to accuse are
 //! the ones whose chain is *broken*, and a broken chain is exactly what an
 //! ordinary reparenting looks like: a pane's launcher shell exiting while the
-//! amux it started keeps running is indistinguishable from a deliberate
+//! atrium it started keeps running is indistinguishable from a deliberate
 //! double-fork. Killing on that is killing on a coin flip.
 //!
 //! Second, the kill was steerable by the party it was aimed at. `enforce` read
 //! the *suspect's own* registry — a mode-0644 file at a fixed path, named after a
 //! pid the agent chooses — and `killpg`'d every group id it listed. One
-//! `printf 'policy=skip\n<victim pgid>\n' > /tmp/amux-session-<some pid>.pids`
+//! `printf 'policy=skip\n<victim pgid>\n' > /tmp/atrium-session-<some pid>.pids`
 //! turned the warden into an agent-directed kill primitive. A tripwire that can
 //! be pointed at a target is worse than no tripwire.
 
@@ -116,7 +116,7 @@ use std::path::{Path, PathBuf};
 
 /// How far the ancestry walk goes before giving up. A bound, not a policy: it
 /// stops a corrupt or cyclic table from spinning. Exhausting it yields
-/// [`Ancestry::Unknown`], never "no ancestor" — see [`walk_to_amux`].
+/// [`Ancestry::Unknown`], never "no ancestor" — see [`walk_to_atrium`].
 #[cfg(unix)]
 const MAX_HOPS: usize = 64;
 
@@ -131,13 +131,13 @@ pub struct Alert {
 
 /// What an ancestry walk could establish. Four states, because collapsing the
 /// last two into "no ancestor" is how the ceiling came to fail open: a `ps` that
-/// could not be run returned an empty table, an empty table meant "no amux
-/// ancestor", and "no amux ancestor" meant no ceiling at all.
+/// could not be run returned an empty table, an empty table meant "no atrium
+/// ancestor", and "no atrium ancestor" meant no ceiling at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ancestry {
-    /// The nearest ancestor running *this* amux binary, by `(dev, ino)`.
-    Amux(u32),
-    /// The walk completed and there is no amux ancestor: a top-level session.
+    /// The nearest ancestor running *this* atrium binary, by `(dev, ino)`.
+    Atrium(u32),
+    /// The walk completed and there is no atrium ancestor: a top-level session.
     NoneFound,
     /// The walk could not be completed — the process table was unreadable, a hop
     /// vanished, or a hop's executable could not be resolved. Callers must treat
@@ -193,7 +193,7 @@ pub struct Warden {
 }
 
 impl Warden {
-    /// Snapshot the world as amux starts.
+    /// Snapshot the world as atrium starts.
     pub fn new(registry: PathBuf) -> Warden {
         let exe = std::env::current_exe().unwrap_or_default();
         let exe_digest = digest_file(&exe);
@@ -228,7 +228,7 @@ impl Warden {
                     out.push(Alert {
                         kind: "warden-binary-changed",
                         detail: format!(
-                            "amux's own binary changed while running ({}); the \
+                            "atrium's own binary changed while running ({}); the \
                              permission ceiling is only as trustworthy as this file",
                             self.exe.display()
                         ),
@@ -238,7 +238,10 @@ impl Warden {
                     self.exe_digest = None;
                     out.push(Alert {
                         kind: "warden-binary-gone",
-                        detail: format!("amux's own binary is unreadable ({})", self.exe.display()),
+                        detail: format!(
+                            "atrium's own binary is unreadable ({})",
+                            self.exe.display()
+                        ),
                     });
                 }
                 _ => {}
@@ -246,7 +249,7 @@ impl Warden {
         }
 
         // The registry is what the ancestry cap reads to learn a parent's policy,
-        // so editing it is editing the ceiling. amux rewrites it only when its
+        // so editing it is editing the ceiling. atrium rewrites it only when its
         // pane set changes, and updates the baseline then — a change we did not
         // make is what shows up here.
         match digest_file(&self.registry) {
@@ -264,7 +267,7 @@ impl Warden {
             }
             None => {
                 // DELETION was silent here, and deletion is the stronger attack:
-                // `rm /tmp/amux-session-<us>.pids` leaves a nested amux with no
+                // `rm /tmp/atrium-session-<us>.pids` leaves a nested atrium with no
                 // policy to read, and an absent policy used to mean no ceiling.
                 // Reporting only on a changed file is the fail-open-on-absent-
                 // input shape this codebase has shipped before.
@@ -272,7 +275,7 @@ impl Warden {
                     out.push(Alert {
                         kind: "warden-registry-gone",
                         detail: format!(
-                            "the session registry was deleted ({}); a nested amux \
+                            "the session registry was deleted ({}); a nested atrium \
                              can no longer read this session's policy",
                             self.registry.display()
                         ),
@@ -285,13 +288,13 @@ impl Warden {
         out
     }
 
-    /// Called after amux rewrites its own registry, so a legitimate write is not
+    /// Called after atrium rewrites its own registry, so a legitimate write is not
     /// reported as tampering.
     pub fn registry_rewritten(&mut self) {
         self.registry_digest = digest_file(&self.registry);
     }
 
-    /// Look for amux sessions we cannot account for.
+    /// Look for atrium sessions we cannot account for.
     ///
     /// The candidate set is deliberately small: only pids that own a session
     /// registry, and only ones we have not already judged. In steady state that
@@ -352,7 +355,7 @@ impl Warden {
 
     /// Windows has no ppid walk or session-id notion here, and the Job Object
     /// bounds a pane's *lifetime* rather than its *posture* — see
-    /// [`amux_ancestor`]. Report the gap once rather than returning an empty
+    /// [`atrium_ancestor`]. Report the gap once rather than returning an empty
     /// list every tick, which would read as "checked, all clear".
     #[cfg(not(unix))]
     fn check_descendants(&mut self, _pane_pids: &[u32]) -> Vec<Alert> {
@@ -363,7 +366,7 @@ impl Warden {
         vec![Alert {
             kind: "warden-descent-unsupported",
             detail: "nested-session detection is not implemented on this platform; \
-                     amux applies no permission ceiling to a nested amux here"
+                     atrium applies no permission ceiling to a nested atrium here"
                 .to_string(),
         }]
     }
@@ -378,7 +381,7 @@ impl Warden {
         Some(Alert {
             kind: "warden-descent-unknown",
             detail: format!(
-                "could not establish whether the amux session at pid {pid} is nested \
+                "could not establish whether the atrium session at pid {pid} is nested \
                  under this one ({why}); treating it as unproven, not as safe"
             ),
         })
@@ -398,7 +401,7 @@ fn judge_session(
     pane_sids: &HashSet<u32>,
     ids: &mut ExeIds,
 ) -> Verdict {
-    let ancestry = table.nearest_amux_ancestor(pid, ids);
+    let ancestry = table.nearest_atrium_ancestor(pid, ids);
     // Only measured when it can change the answer, since it is a syscall per
     // candidate and the ancestry alone settles most cases.
     let in_our_panes = match ancestry {
@@ -413,7 +416,7 @@ fn judge_session(
 /// Nothing the candidate wrote is consulted. The predecessor of this rule read
 /// `capped_by=<parent pid>` out of the candidate's own registry — a
 /// self-declaration in a mode-0644 file at a fixed path, which any process at the
-/// same uid can write, including one that never capped and one that is not amux
+/// same uid can write, including one that never capped and one that is not atrium
 /// at all.
 ///
 /// The replacement is the parent applying **the same predicate the child
@@ -426,33 +429,33 @@ fn judge_session(
 ///
 /// `in_our_panes` is "does this pid's session id belong to one of our live
 /// panes", with `None` for "could not be read". It is only consulted when the
-/// ancestry walk found no amux ancestor at all.
+/// ancestry walk found no atrium ancestor at all.
 #[cfg(unix)]
 fn verdict_for(pid: u32, me: u32, ancestry: Ancestry, in_our_panes: Option<bool>) -> Verdict {
     match ancestry {
-        Ancestry::Amux(a) if a == me => Verdict::Accounted,
-        // Nested under an amux that is not us. If that one is under us, it capped
+        Ancestry::Atrium(a) if a == me => Verdict::Accounted,
+        // Nested under an atrium that is not us. If that one is under us, it capped
         // against our policy and this one capped against its — a chain of
         // ceilings, each link the business of its own parent. Judging it
         // ourselves is the bug that killed correct grandchildren: `capped_by`
         // recorded the NEAREST ancestor while descent was walked 64 hops, so a
         // perfectly-behaved depth-3 session looked uncapped and, under
         // enforcement, had its whole tree torn down about five seconds in.
-        Ancestry::Amux(_) => Verdict::Accounted,
+        Ancestry::Atrium(_) => Verdict::Accounted,
         Ancestry::NoneFound => match in_our_panes {
-            // No amux ancestor, but our session id: `pty` gives each pane its own
+            // No atrium ancestor, but our session id: `pty` gives each pane its own
             // session via `setsid()`, everything the agent spawns there inherits
             // it, and — measured on this host — a plain double-fork moves ppid to
             // 1 while leaving sid untouched. So this is the escape the ancestry
             // cap cannot see, and the one signal that still sees it.
             Some(true) => Verdict::Unaccounted(format!(
-                "an amux session (pid {pid}) is running inside one of this session's \
+                "an atrium session (pid {pid}) is running inside one of this session's \
                  panes but its ancestry does not lead back here, so no ceiling was \
                  applied to it. That is what a double-fork looks like; it is also \
                  what an ordinary reparenting looks like, so this is a report, not \
                  an accusation"
             )),
-            // Neither ancestry nor session id connects it to us: an amux in
+            // Neither ancestry nor session id connects it to us: an atrium in
             // another terminal, which is normal use and none of our business.
             // Alerting on it was a shipped false positive, and a tripwire that
             // fires on legitimate behaviour is worse than none.
@@ -478,14 +481,14 @@ enum Verdict {
     Unproven(&'static str),
 }
 
-/// Pids of every amux session that has a registry file on this host.
+/// Pids of every atrium session that has a registry file on this host.
 ///
 /// This scanned `std::env::temp_dir()` while [`crate::reap::registry_path`]
 /// writes to a FIXED directory (`/tmp` on unix, deliberately not `$TMPDIR`,
 /// which the agent owns). On macOS `$TMPDIR` is a per-user
 /// `/var/folders/…/T/`, so the two never met: this returned the empty set on
 /// every tick and the whole nested-session check was dead code on the platform
-/// amux is developed on. Ask `reap` where registries live rather than guessing.
+/// atrium is developed on. Ask `reap` where registries live rather than guessing.
 fn session_pids() -> HashSet<u32> {
     session_pids_in(&crate::reap::registry_dir())
 }
@@ -500,7 +503,7 @@ fn session_pids_in(dir: &Path) -> HashSet<u32> {
             .path()
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_prefix("amux-session-"))
+            .and_then(|n| n.strip_prefix("atrium-session-"))
             .and_then(|n| n.strip_suffix(".pids"))
             .and_then(|n| n.parse::<u32>().ok())
         {
@@ -510,7 +513,7 @@ fn session_pids_in(dir: &Path) -> HashSet<u32> {
     out
 }
 
-/// The nearest ancestor process that is itself an amux, if any.
+/// The nearest ancestor process that is itself an atrium, if any.
 ///
 /// This is the cap's foundation: a process cannot unset its own parent, so
 /// unlike an environment marker it cannot be shrugged off with `env -u`. It is
@@ -524,19 +527,19 @@ fn session_pids_in(dir: &Path) -> HashSet<u32> {
 /// ceiling". A ceiling that disappears when its input cannot be read is not a
 /// ceiling.
 #[cfg(unix)]
-pub fn amux_ancestor() -> Ancestry {
+pub fn atrium_ancestor() -> Ancestry {
     let Some(table) = ProcTable::snapshot() else {
         return Ancestry::Unknown;
     };
-    table.nearest_amux_ancestor(std::process::id(), &mut ExeIds::new())
+    table.nearest_atrium_ancestor(std::process::id(), &mut ExeIds::new())
 }
 
 #[cfg(not(unix))]
-pub fn amux_ancestor() -> Ancestry {
+pub fn atrium_ancestor() -> Ancestry {
     // A stated decision, not an oversight. `reap::SessionJob` puts every pane in
     // a Job Object with KILL_ON_JOB_CLOSE, and job membership is inherited and
-    // cannot be left — so a nested amux on Windows is already contained. But a
-    // job bounds a tree's LIFETIME, not its POSTURE: a nested amux inside the job
+    // cannot be left — so a nested atrium on Windows is already contained. But a
+    // job bounds a tree's LIFETIME, not its POSTURE: a nested atrium inside the job
     // can still be launched at `--trust skip`, it simply cannot outlive us. So
     // Windows has no permission ceiling today. Doing it properly means
     // `QueryFullProcessImageNameW` for identity and `NtQueryInformationProcess`
@@ -550,7 +553,7 @@ pub fn amux_ancestor() -> Ancestry {
 /// Taken with a SINGLE `ps` call. The first version walked ancestry with one
 /// `ps -p <pid>` per hop — up to 64 subprocesses per lookup, per new session,
 /// every few seconds. That is a process storm, and it showed up immediately as
-/// timing flakiness in the test suite, which runs many amux instances at once. A
+/// timing flakiness in the test suite, which runs many atrium instances at once. A
 /// watchdog that loads the machine it is watching is a bad watchdog.
 ///
 /// It no longer asks for `comm`, which removes a parsing hazard (macOS `comm`
@@ -571,7 +574,7 @@ impl ProcTable {
         // Absolute path, not `ps`. `Command::new("ps")` resolves through `$PATH`,
         // which the agent owns - so a pane could put its own `ps` first and have
         // the ancestry walk report whatever it liked, or simply make the lookup
-        // fail. Both failed OPEN: an empty table means "no amux ancestor", which
+        // fail. Both failed OPEN: an empty table means "no atrium ancestor", which
         // means no ceiling. The ceiling must not be reachable only through a tool
         // the constrained party can replace.
         let o = std::process::Command::new("/bin/ps")
@@ -599,13 +602,13 @@ impl ProcTable {
         Some(ProcTable { parent })
     }
 
-    fn nearest_amux_ancestor(&self, start: u32, ids: &mut ExeIds) -> Ancestry {
+    fn nearest_atrium_ancestor(&self, start: u32, ids: &mut ExeIds) -> Ancestry {
         let parent_of = |pid: u32| self.parent.get(&pid).copied();
-        walk_to_amux(&parent_of, &mut |pid| ids.is_amux(pid), start)
+        walk_to_atrium(&parent_of, &mut |pid| ids.is_atrium(pid), start)
     }
 }
 
-/// Walk `start`'s ancestry for the nearest process running this amux binary.
+/// Walk `start`'s ancestry for the nearest process running this atrium binary.
 ///
 /// Split out from the table and the identity check so both can be driven from a
 /// synthetic fixture in the tests: the three ways this has been wrong (matching
@@ -613,20 +616,20 @@ impl ProcTable {
 /// and answering for a grandchild that belongs to an intermediate) are all
 /// properties of this walk, and all are now covered.
 ///
-/// `is_amux` returns `None` for "cannot tell", which propagates to
-/// [`Ancestry::Unknown`] rather than being read as "not an amux". The difference
-/// is the whole fail-closed story: "not an amux" continues the walk and can end
+/// `is_atrium` returns `None` for "cannot tell", which propagates to
+/// [`Ancestry::Unknown`] rather than being read as "not an atrium". The difference
+/// is the whole fail-closed story: "not an atrium" continues the walk and can end
 /// in `NoneFound`, i.e. no ceiling.
 #[cfg(unix)]
-fn walk_to_amux(
+fn walk_to_atrium(
     parent_of: &dyn Fn(u32) -> Option<u32>,
-    is_amux: &mut dyn FnMut(u32) -> Option<bool>,
+    is_atrium: &mut dyn FnMut(u32) -> Option<bool>,
     start: u32,
 ) -> Ancestry {
     let mut cur = start;
     for _ in 0..MAX_HOPS {
         // Check each PARENT, never `start` itself — the first version compared
-        // the current entry while carrying the parent's pid, so amux matched
+        // the current entry while carrying the parent's pid, so atrium matched
         // itself on the first hop and reported its own parent as the ancestor.
         let Some(ppid) = parent_of(cur) else {
             return Ancestry::Unknown;
@@ -634,8 +637,8 @@ fn walk_to_amux(
         if ppid <= 1 || ppid == cur {
             return Ancestry::NoneFound;
         }
-        match is_amux(ppid) {
-            Some(true) => return Ancestry::Amux(ppid),
+        match is_atrium(ppid) {
+            Some(true) => return Ancestry::Atrium(ppid),
             Some(false) => {}
             None => return Ancestry::Unknown,
         }
@@ -650,7 +653,7 @@ fn walk_to_amux(
 ///
 /// Identity is `(st_dev, st_ino)` of the KERNEL's executable for the pid, not a
 /// name and not a path string. See the module docs for why a name is worthless
-/// here (`exec -a amux /bin/sleep`, verified on this host).
+/// here (`exec -a atrium /bin/sleep`, verified on this host).
 #[cfg(unix)]
 struct ExeIds {
     mine: Option<Option<(u64, u64)>>,
@@ -667,7 +670,7 @@ impl ExeIds {
     }
 
     /// `None` means "cannot tell", which the walk turns into `Unknown`.
-    fn is_amux(&mut self, pid: u32) -> Option<bool> {
+    fn is_atrium(&mut self, pid: u32) -> Option<bool> {
         let mine = *self
             .mine
             .get_or_insert_with(|| exe_identity(std::process::id()));
@@ -686,18 +689,18 @@ impl ExeIds {
 /// Is the process at `pid` running the **same executable file** as this one?
 ///
 /// `None` means "cannot tell" — a vanished process, a denied read — and callers
-/// must treat it as exactly that, never as "not amux". This is the module's
+/// must treat it as exactly that, never as "not atrium". This is the module's
 /// identity check, exported so the orphan sweep
 /// ([`crate::orphan::classify_owner`]) asks the same question the ancestry walk
 /// does rather than reinventing it as a name comparison: `ps -o comm=` is
-/// `argv[0]` on macOS and `(exec -a amux /bin/sleep 40)` forges it in one line,
+/// `argv[0]` on macOS and `(exec -a atrium /bin/sleep 40)` forges it in one line,
 /// verified on this host.
 #[cfg(unix)]
 pub fn same_binary(pid: u32) -> Option<bool> {
-    ExeIds::new().is_amux(pid)
+    ExeIds::new().is_atrium(pid)
 }
 
-/// Windows has no ancestry or identity plumbing here yet — see [`amux_ancestor`]
+/// Windows has no ancestry or identity plumbing here yet — see [`atrium_ancestor`]
 /// — and the Job Object makes the sweep that asks this question unnecessary.
 #[cfg(not(unix))]
 pub fn same_binary(_pid: u32) -> Option<bool> {
@@ -707,7 +710,7 @@ pub fn same_binary(_pid: u32) -> Option<bool> {
 /// `(st_dev, st_ino)` of the executable the kernel says `pid` is running.
 ///
 /// `None` on any failure — a vanished process, a denied read — which callers
-/// must treat as "cannot tell", never as "not amux".
+/// must treat as "cannot tell", never as "not atrium".
 #[cfg(unix)]
 fn exe_identity(pid: u32) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -823,10 +826,10 @@ mod tests {
     }
 
     /// The binary check is the one that matters most: the sharpest attack is not
-    /// evading the ceiling but editing amux so there is no ceiling to evade.
+    /// evading the ceiling but editing atrium so there is no ceiling to evade.
     #[test]
     fn a_changed_file_is_reported_once_not_every_tick() {
-        let dir = std::env::temp_dir().join(format!("amux-warden-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atrium-warden-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = dir.join("registry");
         std::fs::write(&reg, "1234\n").unwrap();
@@ -856,10 +859,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A legitimate rewrite by amux itself is not tampering.
+    /// A legitimate rewrite by atrium itself is not tampering.
     #[test]
     fn our_own_registry_rewrite_is_not_an_alert() {
-        let dir = std::env::temp_dir().join(format!("amux-warden-own-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atrium-warden-own-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = dir.join("registry");
         std::fs::write(&reg, "1\n").unwrap();
@@ -870,17 +873,17 @@ mod tests {
             w.check(&[])
                 .iter()
                 .all(|a| a.kind != "warden-registry-changed"),
-            "amux's own write was reported as tampering"
+            "atrium's own write was reported as tampering"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Deleting the registry is the stronger tamper — it is how you make a nested
-    /// amux find no policy to obey — and it used to be reported as nothing at all,
+    /// atrium find no policy to obey — and it used to be reported as nothing at all,
     /// because only `Some(digest)` was ever compared.
     #[test]
     fn a_deleted_registry_is_reported() {
-        let dir = std::env::temp_dir().join(format!("amux-warden-rm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atrium-warden-rm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let reg = dir.join("registry");
         std::fs::write(&reg, "1\n").unwrap();
@@ -923,29 +926,29 @@ mod tests {
     // tested directly rather than through a live process tree.
 
     #[cfg(unix)]
-    fn walk(edges: &[(u32, u32)], amux: &[u32], unknown: &[u32], start: u32) -> Ancestry {
+    fn walk(edges: &[(u32, u32)], atrium: &[u32], unknown: &[u32], start: u32) -> Ancestry {
         let map: HashMap<u32, u32> = edges.iter().copied().collect();
-        let amux: HashSet<u32> = amux.iter().copied().collect();
+        let atrium: HashSet<u32> = atrium.iter().copied().collect();
         let unknown: HashSet<u32> = unknown.iter().copied().collect();
-        walk_to_amux(
+        walk_to_atrium(
             &|pid| map.get(&pid).copied(),
             &mut |pid| {
                 if unknown.contains(&pid) {
                     None
                 } else {
-                    Some(amux.contains(&pid))
+                    Some(atrium.contains(&pid))
                 }
             },
             start,
         )
     }
 
-    /// amux matching ITSELF on the first hop, and so reporting its own parent as
+    /// atrium matching ITSELF on the first hop, and so reporting its own parent as
     /// its ancestor, is a bug this walk shipped once.
     #[cfg(unix)]
     #[test]
     fn the_walk_never_matches_the_starting_process() {
-        // 50 is amux and its parent 40 is an ordinary shell under init.
+        // 50 is atrium and its parent 40 is an ordinary shell under init.
         assert_eq!(
             walk(&[(50, 40), (40, 1)], &[50], &[], 50),
             Ancestry::NoneFound
@@ -958,13 +961,13 @@ mod tests {
     /// while descent was walked 64 hops.
     #[cfg(unix)]
     #[test]
-    fn depth_three_delegates_to_the_nearest_amux() {
+    fn depth_three_delegates_to_the_nearest_atrium() {
         let edges = [(50, 40), (40, 30), (30, 20), (20, 10), (10, 1)];
-        assert_eq!(walk(&edges, &[10, 30, 50], &[], 50), Ancestry::Amux(30));
-        assert_eq!(walk(&edges, &[10, 30, 50], &[], 30), Ancestry::Amux(10));
+        assert_eq!(walk(&edges, &[10, 30, 50], &[], 50), Ancestry::Atrium(30));
+        assert_eq!(walk(&edges, &[10, 30, 50], &[], 30), Ancestry::Atrium(10));
     }
 
-    /// A hop we cannot identify must not be silently read as "not an amux",
+    /// A hop we cannot identify must not be silently read as "not an atrium",
     /// because that lets the walk run off the top and answer "no ancestor" —
     /// which the cap turns into "no ceiling".
     #[cfg(unix)]
@@ -974,7 +977,7 @@ mod tests {
         assert_eq!(walk(&edges, &[30], &[40], 50), Ancestry::Unknown);
         // The same shape with the hop resolvable finds the real ancestor, so the
         // Unknown above is about the missing answer and nothing else.
-        assert_eq!(walk(&edges, &[30], &[], 50), Ancestry::Amux(30));
+        assert_eq!(walk(&edges, &[30], &[], 50), Ancestry::Atrium(30));
     }
 
     /// A pid missing from the snapshot ends the walk as unproven. Returning
@@ -1002,13 +1005,13 @@ mod tests {
         verdict_for(4242, 7, a, panes)
     }
 
-    /// The ordinary nested session: we are its nearest amux ancestor, so it ran
+    /// The ordinary nested session: we are its nearest atrium ancestor, so it ran
     /// our cap. Nothing it wrote is consulted to reach this.
     #[cfg(unix)]
     #[test]
     fn a_session_nested_directly_under_us_is_accounted_for() {
         assert!(matches!(
-            verdict(Ancestry::Amux(7), None),
+            verdict(Ancestry::Atrium(7), None),
             Verdict::Accounted
         ));
     }
@@ -1019,16 +1022,16 @@ mod tests {
     #[test]
     fn a_grandchild_belongs_to_the_intermediate_not_to_us() {
         assert!(matches!(
-            verdict(Ancestry::Amux(99), None),
+            verdict(Ancestry::Atrium(99), None),
             Verdict::Accounted
         ));
     }
 
-    /// An amux in a second terminal has neither our ancestry nor our session id.
+    /// An atrium in a second terminal has neither our ancestry nor our session id.
     /// Alerting on that also shipped once: normal use reported as an intrusion.
     #[cfg(unix)]
     #[test]
-    fn an_unrelated_amux_elsewhere_is_silent() {
+    fn an_unrelated_atrium_elsewhere_is_silent() {
         assert!(matches!(
             verdict(Ancestry::NoneFound, Some(false)),
             Verdict::Accounted
@@ -1071,7 +1074,7 @@ mod tests {
     // --- the kernel-derived primitives --------------------------------------
 
     /// Identity is the executable FILE, not the name a process chose. Verified on
-    /// this host: `(exec -a amux /bin/sleep 40)` reports `comm=amux` to `ps` while
+    /// this host: `(exec -a atrium /bin/sleep 40)` reports `comm=atrium` to `ps` while
     /// `proc_pidpath` reports `/bin/sleep`, so a name test hands an agent the
     /// ancestry walk for one line.
     #[cfg(unix)]
@@ -1079,7 +1082,7 @@ mod tests {
     fn exe_identity_is_the_file_not_the_name() {
         let me = exe_identity(std::process::id()).expect("our own executable must resolve");
         let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exec -a amux sleep 5"])
+            .args(["-c", "exec -a atrium sleep 5"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -1097,7 +1100,7 @@ mod tests {
         assert_ne!(
             theirs,
             Some(me),
-            "a process calling itself amux must not be identified as amux"
+            "a process calling itself atrium must not be identified as atrium"
         );
     }
 
@@ -1139,14 +1142,14 @@ mod tests {
         assert!(pane_session_ids(&[0]).is_empty());
     }
 
-    /// On this host amux is not launched from inside another amux, so the cap
+    /// On this host atrium is not launched from inside another atrium, so the cap
     /// must not fire. It must also not report "unknown": that would mean the
     /// process table or our own executable could not be read, which is a real
     /// problem worth failing this test over. (The positive case needs a real
     /// nested launch and is covered by the integration test.)
     #[cfg(unix)]
     #[test]
-    fn a_normal_launch_has_no_amux_ancestor() {
-        assert_eq!(amux_ancestor(), Ancestry::NoneFound);
+    fn a_normal_launch_has_no_atrium_ancestor() {
+        assert_eq!(atrium_ancestor(), Ancestry::NoneFound);
     }
 }

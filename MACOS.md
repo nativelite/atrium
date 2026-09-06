@@ -1,7 +1,7 @@
-# macOS support audit (amux 0.23.0)
+# macOS support audit (atrium 0.23.0)
 
-Thread-2 audit of the platform seams, verifying amux builds and runs on macOS.
-amux is developed on Windows; macOS is reached through the `cfg(unix)` branches,
+Thread-2 audit of the platform seams, verifying atrium builds and runs on macOS.
+atrium is developed on Windows; macOS is reached through the `cfg(unix)` branches,
 which it shares with Linux. This documents what was checked and the result.
 
 ## Verdict: builds and runs on macOS; one cross-platform code fix was needed.
@@ -19,11 +19,11 @@ which it shares with Linux. This documents what was checked and the result.
 > UTF-8 BOM on `dev.py`, missing exec bit, `python` vs `python3` docs, brittle
 > byte-layout test assertions) — all addressed. Build green, clippy clean, frames
 > column-exact. **One item stays open:** garbled box-drawing borders in
-> Terminal.app, not yet reproduced — amux does no terminal capability detection
+> Terminal.app, not yet reproduced — atrium does no terminal capability detection
 > (`theme.rs` commits to truecolor; macOS 26 Tahoe added truecolor to Terminal.app,
 > so that is likely not the cause) — a screenshot is needed to discriminate.
 
-The whole tree — amux plus every unix-facing dependency (`rawterm`'s
+The whole tree — atrium plus every unix-facing dependency (`rawterm`'s
 `sys_unix.rs`, `pty`, `abus`, `vterm`, …) and all unit + integration test
 targets — compile-checks cleanly for both Apple architectures, and now also
 **builds and runs green on a real Mac**.
@@ -36,7 +36,7 @@ cargo check --target x86_64-unknown-linux-gnu --all-targets # unix parity   -> g
 ```
 
 (A macOS *link+run* still needs a Mac; only the Apple SDK/linker is missing on
-this host. Nothing in amux's own code blocks it.)
+this host. Nothing in atrium's own code blocks it.)
 
 ## Seams reviewed
 
@@ -44,8 +44,8 @@ this host. Nothing in amux's own code blocks it.)
 |------|----------|----------------|--------|
 | Default shell | `main.rs::default_shell` | unix branch uses `$SHELL`, falls back to `sh` | ✓ correct |
 | Command hosting | `main.rs::effective_command` | `#[cfg(windows)]` does PATHEXT/`.cmd`-shim hosting; `#[cfg(not(windows))]` returns argv unchanged, so a macOS agent launches directly | ✓ correct |
-| Control-plane IPC | `ipc.rs` `#[cfg(unix)] mod sys` | `std::os::unix::net::UnixListener`, address `$TMPDIR/amux-ctl-<pid>.sock`, stale-socket cleanup on bind + drop | ✓ correct |
-| Global fleet path | `fleet.rs::global_path` | unix branch uses `$XDG_CONFIG_HOME` else `~/.config/amux/fleet.json` | ✓ builds & runs |
+| Control-plane IPC | `ipc.rs` `#[cfg(unix)] mod sys` | `std::os::unix::net::UnixListener`, address `$TMPDIR/atrium-ctl-<pid>.sock`, stale-socket cleanup on bind + drop | ✓ correct |
+| Global fleet path | `fleet.rs::global_path` | unix branch uses `$XDG_CONFIG_HOME` else `~/.config/atrium/fleet.json` | ✓ builds & runs |
 | Session id (uuid) | `uid.rs::v4` | pure-std entropy (wall clock + `RandomState` + counter); no OS RNG syscall | ✓ portable |
 | Raw terminal / PTY | external `rawterm` (`sys_unix.rs`), `pty` | not in this repo; both compile-check clean for darwin | ✓ (deps) |
 
@@ -58,14 +58,14 @@ macOS rather than assuming a Windows shell.
 ## Runtime caveats (not build breakers; need a Mac to exercise)
 
 1. **Unix-domain-socket path length.** macOS caps `sun_path` at 104 bytes
-   (Linux 108). `ipc.rs::default_address` builds `$TMPDIR/amux-ctl-<pid>.sock`.
+   (Linux 108). `ipc.rs::default_address` builds `$TMPDIR/atrium-ctl-<pid>.sock`.
    Under launchd `$TMPDIR` (`/var/folders/…`) is ~50 chars, so the total stays
    ~70 < 104 — fine in practice; only a pathologically deep `$TMPDIR` would
    overflow. **Addressed:** a 104-byte `sun_path` guard + test was added in
    `ipc.rs` by the agent-cli/ipc thread (board `macos-support`), so an overflow
    now fails fast with a clear error instead of a truncated bind.
 2. **Resolver case-sensitivity (test-only).** `resolver_finds_shims_and_flags_shell_hosting`
-   in `tests/amux.rs` is not `cfg`-gated and matches `tool.exe` against ext
+   in `tests/atrium.rs` is not `cfg`-gated and matches `tool.exe` against ext
    `.EXE`. It passes on the default case-insensitive APFS volume; on a
    case-sensitive volume it could fail. The resolver (`resolve.rs`) is only
    *used* on Windows — the unix `effective_command` bypasses it — so this is a
@@ -75,5 +75,5 @@ macOS rather than assuming a Windows shell.
 
 - Run the suite on a real Mac (CI runner) to exercise the two runtime caveats.
 - If macOS-native config location is desired, consider
-  `~/Library/Application Support/amux` for `global_path` on `target_os = "macos"`
+  `~/Library/Application Support/atrium` for `global_path` on `target_os = "macos"`
   (currently shares the Linux `~/.config` convention — intentional, left as-is).

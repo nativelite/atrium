@@ -1,18 +1,18 @@
 //! Multi-vendor session worlds: light up a non-claude agent pane in the
 //! overview the same way a claude pane already lights up.
 //!
-//! amux today holds **one** [`agsess::World`] over the claude projects root and
+//! atrium today holds **one** [`agsess::World`] over the claude projects root and
 //! only claude panes ever bind (`src/main.rs`). This module generalizes that to
 //! **one world per supported vendor** ([`VendorWorlds`]), plus the small pure
 //! helpers each pane needs: which vendor a command stem produces transcripts for
 //! ([`vendor_for_stem`]), where that vendor writes them ([`vendor_root`]), how to
-//! associate a *started* non-claude pane with a discovered session when amux
+//! associate a *started* non-claude pane with a discovered session when atrium
 //! could not hand it a `--session-id` ([`adopt_session_for`]), and the overview
 //! decoration for a node's vendor ([`vendor_tag`]).
 //!
 //! ## Supported vs. recognised (be realistic — founder directive 2026-09-03)
 //! We only build worlds for the two vendors that (a) run as a terminal CLI in a
-//! pane and (b) write append-only JSONL amux can tail: [`SUPPORTED_VENDORS`] =
+//! pane and (b) write append-only JSONL atrium can tail: [`SUPPORTED_VENDORS`] =
 //! **Claude (Anthropic)** and **Codex (OpenAI)**. Claude's format is verified;
 //! Codex writes rollout JSONL (`~/.codex/sessions/**/rollout-*.jsonl`), which the
 //! agsess codex parser reads. Every other `agsess::Vendor` (Gemini, Aider, Cursor,
@@ -27,7 +27,7 @@
 //! ## Verification status
 //! Both supported vendors are confirmed against live installs: Claude from day
 //! one, and Codex 0.153.0 on 2026-09-03 (a real codex pane bound and appeared in
-//! the amux activity log; its transcripts live exactly at
+//! the atrium activity log; its transcripts live exactly at
 //! `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`). The mechanism is also proven
 //! end-to-end against a **synthetic** codex root in
 //! `vendorworlds_discovers_adopts_and_binds_a_codex_pane`. Any *future* vendor
@@ -37,7 +37,7 @@
 use agsess::{Status, Vendor, World};
 use std::path::PathBuf;
 
-/// Every vendor amux knows how to *recognise* (map a stem/root/tag for). This is
+/// Every vendor atrium knows how to *recognise* (map a stem/root/tag for). This is
 /// the total set mirroring `agsess::Vendor`; the compiler does **not** force it to
 /// stay total, so a new `agsess::Vendor` variant must be added here too. Building
 /// a world is gated separately by [`SUPPORTED_VENDORS`].
@@ -53,9 +53,9 @@ pub const ALL_VENDORS: &[Vendor] = &[
     Vendor::Goose,
 ];
 
-/// The vendors amux actually builds a world for and stands behind — **Claude
+/// The vendors atrium actually builds a world for and stands behind — **Claude
 /// (Anthropic)** and **Codex (OpenAI)**. Both write append-only JSONL transcripts,
-/// which is exactly what amux's tail-by-byte-offset model reads.
+/// which is exactly what atrium's tail-by-byte-offset model reads.
 /// [`VendorWorlds::new`] enumerates exactly these. Everything else in
 /// [`ALL_VENDORS`] is recognised (stem → tag in the overview) but not tracked.
 ///
@@ -75,7 +75,7 @@ pub const SUPPORTED_VENDORS: &[Vendor] = &[Vendor::ClaudeCode, Vendor::Codex];
 /// `Copilot`, `"qwen"` → `Qwen`, `"opencode"` → `OpenCode`, `"goose"` → `Goose`;
 /// any other stem (a shell, an editor) → `None`.
 ///
-/// `stem` is the command file-stem as amux derives it (e.g. `"cursor-agent"`
+/// `stem` is the command file-stem as atrium derives it (e.g. `"cursor-agent"`
 /// with the hyphen, not the display name). Recognising a stem does not imply a
 /// world is built for it — see [`SUPPORTED_VENDORS`].
 pub fn vendor_for_stem(stem: &str) -> Option<Vendor> {
@@ -123,9 +123,9 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // still: protobuf + SQLite under ~/.gemini/antigravity-cli/.) The path below
         // is retained only so a future array-aware integration has a starting point;
         // it is unused while Gemini stays out of SUPPORTED_VENDORS.
-        // Override: AMUX_GEMINI_ROOT env var.
+        // Override: ATRIUM_GEMINI_ROOT env var.
         Vendor::Gemini => Some(
-            std::env::var("AMUX_GEMINI_ROOT")
+            std::env::var("ATRIUM_GEMINI_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home().join(".gemini").join("tmp")),
         ),
@@ -133,7 +133,7 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // NOTE(roots): VERIFIED against a live install (codex 0.153.0, 2026-09-03):
         // Codex CLI writes session transcripts to
         // ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl — a real codex pane
-        // bound and showed in the amux activity log. Override: CODEX_HOME (the app's
+        // bound and showed in the atrium activity log. Override: CODEX_HOME (the app's
         // own override) — replaces ~/.codex, so the sessions subdir becomes
         // $CODEX_HOME/sessions. (Auto-approval for unattended runs is codex-side:
         // `approval_policy = "never"` in ~/.codex/config.toml, or the launch flags
@@ -154,9 +154,9 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // transcripts live under ~/.cursor/projects/<project-id>/agent-transcripts/
         // <session-id>/subagents/*.jsonl (from Cursor docs; not verified against a
         // live install). Discovery caveat: files are 4 levels deep.
-        // Override: AMUX_CURSOR_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
+        // Override: ATRIUM_CURSOR_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
         Vendor::CursorAgent => Some(
-            std::env::var("AMUX_CURSOR_ROOT")
+            std::env::var("ATRIUM_CURSOR_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home().join(".cursor").join("projects")),
         ),
@@ -169,9 +169,9 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // NOTE(roots): researched-stub. Qwen Code writes session transcripts under
         // ~/.qwen/projects/<sanitized-cwd>/chats/<session>.jsonl (from Qwen Code
         // docs; not verified against a live install).
-        // Override: AMUX_QWEN_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
+        // Override: ATRIUM_QWEN_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
         Vendor::Qwen => Some(
-            std::env::var("AMUX_QWEN_ROOT")
+            std::env::var("ATRIUM_QWEN_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home().join(".qwen").join("projects")),
         ),
@@ -187,9 +187,9 @@ pub fn vendor_root(vendor: Vendor) -> Option<PathBuf> {
         // to a platform-specific path (from Goose docs; not verified):
         //   Linux / macOS: ~/.local/share/goose/sessions (XDG data home fallback)
         //   Windows:       %APPDATA%\goose\sessions
-        // Override: AMUX_GOOSE_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
+        // Override: ATRIUM_GOOSE_ROOT env var. (experimental — not in SUPPORTED_VENDORS.)
         Vendor::Goose => Some(
-            std::env::var("AMUX_GOOSE_ROOT")
+            std::env::var("ATRIUM_GOOSE_ROOT")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| {
                     if let Ok(appdata) = std::env::var("APPDATA") {
@@ -243,8 +243,8 @@ impl VendorWorlds {
     }
 
     /// Refresh every world with a cold-start cutoff. Mirrors
-    /// [`agsess::World::refresh_since`] — amux passes its process start time so a
-    /// first scan never blocks on transcripts that stopped writing before amux.
+    /// [`agsess::World::refresh_since`] — atrium passes its process start time so a
+    /// first scan never blocks on transcripts that stopped writing before atrium.
     pub fn refresh_since(&mut self, cutoff_ms: u64) {
         for w in &mut self.worlds {
             w.refresh_since(cutoff_ms);
@@ -253,7 +253,7 @@ impl VendorWorlds {
 
     /// Resolve a pane's agent status from any vendor's sessions.
     ///
-    /// `session_id` is the id amux stamped on the pane — an injected uuid for
+    /// `session_id` is the id atrium stamped on the pane — an injected uuid for
     /// claude, or an [`adopt_session_for`] result for another vendor; `None` for
     /// an unbound pane. Session ids are unique across worlds (uuids / distinct
     /// transcript stems), so the first match across worlds is the answer and
@@ -284,7 +284,7 @@ impl Default for VendorWorlds {
 /// Associate a *started* non-claude pane with a discovered session, returning the
 /// session id to stamp on the pane so [`VendorWorlds::status_for`] can bind it.
 ///
-/// amux cannot hand a non-claude CLI a `--session-id` (that flag is claude's), so
+/// atrium cannot hand a non-claude CLI a `--session-id` (that flag is claude's), so
 /// the pane launches with no id and we must *adopt* one: pick, from `sessions`,
 /// the session that this pane most plausibly produced.
 ///
@@ -611,14 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn vendor_root_amux_gemini_override() {
+    fn vendor_root_atrium_gemini_override() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("AMUX_GEMINI_ROOT").ok();
-        std::env::set_var("AMUX_GEMINI_ROOT", "/tmp/my_gemini");
+        let prev = std::env::var("ATRIUM_GEMINI_ROOT").ok();
+        std::env::set_var("ATRIUM_GEMINI_ROOT", "/tmp/my_gemini");
         let result = vendor_root(Vendor::Gemini);
         match prev {
-            Some(v) => std::env::set_var("AMUX_GEMINI_ROOT", v),
-            None => std::env::remove_var("AMUX_GEMINI_ROOT"),
+            Some(v) => std::env::set_var("ATRIUM_GEMINI_ROOT", v),
+            None => std::env::remove_var("ATRIUM_GEMINI_ROOT"),
         }
         assert_eq!(result, Some(std::path::PathBuf::from("/tmp/my_gemini")));
     }
@@ -635,7 +635,7 @@ mod tests {
             static N: AtomicU64 = AtomicU64::new(0);
             let n = N.fetch_add(1, Ordering::Relaxed);
             let p =
-                std::env::temp_dir().join(format!("amux-adopt-{tag}-{}-{n}", std::process::id()));
+                std::env::temp_dir().join(format!("atrium-adopt-{tag}-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             TempDir(p)

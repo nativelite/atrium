@@ -1,42 +1,42 @@
 use crate::*;
-use amux::layout::Tree;
+use atrium::layout::Tree;
 use std::process::ExitCode;
 use std::time::Instant;
 
-/// The `amux fleet …` command family. `fleet up <name>` brings up a saved
+/// The `atrium fleet …` command family. `fleet up <name>` brings up a saved
 /// roster; `fleet ls` lists the fleet names; anything else prints usage. Kept
-/// separate from the hosted-program path — a fleet is amux's own command, not a
+/// separate from the hosted-program path — a fleet is atrium's own command, not a
 /// child to run.
 pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("up") => match args.get(1) {
             Some(name) if !name.starts_with('-') => {
-                // Anything after the name is amux's own meta-flags — `--allow-ctl`
+                // Anything after the name is atrium's own meta-flags — `--allow-ctl`
                 // (so the fleet can coordinate over the control plane), `--trust
                 // <policy>`, `--max-depth`. Parsed with the shared parser.
-                match amux::ctl::parse_flags(&args[2..]) {
+                match atrium::ctl::parse_flags(&args[2..]) {
                     Ok((allow_ctl, max_depth, trust, rest)) if rest.is_empty() => {
                         fleet_up(name, allow_ctl, max_depth, trust)
                     }
                     Ok((_, _, _, rest)) => {
-                        eprintln!("amux fleet up: unexpected argument {:?}", rest[0]);
+                        eprintln!("atrium fleet up: unexpected argument {:?}", rest[0]);
                         ExitCode::FAILURE
                     }
                     Err(e) => {
-                        eprintln!("amux fleet up: {e}");
+                        eprintln!("atrium fleet up: {e}");
                         ExitCode::FAILURE
                     }
                 }
             }
             _ => {
-                eprintln!("amux fleet up <name>: needs a fleet name (try `amux fleet ls`)");
+                eprintln!("atrium fleet up <name>: needs a fleet name (try `atrium fleet ls`)");
                 ExitCode::FAILURE
             }
         },
         Some("ls") => fleet_ls(),
         _ => {
             eprintln!(
-                "usage: amux fleet up <name> [--allow-ctl] [--trust <policy>] | amux fleet ls"
+                "usage: atrium fleet up <name> [--allow-ctl] [--trust <policy>] | atrium fleet ls"
             );
             ExitCode::FAILURE
         }
@@ -45,38 +45,38 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
 
 /// Defang a fleet-file string before it reaches the terminal.
 ///
-/// Every string in `amux.fleet.json` is attacker-shaped in the workflow this
+/// Every string in `atrium.fleet.json` is attacker-shaped in the workflow this
 /// feature is built for - an agent writes the roster, a human reads the banner
 /// and presses Enter - and the `json` parser decodes `\u001b`, so an agent name
 /// or a path can carry a real ESC. Unfiltered it can clear the screen and
 /// repaint a forged "every agent dir resolves inside" line over the disclosure
 /// the human is about to approve.
 pub(crate) fn fsan(s: &str) -> String {
-    amux::fleet::sanitize(s)
+    atrium::fleet::sanitize(s)
 }
 
 /// List the fleet names in the discovered fleet file, in file order. A missing
 /// file or a malformed one is a clear error on stderr (non-zero exit).
 pub(crate) fn fleet_ls() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let located = match amux::fleet::discover(&cwd) {
+    let located = match atrium::fleet::discover(&cwd) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("amux fleet: {e}");
+            eprintln!("atrium fleet: {e}");
             return ExitCode::FAILURE;
         }
     };
     let text = match std::fs::read_to_string(&located.path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("amux fleet: cannot read {}: {e}", located.path.display());
+            eprintln!("atrium fleet: cannot read {}: {e}", located.path.display());
             return ExitCode::FAILURE;
         }
     };
-    let fleets = match amux::fleet::parse(&text) {
+    let fleets = match atrium::fleet::parse(&text) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("amux fleet: {}: {e}", located.path.display());
+            eprintln!("atrium fleet: {}: {e}", located.path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -88,7 +88,7 @@ pub(crate) fn fleet_ls() -> ExitCode {
         // `\u001b`, so a fleet name can carry a real ESC and clear the terminal
         // this is being read on. `fsan` escapes control characters and nothing
         // else - no truncation, no backslash doubling - so an ordinary name
-        // still round-trips through `amux fleet ls | xargs amux fleet up`.
+        // still round-trips through `atrium fleet ls | xargs atrium fleet up`.
         for name in names {
             println!("{}", fsan(name));
         }
@@ -96,7 +96,7 @@ pub(crate) fn fleet_ls() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `amux fleet up <name>` — read the fleet file, build one tiled window with a
+/// `atrium fleet up <name>` — read the fleet file, build one tiled window with a
 /// pane per agent (each in its `cwd`, under its identity, with its extra args),
 /// and hand it to the run loop. Any error before spawning (no file, bad JSON,
 /// unknown name, empty fleet, a bad grid, a missing `cwd`) is reported and
@@ -105,27 +105,27 @@ pub(crate) fn fleet_up(
     name: &str,
     allow_ctl: bool,
     max_depth: usize,
-    trust: amux::ctl::TrustMode,
+    trust: atrium::ctl::TrustMode,
 ) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let located = match amux::fleet::discover(&cwd) {
+    let located = match atrium::fleet::discover(&cwd) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("amux fleet: {e}");
+            eprintln!("atrium fleet: {e}");
             return ExitCode::FAILURE;
         }
     };
     let text = match std::fs::read_to_string(&located.path) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("amux fleet: cannot read {}: {e}", located.path.display());
+            eprintln!("atrium fleet: cannot read {}: {e}", located.path.display());
             return ExitCode::FAILURE;
         }
     };
-    let fleets = match amux::fleet::parse(&text) {
+    let fleets = match atrium::fleet::parse(&text) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("amux fleet: {}: {e}", located.path.display());
+            eprintln!("atrium fleet: {}: {e}", located.path.display());
             return ExitCode::FAILURE;
         }
     };
@@ -139,7 +139,7 @@ pub(crate) fn fleet_up(
                 .collect::<Vec<_>>()
                 .join(", ");
             eprintln!(
-                "amux fleet: no fleet named \"{}\" (available: {available})",
+                "atrium fleet: no fleet named \"{}\" (available: {available})",
                 fsan(name)
             );
             return ExitCode::FAILURE;
@@ -152,19 +152,19 @@ pub(crate) fn fleet_up(
     // the file it lives with the roster it applies to and is reviewable in a diff.
     //
     // Still a request, not an override: `set_trust_mode` publishes it, and the
-    // ancestry cap has already lowered `trust` if this amux is nested, so a fleet
+    // ancestry cap has already lowered `trust` if this atrium is nested, so a fleet
     // asking for `skip` inside a `plan` session does not get it.
     // The file may switch the control plane on, as `--allow-ctl` does. A
     // coordinating fleet without ctl fails silently — panes come up and publish
     // into nothing — and that has already cost a run.
     let allow_ctl = allow_ctl || fleet.allow_ctl.unwrap_or(false);
     let trust = match (trust, fleet.trust.as_deref()) {
-        (amux::ctl::TrustMode::Off, Some(declared)) => {
-            match amux::ctl::TrustMode::from_policy_keyword(declared) {
+        (atrium::ctl::TrustMode::Off, Some(declared)) => {
+            match atrium::ctl::TrustMode::from_policy_keyword(declared) {
                 Some(m) => m,
                 None => {
                     eprintln!(
-                        "amux fleet: fleet {name:?} declares trust {declared:?}, which is not \
+                        "atrium fleet: fleet {name:?} declares trust {declared:?}, which is not \
                          one of plan, accept, automode, skip"
                     );
                     return ExitCode::FAILURE;
@@ -181,8 +181,8 @@ pub(crate) fn fleet_up(
     // the roster, a human reviews and runs it. The review is the approval, so the
     // posture must be impossible to slip past it.
     let trust = cap_trust_to_ancestor(trust);
-    if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
-        eprintln!("amux fleet: aborted.");
+    if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
+        eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
     // Vet every agent's argv exactly as `ctl spawn` does. A fleet file's `cmd` was
@@ -200,19 +200,19 @@ pub(crate) fn fleet_up(
     // order is chosen once, below.
     let mut notes: Vec<String> = Vec::new();
     for a in &fleet.agents {
-        match amux::ctl::vet_spawn_argv(&a.cmd) {
-            amux::ctl::ArgvVerdict::Refused(why) => {
-                eprintln!("amux fleet: agent \"{}\": {why}", fsan(&a.name));
+        match atrium::ctl::vet_spawn_argv(&a.cmd) {
+            atrium::ctl::ArgvVerdict::Refused(why) => {
+                eprintln!("atrium fleet: agent \"{}\": {why}", fsan(&a.name));
                 return ExitCode::FAILURE;
             }
-            amux::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
+            atrium::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
                 notes.push(format!(
                     "agent \"{}\": ignoring {} — set the posture with \"trust\" instead",
                     fsan(&a.name),
                     fsan(&stripped.join(", "))
                 ));
             }
-            amux::ctl::ArgvVerdict::Ok { .. } => {}
+            atrium::ctl::ArgvVerdict::Ok { .. } => {}
         }
     }
 
@@ -221,11 +221,11 @@ pub(crate) fn fleet_up(
     // cannot happen anyway.
     let n = fleet.agents.len();
     let grid = match &fleet.grid {
-        Some(spec) => match amux::spawn::Grid::parse_spec(spec) {
+        Some(spec) => match atrium::spawn::Grid::parse_spec(spec) {
             Ok(g) if g.total() >= n => g,
             Ok(g) => {
                 eprintln!(
-                    "amux fleet: grid {:?} has {} cells but fleet \"{}\" has {n} agents",
+                    "atrium fleet: grid {:?} has {} cells but fleet \"{}\" has {n} agents",
                     fsan(spec),
                     g.total(),
                     fsan(name)
@@ -233,11 +233,11 @@ pub(crate) fn fleet_up(
                 return ExitCode::FAILURE;
             }
             Err(e) => {
-                eprintln!("amux fleet: fleet \"{}\": {e}", fsan(name));
+                eprintln!("atrium fleet: fleet \"{}\": {e}", fsan(name));
                 return ExitCode::FAILURE;
             }
         },
-        None => amux::spawn::Grid::balanced(n.max(2)),
+        None => atrium::spawn::Grid::balanced(n.max(2)),
     };
 
     // Resolve every directory this roster grants — ONCE. `plan` is what the
@@ -245,18 +245,18 @@ pub(crate) fn fleet_up(
     // cannot drift: resolving a second time inside the spawn is how an
     // acknowledged "inside" became a live grant on a credential store when a
     // symlink was re-pointed during the operator's Enter window.
-    let anchor = amux::fleet::anchor_for(
+    let anchor = atrium::fleet::anchor_for(
         &located.dir,
         &cwd,
         located.global,
-        amux::fleet::home_dir().as_deref(),
+        atrium::fleet::home_dir().as_deref(),
     );
-    let plan = amux::fleet::Plan::build(
+    let plan = atrium::fleet::Plan::build(
         &fleet,
         &located.path,
         &located.dir,
         anchor,
-        &amux::fleet::Stores::live(),
+        &atrium::fleet::Stores::live(),
     );
 
     // Validate every agent's cwd *before* spawning anything, so a bad path never
@@ -267,9 +267,9 @@ pub(crate) fn fleet_up(
         if let Some(g) = &ap.cwd {
             if !g.given.is_dir() {
                 eprintln!(
-                    "amux fleet: agent \"{}\": cwd {} is not a directory",
+                    "atrium fleet: agent \"{}\": cwd {} is not a directory",
                     ap.label,
-                    amux::fleet::show_path(&g.given)
+                    atrium::fleet::show_path(&g.given)
                 );
                 return ExitCode::FAILURE;
             }
@@ -284,16 +284,16 @@ pub(crate) fn fleet_up(
     // spawn capability and the verdict are the short, decisive part, so they go
     // last and are still on screen when the prompt appears.
     for line in plan.banner_lines() {
-        eprintln!("amux fleet: {line}");
+        eprintln!("atrium fleet: {line}");
     }
     for note in &notes {
-        eprintln!("amux fleet: {note}");
+        eprintln!("atrium fleet: {note}");
     }
     // Always say the posture out loud. A fleet file can be authored by an agent
     // and skimmed by a human; a line naming what everything is about to run under
     // is the difference between reviewing it and assuming it.
     eprintln!(
-        "amux fleet: \"{}\" starting {} agent(s) at trust {}{}",
+        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}",
         fsan(name),
         fleet.agents.len(),
         trust.policy_label(),
@@ -309,7 +309,7 @@ pub(crate) fn fleet_up(
         .map(|(ap, _)| ap.label.clone())
         .collect();
     eprintln!(
-        "amux fleet: {} of {} may spawn teammates{}",
+        "atrium fleet: {} of {} may spawn teammates{}",
         spawners.len(),
         fleet.agents.len(),
         if spawners.is_empty() {
@@ -322,7 +322,7 @@ pub(crate) fn fleet_up(
     // destinations rather than counting them. A surviving summary line that
     // omits the payload is the one thing an operator is guaranteed to read and
     // the one thing that tells them nothing.
-    eprintln!("amux fleet: {}", plan.verdict());
+    eprintln!("atrium fleet: {}", plan.verdict());
     // Hold here until the operator acknowledges.
     //
     // Everything above is printed to the NORMAL screen buffer, and the run loop's
@@ -336,10 +336,10 @@ pub(crate) fn fleet_up(
     // IS the approval - so the approval should be an act, not an assumption. One
     // keypress is proportionate to starting N agents with filesystem access.
     //
-    // Skipped when stdin is not a terminal (a script, CI) or `AMUX_YES=1`, since
+    // Skipped when stdin is not a terminal (a script, CI) or `ATRIUM_YES=1`, since
     // there is nobody to ask; the banner still prints for the log.
     if !fleet_ack() {
-        eprintln!("amux fleet: aborted.");
+        eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
     // Publish the trust policy before the fleet's panes are spawned (they read it
@@ -349,7 +349,7 @@ pub(crate) fn fleet_up(
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("amux: stdin/stdout must be a terminal: {e}");
+            eprintln!("atrium: stdin/stdout must be a terminal: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -357,7 +357,7 @@ pub(crate) fn fleet_up(
 
     let mut flash: Option<(String, Instant)> = None;
     // Bind the ctl endpoint BEFORE spawning the fleet's panes, so each agent is
-    // born with `AMUX_CTL`/`AMUX_PANE` in its env and can drive the board/bus.
+    // born with `ATRIUM_CTL`/`ATRIUM_PANE` in its env and can drive the board/bus.
     // (The default path binds inside run() after its single spawn; a fleet spawns
     // its whole roster up front, so it must publish the address first.)
     let ctl_listener = if allow_ctl {
@@ -368,7 +368,7 @@ pub(crate) fn fleet_up(
     let window = match spawn_fleet_window(&fleet, &plan, grid, rows, cols, &mut flash) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("amux fleet: cannot start fleet \"{}\": {e}", fsan(name));
+            eprintln!("atrium fleet: cannot start fleet \"{}\": {e}", fsan(name));
             return ExitCode::FAILURE;
         }
     };
@@ -376,7 +376,7 @@ pub(crate) fn fleet_up(
     // New panes / splits opened later host a shell under the fleet's default
     // identity — a scratch pane in-role, not another copy of an agent.
     let scratch = vec![default_shell()];
-    // ctl is opt-in for a fleet too (`amux fleet up <name> --allow-ctl`), so the
+    // ctl is opt-in for a fleet too (`atrium fleet up <name> --allow-ctl`), so the
     // roster can coordinate over the board/bus; without the flag it runs as before.
     run(
         &mut term,
@@ -403,8 +403,8 @@ pub(crate) fn fleet_up(
 /// directory at all, so it cannot resolve anything a second time even by
 /// accident.
 pub(crate) fn fleet_launch(
-    agent: &amux::fleet::Agent,
-    disclosed: &amux::fleet::AgentPlan,
+    agent: &atrium::fleet::Agent,
+    disclosed: &atrium::fleet::AgentPlan,
 ) -> (Vec<String>, Option<String>, String) {
     let dirs: Vec<String> = disclosed
         .add_dirs
@@ -430,9 +430,9 @@ pub(crate) fn fleet_launch(
 /// resolved `cwd`. If any agent fails to spawn, the panes already started are
 /// killed and the whole window is abandoned — never a partial fleet.
 pub(crate) fn spawn_fleet_window(
-    fleet: &amux::fleet::Fleet,
-    plan: &amux::fleet::Plan,
-    grid: amux::spawn::Grid,
+    fleet: &atrium::fleet::Fleet,
+    plan: &atrium::fleet::Plan,
+    grid: atrium::spawn::Grid,
     rows: u16,
     cols: u16,
     flash: &mut Option<(String, Instant)>,

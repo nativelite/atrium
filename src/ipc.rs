@@ -1,13 +1,13 @@
 //! The `ctl` control channel: a tiny, zero-dependency, **local** request/reply
 //! transport — a Windows named pipe or a unix-domain socket, chosen at compile
 //! time. It carries one JSON request line and one JSON reply line per client
-//! connection; amux ("the server") owns the endpoint and drains it from its run
-//! loop without blocking, and each `amux ctl <cmd>` invocation is a short-lived
+//! connection; atrium ("the server") owns the endpoint and drains it from its run
+//! loop without blocking, and each `atrium ctl <cmd>` invocation is a short-lived
 //! client ([`request`]).
 //!
 //! The API is deliberately small:
-//! * [`default_address`] — the per-process endpoint amux binds and injects as
-//!   `AMUX_CTL` into every pane it spawns.
+//! * [`default_address`] — the per-process endpoint atrium binds and injects as
+//!   `ATRIUM_CTL` into every pane it spawns.
 //! * [`Listener::bind`] / [`Listener::poll`] / [`Listener::respond`] — the
 //!   server side. `poll` is **non-blocking**: it returns `Ok(None)` when no
 //!   request is ready, so it fits the 15 ms run-loop tick with no thread. One
@@ -32,28 +32,28 @@
 //! syscalls and lifetime.
 //!
 //! **Same-user endpoint (peer-cred).** The endpoint is restricted to the user who
-//! launched amux: on unix the socket is 0600 and every accepted connection's peer
+//! launched atrium: on unix the socket is 0600 and every accepted connection's peer
 //! uid is checked against `geteuid` (`SO_PEERCRED` / `getpeereid`) — a mismatched
 //! client is dropped before its request is read; on Windows the pipe is created
 //! with a security descriptor granting access only to the current user and
 //! SYSTEM, and with `FILE_FLAG_FIRST_PIPE_INSTANCE` on the first instance, so a
-//! process that pre-created the name makes amux's `bind` fail loudly instead of
-//! letting amux attach as a second instance of someone else's pipe. This is
-//! defense in depth *beneath* the per-pane capability token (`AMUX_TOKEN`), which
+//! process that pre-created the name makes atrium's `bind` fail loudly instead of
+//! letting atrium attach as a second instance of someone else's pipe. This is
+//! defense in depth *beneath* the per-pane capability token (`ATRIUM_TOKEN`), which
 //! remains the primary authenticator.
 //!
 //! **What none of that stops — and why that is by design.** Peer-cred, mode 0600
 //! and the SDDL all admit a process running as the *same user* — which is exactly
 //! what a hosted agent is. That is deliberate: **defending against a same-user
-//! attacker is an explicit non-goal.** amux's security scope is fleet/agent safety
+//! attacker is an explicit non-goal.** atrium's security scope is fleet/agent safety
 //! (a pane cannot impersonate a sibling or claim operator; credentials stay
 //! scoped; a *different* user on a shared box is kept out). A process already
 //! running as you has won by far easier paths — it can read your env, your files,
 //! `~/.claude.json`, your OS vault — so there is nothing this channel can protect
 //! that such an attacker does not already hold. Concretely: a same-uid process can
-//! replace the unix endpoint (amux raises a tripwire it happens to have there; see
+//! replace the unix endpoint (atrium raises a tripwire it happens to have there; see
 //! [`Listener::take_security_event`]) or create an additional Windows pipe instance
-//! under the same name and race amux for clients (no tripwire on Windows — a named
+//! under the same name and race atrium for clients (no tripwire on Windows — a named
 //! pipe has no `(dev,ino)` to re-stat). Both are the same **same-user non-goal**,
 //! not open defects. Truly closing them needs the server to *authenticate* itself
 //! to its clients — real crypto, out of scope for a single-user local tool, and
@@ -61,8 +61,8 @@
 
 use std::io;
 
-/// The endpoint amux binds for this process, unique per pid so two amux
-/// instances never collide. Injected as `AMUX_CTL` into spawned panes.
+/// The endpoint atrium binds for this process, unique per pid so two atrium
+/// instances never collide. Injected as `ATRIUM_CTL` into spawned panes.
 pub fn default_address() -> String {
     sys::default_address(std::process::id())
 }
@@ -94,7 +94,7 @@ impl Listener {
     /// gates `board claim`/`release`, the fleet's mutual exclusion.
     ///
     /// Also re-checks, a few times a second, that the endpoint still names the
-    /// object amux bound — see
+    /// object atrium bound — see
     /// [`take_security_event`](Listener::take_security_event).
     pub fn poll(&mut self) -> io::Result<Option<String>> {
         self.sys.poll()
@@ -126,9 +126,9 @@ impl Listener {
     /// On unix the ctl socket path lives in a directory the user owns, so a
     /// same-uid process can `unlink()` it and `bind()` its own socket in its
     /// place: the file mode is no defense, because the authority to unlink comes
-    /// from the directory. amux records the socket's `(dev, ino)` at bind time
+    /// from the directory. atrium records the socket's `(dev, ino)` at bind time
     /// and re-`stat`s the path a few times a second; a mismatch means the name
-    /// no longer refers to amux's socket. It is a tripwire, not a lock: an
+    /// no longer refers to atrium's socket. It is a tripwire, not a lock: an
     /// attacker who replaces the socket, harvests a token and restores the
     /// original inside the check interval is not seen at all, and by the time
     /// the alarm fires the token has already gone to the squatter. That is a
@@ -154,7 +154,7 @@ impl Listener {
 }
 
 /// Client: connect to `addr`, send `req` (one line), return the reply line
-/// (newline trimmed). Used by `amux ctl <cmd>`.
+/// (newline trimmed). Used by `atrium ctl <cmd>`.
 ///
 /// The reply is bounded (`wire::MAX_REPLY`) and deadlined, and a connection that
 /// ends before a newline is an error, never a truncated success.
@@ -181,18 +181,18 @@ mod wire {
     /// It used to be a client-only rule: `respond` would frame a reply of any
     /// size and the client refused past 8 MiB with `InvalidData`, so a `ctl
     /// audit` that grew past the cap failed with an error blaming the channel
-    /// rather than an answer from amux. The server now refuses first, with an
+    /// rather than an answer from atrium. The server now refuses first, with an
     /// explicit reply naming the limit — a cap the writer does not know about is
     /// the same class of bug as a fix applied to a writer but not its readers.
     pub const MAX_REPLY: usize = 8 * 1024 * 1024;
     /// The reply that a caller-supplied answer over [`MAX_REPLY`] is replaced
     /// with, so the client gets a diagnosis instead of a channel error.
     pub const TOO_LARGE_REPLY: &str =
-        r#"{"ok":false,"error":"amux reply exceeded 8388608 bytes and was not sent"}"#;
-    /// How long a client may hold a half-sent request before amux drops it.
+        r#"{"ok":false,"error":"atrium reply exceeded 8388608 bytes and was not sent"}"#;
+    /// How long a client may hold a half-sent request before atrium drops it.
     /// Wall-clock across ticks, not per read.
     pub const CLIENT_DEADLINE: Duration = Duration::from_secs(2);
-    /// How long a reply may make **no progress at all** before amux gives up on
+    /// How long a reply may make **no progress at all** before atrium gives up on
     /// the connection. Anchored on the last byte the kernel accepted, so a slow
     /// but honest reader is served for as long as it keeps reading, while a
     /// client that stops reading is dropped instead of held forever.
@@ -200,7 +200,7 @@ mod wire {
     /// After the last byte is written, how long to wait for the client to close
     /// (proof it read everything) before letting go anyway.
     pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
-    /// How long a refused client may be quiet before amux stops holding the
+    /// How long a refused client may be quiet before atrium stops holding the
     /// connection open for it. Short: it exists only to keep the receive queue
     /// empty long enough that closing delivers the refusal instead of a reset.
     pub const DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -229,7 +229,7 @@ mod wire {
     // These used to be four unrelated literals: `Duration::from_secs(5)` at the
     // Windows connect, a `stall`/`hard` pair inside the Windows `read_reply`,
     // and a `STALL`/`HARD_DEADLINE` pair inside the unix one. Nothing tied them
-    // together, so "how long may a hostile endpoint hold `amux ctl`?" had two
+    // together, so "how long may a hostile endpoint hold `atrium ctl`?" had two
     // different answers depending on the platform. One place now.
 
     /// How long a client tolerates a server that sends **nothing at all**. This
@@ -237,9 +237,9 @@ mod wire {
     pub const REPLY_STALL: Duration = Duration::from_secs(5);
     /// The ceiling on one whole client exchange — connect, request, reply —
     /// measured once at the start and never re-armed, because a per-read timeout
-    /// that re-arms is how a dripping server held `amux ctl` open forever.
+    /// that re-arms is how a dripping server held `atrium ctl` open forever.
     ///
-    /// 30 s, and the number is measured rather than wished for. amux hands a
+    /// 30 s, and the number is measured rather than wished for. atrium hands a
     /// parked reply to the kernel once per 15 ms run-loop tick, one socket
     /// buffer at a time; on this mac that delivers 120 623 bytes (a real `ctl
     /// audit`) in 324 ms, 1 MB in 2.53 s and 4 MiB in 10.59 s — about 400 KB/s.
@@ -579,7 +579,7 @@ mod chan {
         /// has closed.
         ///
         /// Needed for a client whose request was refused mid-flight: it is still
-        /// pushing the tail of an oversize body, and if amux simply stopped
+        /// pushing the tail of an oversize body, and if atrium simply stopped
         /// reading and closed, the unread bytes would turn the close into a reset
         /// and the client would lose the error reply it is owed. So keep the
         /// receive queue empty while the refusal goes out, and let go once the
@@ -589,7 +589,7 @@ mod chan {
         /// Bounded by [`DRAIN_BUDGET`] bytes as well as by the step count: the
         /// step count alone let one refused client hand the run loop a ~16 MB
         /// read budget in a single tick, which is far more than anything else in
-        /// the loop takes and is chosen by the attacker, not by amux.
+        /// the loop takes and is chosen by the attacker, not by atrium.
         pub fn drain_input(&mut self, buf: &mut [u8]) -> (bool, bool) {
             let mut consumed = false;
             let mut budget = DRAIN_BUDGET;
@@ -733,7 +733,7 @@ mod winmap {
 //   * `FlushFileBuffers` is gone. On the server end of a named pipe it does not
 //     return until the client has read everything — an unbounded block on the
 //     single run loop, triggerable by any client that simply stops reading (a
-//     debugger-suspended `amux ctl` does it by accident). The invariant it was
+//     debugger-suspended `atrium ctl` does it by accident). The invariant it was
 //     protecting (`DisconnectNamedPipe` discards unread data) is now held by
 //     state: after the last byte is written the instance sits in `Draining`
 //     until a non-blocking `ReadFile` reports ERROR_BROKEN_PIPE (the client
@@ -906,8 +906,8 @@ mod sys {
 
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     /// Only the *first* instance may claim the name: a second process that tries
-    /// to add an instance to `\\.\pipe\amux-ctl-<pid>` fails instead of quietly
-    /// serving amux's clients. This is the Windows answer to the unix endpoint
+    /// to add an instance to `\\.\pipe\atrium-ctl-<pid>` fails instead of quietly
+    /// serving atrium's clients. This is the Windows answer to the unix endpoint
     /// hijack — prevention rather than the after-the-fact detection a filesystem
     /// path can offer.
     const FILE_FLAG_FIRST_PIPE_INSTANCE: u32 = 0x0008_0000;
@@ -949,7 +949,7 @@ mod sys {
     }
 
     pub fn default_address(pid: u32) -> String {
-        format!(r"\\.\pipe\amux-ctl-{pid}")
+        format!(r"\\.\pipe\atrium-ctl-{pid}")
     }
 
     /// The syscall half of one pipe instance: calls the OS, classifies the
@@ -1271,22 +1271,22 @@ mod sys {
         /// report is a **same-user non-goal**, not an unguarded hole.
         ///
         /// `FILE_FLAG_FIRST_PIPE_INSTANCE` is real and worth having: it makes
-        /// amux's own `bind` fail loudly if the name already exists, so amux can
+        /// atrium's own `bind` fail loudly if the name already exists, so atrium can
         /// never silently attach as a second instance of an attacker's pipe,
         /// inheriting the attacker's DACL and pipe type. What it does **not** do
         /// is stop the reverse: the flag only fails *the caller's* create, so a
         /// same-user process can create additional instances of
-        /// `\\.\pipe\amux-ctl-<pid>` *without* the flag once amux holds the
-        /// name, and race amux for connecting clients.
+        /// `\\.\pipe\atrium-ctl-<pid>` *without* the flag once atrium holds the
+        /// name, and race atrium for connecting clients.
         ///
         /// A named pipe has no `(dev, ino)` to re-`stat`, so the unix path's
         /// tripwire has no analogue here. But this is the **same-user** case, which
-        /// is outside amux's threat model (a process running as you has already won
+        /// is outside atrium's threat model (a process running as you has already won
         /// by easier paths — env, files, `~/.claude.json`, the OS vault). So this
         /// is a documented non-goal, not an open defect: `None` is the honest,
         /// intended answer. The unix side merely *happens* to have a cheap tripwire
         /// (path re-stat) and uses it; the absence of one here changes nothing about
-        /// what amux is defending. Truly closing it needs server-authenticates-to-
+        /// what atrium is defending. Truly closing it needs server-authenticates-to-
         /// client crypto — over-engineering for a single-user local tool.
         pub fn take_security_event(&mut self) -> Option<String> {
             None
@@ -1336,7 +1336,7 @@ mod sys {
         if h == INVALID_HANDLE_VALUE {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "amux control channel did not answer",
+                "atrium control channel did not answer",
             ));
         }
 
@@ -1344,7 +1344,7 @@ mod sys {
         // well, so `read_reply`'s deadlines are real — the handle `CreateFileW`
         // returns is a *blocking* one by default, which is why the old
         // ERROR_NO_DATA retry loop could never fire and a server that answered
-        // nothing hung `amux ctl` for as long as it liked.
+        // nothing hung `atrium ctl` for as long as it liked.
         let mut mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
         unsafe {
             SetNamedPipeHandleState(h, &mut mode, std::ptr::null_mut(), std::ptr::null_mut());
@@ -1382,7 +1382,7 @@ mod sys {
                     unsafe { CloseHandle(h) };
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "amux control channel would not accept the request",
+                        "atrium control channel would not accept the request",
                     ));
                 }
                 thread::sleep(CLIENT_POLL);
@@ -1432,7 +1432,7 @@ mod sys {
                 if out.len() > MAX_REPLY {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "amux control channel sent an oversize reply",
+                        "atrium control channel sent an oversize reply",
                     ));
                 }
                 last_progress = Instant::now();
@@ -1441,7 +1441,7 @@ mod sys {
             if ok == 0 && (e == ERROR_BROKEN_PIPE || e == super::winmap::ERROR_PIPE_NOT_CONNECTED) {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "amux control channel closed before a complete reply",
+                    "atrium control channel closed before a complete reply",
                 ));
             }
             if ok == 0 && e != ERROR_NO_DATA && e != super::winmap::ERROR_MORE_DATA {
@@ -1451,13 +1451,13 @@ mod sys {
             if expired(last_progress, now, stall) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "no reply from amux control channel",
+                    "no reply from atrium control channel",
                 ));
             }
             if expired(start, now, hard) {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "amux control channel never finished its reply",
+                    "atrium control channel never finished its reply",
                 ));
             }
             thread::sleep(CLIENT_POLL);
@@ -1544,7 +1544,7 @@ mod sys {
 
     pub fn default_address(pid: u32) -> String {
         std::env::temp_dir()
-            .join(format!("amux-ctl-{pid}.sock"))
+            .join(format!("atrium-ctl-{pid}.sock"))
             .to_string_lossy()
             .into_owned()
     }
@@ -1606,7 +1606,7 @@ mod sys {
         refused: usize,
         refusal_reported: Option<Instant>,
         /// Replies still being handed to the kernel a buffer at a time. The flag
-        /// marks a *refused* client, which amux keeps draining until it hangs up
+        /// marks a *refused* client, which atrium keeps draining until it hangs up
         /// so the refusal is not lost to a reset (see `Channel::drain_input`).
         outbox: VecDeque<(Channel<Stream>, Option<Instant>)>,
     }
@@ -1629,7 +1629,7 @@ mod sys {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
-                        "amux control-socket path is {} bytes, over the {}-byte \
+                        "atrium control-socket path is {} bytes, over the {}-byte \
                          unix-domain socket limit on this platform: {}",
                         path.as_os_str().len(),
                         SUN_PATH_MAX,
@@ -1647,7 +1647,7 @@ mod sys {
             // The result used to be discarded. A defense that silently does not
             // apply is worse than none, because everything above it assumes it
             // held: if the mode cannot be set, the socket is world-connectable and
-            // amux would have carried on serving on it. Refuse to bind instead,
+            // atrium would have carried on serving on it. Refuse to bind instead,
             // and take the socket file with us so nothing is left listening.
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -1681,7 +1681,7 @@ mod sys {
         }
 
         /// Re-`stat` the endpoint at most once a second and raise an alarm if the
-        /// path no longer names the socket amux bound.
+        /// path no longer names the socket atrium bound.
         ///
         /// A same-uid process can `unlink()` the path and `bind()` its own socket
         /// there — the authority to do that comes from the 0700 TMPDIR, not from
@@ -1707,13 +1707,13 @@ mod sys {
                     self.path.display()
                 ),
                 None => format!(
-                    "ctl endpoint {} disappeared — ctl clients cannot reach amux",
+                    "ctl endpoint {} disappeared — ctl clients cannot reach atrium",
                     self.path.display()
                 ),
             };
             if !self.alarm_reported {
                 self.alarm_reported = true;
-                eprint!("[amux] SECURITY: {msg}\r\n");
+                eprint!("[atrium] SECURITY: {msg}\r\n");
             }
             self.alarm = Some(msg);
         }
@@ -1837,7 +1837,7 @@ mod sys {
             }
             let n = std::mem::take(&mut self.refused);
             self.refusal_reported = Some(now);
-            eprint!("[amux] ipc: refused {n} peer(s) amux could not vouch for\r\n");
+            eprint!("[atrium] ipc: refused {n} peer(s) atrium could not vouch for\r\n");
         }
 
         /// Accept whoever is waiting, up to a few per tick.
@@ -1916,7 +1916,7 @@ mod sys {
                     ReadOutcome::Oversize => {
                         let mut ch = self.slots.remove(i).expect("index in range");
                         // Say why. A rejected request used to get no reply at all,
-                        // so an oversize `ctl` looked exactly like a crashed amux.
+                        // so an oversize `ctl` looked exactly like a crashed atrium.
                         ch.queue(OVERSIZE_REPLY, now);
                         let _ = ch.pump_write(now);
                         // Best effort: if the refusal lane is full the connection
@@ -1947,7 +1947,7 @@ mod sys {
             // The size limit is the SERVER's too. It used to be enforced only by
             // the client, so an answer past the cap reached the wire and came
             // back to the caller as `InvalidData` from the channel instead of as
-            // a diagnosis from amux.
+            // a diagnosis from atrium.
             if reply.len() > MAX_REPLY {
                 ch.queue(TOO_LARGE_REPLY, now);
                 let _ = ch.pump_write(now);
@@ -2008,7 +2008,7 @@ mod sys {
         // 1. A socket timeout re-arms on every read, so an endpoint that keeps
         //    dribbling bytes is never timed out at all. That is the hole the
         //    67 MB reply came through, and the size cap alone does not close it:
-        //    a drip that stays under `MAX_REPLY` can still hold `amux ctl` — and
+        //    a drip that stays under `MAX_REPLY` can still hold `atrium ctl` — and
         //    the pane that ran it — open indefinitely.
         //
         // 2. On macOS, `setsockopt(SO_RCVTIMEO/SO_SNDTIMEO)` on a unix-domain
@@ -2045,14 +2045,14 @@ mod sys {
     fn silent_endpoint() -> io::Error {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "no reply from amux control channel",
+            "no reply from atrium control channel",
         )
     }
 
     fn unfinished_reply() -> io::Error {
         io::Error::new(
             io::ErrorKind::TimedOut,
-            "amux control channel never finished its reply",
+            "atrium control channel never finished its reply",
         )
     }
 
@@ -2072,7 +2072,7 @@ mod sys {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
-                        "the amux control channel accepted no bytes",
+                        "the atrium control channel accepted no bytes",
                     ))
                 }
                 Ok(n) => {
@@ -2100,8 +2100,8 @@ mod sys {
 
     /// Read one reply line.
     ///
-    /// Waiting is fine here in a way it never is on amux's event loop — this
-    /// runs in a short-lived `amux ctl` whose only job is to wait for this
+    /// Waiting is fine here in a way it never is on atrium's event loop — this
+    /// runs in a short-lived `atrium ctl` whose only job is to wait for this
     /// answer — *as long as it is bounded*, which is exactly what a hostile
     /// endpoint planted at the socket path would otherwise exploit. Three rules
     /// the old version got wrong:
@@ -2127,7 +2127,7 @@ mod sys {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "amux control channel closed before a complete reply",
+                        "atrium control channel closed before a complete reply",
                     ))
                 }
                 Ok(n) => {
@@ -2141,7 +2141,7 @@ mod sys {
                     if out.len() > MAX_REPLY {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "amux control channel sent an oversize reply",
+                            "atrium control channel sent an oversize reply",
                         ));
                     }
                     progress = Instant::now();
@@ -2188,12 +2188,12 @@ mod tests {
         let pid = std::process::id();
         #[cfg(windows)]
         {
-            format!(r"\\.\pipe\amux-ctl-test-{pid}-{nonce}")
+            format!(r"\\.\pipe\atrium-ctl-test-{pid}-{nonce}")
         }
         #[cfg(unix)]
         {
             std::env::temp_dir()
-                .join(format!("amux-ctl-test-{pid}-{nonce}.sock"))
+                .join(format!("atrium-ctl-test-{pid}-{nonce}.sock"))
                 .to_string_lossy()
                 .into_owned()
         }
@@ -2748,7 +2748,7 @@ mod tests {
     ///
     /// The accepted stream used to be set BLOCKING with a 2s read timeout, read
     /// one byte at a time — so the timeout re-armed per byte and a client that
-    /// dripped bytes held amux's single event loop for as long as it liked,
+    /// dripped bytes held atrium's single event loop for as long as it liked,
     /// freezing every pane. Any process able to connect could do it.
     ///
     /// This drives exactly that shape: connect, send half a line, and require
@@ -2803,7 +2803,7 @@ mod tests {
     /// **D1, the executed exploit.** `poll()` sets the accepted stream
     /// non-blocking; `respond` then called `write_all`, which retries only on
     /// `Interrupted`. On macOS's 8 192-byte `net.local.stream.sendspace` that
-    /// returned `Err(WouldBlock)` AFTER a partial write, so `amux ctl audit`
+    /// returned `Err(WouldBlock)` AFTER a partial write, so `atrium ctl audit`
     /// delivered 8 192 of 120 631 bytes and the client printed half-written JSON
     /// and exited FAILURE — after roughly 120 ctl commands on any session.
     #[cfg(unix)]
@@ -2817,7 +2817,7 @@ mod tests {
             let _ = tx.send(request(&addr2, r#"{"cmd":"audit"}"#));
         });
 
-        // The measured size of a real `amux ctl audit` reply.
+        // The measured size of a real `atrium ctl audit` reply.
         let payload = format!(r#"{{"ok":true,"detail":"{}"}}"#, "a".repeat(120_600));
         let mut answered = false;
         let start = Instant::now();
@@ -2964,7 +2964,7 @@ mod tests {
 
     /// **D9.** An oversize request must be refused *with an answer* — the old
     /// path closed the connection with nothing on it, which is
-    /// indistinguishable from a crashed amux — and must never surface to the run
+    /// indistinguishable from a crashed atrium — and must never surface to the run
     /// loop as a request.
     #[cfg(unix)]
     #[test]
@@ -3007,8 +3007,8 @@ mod tests {
     /// `bind()` its own in its place — the authority comes from the 0700 TMPDIR,
     /// not from the socket's 0600 mode. Observed against the real binary: the
     /// attacker received `{"caller":1,"token":"…","cmd":"list"}` on the wire, the
-    /// victim printed the attacker's forged reply and exited 0, and real amux
-    /// served nothing thereafter. amux cannot repair that from here, but it must
+    /// victim printed the attacker's forged reply and exited 0, and real atrium
+    /// served nothing thereafter. atrium cannot repair that from here, but it must
     /// not fail to NOTICE it.
     #[cfg(unix)]
     #[test]
@@ -3430,12 +3430,12 @@ mod tests {
     /// **The other half of the client's two budgets.** The test above drives the
     /// TOTAL deadline with a server that never stops talking. This drives the
     /// STALL deadline with a server that never starts: it accepts the connection
-    /// and then says nothing at all, ever — a wedged amux, or the endpoint
+    /// and then says nothing at all, ever — a wedged atrium, or the endpoint
     /// squatter of D8 sitting on the socket without answering.
     ///
     /// Delete the stall check from `read_reply` and this case falls through to
     /// the total budget instead. In shipping that is `REPLY_DEADLINE` 30 s
-    /// against `REPLY_STALL` 5 s, so `amux ctl` would hang for half a minute on
+    /// against `REPLY_STALL` 5 s, so `atrium ctl` would hang for half a minute on
     /// a dead control plane. Nothing caught that removal before this test.
     #[cfg(unix)]
     #[test]
@@ -3621,7 +3621,7 @@ mod tests {
     /// **G3.** Every client budget is one shared set in `wire`. They used to be
     /// four unrelated literals — a `from_secs(5)` at the Windows connect, a
     /// `stall`/`hard` pair in each platform's `read_reply` — so "how long may a
-    /// hostile endpoint hold `amux ctl`?" had two different answers depending on
+    /// hostile endpoint hold `atrium ctl`?" had two different answers depending on
     /// the platform.
     #[test]
     fn the_transport_budgets_live_in_one_place() {
@@ -3687,7 +3687,7 @@ mod tests {
     /// Either way the peer that never reads is the peer that freezes every pane.
     ///
     /// So: a client that sends a real request and then reads NOTHING, ever,
-    /// while amux tries to hand it a reply far larger than one send buffer. Both
+    /// while atrium tries to hand it a reply far larger than one send buffer. Both
     /// `poll()` and `respond()` must come back inside a fraction of one 15 ms
     /// tick, every tick, for the whole of `WRITE_STALL` — and then the hopeless
     /// connection must be retired instead of held forever.
@@ -3908,17 +3908,17 @@ mod tests {
 // ===========================================================================
 // The four audited exploits, replayed. `#[ignore]`d, and deliberately so.
 //
-// Two of them drive the REAL `amux ctl` binary — which is the only way to
+// Two of them drive the REAL `atrium ctl` binary — which is the only way to
 // reproduce what the audit actually measured ("the client printed half-written
 // JSON and exited FAILURE"), and is also why they cannot be ordinary tests:
-// `cargo test --lib` does not rebuild `target/debug/amux`, so a stale binary
+// `cargo test --lib` does not rebuild `target/debug/atrium`, so a stale binary
 // would let them pass against code that no longer exists. A test that can pass
 // against a stale binary is the same fail-open shape this file was hardened
-// against, so `amux_bin()` refuses to run at all unless the binary is newer
+// against, so `atrium_bin()` refuses to run at all unless the binary is newer
 // than this source, and the whole module is opt-in.
 //
 // Run them with:
-//     cargo build --bin amux && cargo test --lib -- --ignored --test-threads=1
+//     cargo build --bin atrium && cargo test --lib -- --ignored --test-threads=1
 //
 // They take about 45 s (one waits out a 30 s denial-of-service attack in real
 // time), which is the other reason they are not in the default gate.
@@ -3933,22 +3933,22 @@ mod exploit_replays {
 
     fn tmp(name: &str) -> String {
         let mut p = std::env::temp_dir();
-        p.push(format!("amux-hx-{}-{name}.sock", std::process::id()));
+        p.push(format!("atrium-hx-{}-{name}.sock", std::process::id()));
         p.to_string_lossy().into_owned()
     }
 
-    /// The `amux` binary cargo just built next to this test harness.
-    fn amux_bin() -> std::path::PathBuf {
+    /// The `atrium` binary cargo just built next to this test harness.
+    fn atrium_bin() -> std::path::PathBuf {
         let exe = std::env::current_exe().expect("current_exe");
         let dir = exe
             .parent()
             .and_then(|d| d.parent())
             .expect("target/debug")
             .to_path_buf();
-        let bin = dir.join("amux");
+        let bin = dir.join("atrium");
         assert!(
             bin.exists(),
-            "build the bin first: cargo build --bin amux ({bin:?})"
+            "build the bin first: cargo build --bin atrium ({bin:?})"
         );
         // Guard against the stale-binary trap: the binary must be newer than
         // the source it is supposed to embody.
@@ -3957,16 +3957,16 @@ mod exploit_replays {
             std::fs::metadata(&bin).unwrap().modified().unwrap(),
             std::fs::metadata(&src).unwrap().modified().unwrap(),
         );
-        assert!(bt >= st, "STALE amux binary: rebuild before replaying");
+        assert!(bt >= st, "STALE atrium binary: rebuild before replaying");
         bin
     }
 
-    /// **E1 — D1.** The audit measured `amux ctl audit` delivering 8192 of
+    /// **E1 — D1.** The audit measured `atrium ctl audit` delivering 8192 of
     /// 120631 bytes: `write_all` on a non-blocking socket returns
     /// `Err(WouldBlock)` AFTER a partial write, so the client printed
     /// half-written JSON and exited FAILURE.
     #[test]
-    #[ignore = "replays a real attack; needs a freshly built `amux` binary"]
+    #[ignore = "replays a real attack; needs a freshly built `atrium` binary"]
     fn exploit_1_a_120kb_ctl_audit_reply_arrives_whole_through_the_real_binary() {
         let addr = tmp("e1");
         let _ = std::fs::remove_file(&addr);
@@ -3976,14 +3976,14 @@ mod exploit_replays {
         let body = format!("{{\"ok\":true,\"audit\":\"{}\"}}", "a".repeat(120_623 - 22));
         assert_eq!(body.len(), 120_623);
 
-        let mut child = Command::new(amux_bin())
+        let mut child = Command::new(atrium_bin())
             .args(["ctl", "audit", "--json"])
-            .env("AMUX_CTL", &addr)
-            .env("AMUX_PANE", "1")
+            .env("ATRIUM_CTL", &addr)
+            .env("ATRIUM_PANE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("spawn amux ctl");
+            .expect("spawn atrium ctl");
 
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut served = false;
@@ -4006,7 +4006,7 @@ mod exploit_replays {
         let out = child.wait_with_output().expect("wait");
         let printed = out.stdout.len();
         eprintln!(
-            "E1: real `amux ctl audit` printed {printed} bytes, exit={:?}, stderr={:?}",
+            "E1: real `atrium ctl audit` printed {printed} bytes, exit={:?}, stderr={:?}",
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         );
@@ -4022,14 +4022,14 @@ mod exploit_replays {
     /// **E2 — D5.** The audit measured 0 of 6 legitimate ctl calls succeeding
     /// over 30 s while one silent connection per second held the single-slot
     /// channel. This is that attack, at that rate, for that long, against the
-    /// real `amux ctl` binary.
+    /// real `atrium ctl` binary.
     #[test]
-    #[ignore = "replays a real attack; needs a freshly built `amux` binary"]
+    #[ignore = "replays a real attack; needs a freshly built `atrium` binary"]
     fn exploit_2_one_silent_connection_per_second_no_longer_denies_service() {
         let addr = tmp("e2");
         let _ = std::fs::remove_file(&addr);
         let mut server = Listener::bind(&addr).expect("bind");
-        let bin = amux_bin();
+        let bin = atrium_bin();
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -4056,10 +4056,10 @@ mod exploit_replays {
             for _ in 0..6 {
                 let out = Command::new(&bin)
                     .args(["ctl", "list", "--json"])
-                    .env("AMUX_CTL", &l_addr)
-                    .env("AMUX_PANE", "1")
+                    .env("ATRIUM_CTL", &l_addr)
+                    .env("ATRIUM_PANE", "1")
                     .output()
-                    .expect("run amux ctl");
+                    .expect("run atrium ctl");
                 if out.status.success()
                     && String::from_utf8_lossy(&out.stdout).contains("\"ok\":true")
                 {
@@ -4110,7 +4110,7 @@ mod exploit_replays {
     /// 67,108,864-byte String after a hostile server pushed 64 MiB with no
     /// newline in 250 ms.
     #[test]
-    #[ignore = "replays a real attack; needs a freshly built `amux` binary"]
+    #[ignore = "replays a real attack; needs a freshly built `atrium` binary"]
     fn exploit_3_a_67mb_reply_is_refused_not_accumulated() {
         let addr = tmp("e3");
         let _ = std::fs::remove_file(&addr);
@@ -4146,7 +4146,7 @@ mod exploit_replays {
     /// reply, so a server that died mid-answer handed the caller truncated JSON
     /// and exit 0.
     #[test]
-    #[ignore = "replays a real attack; needs a freshly built `amux` binary"]
+    #[ignore = "replays a real attack; needs a freshly built `atrium` binary"]
     fn exploit_4_eof_without_a_newline_is_an_error() {
         let addr = tmp("e4");
         let _ = std::fs::remove_file(&addr);

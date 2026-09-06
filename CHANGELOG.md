@@ -8,17 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`amux --version` (and `-V`).** There was none: an unrecognized flag falls
-  through to "the command to host", so `amux --version` reached the terminal
+- **`atrium --version` (and `-V`).** There was none: an unrecognized flag falls
+  through to "the command to host", so `atrium --version` reached the terminal
   check and died with `stdin/stdout must be a terminal` — the first thing anyone
   types into a bug report, answering with an unrelated error. It now prints
-  `amux <version>` on stdout and exits 0, before the terminal is taken, and works
+  `atrium <version>` on stdout and exits 0, before the terminal is taken, and works
   after an `--identity` (which is stripped first).
 - **A hung test can no longer wedge the machine that ran it.** `cargo test` has
   no per-test timeout and this project has no CI to kill a stuck job, so a test
   that deadlocked produced no failing line and no end — the last one was found
   only because someone noticed the terminal had not moved. `./dev.py test` now
-  runs each invocation under a wall-clock budget (`AMUX_TEST_TIMEOUT`, default
+  runs each invocation under a wall-clock budget (`ATRIUM_TEST_TIMEOUT`, default
   300 s; the suite takes ~15 s), kills the whole **process tree** on expiry —
   cargo alone would leave the panes, ptys and `ctl` clients a hung test spawned
   parked forever — and exits `124`, the code `timeout(1)` uses, so a hang is
@@ -33,9 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.30.0] - 2026-09-06
 
 ### Added
-- **`amux reap` collects orphaned pane groups, and the watchdog no longer
+- **`atrium reap` collects orphaned pane groups, and the watchdog no longer
   depends on a file to find them.** Every pane now carries
-  `AMUX_SESSION=<owner pid>:<owner start time>` — injected unconditionally,
+  `ATRIUM_SESSION=<owner pid>:<owner start time>` — injected unconditionally,
   where the ctl env was injected only under `--allow-ctl`, so a pane in a plain
   session carried no marker at all and nothing could recognise it afterwards.
   A pane is collected only when it carries the marker, is its own
@@ -43,12 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skipped, so concurrent sessions are safe by construction. Liveness uses
   `pid_running` (`kill(pid, 0)` succeeds on a zombie), the start time defeats
   pid reuse, and identity is `proc_pidpath` + `(dev, ino)` rather than the
-  forgeable `argv[0]`. `amux --reap-orphans` runs the same sweep at startup,
+  forgeable `argv[0]`. `atrium --reap-orphans` runs the same sweep at startup,
   opt-in, printing every victim. Unix only: on Windows the Job Object already
   enforces this in the kernel.
 
 ### Fixed
-- **The pty stranding that made amux degrade until reboot was never amux's
+- **The pty stranding that made atrium degrade until reboot was never atrium's
   bug.** `pty-rs` leaked a terminal into every child it spawned: it set
   `FD_CLOEXEC` on the master and checked the result, but `fcntl` is variadic in
   C and was declared there as a plain three-argument function — on Apple ARM64
@@ -56,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   register, so the flag never reached the kernel, and `fcntl` returned 0, so
   the error check reported success on a call that did nothing. The slave had no
   `FD_CLOEXEC` at all. Every pane child therefore inherited its own master on
-  fd 3 and a second slave on fd 4, and a pane that outlived its amux pinned
+  fd 3 and a second slave on fd 4, and a pane that outlived its atrium pinned
   terminals nothing could reclaim — the holders are already exiting, blocked
   revoking a controlling terminal another process still holds open, sitting in
   state `E` where SIGKILL does not touch them. That is what drained the pool to
@@ -64,17 +64,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a reboot. Fixed upstream in `pty-rs` `c0caa6d`; this is the dependency bump.
 
   The two lifecycle tests that failed intermittently
-  (`a_sigkilled_amux_still_takes_its_tree_down` and its no-registry twin) were
+  (`a_sigkilled_atrium_still_takes_its_tree_down` and its no-registry twin) were
   never wrong about teardown. The watchdog woke on pipe EOF and killed the
   group correctly in under 800ms; the tests were timing out against corpses
   that could not finish exiting, because `kill -0` cannot tell a process stuck
   mid-exit from a live one. The suite goes from 68/70 to 70/70, adds zero
   stuck processes and zero leaked ptys per run (previously 4+ and ~10), and
-  runs in 5s instead of 13-16s — with no change to amux's own code.
+  runs in 5s instead of 13-16s — with no change to atrium's own code.
 - **A clean teardown deleted the crash registry even when panes had survived
   it.** The `remove_file` ran unconditionally, immediately after the check that
   had just proved survivors existed — so on the one path where recovery was
-  needed, amux destroyed the only record of what to kill, downgraded the
+  needed, atrium destroyed the only record of what to kill, downgraded the
   failure to a warning printed to a terminal it was about to tear down, and
   exited. The watchdog then woke on pipe EOF, read an empty registry, and
   killed nothing. The registry is now rewritten with exactly the surviving
@@ -116,20 +116,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two never met: the warden enumerated zero sessions on every tick, and a crashed
   session's pane trees were never swept while its registry accumulated on disk.
   Both now ask `reap` where registries live.
-- **An `exec -a amux` shim could lift the session ceiling in one line.** The
-  ancestry walk decided "is this hop an amux?" from `ps -eo comm=`, which on macOS
+- **An `exec -a atrium` shim could lift the session ceiling in one line.** The
+  ancestry walk decided "is this hop an atrium?" from `ps -eo comm=`, which on macOS
   prints **argv[0]** — chosen by the watched process. A pane could interpose a
-  fake "amux" between itself and its session; the walk stopped at the fake, read
+  fake "atrium" between itself and its session; the walk stopped at the fake, read
   the fake's registry (nonexistent, or agent-authored), and applied no ceiling. No
-  double-fork required. A hop now counts as amux only when the *kernel's*
+  double-fork required. A hop now counts as atrium only when the *kernel's*
   executable for that pid is the same file as ours, by `(st_dev, st_ino)` —
   `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux.
 - **Deleting the parent's registry no longer removes the ceiling.** The cap read
   the parent's policy from disk and, finding nothing, capped nothing — so
-  `rm -f /tmp/amux-session-$PPID.pids` from a pane turned it off. An unreadable
+  `rm -f /tmp/atrium-session-$PPID.pids` from a pane turned it off. An unreadable
   policy now caps to `plan`: the kernel still says we are nested, and that half
   cannot be deleted.
-- **An unreadable process table no longer means "no ceiling".** `amux_ancestor`
+- **An unreadable process table no longer means "no ceiling".** `atrium_ancestor`
   mapped every failure onto "no ancestor", which the caller read as "not nested".
   It now reports four states, and a walk that did not complete is *unproven* — the
   posture is left alone and the operator is told, rather than the ceiling
@@ -157,12 +157,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nested *grandchild* look like an escapee: `capped_by` recorded the nearest
   ancestor while descent was walked 64 hops.
 - **A second descent signal: the pty session id.** A plain double-fork moves ppid
-  to 1 but leaves the session id untouched, so an amux launched that way inside a
+  to 1 but leaves the session id untouched, so an atrium launched that way inside a
   pane is now visible where the ancestry walk lost it. One `setsid()` still sheds
   it — the same act that already defeats process-group teardown.
 
 ### Removed
-- **`AMUX_WARDEN=enforce`.** The warden no longer kills anything. Under a correct
+- **`ATRIUM_WARDEN=enforce`.** The warden no longer kills anything. Under a correct
   ancestry rule the enforceable set is empty by construction, and the only
   sessions left to accuse are indistinguishable from an ordinary reparenting — a
   pane's launcher shell exiting is the same shape as a deliberate double-fork.
@@ -175,14 +175,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - **The `ctl` control channel was audited end to end, and the nine defects the
-  audit found are closed on both platforms.** `amux ctl` reaches a running amux
+  audit found are closed on both platforms.** `atrium ctl` reaches a running atrium
   over a unix socket or a Windows named pipe, served by the single 15 ms event
   loop that drives every pane — so a defect there is not a slow command, it is
   every pane in every window frozen. What was wrong:
 
   * **A reply larger than the socket buffer was silently cut in half.**
     `respond()` called `write_all` on a *non-blocking* socket, which returns
-    `WouldBlock` after a partial write, so `amux ctl audit` on a real fleet
+    `WouldBlock` after a partial write, so `atrium ctl audit` on a real fleet
     printed half a JSON document and exited failure. Replies now go to a
     per-client outbox, flushed a slice per tick, and a writer that stalls is
     dropped on a deadline instead of parked forever.
@@ -193,7 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are counted and announced at a bounded rate, replacing an `eprint!` from
     inside the accept loop — an unbounded terminal write on the run-loop thread,
     at whatever rate an attacker connects.
-  * **A hostile endpoint could make `amux ctl` allocate without limit, and a
+  * **A hostile endpoint could make `atrium ctl` allocate without limit, and a
     truncated reply came back as success.** The client accumulated until a
     newline that never arrived (64 MiB pushed in 250 ms became a 67 MB `String`),
     and EOF before a newline returned `Ok` over a half-read answer. `MAX_REPLY`
@@ -231,15 +231,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **What this does not claim, by design.** Every mitigation here admits a process
   running as the *same user*, which is exactly what a hosted agent is: peer-cred,
   mode 0600 and the Windows SDDL bound the damage, they do not prevent it.
-  Defending against a same-user attacker is an explicit **non-goal** — amux's
+  Defending against a same-user attacker is an explicit **non-goal** — atrium's
   scope is fleet and agent safety (a pane cannot impersonate a sibling or claim
   operator, credentials stay scoped) plus keeping a *different* user off a shared
   box. A process already running as you has won by far easier paths: your env,
   your files, `~/.claude.json`, your OS vault. So the unix endpoint tripwire (a
-  `(dev, ino)` re-stat, which announces a socket swapped underneath amux) is a
+  `(dev, ino)` re-stat, which announces a socket swapped underneath atrium) is a
   cheap bonus the unix path happens to afford, and its absence on Windows — where
   a named pipe has no `(dev, ino)` and a same-user process can add an instance
-  under amux's name — is a documented non-goal, not an open defect. Closing it
+  under atrium's name — is a documented non-goal, not an open defect. Closing it
   would need the server to authenticate itself to its clients with real crypto,
   which is over-engineering for a single-user local tool.
 - **On Windows, a `..` that popped a directory which does not exist reported the
@@ -259,7 +259,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **`board set` / `bus pub` accept unquoted spaced values.** The shell splits
   `msg=merged the PR` into three argv tokens; the parser now rejoins continuation
-  words into the current field's value, so `amux ctl bus pub deploy msg=merged the
+  words into the current field's value, so `atrium ctl bus pub deploy msg=merged the
   PR url=…` works without quoting (a token with `=` starts a new field; a token
   without `=` appends to the current one).
 - **Text selection works by default.** Mouse capture is now **off** at startup, so
@@ -268,7 +268,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Pane labels are 1-based**, matching the status bar. The `board`/`bus` "by/from"
   attribution for an unnamed pane now reads `pane 1`, `pane 2` (was `pane 0`), so
   it lines up with the bar's `1:`, `2:`. (Roles remain the stable identity.)
-- **amux no longer freezes at startup on a machine with many/large agent
+- **atrium no longer freezes at startup on a machine with many/large agent
   transcripts.** The agent-status monitor (`agsess`) discovered stale sessions at
   cold start but left them un-tailed, so the first status poll `read_to_end`'d
   every historical transcript — on a box with a real fleet (hundreds of sessions,
@@ -276,13 +276,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   event loop for tens of seconds (queued `ctl send`s never delivered, nothing
   repainted). Fixed in `agsess`: a stale session is marked *caught up* (length
   only, no read) so later polls tail only new bytes, and a single tail is now
-  capped at 16 MiB (reads the recent tail, resyncs at a line boundary). amux picks
+  capped at 16 MiB (reads the recent tail, resyncs at a line boundary). atrium picks
   this up via its `agsess` dependency.
 
 ### Changed
 - **The coordination layer (board + bus) moved into the new [`abus`] org crate**
-  (the one-concern rule; amux stays "multi-agent terminal + broker"). No behavior
-  or API change — `amux::board` / `amux::bus` are re-exported from `abus`, so the
+  (the one-concern rule; atrium stays "multi-agent terminal + broker"). No behavior
+  or API change — `atrium::board` / `atrium::bus` are re-exported from `abus`, so the
   `ctl` surface and everything else are byte-for-byte the same. The 16 board/bus
   unit tests moved with the code.
 
@@ -297,17 +297,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closes. Built to scale past the `Ctrl+A <digit>` limit — you *select* an agent,
   you don't *number* it — so the same panel works at 3 agents and at 300. Updates
   live at ~1 Hz (calm, not flickering).
-- **`amux fleet up <name>` now takes `--allow-ctl` / `--trust <policy>`**, so a
+- **`atrium fleet up <name>` now takes `--allow-ctl` / `--trust <policy>`**, so a
   saved roster can coordinate over the control plane (board + bus) — the fleet
   path previously always ran without ctl. The ctl endpoint is bound *before* the
-  fleet's panes spawn, so each agent is born with `AMUX_CTL` in its env (a fleet
+  fleet's panes spawn, so each agent is born with `ATRIUM_CTL` in its env (a fleet
   spawns its whole roster up front, unlike the single-pane path).
 - **Fleet agents can auto-start** via a per-agent `"kickoff"` field in
-  `amux.fleet.json` — appended as the trailing positional prompt, so claude reads
+  `atrium.fleet.json` — appended as the trailing positional prompt, so claude reads
   it as the first user message and begins working the moment the fleet comes up
   (no more waiting for a human to type). Absent ⇒ the agent idles as before.
 - **`--identity` accepts multiple keys — one agent, several credentials.** Give a
-  comma-separated list (`amux --identity work,hf claude`) and each resolves to its
+  comma-separated list (`atrium --identity work,hf claude`) and each resolves to its
   own environment variable(s) and they're all injected into that pane. Pairs with
   the new `akey` per-key env-var support: `akey set hf --for huggingface` stores a
   Hugging Face token as `HF_TOKEN`, `akey set X --env VAR` for anything custom — so
@@ -316,30 +316,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Command prompt — `Ctrl+A :` — open any shell/program in a new pane.** Type a
   command line (e.g. `wsl`, `wsl -d Ubuntu`, `pwsh -NoLogo`, `claude`, a quoted
   path with spaces) and Enter opens it in a new window, mid-session — no longer
-  limited to the command amux was launched with. The prompt shows on the bar row
+  limited to the command atrium was launched with. The prompt shows on the bar row
   with the cursor; Esc or Ctrl+C cancels, Backspace edits. Quoted arguments are
   honored so a path with spaces stays one argument.
 - **The bus — topic-routed pub/sub for a coordinating team** (coordination layer
   part 2, the active complement to the board's durable state). A teammate
   publishes a **structured event** to a **topic**; teammates **pull** the topics
   they subscribe to. Command surface (all `--allow-ctl` gated, like the board):
-  - `amux ctl bus pub <topic> [--decision] <field=value…>` — publish. Default
+  - `atrium ctl bus pub <topic> [--decision] <field=value…>` — publish. Default
     urgency is **`fyi`** (cheap, informational); `--decision` (or
     `--kind decision_needed`) marks an **escalation** that needs a human/lead
     answer.
-  - `amux ctl bus sub <topic…>` — subscribe (merged); `*` is the firehose.
-    `amux ctl bus unsub [topic…]` drops interest (empty ⇒ all).
-  - `amux ctl bus feed [--since <seq>]` — pull your subscribed events, resumable
+  - `atrium ctl bus sub <topic…>` — subscribe (merged); `*` is the firehose.
+    `atrium ctl bus unsub [topic…]` drops interest (empty ⇒ all).
+  - `atrium ctl bus feed [--since <seq>]` — pull your subscribed events, resumable
     via the returned `cursor`. Rendered as a colored feed (amber `!` decisions,
     dim `·` FYI, clickable URLs); `--json` for the raw form.
-  - `amux ctl bus resolve <seq>` — mark a decision answered.
+  - `atrium ctl bus resolve <seq>` — mark a decision answered.
   - **Backpressure is built in:** no echo of your own events, pull-not-push (you
     only pay for topics you own), a per-agent publish **rate cap** (20 events /
     10 s), and a **bounded ring** (512 events, oldest fall off). The server
     derives *who* from the caller's role/pane, so a worker can't publish or
     subscribe as someone else.
-  - **`AMUX_BUS=<file>`** persists the feed + subscriptions across a restart
-    (atomic snapshot), mirroring `AMUX_BOARD`.
+  - **`ATRIUM_BUS=<file>`** persists the feed + subscriptions across a restart
+    (atomic snapshot), mirroring `ATRIUM_BOARD`.
 - **`Ctrl+A b` is now a board **+** bus dashboard.** The overlay shows the board on
   top and the bus feed below a divider — open `decision_needed` escalations first
   (amber), then recent events. Its title shows `N decisions awaiting you`.
@@ -353,7 +353,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Resizing during an agent's boot/reconnect no longer leaves it drawn in a
   corner.** A single pty resize can be missed by an app mid-boot (claude while
   `/rc` is connecting), so it kept rendering at the stale size in the top-left of
-  the enlarged terminal. On a resize amux now forces a full redraw of the focused
+  the enlarged terminal. On a resize atrium now forces a full redraw of the focused
   passthrough pane with a second resize (size-1 → size) — which fires even during
   boot, unlike the previous nudge that only ran once the pane had painted. Size is
   also polled faster (150 ms, was 400 ms) so a resize settles sooner.
@@ -377,8 +377,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The status bar no longer disappears on initial load** (until the agent's UI
   settled / remote-control connected). A passthrough app emits a full-screen erase
   (`ESC[2J`) at startup and again as it settles; `2J` ignores the scroll region and
-  wipes the bar row, and amux only repainted the bar on a change or a 500 ms
-  heartbeat. amux now repaints the bar immediately after the splash→app handoff and
+  wipes the bar row, and atrium only repainted the bar on a change or a 500 ms
+  heartbeat. atrium now repaints the bar immediately after the splash→app handoff and
   after any full-screen clear, so the bar is present from the first frame.
 - **A newly-switched passthrough pane no longer scrolls into the bar row** (seen as
   the `Ctrl+A !` shell "shrinking" a row after the first command). `switch_window`
@@ -390,8 +390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **`Ctrl+A !` opens a plain shell in a new window.** Every other pane runs your
-  launch command (e.g. claude); this gives you a shell to drive `amux ctl` from —
-  so you can run `amux ctl board list` and actually *see* the rendered, colored,
+  launch command (e.g. claude); this gives you a shell to drive `atrium ctl` from —
+  so you can run `atrium ctl board list` and actually *see* the rendered, colored,
   clickable board view (agent tool-output panes render it plainly). The shell gets
   the ctl env injected like any pane, but no trust posture (it isn't an agent).
   Uses `$SHELL` / `%COMSPEC%`.
@@ -399,7 +399,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.21.1] - 2026-08-31
 
 ### Added
-- **Rendered board view with clickable links.** `amux ctl board list` / `get` /
+- **Rendered board view with clickable links.** `atrium ctl board list` / `get` /
   `set` now print a human table instead of raw JSON: one line per entry, the
   `status` field **colored** (green done/shipped, red blocked, cyan in-progress,
   amber waiting), any `http(s)` value rendered as an **OSC-8 clickable hyperlink**,
@@ -412,22 +412,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **The shared board — a source-of-truth tracker for a coordinating team.** New
-  `amux ctl board set <key> <field=value…> | get <key> | list | del <key>`. Where
+  `atrium ctl board set <key> <field=value…> | get <key> | list | del <key>`. Where
   `send` is the ephemeral message stream, the board is the durable current truth
   (`auth: DONE, owner: Max, url: …`) — a schemaless `key → fields` map living in
-  the amux daemon. Because amux is the single broker process, it's a plain map
+  the atrium daemon. Because atrium is the single broker process, it's a plain map
   behind the pipe: single writer, no locking, no consensus. A lead reads
   `board list` for status/owner/blocker instead of re-scraping teammate
   transcripts (the readback gap from real use); teammates update their own entry
   as they work. Shared by the whole session (no per-teammate walls); every write
-  records `by` and is audited. Gated by `--allow-ctl`; set `AMUX_BOARD=<file>` to
+  records `by` and is audited. Gated by `--allow-ctl`; set `ATRIUM_BOARD=<file>` to
   persist across restarts (in-memory otherwise). The injected agent directive and
-  the amux-coordinate skill now teach teammates to keep the board current.
+  the atrium-coordinate skill now teach teammates to keep the board current.
 
-  This is the first increment of amux's coordination layer; a topic-routed pub/sub
+  This is the first increment of atrium's coordination layer; a topic-routed pub/sub
   bus (structured `fyi` vs `decision_needed` events, backpressure) is the planned
   second half, at which point the board + bus extract into an `abus` org crate.
-  New `amux::board` module (`Board`, `Entry`, snapshot persistence).
+  New `atrium::board` module (`Board`, `Entry`, snapshot persistence).
 
 ## [0.20.1] - 2026-08-31
 
@@ -437,7 +437,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ESC 7`/`ESC 8` (DECSC/DECRC), whose single cursor-save slot is **shared** with
   the hosted app — claude parks its cursor there to draw a popup and restores it
   later, so a bar repaint landing in between corrupted claude's saved cursor and
-  its next draw landed in the wrong place. amux now tracks the cursor itself (the
+  its next draw landed in the wrong place. atrium now tracks the cursor itself (the
   tiled master carries it; a passthrough pane is fed to its emulator) and
   repositions with an explicit CUP after the bar instead of DECSC/DECRC — no
   shared state, no fragments. Tiled mode was already immune (the app's cursor
@@ -447,7 +447,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Scroll the tile your mouse is over.** The wheel now scrolls whichever tile the
-  cursor is hovering — not just the focused one. amux routes a wheel notch to the
+  cursor is hovering — not just the focused one. atrium routes a wheel notch to the
   pane under the cursor, translated into that pane's inner coordinates, and
   forwards it as a mouse-wheel event to the app. It only forwards to a pane whose
   app actually enabled mouse tracking (sniffed per-pane from its output), so
@@ -461,11 +461,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.19.0] - 2026-08-31
 
 ### Added
-- **A themed color identity (`amux::theme`).** One shared, vivid truecolor palette
+- **A themed color identity (`atrium::theme`).** One shared, vivid truecolor palette
   drives both the status bar and the tile borders, so the chrome reads as a
   designed system and states are distinguishable at a glance:
   - **Status bar** is now a dark themed statusline (was a raw reverse-video strip):
-    a cyan **`amux` signature chip**, and each window entry colored by its state in
+    a cyan **`atrium` signature chip**, and each window entry colored by its state in
     the *same* language as the tile borders — focused = bright cyan, waiting =
     amber, exited = red, background-activity = green, idle = dim grey. The visible
     text (and every column) is unchanged; only color was added.
@@ -531,13 +531,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `layout::Tree::grid_from_ids`.
 
 ### Security
-- **amux governs agent permissions — a spawned agent can no longer escalate its
+- **atrium governs agent permissions — a spawned agent can no longer escalate its
   teammates.** A hosted agent could append `--dangerously-skip-permissions` (or
   `--permission-mode` / `--allowedTools "Bash(*)"`) to its `ctl spawn -- claude …`
   and hand teammates full bypass even when the human launched in safe `--trust`
-  mode. `ctl spawn` now strips those amux-governed permission flags from
+  mode. `ctl spawn` now strips those atrium-governed permission flags from
   agent-supplied argv and reports what it removed in the spawn reply's `note`
-  (visible, never silent); amux's launch trust mode is the single source of
+  (visible, never silent); atrium's launch trust mode is the single source of
   truth. The injected delegation directive also now tells agents to spawn plain
   `claude` with no permission flags. New `ctl::sanitize_spawn_argv`.
 
@@ -583,7 +583,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of a ~3-second blank screen while the agent boots — so the initial load
   reads as *loading*, not broken. It wipes itself the instant the agent produces
   output. (Complements the tiled per-pane loading spinner from 0.15.0.)
-- **`AMUX_SPAWN_LOG=<file>`** — opt-in diagnostic: appends the exact command amux
+- **`ATRIUM_SPAWN_LOG=<file>`** — opt-in diagnostic: appends the exact command atrium
   launches for each pane (post trust-flags, post shim), so "why isn't this pane
   in the mode I expected" is answered by data. Confirmed with it that `--trust`'s
   `acceptEdits` + allowlist reach ctl-spawned teammates identically to the
@@ -615,7 +615,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Teammate placement guidance.** The injected ctl directive and the
-  `amux-coordinate` skill now tell the agent about `--here` (tile the teammate
+  `atrium-coordinate` skill now tell the agent about `--here` (tile the teammate
   beside you as a pane, for a one-view org chart) vs `--window` (a separate
   window/tab, the default — better for many teammates), and to follow the
   human's stated layout preference. Both were always available on `ctl spawn`;
@@ -628,8 +628,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Agent panes died on launch under `--allow-ctl` on Windows.** The ctl
   directive added in 0.14.0 contained shell-special characters (`"`, `<`, `>`,
   backticks) that broke the `cmd /C claude.cmd …` shim's argument quoting, so
-  `amux --allow-ctl --trust claude` opened and quit immediately (the pane's
-  claude got a garbled command line and exited, taking amux with it). The
+  `atrium --allow-ctl --trust claude` opened and quit immediately (the pane's
+  claude got a garbled command line and exited, taking atrium with it). The
   directive is now plain prose with no shell-special characters, so it survives
   the shim intact. (A loud comment on the constant guards against reintroducing
   a special character.)
@@ -637,7 +637,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.14.0] - 2026-08-31
 
 ### Fixed
-- **Buttery tiled rendering — synchronized output on emit.** amux now wraps each
+- **Buttery tiled rendering — synchronized output on emit.** atrium now wraps each
   composited frame it writes to the real terminal in DEC mode 2026
   (`?2026h … ?2026l`) and coalesces the tiled composite + the bar into a single
   write per tick, so the outer terminal paints each frame atomically instead of
@@ -647,14 +647,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanly), and an idle tick (empty frame) emits nothing.
 
 ### Added
-- **Reliable ctl delegation — amux teaches its agents about `ctl`.** When the
-  control channel is live (`--allow-ctl`), amux appends a short directive to
+- **Reliable ctl delegation — atrium teaches its agents about `ctl`.** When the
+  control channel is live (`--allow-ctl`), atrium appends a short directive to
   every agent pane it launches (via `--append-system-prompt`): delegate through
-  `amux ctl spawn`/`send`/`status`/`kill` (visible panes), **not** the agent's
+  `atrium ctl spawn`/`send`/`status`/`kill` (visible panes), **not** the agent's
   own invisible Task/background-agents tool. This is always in the agent's
   context, so reliable coordination no longer depends on a skill happening to
-  auto-surface. The `amux-coordinate` / `amux-delegate` skills are hardened with
-  the same "use `amux ctl`, never background agents" rule.
+  auto-surface. The `atrium-coordinate` / `atrium-delegate` skills are hardened with
+  the same "use `atrium ctl`, never background agents" rule.
 
 ## [0.13.0] - 2026-08-31
 
@@ -667,7 +667,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surfaces as a **visible approval prompt** in its pane. The built-in allowlist
   covers `python`/`pytest`, `cargo test`/`build`/`check`/`clippy`/`fmt`,
   `go test`/`build`/`vet`, `node`, `npm test`; extend it with
-  `AMUX_TRUST_ALLOW="cmd one,cmd two"` (each prefix → a `Bash(P *)` matcher).
+  `ATRIUM_TRUST_ALLOW="cmd one,cmd two"` (each prefix → a `Bash(P *)` matcher).
 
 ### Added
 - **`--skip-permissions`** — the previous full-bypass behavior
@@ -675,7 +675,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit plain-English risk warning + a **launch confirmation**. Mutually
   exclusive with `--trust`. Full bypass is a conscious, confirmed choice, not the
   default trusted mode.
-- `AMUX_TRUST_ALLOW` — configure the `--trust` safe-command allowlist.
+- `ATRIUM_TRUST_ALLOW` — configure the `--trust` safe-command allowlist.
 
 Both trusted modes still pre-accept claude's per-directory folder-trust dialog
 (unchanged from 0.12.0). Verified: `dev.py check` green (145 lib incl. new
@@ -693,13 +693,13 @@ flag-parsing + allowlist tests, 54 integ), clippy clean.
   human to click through the dialog.
 
 ### Added
-- **`amux::trust`** — pre-accepts claude's folder-trust dialog by setting
+- **`atrium::trust`** — pre-accepts claude's folder-trust dialog by setting
   `projects["<dir>"].hasTrustDialogAccepted = true` in `~/.claude.json` (the same
   state claude writes when you accept). Only under `--trust`, only the trust bit,
   only for the pane's own directory; an atomic temp-then-rename write that
   preserves the rest of the file byte-for-byte, and **leaves a config it can't
   parse untouched** (never clobbers what it didn't understand). Honors
-  `CLAUDE_CONFIG_DIR`. This is the one place amux writes another tool's config —
+  `CLAUDE_CONFIG_DIR`. This is the one place atrium writes another tool's config —
   deliberate and opt-in; see the `--trust` note in the README.
 
 ## [0.11.0] - 2026-08-30
@@ -708,37 +708,37 @@ flag-parsing + allowlist tests, 54 integ), clippy clean.
 - **ctl C3 — `kill`, credential delegation, and an audit log.** The control
   plane gains the last milestone (design §5), so a hosted agent hierarchy is
   fully steerable *and* governed:
-  - **`amux ctl kill <target>`** tears down a worker **and its whole subtree**
+  - **`atrium ctl kill <target>`** tears down a worker **and its whole subtree**
     (a lead's `kill` reaps its ICs too). Subtree-scoped like `send`/`status`: a
     worker may only kill inside its own subtree; the operator kills anything.
     The reply lists the torn-down pane ids. Teardown reuses the interactive-kill
     reap path (collapse split tree, drop panes, remove any emptied window).
-  - **`amux ctl spawn --identity X`** delegates a credential identity to the
+  - **`atrium ctl spawn --identity X`** delegates a credential identity to the
     worker — **scoped**: a worker may only pass down an identity it itself holds
-    (its own, or the session/fleet default amux launched with), so an IC can't
+    (its own, or the session/fleet default atrium launched with), so an IC can't
     mint `wif:prod` its lead was never granted. The operator (human root) is the
     trust root and may delegate any vault identity. Only the identity *name* is
     ever handled here; resolved secrets are re-resolved per spawn and never
     stored or logged (unchanged from identity path B).
   - **Audit log** — every ctl request is recorded (caller, action, a secret-free
-    detail, outcome) to an in-memory ring, readable live via **`amux ctl audit
+    detail, outcome) to an in-memory ring, readable live via **`atrium ctl audit
     [N]`** (subtree-scoped: a worker sees only its own subtree's entries).
-    Opt-in on-disk JSONL mirror via `AMUX_CTL_AUDIT=<file>`. `send` logs the
+    Opt-in on-disk JSONL mirror via `ATRIUM_CTL_AUDIT=<file>`. `send` logs the
     text *length*, never the body; identity *names* only, never secrets.
 
 ### Fixed
 - **Synchronized-output fidelity (via vterm 0.2.0).** Tiled panes hosting Claude
   Code no longer show stray leftover / overlapping text: vterm now honors DEC
   private mode 2026 (`?2026h`/`?2026l`), double-buffering across a synchronized
-  update, so amux's compositor never samples a pane mid-redraw. No amux code
+  update, so atrium's compositor never samples a pane mid-redraw. No atrium code
   change — the compositor already reads `term.screen()` each tick; this bumps
   the vterm git dependency to the fix.
 
 ## [0.10.0] - 2026-08-30
 
 ### Added
-- **`--trust` — hands-off agent fleets.** `amux --trust …` launches every agent
-  pane amux spawns (the initial one, splits, grid tiles, and **ctl-spawned
+- **`--trust` — hands-off agent fleets.** `atrium --trust …` launches every agent
+  pane atrium spawns (the initial one, splits, grid tiles, and **ctl-spawned
   workers**) with claude's `--dangerously-skip-permissions`, so a spawned worker
   comes up **trusted and in auto mode** — no workspace-trust dialog, no
   per-action prompts. This is what makes an agent-driven hierarchy (a lead
@@ -762,9 +762,9 @@ flag-parsing + allowlist tests, 54 integ), clippy clean.
 ## [0.8.2] - 2026-08-30
 
 ### Fixed
-- **You can select and copy text again.** amux (via `rawterm`) was capturing the
+- **You can select and copy text again.** atrium (via `rawterm`) was capturing the
   mouse and clearing the console's quick-edit mode, which disabled native
-  drag-to-select — so copying out of a pane didn't work. amux now leaves the
+  drag-to-select — so copying out of a pane didn't work. atrium now leaves the
   mouse alone by default (picks up `rawterm` 0.2.1), so text selection/copy works
   in every mode. (Click-to-focus a pane will return as an explicit, opt-in mouse
   mode.)
@@ -785,13 +785,13 @@ flag-parsing + allowlist tests, 54 integ), clippy clean.
 ### Added
 - **`ctl` control plane (C2): task and observe the hierarchy.** Building on C1's
   channel + `spawn`/`list`:
-  - `amux ctl send <target> <text>` — deliver a task to a worker as a submitted
+  - `atrium ctl send <target> <text>` — deliver a task to a worker as a submitted
     prompt. **Queue-until-idle** (agsess-gated): if the target is mid-turn the
     text waits and is delivered (text, then Enter) once it goes idle, so a send
     never lands in the middle of a turn. `<target>` is a pane id or role label.
-  - `amux ctl status [<target>]` — a target's live `agsess` status, or (no
+  - `atrium ctl status [<target>]` — a target's live `agsess` status, or (no
     target) the caller's subtree roll-up.
-  - `amux ctl spawn --here` — tile the worker *beside* the pane that spawned it
+  - `atrium ctl spawn --here` — tile the worker *beside* the pane that spawned it
     (same window), so a lead and its ICs sit in one view; default `spawn` still
     opens a new window.
 - **Subtree-scoped control (Decision 3).** `send`/`status` on a specific target
@@ -802,20 +802,20 @@ flag-parsing + allowlist tests, 54 integ), clippy clean.
 ## [0.7.0] - 2026-08-30
 
 ### Added
-- **`ctl` control plane (C1) — opt-in.** amux can now host a *controllable*
-  hierarchy of agents. Launch with `amux --allow-ctl [--max-depth <N>] …` and
-  amux binds a per-process control channel (a Windows **named pipe** / unix
-  **socket**, zero third-party deps), injecting its address (`AMUX_CTL`) and each
-  pane's id (`AMUX_PANE`) into every pane it spawns. From inside a pane:
-  - `amux ctl spawn [--role R] -- <cmd>` opens a **visible** new worker pane
+- **`ctl` control plane (C1) — opt-in.** atrium can now host a *controllable*
+  hierarchy of agents. Launch with `atrium --allow-ctl [--max-depth <N>] …` and
+  atrium binds a per-process control channel (a Windows **named pipe** / unix
+  **socket**, zero third-party deps), injecting its address (`ATRIUM_CTL`) and each
+  pane's id (`ATRIUM_PANE`) into every pane it spawns. From inside a pane:
+  - `atrium ctl spawn [--role R] -- <cmd>` opens a **visible** new worker pane
     (returns its agent id + session id as JSON);
-  - `amux ctl list` returns the spawn tree (id, parent, role, depth, live
+  - `atrium ctl list` returns the spawn tree (id, parent, role, depth, live
     `agsess` status) as JSON.
   The channel is drained non-blocking from the run loop (no thread). **Off by
-  default:** without `--allow-ctl` there is no pipe, `amux ctl` refuses, and
+  default:** without `--allow-ctl` there is no pipe, `atrium ctl` refuses, and
   behavior is identical to before.
 - **Spawn-tree safety guards.** `ctl spawn` accepts only commands on the agent
-  allowlist (`{claude}`, extensible per-session via `AMUX_CTL_ALLOW`), and a
+  allowlist (`{claude}`, extensible per-session via `ATRIUM_CTL_ALLOW`), and a
   `--max-depth` ceiling (default 6, `0` = unlimited) bounds *recursion* — never
   fleet width — as a fork-bomb circuit-breaker. Every worker is a normal pane:
   visible in the bar, killable, in the org chart.
@@ -845,12 +845,12 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
 ## [0.6.0] - 2026-08-29
 
 ### Added
-- **Saved rosters — `amux fleet up <name>`.** Bring up a whole squad of agents
+- **Saved rosters — `atrium fleet up <name>`.** Bring up a whole squad of agents
   already in-role — identity, working directory, context dirs, and instructions —
-  from one command. A fleet is defined in a project-local **`amux.fleet.json`**
+  from one command. A fleet is defined in a project-local **`atrium.fleet.json`**
   (checked into the repo so a team shares it), with a user-global fallback
-  (`%APPDATA%\amux\fleet.json` on Windows / `~/.config/amux/fleet.json`
-  elsewhere). `amux fleet up review-crew` reads the file (read-only), builds one
+  (`%APPDATA%\atrium\fleet.json` on Windows / `~/.config/atrium/fleet.json`
+  elsewhere). `atrium fleet up review-crew` reads the file (read-only), builds one
   tiled window with a pane per agent — laid out by the fleet's `"grid"` or an
   auto balanced grid — and spawns each agent's `cmd` in its `cwd` (so its
   `CLAUDE.md` auto-loads), under its identity (per-agent, else a fleet default,
@@ -858,13 +858,13 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
   `--append-system-prompt` (`prompt`), `--model`, and `--effort` when set, plus
   the usual `--session-id` so status binding works per pane. Each pane wears its
   identity `·<name>` tag exactly as `--identity` panes do — the **name** only,
-  never a secret. `amux fleet ls` lists the fleet names. Any error before
+  never a secret. `atrium fleet ls` lists the fleet names. Any error before
   spawning — no file (the message names both locations), malformed JSON, unknown
   fleet, a fleet with zero agents, a grid that does not fit the agent count, or a
   `cwd` that does not exist — is reported and **nothing is spawned** (never a
   partial fleet). Unknown JSON fields are ignored, so the schema can grow without
   breaking older files. Reuses the existing per-pane spawn machinery (identity /
-  `--session-id` / effective-command / cwd), so amux adds no secret handling.
+  `--session-id` / effective-command / cwd), so atrium adds no secret handling.
   Depends on the `json` crate (org, zero-dep) and pty 0.3.0's `spawn_full` (cwd).
 
 ## [0.5.0] - 2026-08-29
@@ -872,11 +872,11 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
 ### Added
 - **Mass-spawn — open N agent panes at once (`-n <N>` / `--grid <R>x<C>`).** One
   command now opens a whole balanced grid of agent tiles in a single window
-  instead of N interactive splits: `amux -n 4 claude` gives a 2×2 square,
-  `amux -n 6 claude` a 2×3, `amux -n 8 claude` a 2×4. `-n <N>` takes a positive
+  instead of N interactive splits: `atrium -n 4 claude` gives a 2×2 square,
+  `atrium -n 6 claude` a 2×3, `atrium -n 8 claude` a 2×4. `-n <N>` takes a positive
   **multiple of 2** (an odd or zero N is a clear startup error:
   `-n must be a positive multiple of 2`); `--grid <R>x<C>` sets the shape
-  explicitly (`--grid 2x3`, product ≥ 2). The flags are amux's own, stripped off
+  explicitly (`--grid 2x3`, product ≥ 2). The flags are atrium's own, stripped off
   the front after `--identity`, before the hosted command — a later `-n` that
   belongs to the hosted program is never eaten. Every tile runs the same command,
   **each its own session** (its own `--session-id` via the existing bind path),
@@ -896,14 +896,14 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
 ## [0.4.1] - 2026-08-29
 
 ### Fixed
-- **Terminal restored cleanly on exit (amux owns the alt screen).** A hosted app
+- **Terminal restored cleanly on exit (atrium owns the alt screen).** A hosted app
   that toggles the **alternate screen buffer** (`ESC[?1049h/l`, or the legacy
-  `?1047`/`?47`) in passthrough was fighting amux's own alt screen, so on quit the
+  `?1047`/`?47`) in passthrough was fighting atrium's own alt screen, so on quit the
   agent's last frame (e.g. Claude's "custom API key detected" prompt) stayed on
-  screen instead of the user's pre-amux shell. amux now **owns** the alt screen
+  screen instead of the user's pre-atrium shell. atrium now **owns** the alt screen
   tmux-style: the passthrough filter strips a pane's alt-screen enter/leave
   (alongside the win32-input-mode toggles it already stripped), so panes render
-  into amux's buffer and never touch the real terminal's. `cleanup_screen` is now
+  into atrium's buffer and never touch the real terminal's. `cleanup_screen` is now
   a full sanitize — reset SGR, disable mouse reporting and bracketed paste, show
   the cursor, reset the scroll region, then leave the alt screen — run on every
   exit path so a hosted app that left modes on can't corrupt the terminal.
@@ -917,13 +917,13 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
 ## [0.4.0] - 2026-08-29
 
 ### Added
-- **Per-pane agent identity — `--identity <name>` (short `-I <name>`).** amux
+- **Per-pane agent identity — `--identity <name>` (short `-I <name>`).** atrium
   now launches an agent pane under a chosen credential identity: it resolves the
   target's environment via [`akey`](https://github.com/nativelite/akey)
   (`akey::resolve` — a key name → `ANTHROPIC_API_KEY`; `wif:<name>` → the five
   federation vars) and injects it into that one child via the new
-  `pty::Pty::spawn_with_env`. This is path B of the amux ⨯ akey design (native
-  flag, not the wrapper). Usage: `amux --identity work claude`.
+  `pty::Pty::spawn_with_env`. This is path B of the atrium ⨯ akey design (native
+  flag, not the wrapper). Usage: `atrium --identity work claude`.
 - **Inherit-on-split.** The identity applies to the initial agent pane and is
   inherited by every split / new pane. It is re-resolved on **each** spawn; only
   the identity **name** is stored on the pane — never the resolved secret.
@@ -937,15 +937,15 @@ _Not yet: `ctl send` / `status` / `kill`, identity delegation, `--here` splits
   locked) the reason is surfaced in the pane bar and the agent spawns *without*
   the credential — never silently, never unauthenticated-without-saying-so.
 
-amux renders identity **names** only: no key, no token, ever. The resolved env
+atrium renders identity **names** only: no key, no token, ever. The resolved env
 lives only for the spawn call and is never logged, printed, or persisted (the
-`AMUX_DEBUG` traces never include it). New dependency: the org crate `akey`;
+`ATRIUM_DEBUG` traces never include it). New dependency: the org crate `akey`;
 `pty` bumped to 0.2.0 for `spawn_with_env`. Third-party dependencies remain zero.
 
 ## [0.3.0] - 2026-08-29
 
 ### Added
-- **Agent-aware pane borders.** When amux launches an agent pane (`claude`) it
+- **Agent-aware pane borders.** When atrium launches an agent pane (`claude`) it
   mints a fresh session id and passes `claude --session-id <uuid>` (unless the
   user already supplied `--session-id`/`--resume`/`--continue`), so the pane's
   transcript path is known exactly. The [`agsess`](https://github.com/nativelite/agsess)
@@ -967,7 +967,7 @@ lives only for the spawn call and is never logged, printed, or persisted (the
 
 Agents launched *inside* a shell pane (`$ claude`) are not bound — a documented
 v1 limitation. New dependency: the org crate `agsess`. Third-party dependencies
-remain zero. M5 of the amux 0.3 agent-aware feature.
+remain zero. M5 of the atrium 0.3 agent-aware feature.
 
 ## [0.2.1] - 2026-08-28
 
@@ -998,24 +998,24 @@ remain zero. M5 of the amux 0.3 agent-aware feature.
   active/activity/idle/exited markers.
 - `Ctrl+A` prefix keys: `c` new pane, `1`-`9` switch, `n`/`p` cycle, `x`
   kill, `q` quit, doubled prefix for a literal `Ctrl+A`. Panes close on
-  child exit; amux exits with the last pane.
+  child exit; atrium exits with the last pane.
 - Pane-switch repaint via ConPTY's resize-repaint contract (resize nudge);
   resize propagation to all panes; per-pane background-activity flagging.
 - Host-level mode-negotiation filtering: a pane's `ESC[?9001h/l`
-  (win32-input-mode) request terminates at amux instead of tunneling to
-  the outer terminal and silently re-encoding amux's own stdin — the bug
+  (win32-input-mode) request terminates at atrium instead of tunneling to
+  the outer terminal and silently re-encoding atrium's own stdin — the bug
   the first e2e run shipped, kept fixed by a split-safe filter test.
-- Diagnostics: `--stdin-probe` (hex of delivered input) and `AMUX_DEBUG`
+- Diagnostics: `--stdin-probe` (hex of delivered input) and `ATRIUM_DEBUG`
   stage markers.
 - 14 tests: pure scanner/bar/filter units plus end-to-end suites running
-  amux itself inside a `pty` with real keystrokes (passthrough +
+  atrium itself inside a `pty` with real keystrokes (passthrough +
   auto-exit, interactive round-trip + bar + quit, literal prefix).
 
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/amux/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/nativelite/amux/compare/v0.2.1...v0.3.0
-[0.2.1]: https://github.com/nativelite/amux/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/nativelite/amux/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/nativelite/amux/releases/tag/v0.1.0
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/nativelite/atrium/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/nativelite/atrium/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/nativelite/atrium/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/nativelite/atrium/releases/tag/v0.1.0

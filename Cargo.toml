@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
 license = "MIT"
-repository = "https://github.com/nativelite/amux"
+repository = "https://github.com/nativelite/atrium"
 keywords = ["terminal", "multiplexer", "agents", "claude", "nativelite"]
 categories = ["command-line-utilities"]
 
@@ -21,14 +21,9 @@ agsess = { package = "nativelite-agsess", version = "0.1", path = "../agsess" }
 json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
 
 [lib]
-# Internal library name kept as `amux` on purpose: nothing outside this crate
-# depends on it, and the whole crate's ~200 `amux::` paths + the runtime
-# contract (AMUX_* env vars, `amux-*` IPC/file prefixes, process-ancestry
-# detection) rename together in a separate, run-tested pass. The crate PUBLISHES
-# as `atrium` (the [package] name), which is what resolves the crates.io collision.
-name = "amux"
+name = "atrium"
 path = "src/lib.rs"
 
 [[bin]]
-name = "amux"
+name = "atrium"
 path = "src/main.rs"

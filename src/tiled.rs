@@ -1,7 +1,7 @@
 use crate::*;
-use amux::input::Dir;
-use amux::layout::{self, Rect};
-use amux::tile::{compose, AgentMark, PaneState, PaneView};
+use atrium::input::Dir;
+use atrium::layout::{self, Rect};
+use atrium::tile::{compose, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::time::Instant;
 
@@ -30,7 +30,7 @@ pub(crate) fn render_tiled(
     w: &Window,
     rows: u16,
     cols: u16,
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
     frame: usize,
 ) -> ansi::Screen {
     let outer = tiled_outer(rows, cols);

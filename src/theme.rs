@@ -1,4 +1,4 @@
-//! The amux color theme — one palette shared by the status bar ([`crate::bar`])
+//! The atrium color theme — one palette shared by the status bar ([`crate::bar`])
 //! and the tile borders ([`crate::tile`]), so the chrome reads as a single
 //! designed system rather than borrowed terminal defaults.
 //!
@@ -18,8 +18,8 @@ pub const BAR_BG: Color = Color::Rgb(28, 28, 36);
 /// The bar's default (non-state) text.
 pub const BAR_FG: Color = Color::Rgb(205, 205, 215);
 
-// --- the amux signature chip ----------------------------------------------
-/// Background of the ` amux ` wordmark chip (teal-cyan).
+// --- the atrium signature chip ----------------------------------------------
+/// Background of the ` atrium ` wordmark chip (teal-cyan).
 pub const BRAND_BG: Color = Color::Rgb(0, 184, 209);
 /// Text on the wordmark chip (near-black, for max legibility on the chip).
 pub const BRAND_FG: Color = Color::Rgb(10, 14, 18);

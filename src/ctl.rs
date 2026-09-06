@@ -1,13 +1,13 @@
-//! `amux ctl` — the verb layer over the control channel ([`crate::ipc`]).
+//! `atrium ctl` — the verb layer over the control channel ([`crate::ipc`]).
 //!
 //! Two halves live here:
-//! * The **client** ([`ctl_cmd`]): parse `amux ctl <cmd> …` argv into one JSON
-//!   request, read `AMUX_CTL` (the endpoint) and `AMUX_PANE` (the caller's agent
-//!   id) from the environment amux injected, send it, and print the JSON reply.
+//! * The **client** ([`ctl_cmd`]): parse `atrium ctl <cmd> …` argv into one JSON
+//!   request, read `ATRIUM_CTL` (the endpoint) and `ATRIUM_PANE` (the caller's agent
+//!   id) from the environment atrium injected, send it, and print the JSON reply.
 //! * The **protocol + policy** the server (the run loop) applies: [`parse_request`]
 //!   turns a request line into a typed [`Request`], and [`evaluate_spawn`] is the
 //!   *pure* guard — allowlist + depth cap — so the safety rules are unit-tested
-//!   without a pty or a running amux.
+//!   without a pty or a running atrium.
 //!
 //! Surface: `spawn` (open a visible worker — new window or `--here` split, under
 //! an optionally-delegated `--identity`), `list` (the org chart), `send`
@@ -23,18 +23,18 @@ use json::{Number, Value};
 use crate::bind;
 
 /// Environment variable naming the control endpoint, injected into every pane a
-/// `--allow-ctl` amux spawns. Absent → `amux ctl` refuses (not in a ctl session).
-pub const ENV_ADDRESS: &str = "AMUX_CTL";
+/// `--allow-ctl` atrium spawns. Absent → `atrium ctl` refuses (not in a ctl session).
+pub const ENV_ADDRESS: &str = "ATRIUM_CTL";
 /// Environment variable carrying the *caller* pane's agent id, so the server can
 /// attribute a spawn to its parent (spawn tree + depth). Injected per pane.
-pub const ENV_PANE: &str = "AMUX_PANE";
+pub const ENV_PANE: &str = "ATRIUM_PANE";
 /// Environment variable carrying the pane's **capability token** — an unguessable
 /// per-pane secret minted at spawn. The server authenticates a request by looking
 /// up the pane whose token matches (identity comes from the token, not the
-/// self-reported `AMUX_PANE`), so a pane can neither claim another pane's id nor
+/// self-reported `ATRIUM_PANE`), so a pane can neither claim another pane's id nor
 /// claim operator. A request with no valid token is *unauthenticated* and may
-/// only run read-only commands. Injected per pane alongside `AMUX_PANE`.
-pub const ENV_TOKEN: &str = "AMUX_TOKEN";
+/// only run read-only commands. Injected per pane alongside `ATRIUM_PANE`.
+pub const ENV_TOKEN: &str = "ATRIUM_TOKEN";
 
 /// The default spawn-depth ceiling: the recursion circuit-breaker (design §5).
 /// Generous — a real hierarchy is CEO→lead→IC (depth 2–3); this only stops a
@@ -44,11 +44,11 @@ pub const DEFAULT_MAX_DEPTH: usize = 6;
 /// A parsed control request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
-    /// The agent id of the pane that issued this (from `AMUX_PANE`), if any. This
+    /// The agent id of the pane that issued this (from `ATRIUM_PANE`), if any. This
     /// is *self-reported* and used only as a hint; the server authenticates the
     /// caller by [`Request::token`], never by trusting this field.
     pub caller: Option<usize>,
-    /// The pane's capability token (from `AMUX_TOKEN`). The server resolves the
+    /// The pane's capability token (from `ATRIUM_TOKEN`). The server resolves the
     /// real caller identity by matching this against a pane's minted token; absent
     /// or non-matching ⇒ the request is unauthenticated.
     pub token: Option<String>,
@@ -173,7 +173,7 @@ pub struct SpawnReq {
     /// The permission mode this spawn requested
     /// (`--mode plan|accept|automode|skip`),
     /// if any. `None` ⇒ inherit the session policy (the launch `--trust`). When
-    /// set, amux honors it for the operator (root pane) and, for a non-operator
+    /// set, atrium honors it for the operator (root pane) and, for a non-operator
     /// worker, caps it at the session policy — a worker may match or de-escalate
     /// but never elevate ([`TrustMode::rank`]).
     pub mode: Option<TrustMode>,
@@ -206,7 +206,7 @@ impl SpawnDenied {
 /// `caller_depth` is the depth of the requesting pane (a human/root pane is 0);
 /// the new worker would be at `caller_depth + 1`. `extra_allow` extends the
 /// built-in agent allowlist ([`bind::AGENT_STEMS`]) with operator-approved stems
-/// (the `AMUX_CTL_ALLOW` knob). Returns the new worker's depth on success.
+/// (the `ATRIUM_CTL_ALLOW` knob). Returns the new worker's depth on success.
 /// Unit-tested in isolation — this is the heart of the safety model.
 pub fn evaluate_spawn(
     argv: &[String],
@@ -238,12 +238,12 @@ pub fn evaluate_spawn(
     Ok(attempted)
 }
 
-/// Permission-posture flags that **amux** owns, not the spawning agent. A hosted
-/// agent running `amux ctl spawn -- claude …` must not be able to hand its
+/// Permission-posture flags that **atrium** owns, not the spawning agent. A hosted
+/// agent running `atrium ctl spawn -- claude …` must not be able to hand its
 /// teammates a stronger posture than the human chose at launch — e.g. appending
 /// `--dangerously-skip-permissions` (full bypass) or `--allowedTools "Bash(*)"`
 /// (auto-allow everything) when the operator launched in safe `--trust` mode.
-/// amux applies the launch posture itself (see `spawn_pane_full`), so these are
+/// atrium applies the launch posture itself (see `spawn_pane_full`), so these are
 /// stripped from agent-supplied argv.
 const GOVERNED_FLAGS: [&str; 3] = [
     "--dangerously-skip-permissions",
@@ -260,21 +260,21 @@ const GOVERNED_FLAGS: [&str; 3] = [
 /// `--plugin-dir`, `--plugin-url` and `--settings` — each of which reaches code
 /// execution *outside* the tool-permission system entirely. An stdio MCP server
 /// is a command claude launches at startup; a plugin carries hooks. None of
-/// those names appears anywhere else in amux, so a worker could pass one
+/// those names appears anywhere else in atrium, so a worker could pass one
 /// verbatim in **every** mode, `plan` included.
 ///
 /// So: name what a teammate is allowed to choose, and refuse the rest. The set
 /// is deliberately small — a spawn request selects a model and a session to
-/// resume, and nothing that changes what the agent is permitted to do. amux
+/// resume, and nothing that changes what the agent is permitted to do. atrium
 /// supplies the posture flags itself.
 fn worker_allowed_flags(stem: &str) -> Option<&'static [&'static str]> {
     match stem {
         // Model/effort selection and session continuation only.
         "claude" => Some(&["--model", "--effort", "--continue", "-c", "--resume", "-r"]),
-        // codex takes `--model`; its approval flags are amux's to set (see
+        // codex takes `--model`; its approval flags are atrium's to set (see
         // `trust::codex_trust_args`), never the caller's.
         "codex" => Some(&["--model", "-m"]),
-        // Any other AGENT stem — gemini, aider, cursor-agent — is one amux will
+        // Any other AGENT stem — gemini, aider, cursor-agent — is one atrium will
         // bind but has no trust posture for, so it cannot cap what the agent may
         // do. Refuse rather than guess.
         _ => None,
@@ -294,14 +294,14 @@ pub enum ArgvVerdict {
 }
 
 /// Vet a ctl-spawn argv: refuse an unknown vendor or an unlisted flag, then
-/// strip the governed permission flags amux sets itself.
+/// strip the governed permission flags atrium sets itself.
 ///
 /// Pure, so the whole policy is unit-testable without spawning anything.
 pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
     let Some(program) = argv.first() else {
         return ArgvVerdict::Refused("spawn needs a command".to_string());
     };
-    // Match the stem the way the rest of amux does, so a path or a `.cmd` shim
+    // Match the stem the way the rest of atrium does, so a path or a `.cmd` shim
     // resolves identically here and at bind time.
     let stem = std::path::Path::new(program)
         .file_stem()
@@ -320,11 +320,11 @@ pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
             let (argv, stripped) = sanitize_spawn_argv(argv);
             return ArgvVerdict::Ok { argv, stripped };
         }
-        // An agent stem amux will bind but has no posture for: it would run
+        // An agent stem atrium will bind but has no posture for: it would run
         // uncapped, so a teammate must not be able to start one.
         None => {
             return ArgvVerdict::Refused(format!(
-                "refusing to spawn {stem:?}: no trust posture is defined for it, so amux \
+                "refusing to spawn {stem:?}: no trust posture is defined for it, so atrium \
                  cannot cap what it may do"
             ))
         }
@@ -351,7 +351,7 @@ pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
     ArgvVerdict::Ok { argv, stripped }
 }
 
-/// Strip amux-governed permission flags (and their values) from a ctl-spawn
+/// Strip atrium-governed permission flags (and their values) from a ctl-spawn
 /// argv, returning `(cleaned, stripped)` where `stripped` names the flags removed
 /// (surfaced in the spawn reply's `note` — never silent, per the guardrails).
 /// `--dangerously-skip-permissions` is a bare switch; `--permission-mode` and
@@ -441,14 +441,14 @@ pub fn in_subtree(target: usize, root: usize, parents: &[(usize, Option<usize>)]
 /// The **credential-delegation guard** (design §5): which identity may a
 /// `ctl spawn` run its worker under? A spawned worker (non-privileged caller)
 /// may only delegate an identity it itself holds — its **own** identity, or the
-/// **session/fleet default** amux launched with — so an IC can't mint itself
+/// **session/fleet default** atrium launched with — so an IC can't mint itself
 /// `wif:prod` that its lead was never granted. The **operator** (human root,
 /// `privileged`) is the trust root and may delegate any identity in the vault.
 /// Requesting `None` (no identity) is always allowed. Pure; unit-tested.
 ///
 /// * `requested` — the `--identity` name the spawn asked for (or `None`).
 /// * `caller_identity` — the requesting pane's own identity name.
-/// * `session_default` — the identity amux itself was launched under.
+/// * `session_default` — the identity atrium itself was launched under.
 pub fn delegation_allowed(
     requested: Option<&str>,
     caller_identity: Option<&str>,
@@ -471,13 +471,13 @@ pub fn delegation_allowed(
 /// object per request (opt-in, on top of `--allow-ctl`; design §5 "optionally
 /// on-disk"). Unset ⇒ the log is kept in memory only, readable via `ctl audit`.
 /// Only identity **names** are ever written — never resolved secret values.
-pub const ENV_AUDIT: &str = "AMUX_CTL_AUDIT";
+pub const ENV_AUDIT: &str = "ATRIUM_CTL_AUDIT";
 
 /// Environment knob (comma-separated) that extends the ctl agent allowlist
 /// beyond [`bind::AGENT_STEMS`]. Opt-in on top of `--allow-ctl` and set by the
-/// human who launches amux, so it never weakens the confused-agent guard for a
+/// human who launches atrium, so it never weakens the confused-agent guard for a
 /// session that did not ask for it. Empty/unset ⇒ agents-only (`{claude}`).
-pub const ENV_ALLOW: &str = "AMUX_CTL_ALLOW";
+pub const ENV_ALLOW: &str = "ATRIUM_CTL_ALLOW";
 
 /// Read [`ENV_ALLOW`] into the extra-allow list (trimmed, empties dropped).
 pub fn extra_allow_from_env() -> Vec<String> {
@@ -508,12 +508,12 @@ pub fn parse_allow_list(var: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// How much amux relaxes the permission posture of the agent panes it spawns.
+/// How much atrium relaxes the permission posture of the agent panes it spawns.
 /// Two opt-in levels, deliberately separate so the safe one is the easy one and
 /// the dangerous one is a conscious choice:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrustMode {
-    /// Default: no relaxation. claude decides per its own settings; amux does not
+    /// Default: no relaxation. claude decides per its own settings; atrium does not
     /// touch the folder-trust dialog or the permission mode. Policy keyword
     /// `default`.
     Off,
@@ -535,7 +535,7 @@ pub enum TrustMode {
     Auto,
     /// `skip` (`--skip-permissions`): **full bypass**
     /// (`--dangerously-skip-permissions`, i.e. `--permission-mode bypassPermissions`).
-    /// Every command runs with no gate at all. Genuinely dangerous — amux requires
+    /// Every command runs with no gate at all. Genuinely dangerous — atrium requires
     /// an explicit launch confirmation before using it.
     Skip,
 }
@@ -585,7 +585,7 @@ impl TrustMode {
     }
 }
 
-/// Pull amux's own launch meta-flags off the front of the (already identity-
+/// Pull atrium's own launch meta-flags off the front of the (already identity-
 /// stripped) argument vector, before the hosted command begins — exactly the way
 /// [`crate::spawn::parse`] pulls `-n`/`--grid`. Returns `(allow_ctl, max_depth,
 /// trust, rest)`, where `rest` is the untouched remainder (grid flags + hosted
@@ -597,7 +597,7 @@ impl TrustMode {
 /// * `--trust` — [`TrustMode::Edits`]: auto-accept-edits + safe allowlist, the
 ///   safe hands-off default (dangerous commands still prompt, visibly).
 /// * `--skip-permissions` — [`TrustMode::Skip`]: full `--dangerously-skip-
-///   permissions` bypass. Mutually exclusive with `--trust`; amux confirms it at
+///   permissions` bypass. Mutually exclusive with `--trust`; atrium confirms it at
 ///   launch (§`main`).
 ///
 /// Parsing stops at the first non-flag token, so a flag the hosted program takes
@@ -688,7 +688,7 @@ pub fn parse_flags(args: &[String]) -> Result<(bool, usize, TrustMode, Vec<Strin
 /// workspace trust dialog and **all** permission prompts (full bypass).
 pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 
-/// System-prompt directive amux appends (via `--append-system-prompt`) to every
+/// System-prompt directive atrium appends (via `--append-system-prompt`) to every
 /// **agent** pane it launches **when the ctl channel is live** — so a hosted
 /// agent reliably knows to delegate through `ctl` (visible panes) instead of its
 /// own invisible Task/background-agents tool. This is the dependable layer: it is
@@ -701,50 +701,50 @@ pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 // brackets, parens, &, |, %, ^ — or the shim's quoting breaks and the agent pane
 // dies on launch. Keep it plain prose (letters, spaces, commas, periods, colons,
 // hyphens) so it survives the round-trip intact.
-pub const AGENT_CTL_DIRECTIVE: &str = "You are running inside amux, a terminal \
-multiplexer with a live control plane whose endpoint is in the AMUX_CTL \
+pub const AGENT_CTL_DIRECTIVE: &str = "You are running inside atrium, a terminal \
+multiplexer with a live control plane whose endpoint is in the ATRIUM_CTL \
 environment variable. When a task calls for delegating to teammates or \
-coordinating a team, delegate by running the shell command amux ctl spawn \
---role NAME -- claude, then amux ctl send NAME followed by a self-contained \
-subtask, and track them with amux ctl status and reap them with amux ctl kill. \
+coordinating a team, delegate by running the shell command atrium ctl spawn \
+--role NAME -- claude, then atrium ctl send NAME followed by a self-contained \
+subtask, and track them with atrium ctl status and reap them with atrium ctl kill. \
 Placement: add --here to a spawn to tile the teammate beside you in one shared \
 view, or --window for a separate window, and follow the human preference on \
-layout. Spawn each teammate as plain claude with NO raw permission flags: amux \
+layout. Spawn each teammate as plain claude with NO raw permission flags: atrium \
 applies the session trust policy to every pane it launches, so never add \
 --dangerously-skip-permissions or --permission-mode yourself. To request a \
 specific mode for a teammate, add --mode plan or --mode accept or --mode \
 automode or --mode skip to the spawn (plan is read-only, accept auto-accepts \
-edits, automode is claude auto mode, skip is full bypass); amux honors it when \
+edits, automode is claude auto mode, skip is full bypass); atrium honors it when \
 the human operator asks and otherwise caps it at the session policy (a worker \
 cannot elevate itself). \
-Each teammate is a VISIBLE amux pane the human can watch, steer, and \
+Each teammate is a VISIBLE atrium pane the human can watch, steer, and \
 take over. \
 Do NOT use your Task tool or background agents to delegate, since those run \
-invisibly and defeat the purpose of amux. \
+invisibly and defeat the purpose of atrium. \
 Track shared team state on the board instead of re-reading transcripts: \
-amux ctl board set KEY field=value records current truth (status, owner, \
-blocker, url), amux ctl board get KEY reads one entry, and amux ctl board list \
+atrium ctl board set KEY field=value records current truth (status, owner, \
+blocker, url), atrium ctl board get KEY reads one entry, and atrium ctl board list \
 shows the whole board. Update the board when your status changes so the lead and \
 your teammates see it. \
-Before you start working a task, claim it: amux ctl board claim KEY takes it for \
+Before you start working a task, claim it: atrium ctl board claim KEY takes it for \
 you and holds a short lease. If the claim is denied it names who already holds it, \
 so pick a different unclaimed task rather than assuming a teammate owns \
 everything. Your board set updates renew your lease automatically while you work, \
-so a task you hold never slips away. When you finish, amux ctl board release KEY \
+so a task you hold never slips away. When you finish, atrium ctl board release KEY \
 frees it for others. Claim before you build and the team divides work with no \
 collisions. \
 Share fast-moving events on the bus, not just durable state on the board: \
-amux ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
-when something needs a decision, and amux ctl bus sub TOPIC then amux ctl \
+atrium ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
+when something needs a decision, and atrium ctl bus sub TOPIC then atrium ctl \
 bus feed pulls what teammates published on the topics you follow. Post fyi \
 updates freely. Route a decision to the teammate who should answer it with \
---to ROLE: a design question for the lead is amux ctl bus pub TOPIC --decision \
+--to ROLE: a design question for the lead is atrium ctl bus pub TOPIC --decision \
 --to lead q=your question, which reaches the lead first instead of the human. \
 Reserve a plain --decision with no --to for things that truly need the human. \
 If you are the lead, watch your feed for decisions addressed to you and resolve \
-them with amux ctl bus resolve SEQ once answered. \
-Run amux ctl with no arguments for the full command surface, or use the \
-amux-coordinate or amux-delegate skills for the full workflow.";
+them with atrium ctl bus resolve SEQ once answered. \
+Run atrium ctl with no arguments for the full command surface, or use the \
+atrium-coordinate or atrium-delegate skills for the full workflow.";
 
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
@@ -1088,7 +1088,7 @@ pub fn reply_bus_resolved(seq: u64, resolved: bool) -> String {
 }
 
 /// `{"ok":true,"pane":<id>,"role":<role|null>,"session":<sid|null>,"note":<note|null>}`.
-/// `note` carries a non-fatal advisory (e.g. permission flags amux stripped from
+/// `note` carries a non-fatal advisory (e.g. permission flags atrium stripped from
 /// the spawn argv) so the caller sees it instead of it happening silently.
 pub fn reply_spawned(
     pane: usize,
@@ -1193,13 +1193,13 @@ pub fn reply_list(nodes: &[TreeNode]) -> String {
 
 // ---- client --------------------------------------------------------------
 
-/// `amux ctl <cmd> …`: build a request from argv, send it to `AMUX_CTL`, print
+/// `atrium ctl <cmd> …`: build a request from argv, send it to `ATRIUM_CTL`, print
 /// the reply. Exit code reflects the reply's `ok`.
 pub fn ctl_cmd(args: &[String]) -> ExitCode {
     let Some(address) = std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty()) else {
         eprintln!(
-            "amux ctl: not inside a ctl-enabled amux session ({ENV_ADDRESS} unset).\n\
-             Start amux with `--allow-ctl` and run `amux ctl` from one of its panes."
+            "atrium ctl: not inside a ctl-enabled atrium session ({ENV_ADDRESS} unset).\n\
+             Start atrium with `--allow-ctl` and run `atrium ctl` from one of its panes."
         );
         return ExitCode::FAILURE;
     };
@@ -1220,9 +1220,9 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     let request = match build_request(args, caller) {
         Ok(r) => r,
         Err(msg) => {
-            eprintln!("amux ctl: {msg}");
+            eprintln!("atrium ctl: {msg}");
             eprintln!(
-                "usage: amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
+                "usage: atrium ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
                  \x20      | board claim <key> [--ttl secs] | board release <key>\n\
@@ -1258,7 +1258,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             }
         }
         Err(e) => {
-            eprintln!("amux ctl: {e}");
+            eprintln!("atrium ctl: {e}");
             ExitCode::FAILURE
         }
     }
@@ -1557,7 +1557,7 @@ fn fields_to_value(fields: Vec<(String, String)>) -> Value {
     )
 }
 
-/// Turn `amux ctl` argv (after the `ctl` word) + caller id into a JSON request
+/// Turn `atrium ctl` argv (after the `ctl` word) + caller id into a JSON request
 /// line. Pure and testable. Grammar:
 ///   `spawn [--role R] [--here | --window] [-- <cmd...>]`
 ///   `list`
@@ -1568,7 +1568,7 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
     }
     // The capability token authenticates the caller. It is env-sourced (like the
     // endpoint address and the caller id in `ctl_cmd`); tests, which never set
-    // `AMUX_TOKEN`, simply send no token and are treated as unauthenticated.
+    // `ATRIUM_TOKEN`, simply send no token and are treated as unauthenticated.
     if let Ok(tok) = std::env::var(ENV_TOKEN) {
         if !tok.is_empty() {
             pairs.push(("token", Value::String(tok)));
@@ -1962,7 +1962,7 @@ mod tests {
 
     #[test]
     fn vet_still_strips_governed_flags_rather_than_refusing() {
-        // A governed flag is amux's to set, so asking for it is not an attack —
+        // A governed flag is atrium's to set, so asking for it is not an attack —
         // it is reported and removed, exactly as before.
         match vet_spawn_argv(&v(&["claude", "--dangerously-skip-permissions"])) {
             ArgvVerdict::Ok { argv, stripped } => {
@@ -1975,7 +1975,7 @@ mod tests {
 
     #[test]
     fn vet_refuses_a_vendor_with_no_posture_mapping() {
-        // aider and cursor-agent are agent stems amux will bind, but it has no
+        // aider and cursor-agent are agent stems atrium will bind, but it has no
         // way to cap what they may do, so a teammate must not be able to spawn one.
         for stem in ["aider", "cursor-agent", "gemini"] {
             assert!(
@@ -2014,7 +2014,7 @@ mod tests {
 
     #[test]
     fn extra_allow_admits_an_operator_approved_stem() {
-        // `sh` is not a built-in agent, but AMUX_CTL_ALLOW=sh lets it spawn.
+        // `sh` is not a built-in agent, but ATRIUM_CTL_ALLOW=sh lets it spawn.
         assert_eq!(
             evaluate_spawn(&v(&["sh"]), 0, 6, &["sh".to_string()]),
             Ok(1)

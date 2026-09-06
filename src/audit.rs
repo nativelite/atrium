@@ -1,7 +1,7 @@
 //! The ctl **audit log**: an in-memory record of every control request the run
 //! loop applies — who issued it, what it was, and how it resolved — so a ctl
 //! session is reconstructable (design §5). Optionally mirrored to a JSONL file
-//! (opt-in via `AMUX_CTL_AUDIT`), read live via `ctl audit`. Only identity
+//! (opt-in via `ATRIUM_CTL_AUDIT`), read live via `ctl audit`. Only identity
 //! **names** ever appear here; resolved secret values never touch the log,
 //! in memory or on disk.
 

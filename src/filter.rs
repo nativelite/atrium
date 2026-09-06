@@ -1,49 +1,49 @@
-//! Passthrough filter: terminate host-level mode negotiations at amux.
+//! Passthrough filter: terminate host-level mode negotiations at atrium.
 //!
 //! A pane's ConPTY asks *its host* to switch input to win32-input-mode by
-//! emitting `ESC[?9001h`. amux is that host — if the request tunnels
-//! through to amux's own terminal, *that* terminal flips amux's stdin into
+//! emitting `ESC[?9001h`. atrium is that host — if the request tunnels
+//! through to atrium's own terminal, *that* terminal flips atrium's stdin into
 //! win32-encoded key sequences and every hotkey goes dark (this exact bug
 //! shipped the first e2e run). The filter removes such host-level mode
 //! sequences from the passthrough stream, chunk-split-safely; everything
 //! else passes untouched.
 //!
-//! amux also **owns the alternate screen** (tmux-style): it enters the alt
+//! atrium also **owns the alternate screen** (tmux-style): it enters the alt
 //! buffer at startup and restores it on exit. A hosted app (claude, vim) that
 //! toggles the alt buffer itself — `ESC[?1049h/l`, or the older `?1047`/`?47`
-//! — would fight amux's own alt screen, so on exit amux's `\x1b[?1049l` would
+//! — would fight atrium's own alt screen, so on exit atrium's `\x1b[?1049l` would
 //! leave the hosted app's last frame on screen instead of the user's original
 //! shell. We strip the pane's alt-screen enter/leave here so panes render into
-//! amux's buffer and never toggle the real terminal's; amux alone owns it.
+//! atrium's buffer and never toggle the real terminal's; atrium alone owns it.
 //!
-//! Finally, amux **owns the terminal window**. A pane's ConPTY announces its
+//! Finally, atrium **owns the terminal window**. A pane's ConPTY announces its
 //! size to *its host* by emitting an XTWINOPS resize, `ESC [ 8 ; H ; W t` (and a
 //! full-screen app may move/resize/iconify the window with the rest of the
-//! `ESC [ … t` family). amux is that host — if such a sequence tunnels through to
+//! `ESC [ … t` family). atrium is that host — if such a sequence tunnels through to
 //! the real terminal, the terminal window itself resizes to the pane's size
 //! (measured: a 70-row Windows Terminal shrank to 67 the instant a pane started).
 //! We strip the whole `ESC [ <params> t` window-manipulation family from the
-//! passthrough; amux already knows and sets each pane's size.
+//! passthrough; atrium already knows and sets each pane's size.
 
-/// The host-level mode sequences we terminate at amux. Every entry shares the
+/// The host-level mode sequences we terminate at atrium. Every entry shares the
 /// `ESC [ ? … (h|l)` shape but the numeric parameter — and thus the length —
 /// varies, so the matcher is length-agnostic (see [`Passthrough::feed`]).
 const STRIP: &[&[u8]] = &[
     // win32-input-mode enable / disable (the original hotkey-eating bug).
     b"\x1b[?9001h",
     b"\x1b[?9001l",
-    // Mouse tracking — amux owns the real terminal's mouse state. A hosted app
+    // Mouse tracking — atrium owns the real terminal's mouse state. A hosted app
     // (claude does this) that turns reporting on would otherwise flip the outer
     // terminal into it, and the user loses native text selection: click-drag
-    // becomes a mouse report to the app instead of a selection. amux keeps mouse
+    // becomes a mouse report to the app instead of a selection. atrium keeps mouse
     // capture OFF by default precisely so selection works, and `Ctrl+A m` is the
-    // documented way to turn it on — at which point amux enables it on the real
+    // documented way to turn it on — at which point atrium enables it on the real
     // terminal itself and routes events to the pane. The pane's own request is
     // still observed (the emulator is fed the unfiltered stream, so
     // `Pane::mouse_wanted` still tracks it); it just no longer reaches the user's
     // terminal. Both the X10/normal/button/any-event modes and the extended
     // coordinate encodings are terminated, enable and disable alike, so a pane
-    // can never leave the terminal in a state amux did not set.
+    // can never leave the terminal in a state atrium did not set.
     b"\x1b[?1000h",
     b"\x1b[?1000l",
     b"\x1b[?1002h",
@@ -58,7 +58,7 @@ const STRIP: &[&[u8]] = &[
     b"\x1b[?1015l",
     b"\x1b[?1016h",
     b"\x1b[?1016l",
-    // Alternate screen buffer enter / leave — amux owns the alt screen.
+    // Alternate screen buffer enter / leave — atrium owns the alt screen.
     b"\x1b[?1049h",
     b"\x1b[?1049l",
     b"\x1b[?1047h",
@@ -225,10 +225,10 @@ mod tests {
     }
 
     #[test]
-    fn mouse_tracking_requests_are_terminated_at_amux() {
+    fn mouse_tracking_requests_are_terminated_at_atrium() {
         // A hosted agent that turns on mouse reporting must not flip the *real*
         // terminal into it: that is what stops the user selecting text with the
-        // mouse, which amux documents as working by default. `sh` never asks, so
+        // mouse, which atrium documents as working by default. `sh` never asks, so
         // the symptom appeared only once an agent pane was open.
         let modes: &[&[u8]] = &[
             b"\x1b[?1000h",
@@ -251,7 +251,7 @@ mod tests {
             );
         }
         // The matching disables too, so a pane cannot leave the real terminal in
-        // a state amux did not put it in.
+        // a state atrium did not put it in.
         assert_eq!(feed_all(&[b"a\x1b[?1006lb"]), b"ab".to_vec());
         // Chunk-split safe, like every other stripped mode.
         assert_eq!(feed_all(&[b"a\x1b[?10", b"00hb"]), b"ab".to_vec());

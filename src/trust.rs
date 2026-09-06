@@ -5,16 +5,16 @@
 //! *"Do you trust the files in this folder?"* dialog is a **separate** gate: it
 //! is stored per-directory in `~/.claude.json` under
 //! `projects["<dir>"].hasTrustDialogAccepted`, and no CLI flag / env var
-//! bypasses it (verified — there is only the stored state). So amux, only when
+//! bypasses it (verified — there is only the stored state). So atrium, only when
 //! the operator opts into `--trust`, writes that same bit for the pane's working
 //! directory before spawning claude there: the programmatic equivalent of the
 //! human clicking *"trust this folder."*
 //!
-//! This is the one place amux writes another tool's config; it is deliberate,
+//! This is the one place atrium writes another tool's config; it is deliberate,
 //! opt-in behind `--trust`, and surgical — it parses the whole file, flips (or
 //! adds) exactly the trust keys for one directory, and writes it back atomically
 //! (temp + rename), preserving everything else byte-for-byte (json round-trips
-//! losslessly). A file it cannot parse is left **untouched** — amux never
+//! losslessly). A file it cannot parse is left **untouched** — atrium never
 //! clobbers a config it did not understand.
 
 use std::path::{Path, PathBuf};
@@ -24,10 +24,10 @@ use json::Value;
 
 /// Environment knob (comma-separated command prefixes) that **extends** the
 /// built-in `--trust` allowlist ([`DEFAULT_ALLOW`]) with the user's own safe dev
-/// commands — e.g. `AMUX_TRUST_ALLOW="just build,make test"`. Each prefix P
+/// commands — e.g. `ATRIUM_TRUST_ALLOW="just build,make test"`. Each prefix P
 /// becomes the claude matcher `Bash(P *)`, so it runs hands-off while anything
-/// outside the list still prompts. Set by the human who launches amux.
-pub const ENV_TRUST_ALLOW: &str = "AMUX_TRUST_ALLOW";
+/// outside the list still prompts. Set by the human who launches atrium.
+pub const ENV_TRUST_ALLOW: &str = "ATRIUM_TRUST_ALLOW";
 
 /// The built-in safe dev-command prefixes `--trust` ([`crate::ctl::TrustMode::Edits`])
 /// lets an agent run **without a prompt** — the build/test/run loop. Read-only
@@ -36,15 +36,15 @@ pub const ENV_TRUST_ALLOW: &str = "AMUX_TRUST_ALLOW";
 /// not extended via [`ENV_TRUST_ALLOW`]) still surfaces as a visible approval
 /// prompt in the pane — that is the safety of this mode.
 const DEFAULT_ALLOW: &[&str] = &[
-    // `amux ctl` - the coordination layer, and ONLY that.
+    // `atrium ctl` - the coordination layer, and ONLY that.
     //
     // Every agent needs it: `bus pub`, `board claim`, `ctl list` are how a fleet
     // works at all, and without this each one surfaces an approval prompt, so the
     // operator is asked to approve the very messages the fleet exists to exchange.
     //
-    // But this is deliberately `amux ctl`, NOT `amux`. Starting a NEW amux session
+    // But this is deliberately `atrium ctl`, NOT `atrium`. Starting a NEW atrium session
     // from inside a pane has no legitimate use for any agent, lead or worker, and
-    // it is the escape route: `amux --trust skip` is a fresh session that sets its
+    // it is the escape route: `atrium --trust skip` is a fresh session that sets its
     // own policy. That is supposed to be caught by the ancestry cap, but a review
     // found the cap reachable only through paths the agent itself owns - the
     // registry is addressed via $TMPDIR and the ancestry walk shells out to a
@@ -56,7 +56,7 @@ const DEFAULT_ALLOW: &[&str] = &[
     // `accept` it surfaces as a visible approval prompt. (Under `automode` claude
     // runs commands on its own guardrails and this allowlist does not apply -
     // that gap is real and is not closed by this.)
-    "amux ctl",
+    "atrium ctl",
     "python",
     "python3",
     "pytest",
@@ -316,7 +316,7 @@ fn obj_set(members: &mut Vec<(String, Value)>, key: &str, val: Value) {
 /// the target (atomic replace on Windows and Unix), so a reader never sees a
 /// half-written config even if we're interrupted.
 fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
-    let tmp = PathBuf::from(format!("{}.amux-tmp", path.display()));
+    let tmp = PathBuf::from(format!("{}.atrium-tmp", path.display()));
     std::fs::write(&tmp, contents).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
@@ -481,7 +481,7 @@ mod tests {
     }
 
     fn tmp(nonce: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("amux-trust-{}-{nonce}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("atrium-trust-{}-{nonce}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
     }
@@ -502,7 +502,7 @@ mod tests {
     }
 
     /// **Never clobber a config we could not parse.** This is the guarantee that
-    /// matters most here: the file belongs to another tool, and amux overwriting
+    /// matters most here: the file belongs to another tool, and atrium overwriting
     /// a config it did not understand would destroy the user's settings. Untested
     /// until now, on the one function in this module that touches live state.
     #[test]
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&cfg).unwrap(),
             garbage,
-            "amux overwrote a config it could not parse"
+            "atrium overwrote a config it could not parse"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

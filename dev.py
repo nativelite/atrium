@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local dev runner for amux — stdlib Python driving cargo, no task runner.
+"""Local dev runner for atrium — stdlib Python driving cargo, no task runner.
 
 The same `check` gate as every nativelite package, so the muscle memory is
 identical across languages. Here `check` is the zero-dependency guard, then
@@ -17,11 +17,11 @@ shebang + exec bit make `./dev.py` work everywhere:
 Test runs are bounded. `cargo test` has no per-test timeout and this project has
 no CI to kill a stuck job, so a test that deadlocks used to wedge the machine
 that ran it — silently, since a hang produces no failing line. Every test
-invocation now gets `AMUX_TEST_TIMEOUT` seconds (default 300); when it expires
+invocation now gets `ATRIUM_TEST_TIMEOUT` seconds (default 300); when it expires
 the whole process tree is killed and the run is repeated serially to name the
 test that hung:
 
-  AMUX_TEST_TIMEOUT=600 ./dev.py check    # a slow machine, or a cold build
+  ATRIUM_TEST_TIMEOUT=600 ./dev.py check    # a slow machine, or a cold build
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ WINDOWS = os.name == "nt"
 #: Wall-clock budget for one `cargo test` invocation. Generous on purpose: this
 #: is a backstop against a deadlock, not a performance assertion (the suite runs
 #: in ~15 s), so raising it on a slow or cold machine costs nothing.
-TEST_TIMEOUT = int(os.environ.get("AMUX_TEST_TIMEOUT", "300"))
+TEST_TIMEOUT = int(os.environ.get("ATRIUM_TEST_TIMEOUT", "300"))
 
 #: The exit code `timeout(1)` uses, so a caller can tell a hang from a failure.
 TIMED_OUT = 124
@@ -48,7 +48,7 @@ TIMED_OUT = 124
 def _spawn(args: list[str], **kw) -> subprocess.Popen:
     """Start `args` in its own process group, so the whole tree can be killed.
 
-    A hung test is usually hung *on a child* — a pane, a pty, an `amux ctl`
+    A hung test is usually hung *on a child* — a pane, a pty, an `atrium ctl`
     waiting on a reply that never comes. Killing cargo alone would leave those
     parked, which is the failure this runner exists to end.
     """
@@ -138,7 +138,7 @@ def _name_the_hang(args: tuple[str, ...], timeout: int) -> None:
 
 
 def test() -> int:
-    print(f"# test budget: {TEST_TIMEOUT}s per invocation (AMUX_TEST_TIMEOUT)")
+    print(f"# test budget: {TEST_TIMEOUT}s per invocation (ATRIUM_TEST_TIMEOUT)")
     for args in (("cargo", "test", "--all-targets"), ("cargo", "test", "--doc")):
         code = run(*args, timeout=TEST_TIMEOUT)
         if code == TIMED_OUT:

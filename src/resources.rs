@@ -1,6 +1,6 @@
 //! Host-derived limits so a fleet can't exhaust the machine.
 //!
-//! The binding constraint on how many agents a box can run is **not** amux — a
+//! The binding constraint on how many agents a box can run is **not** atrium — a
 //! pane costs one PTY, one emulator buffer, and one bounded tailer — but the
 //! *agent processes*, each a heavyweight language-model runtime (hundreds of MB).
 //! So the pane cap is derived from host RAM: how many agents fit with headroom.
@@ -22,7 +22,7 @@ const RAM_FRACTION: f64 = 0.75;
 /// context size and workload, and the cost of guessing low (a swapping host, an
 /// OOM-killed pane) is far worse than the cost of guessing high (a smaller fleet).
 /// 384 keeps ~1.9x headroom over the measured average while still roughly doubling
-/// the usable fleet size. Tunable via `AMUX_AGENT_MB` for an operator who has
+/// the usable fleet size. Tunable via `ATRIUM_AGENT_MB` for an operator who has
 /// measured their own agents.
 const DEFAULT_AGENT_MB: u64 = 384;
 /// Portable fallback when total RAM can't be detected: agents are mostly idle
@@ -32,11 +32,11 @@ const AGENTS_PER_CORE: usize = 4;
 /// zero and wedge spawning entirely.
 const MIN_CAP: usize = 2;
 
-/// Environment override for the absolute pane cap (`AMUX_MAX_PANES`). When set and
+/// Environment override for the absolute pane cap (`ATRIUM_MAX_PANES`). When set and
 /// parseable, it wins outright — the operator knows their box.
-pub const ENV_MAX_PANES: &str = "AMUX_MAX_PANES";
-/// Environment override for the per-agent RAM estimate in MiB (`AMUX_AGENT_MB`).
-pub const ENV_AGENT_MB: &str = "AMUX_AGENT_MB";
+pub const ENV_MAX_PANES: &str = "ATRIUM_MAX_PANES";
+/// Environment override for the per-agent RAM estimate in MiB (`ATRIUM_AGENT_MB`).
+pub const ENV_AGENT_MB: &str = "ATRIUM_AGENT_MB";
 
 /// The maximum number of concurrent panes, from first available of: an explicit
 /// `override_`; a RAM budget (`ram_bytes × RAM_FRACTION / per_agent_bytes`); or a
@@ -59,7 +59,7 @@ pub fn pane_cap(
     }
 }
 
-/// The effective cap for this host, honoring `AMUX_MAX_PANES` / `AMUX_AGENT_MB`.
+/// The effective cap for this host, honoring `ATRIUM_MAX_PANES` / `ATRIUM_AGENT_MB`.
 pub fn effective_cap() -> usize {
     let override_ = std::env::var(ENV_MAX_PANES)
         .ok()

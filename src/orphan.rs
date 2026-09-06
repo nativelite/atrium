@@ -1,18 +1,18 @@
-//! The last backstop: find and kill pane trees whose amux is gone.
+//! The last backstop: find and kill pane trees whose atrium is gone.
 //!
 //! # Why this exists at all
 //!
 //! Windows gets a kernel-enforced answer for free — a Job Object with
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (see [`crate::reap::SessionJob`]) —
-//! and the kernel honours it however amux dies, `TerminateProcess` included.
+//! and the kernel honours it however atrium dies, `TerminateProcess` included.
 //! Unix has no such container, so [`crate::reap`] reconstructs one out of
 //! process groups, `setsid`, and a pipe-EOF watchdog. Every part of that
 //! reconstruction is *advisory*, and two holes were measured on the author's
 //! machine, not theorised:
 //!
-//! 1. **A pane carried no marker.** `AMUX_CTL`/`AMUX_PANE`/`AMUX_TOKEN` were
+//! 1. **A pane carried no marker.** `ATRIUM_CTL`/`ATRIUM_PANE`/`ATRIUM_TOKEN` were
 //!    injected only when `--allow-ctl` was on. Without it a pane child had no
-//!    amux environment whatsoever, so nothing on the machine identified it as
+//!    atrium environment whatsoever, so nothing on the machine identified it as
 //!    ours and nothing could find it after the fact.
 //! 2. **The registry — the watchdog's only record — was deleted even on the one
 //!    path that proved it was needed.** Teardown computed `survivors`, then
@@ -22,7 +22,7 @@
 //!
 //! The cost was 75 stranded processes holding 526 ptys against a machine-wide
 //! `kern.tty.ptmx_max` of 511. Past that line *nothing* on the machine can open
-//! a pty — not amux, not a new terminal tab, not the test suite.
+//! a pty — not atrium, not a new terminal tab, not the test suite.
 //!
 //! # The rule
 //!
@@ -31,20 +31,20 @@
 //!
 //! 1. It is linked to a session key `<owner_pid>:<owner_start>` (see
 //!    [`SessionKey`] and "Two markers" below).
-//! 2. Its pgid equals its pid — a session leader, i.e. a pane root amux itself
+//! 2. Its pgid equals its pid — a session leader, i.e. a pane root atrium itself
 //!    created through `setsid`, not some descendant that wandered in.
-//! 3. The owner named by the key is not a live amux ([`classify_owner`]).
+//! 3. The owner named by the key is not a live atrium ([`classify_owner`]).
 //!
 //! ## Why not `ppid == 1`
 //!
 //! The cheap test is wrong, and the counterexample came off the owner's machine:
 //!
 //! ```text
-//! 17686     1  ?Es  (amux)   <- owner, STUCK EXITING
+//! 17686     1  ?Es  (atrium)   <- owner, STUCK EXITING
 //! 17736 17686 Ss+   sh       <- pane, ALIVE, ppid still points at the corpse
 //! ```
 //!
-//! A child is reparented when its parent *finishes* exiting. An amux wedged in
+//! A child is reparented when its parent *finishes* exiting. An atrium wedged in
 //! `?E` never gets there, so its panes keep pointing at a corpse and `ppid == 1`
 //! never becomes true — and that was the exact population that had to be cleared
 //! by hand. [`Proc::ppid`] is carried for the report; it is never the test.
@@ -59,16 +59,16 @@
 //!
 //! # Two markers, because one of them cannot see shells on macOS
 //!
-//! The approved design injects `AMUX_SESSION` into every pane and reads it back
+//! The approved design injects `ATRIUM_SESSION` into every pane and reads it back
 //! from the process table. **Measured on macOS 26 (Darwin 25.6.0), that is only
 //! half a mechanism:** `ps -E` prints the environment of ordinary binaries but
 //! prints *nothing* for a SIP/platform binary. Verified here, same uid, same
 //! session:
 //!
 //! ```text
-//! $ env AMUX_SESSION=7:x ./a-rust-binary &  ps -ww -E -o command= -p $!
+//! $ env ATRIUM_SESSION=7:x ./a-rust-binary &  ps -ww -E -o command= -p $!
 //! ./a-rust-binary TERM_PROGRAM=Apple_Terminal SHELL=/bin/zsh ...   <- env visible
-//! $ env AMUX_SESSION=9:z /bin/sh -c 'sleep 5' & ps -ww -E -o command= -p $!
+//! $ env ATRIUM_SESSION=9:z /bin/sh -c 'sleep 5' & ps -ww -E -o command= -p $!
 //! sleep 5                                                          <- env hidden
 //! ```
 //!
@@ -78,11 +78,11 @@
 //!
 //! So there are two markers and one predicate:
 //!
-//! * [`Marker::Env`] — `AMUX_SESSION` in the process's own environment. Always
+//! * [`Marker::Env`] — `ATRIUM_SESSION` in the process's own environment. Always
 //!   readable on Linux; on macOS readable for non-platform binaries (`node`,
-//!   `claude`, a nested `amux`). Travels with the process and survives anything
+//!   `claude`, a nested `atrium`). Travels with the process and survives anything
 //!   that happens to `/tmp`.
-//! * [`Marker::Stamp`] — a file `amux-pane-<pid>.stamp` in
+//! * [`Marker::Stamp`] — a file `atrium-pane-<pid>.stamp` in
 //!   [`crate::reap::registry_dir`] recording the session key **and the pane's
 //!   own start token**. Covers every pane including `/bin/sh`. The start token
 //!   is what makes a stale stamp harmless: a recycled pid has a different start
@@ -101,7 +101,7 @@
 //!
 //! # Where it runs, and where it must not
 //!
-//! At watchdog-death and on an explicit `amux reap` (plus `--reap-orphans` at
+//! At watchdog-death and on an explicit `atrium reap` (plus `--reap-orphans` at
 //! startup, opt-in for this first release). **Never on the 15 ms event loop**: a
 //! prior version of this codebase ran `ps` per ancestry hop and the resulting
 //! process storm showed up as timing flakiness in unrelated tests.
@@ -110,23 +110,23 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-/// The pane marker. Non-secret and *meant* to be readable — unlike `AMUX_TOKEN`,
+/// The pane marker. Non-secret and *meant* to be readable — unlike `ATRIUM_TOKEN`,
 /// which is a capability. Injected into every pane unconditionally, independent
 /// of `--allow-ctl`: a pane with no marker is a pane nothing can ever find.
-pub const ENV_SESSION: &str = "AMUX_SESSION";
+pub const ENV_SESSION: &str = "ATRIUM_SESSION";
 
 /// The argv flag that opts a launch into the startup sweep.
 pub const REAP_FLAG: &str = "--reap-orphans";
 
 // --- the key ---------------------------------------------------------------
 
-/// Identifies one amux session: the owner's pid **and** the instant it started.
+/// Identifies one atrium session: the owner's pid **and** the instant it started.
 ///
 /// The start token is opaque and only ever compared for equality; it is not a
 /// wall-clock time and is not comparable across platforms or reboots.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionKey {
-    /// The pid of the amux that owns the pane.
+    /// The pid of the atrium that owns the pane.
     pub owner: u32,
     /// [`start_token`] of that pid, taken when the key was minted.
     pub started: u64,
@@ -183,9 +183,9 @@ pub fn session_key() -> Option<SessionKey> {
 /// identical either way.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Marker {
-    /// `AMUX_SESSION` read out of the process's own environment.
+    /// `ATRIUM_SESSION` read out of the process's own environment.
     Env,
-    /// An `amux-pane-<pid>.stamp` file whose recorded start token still matches.
+    /// An `atrium-pane-<pid>.stamp` file whose recorded start token still matches.
     Stamp,
 }
 
@@ -211,7 +211,7 @@ pub struct Proc {
     pub via: Marker,
 }
 
-/// What is known about the amux named by a session key.
+/// What is known about the atrium named by a session key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Owner {
     /// Still there. Its panes are not orphans.
@@ -239,7 +239,7 @@ pub struct Sweeper {
 ///   `Some(false)` is "definitely a different image", `None` is "cannot tell".
 ///   From [`crate::warden::same_binary`], which compares `(st_dev, st_ino)` of
 ///   the kernel's executable, never `argv[0]` — `ps -o comm=` is argv[0] on
-///   macOS and `exec -a amux /bin/sleep` forges it in one line.
+///   macOS and `exec -a atrium /bin/sleep` forges it in one line.
 /// * `start` — the pid's current start token, and `recorded` the one in the key.
 ///
 /// The two checks are deliberately not symmetric:
@@ -248,8 +248,8 @@ pub struct Sweeper {
 ///   original owner is gone. `Dead`.
 /// * A start-token **match** is conclusive the other way — same pid *and* same
 ///   start instant is the same process — so a disagreeing identity check there
-///   yields `Unknown`, not `Dead`. A differently-built amux (`./target/release/
-///   amux` hosting a pane that launches `~/.cargo/bin/amux`) is a real, already
+///   yields `Unknown`, not `Dead`. A differently-built atrium (`./target/release/
+///   atrium` hosting a pane that launches `~/.cargo/bin/atrium`) is a real, already
 ///   documented configuration in this codebase, and it must not become a reason
 ///   to kill a live session's panes.
 /// * Identity only creates a `Dead` where the start token is unreadable, which
@@ -283,7 +283,7 @@ pub fn is_orphan(p: &Proc, owner: Owner, me: Sweeper) -> bool {
     if p.key.is_none() {
         return false;
     }
-    // (2) a session leader: a pane root amux created with setsid, not a
+    // (2) a session leader: a pane root atrium created with setsid, not a
     // descendant that inherited the marker and wandered into the group. Killing
     // by pgid is what `reap` does, so a non-leader would take its whole group
     // down with it — including processes that were never ours.
@@ -301,8 +301,8 @@ pub fn is_orphan(p: &Proc, owner: Owner, me: Sweeper) -> bool {
 /// Pick the orphans out of a snapshot.
 ///
 /// `only` restricts the sweep to a single session key — what the watchdog uses,
-/// so a dying amux only ever collects its own panes. `None` sweeps every dead
-/// owner, which is what `amux reap` does and what self-heals an exhausted pty
+/// so a dying atrium only ever collects its own panes. `None` sweeps every dead
+/// owner, which is what `atrium reap` does and what self-heals an exhausted pty
 /// pool.
 ///
 /// `owner_of` is injected so this function is pure: the tests drive it with a
@@ -367,7 +367,7 @@ impl std::fmt::Display for Victim {
 
 /// Strip [`REAP_FLAG`] from the front of an argument list.
 ///
-/// Front-stripping, like every other amux meta-flag (`--identity`,
+/// Front-stripping, like every other atrium meta-flag (`--identity`,
 /// `--allow-ctl`, `-n`): everything after the hosted command belongs to the
 /// hosted command and is never inspected.
 pub fn parse_flag(args: &[String]) -> (bool, Vec<String>) {
@@ -403,7 +403,7 @@ fn marker_in<'a>(tokens: impl Iterator<Item = &'a str>) -> Option<SessionKey> {
 /// registry, and for the same reason: `std::env::temp_dir()` reads `$TMPDIR`,
 /// which an agent in a pane owns.
 pub fn stamp_path(pid: u32) -> PathBuf {
-    crate::reap::registry_dir().join(format!("amux-pane-{pid}.stamp"))
+    crate::reap::registry_dir().join(format!("atrium-pane-{pid}.stamp"))
 }
 
 /// Record that `pid` is a pane root of this session.
@@ -441,7 +441,7 @@ fn read_stamp(path: &std::path::Path) -> Option<(u32, SessionKey)> {
     let pid: u32 = path
         .file_name()?
         .to_str()?
-        .strip_prefix("amux-pane-")?
+        .strip_prefix("atrium-pane-")?
         .strip_suffix(".stamp")?
         .parse()
         .ok()?;
@@ -480,7 +480,7 @@ pub fn prune_stamps() -> usize {
         let is_stamp = path
             .file_name()
             .and_then(|s| s.to_str())
-            .is_some_and(|s| s.starts_with("amux-pane-") && s.ends_with(".stamp"));
+            .is_some_and(|s| s.starts_with("atrium-pane-") && s.ends_with(".stamp"));
         if !is_stamp {
             continue;
         }
@@ -712,9 +712,9 @@ fn parse_proc_stat(text: &str) -> Option<(u32, u32, u64)> {
 ///
 /// The hazard, stated plainly: `-E` puts argv and env in one column with no
 /// delimiter, so a process whose *argv* contains the literal text
-/// `AMUX_SESSION=<key>` is indistinguishable from one whose environment does.
+/// `ATRIUM_SESSION=<key>` is indistinguishable from one whose environment does.
 /// That is a way to nominate yourself for collection, not a way to nominate
-/// anyone else — the key must still name a dead amux, and the process must be
+/// anyone else — the key must still name a dead atrium, and the process must be
 /// its own group leader.
 #[cfg(all(unix, target_os = "macos"))]
 fn env_candidates() -> Vec<Proc> {
@@ -816,7 +816,7 @@ fn own_pgid() -> u32 {
 // Deliberately inert, and this is not a gap. Windows already has the
 // kernel-enforced version of everything above: a Job Object created at spawn
 // with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (see `reap::SessionJob`), whose
-// guarantee the kernel honours however amux dies — including `TerminateProcess`,
+// guarantee the kernel honours however atrium dies — including `TerminateProcess`,
 // which no handler can catch, and which is the exact death mode the unix
 // reconstruction cannot cover. There is nothing left over for a marker-and-sweep
 // to collect, so adding one would be untested Windows code buying nothing.
@@ -909,7 +909,7 @@ mod tests {
 
     /// `pid_running`, not `pid_alive`. A zombie owner reports `running == false`
     /// (that is what `reap::pid_running` exists for) and its panes are orphans —
-    /// the "amux stuck in `?E` with live panes" population from the incident.
+    /// the "atrium stuck in `?E` with live panes" population from the incident.
     #[test]
     fn a_live_matching_owner_is_never_collected() {
         assert_eq!(classify_owner(true, Some(true), Some(7), 7), Owner::Live);
@@ -930,7 +930,7 @@ mod tests {
 
     /// Identity may only create a `Dead` where the start token is unreadable.
     /// With a matching start instant it is contradicting proof, and the fail-safe
-    /// direction is to skip — a differently-built amux is a real configuration.
+    /// direction is to skip — a differently-built atrium is a real configuration.
     #[test]
     fn a_disagreeing_identity_never_outvotes_a_matching_start() {
         assert_eq!(
@@ -957,7 +957,7 @@ mod tests {
     }
 
     /// (1) No marker, no opinion. This is the hole that made the incident
-    /// unrecoverable: without `--allow-ctl` a pane carried no amux env at all.
+    /// unrecoverable: without `--allow-ctl` a pane carried no atrium env at all.
     #[test]
     fn an_unmarked_process_is_never_an_orphan() {
         let p = leader(100, None);
@@ -999,7 +999,7 @@ mod tests {
     }
 
     /// A sweep must never collect the process running it, nor anything sharing
-    /// its group — `amux reap` runs in the operator's shell group.
+    /// its group — `atrium reap` runs in the operator's shell group.
     #[test]
     fn a_sweep_never_collects_itself() {
         let me = leader(ME.pid, Some(key(1, 1)));
@@ -1046,7 +1046,7 @@ mod tests {
         );
     }
 
-    /// The watchdog sweeps for ITS OWN key only. A dying amux collecting some
+    /// The watchdog sweeps for ITS OWN key only. A dying atrium collecting some
     /// other session's panes because they also look orphaned is not its business
     /// and is exactly the "agent-directed kill primitive" shape `warden` warns
     /// about.
@@ -1065,7 +1065,7 @@ mod tests {
         assert_eq!(
             got.iter().map(|v| v.pid).collect::<Vec<_>>(),
             vec![101, 102],
-            "an unrestricted sweep is what `amux reap` runs"
+            "an unrestricted sweep is what `atrium reap` runs"
         );
     }
 
@@ -1091,9 +1091,9 @@ mod tests {
     #[test]
     fn the_ps_reader_finds_a_marker_after_the_command_line() {
         let text = "\
-  101   1   101 /bin/sh -i PATH=/usr/bin AMUX_SESSION=17686:99 TERM=xterm
+  101   1   101 /bin/sh -i PATH=/usr/bin ATRIUM_SESSION=17686:99 TERM=xterm
   102   1   102 /bin/sh -i PATH=/usr/bin TERM=xterm
-  103 102   102 node server.js AMUX_SESSION=17686:99
+  103 102   102 node server.js ATRIUM_SESSION=17686:99
   bad line
 ";
         let got = parse_ps_e(text);
@@ -1113,9 +1113,9 @@ mod tests {
     /// all rather than a key with a defaulted owner.
     #[test]
     fn a_malformed_marker_yields_no_candidate() {
-        assert!(parse_ps_e("  101   1   101 sh AMUX_SESSION=\n").is_empty());
-        assert!(parse_ps_e("  101   1   101 sh AMUX_SESSION=0:1\n").is_empty());
-        assert!(parse_ps_e("  101   1   101 sh XAMUX_SESSION=1:1\n").is_empty());
+        assert!(parse_ps_e("  101   1   101 sh ATRIUM_SESSION=\n").is_empty());
+        assert!(parse_ps_e("  101   1   101 sh ATRIUM_SESSION=0:1\n").is_empty());
+        assert!(parse_ps_e("  101   1   101 sh XATRIUM_SESSION=1:1\n").is_empty());
     }
 
     /// `/proc/<pid>/stat` field 2 is the comm in parentheses and may contain
@@ -1181,7 +1181,7 @@ mod tests {
     fn a_stamp_is_bound_to_the_process_it_named() {
         let dir = crate::reap::registry_dir();
         let me = std::process::id();
-        let path = dir.join(format!("amux-pane-{me}.stamp"));
+        let path = dir.join(format!("atrium-pane-{me}.stamp"));
         let real = start_token(me).expect("our own start token");
         let k = key(999_001, 7);
 
@@ -1262,7 +1262,7 @@ mod tests {
         false
     }
 
-    /// The incident, reproduced and then cleaned up: a `/bin/sh` pane whose amux
+    /// The incident, reproduced and then cleaned up: a `/bin/sh` pane whose atrium
     /// is gone. macOS will not show a SIP binary's environment to `ps`, so this
     /// pane is invisible to the env marker and is found through its stamp alone.
     #[cfg(unix)]
@@ -1303,7 +1303,7 @@ mod tests {
     /// `reap::pid_running`. Swap `pid_running` for `pid_alive` in `live_owner`
     /// and this test fails with the pane still running: the corpse reads as a
     /// live owner and its panes are protected forever — exactly the population
-    /// (`?Es (amux)` with live `sh` children) that had to be cleared by hand.
+    /// (`?Es (atrium)` with live `sh` children) that had to be cleared by hand.
     #[cfg(unix)]
     #[test]
     fn a_pane_of_a_zombie_owner_is_collected() {
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     /// The same thing through the OTHER marker, with no stamp file at all: the
-    /// process carries `AMUX_SESSION` in its own environment and is found by
+    /// process carries `ATRIUM_SESSION` in its own environment and is found by
     /// reading the process table. Uses this test binary as the sleeper because
     /// it is an ordinary (non-platform) binary, which on macOS is the condition
     /// for `ps -E` disclosing an environment at all.
@@ -1395,7 +1395,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_pane_of_a_live_owner_is_never_collected() {
-        // This very test process stands in for the live amux: it is running, and
+        // This very test process stands in for the live atrium: it is running, and
         // the key names it with its real start token.
         let key = session_key().expect("unix supplies a start token");
         let mut pane = spawn_leader(&["/bin/sh", "-c", "sleep 30"], Some(&key));

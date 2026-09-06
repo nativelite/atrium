@@ -190,8 +190,8 @@ mod sys {
     // Windows has no process groups, but a Job Object with
     // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is strictly stronger than every unix
     // layer in this module combined: assign each pane process to one job, hold
-    // its handle for amux's lifetime, and the kernel terminates every process in
-    // the job when the last handle closes — however amux died, including
+    // its handle for atrium's lifetime, and the kernel terminates every process in
+    // the job when the last handle closes — however atrium died, including
     // `TerminateProcess`, which nothing can catch. Children of assigned processes
     // inherit the job automatically, so grandchildren are covered without walking.
     //
@@ -252,14 +252,14 @@ mod sys {
     }
 
     /// One-line warning naming the failing call and its error `code`, only under
-    /// `AMUX_DEBUG` (a TUI can't print to the screen mid-run without corrupting it).
+    /// `ATRIUM_DEBUG` (a TUI can't print to the screen mid-run without corrupting it).
     /// A job failure degrades the cleanup guarantee; it never blocks a pane (R1).
     /// The caller captures `code` from `GetLastError` **immediately** after the
     /// failing FFI call — before any other Rust runs (e.g. `CloseHandle`, which
     /// would otherwise clobber the thread's last-error).
     fn debug_warn(what: &str, code: u32) {
-        if std::env::var_os("AMUX_DEBUG").is_some() {
-            eprint!("[amux-dbg job] {what} failed (GetLastError={code})\r\n");
+        if std::env::var_os("ATRIUM_DEBUG").is_some() {
+            eprint!("[atrium-dbg job] {what} failed (GetLastError={code})\r\n");
         }
     }
 
@@ -268,7 +268,7 @@ mod sys {
     pub fn create_job() -> Handle {
         // `CreateJobObjectW(null, null)` yields a NON-inheritable handle, which is
         // required: an inherited handle held by a pane would keep the job open past
-        // amux and silently defeat kill-on-close (R2).
+        // atrium and silently defeat kill-on-close (R2).
         // SAFETY: FFI call with null attributes and null name.
         let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if job.is_null() {
@@ -299,7 +299,7 @@ mod sys {
     }
 
     /// Assign the process `pid` to `job`; its descendants inherit the job. `false`
-    /// on failure — notably `ERROR_ACCESS_DENIED` when amux is itself inside a
+    /// on failure — notably `ERROR_ACCESS_DENIED` when atrium is itself inside a
     /// non-nesting job (R1), which must degrade to a warning, never a refused pane.
     pub fn assign_to_job(job: Handle, pid: u32) -> bool {
         if job.is_null() || pid == 0 {
@@ -325,26 +325,26 @@ mod sys {
         }
     }
 
-    /// Close amux's handle to `job`; the kernel then fires kill-on-close.
+    /// Close atrium's handle to `job`; the kernel then fires kill-on-close.
     pub fn close_job(job: Handle) {
         if !job.is_null() {
-            // SAFETY: closing a handle we own; drops amux's reference to the job.
+            // SAFETY: closing a handle we own; drops atrium's reference to the job.
             unsafe { CloseHandle(job) };
         }
     }
 }
 
-/// A session-lifetime container that guarantees no pane tree outlives amux.
+/// A session-lifetime container that guarantees no pane tree outlives atrium.
 ///
 /// On **Windows** it is a Job Object with `KILL_ON_JOB_CLOSE`: every pane assigned
 /// to it — and every descendant, which inherit the job automatically — is
-/// terminated by the kernel when amux's handle closes, however amux exits (normal
+/// terminated by the kernel when atrium's handle closes, however atrium exits (normal
 /// quit, panic, or an uncatchable `TerminateProcess`). This is the one death mode
 /// no unix layer in this module can match. On **unix** it is a deliberate no-op:
 /// the process-group teardown and the pipe-EOF watchdog already cover the tree,
 /// and there is no Job Object to use.
 ///
-/// Hold one for amux's whole run and [`assign`](SessionJob::assign) each pane
+/// Hold one for atrium's whole run and [`assign`](SessionJob::assign) each pane
 /// after spawn; dropping it (or the process exiting) fires the guarantee. A
 /// Windows failure to create or configure the job yields an inert handle whose
 /// `assign` is a no-op — panes still spawn, the guarantee is simply unavailable
@@ -369,7 +369,7 @@ impl SessionJob {
         }
     }
 
-    /// Assign a pane process (by pid) so its whole tree is torn down with amux.
+    /// Assign a pane process (by pid) so its whole tree is torn down with atrium.
     /// `false` on unix (no-op) and on a Windows assignment failure (kept non-fatal).
     pub fn assign(&self, pid: u32) -> bool {
         #[cfg(unix)]
@@ -387,7 +387,7 @@ impl SessionJob {
 #[cfg(not(unix))]
 impl Drop for SessionJob {
     fn drop(&mut self) {
-        // Closing amux's last handle fires KILL_ON_JOB_CLOSE. On a normal return
+        // Closing atrium's last handle fires KILL_ON_JOB_CLOSE. On a normal return
         // this is the clean path; on TerminateProcess the kernel closes it for us
         // — either way no pane tree is left behind.
         sys::close_job(self.raw);
@@ -396,33 +396,33 @@ impl Drop for SessionJob {
 
 // --- session registry + watchdog -------------------------------------------
 //
-// Layers above cover an exit amux can *observe*: a quit, or a signal it handles.
+// Layers above cover an exit atrium can *observe*: a quit, or a signal it handles.
 // Nothing above survives `SIGKILL`, a panic, or an OOM kill — no handler runs,
 // so no teardown happens and the whole tree leaks. The only thing that still
-// works then is a second process noticing amux is gone.
+// works then is a second process noticing atrium is gone.
 //
 // That watcher needs to know what to kill, which is the same durable list that
 // lets a later run clean up wreckage from a crash: one registry file serves both.
-// `amux reap` sweeps registries whose owner is dead.
+// `atrium reap` sweeps registries whose owner is dead.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// The hidden argv flag that runs amux as its own watchdog.
+/// The hidden argv flag that runs atrium as its own watchdog.
 pub const WATCHDOG_FLAG: &str = "--reap-watchdog";
 
-/// Registry path for a session. Lives in the temp dir, keyed by amux's pid, so a
-/// crashed session leaves a file a later `amux reap` can find and act on.
+/// Registry path for a session. Lives in the temp dir, keyed by atrium's pid, so a
+/// crashed session leaves a file a later `atrium reap` can find and act on.
 pub fn registry_path(pid: u32) -> PathBuf {
-    registry_dir().join(format!("amux-session-{pid}.pids"))
+    registry_dir().join(format!("atrium-session-{pid}.pids"))
 }
 
 /// Where session registries live.
 ///
 /// NOT `std::env::temp_dir()`, which reads `$TMPDIR` - a variable the agent owns.
-/// A nested amux resolves its PARENT's registry through this path to learn the
+/// A nested atrium resolves its PARENT's registry through this path to learn the
 /// ceiling it must accept, so an env-derived location meant the ceiling was one
-/// variable away from gone: `TMPDIR=/tmp/x amux --trust skip` walked the ancestry
+/// variable away from gone: `TMPDIR=/tmp/x atrium --trust skip` walked the ancestry
 /// correctly, then looked for the parent's registry under the CHILD's TMPDIR,
 /// found nothing, and capped nothing. No double-fork required.
 ///
@@ -444,7 +444,7 @@ pub fn registry_dir() -> PathBuf {
 /// Record this session's pane process groups. Rewritten whenever the set
 /// changes, so a watchdog started early still learns about panes spawned later.
 pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()> {
-    // The `policy=` line is what a NESTED amux reads to learn the ceiling it must
+    // The `policy=` line is what a NESTED atrium reads to learn the ceiling it must
     // cap itself at. It lives on disk rather than in the environment on purpose:
     // an agent owns its own environment and can `env -u` any marker away, but it
     // would have to overtly edit this file - which the warden watches.
@@ -453,10 +453,10 @@ pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()
     // line is invisible to it and older readers are unaffected.
     //
     // There is deliberately NO `capped_by=<parent pid>` line any more. It was
-    // meant to let a parent tell a legitimate nested amux from one that
+    // meant to let a parent tell a legitimate nested atrium from one that
     // double-forked to escape, but it is a self-declaration: this file is mode
     // 0644 at a fixed path owned by the same uid the agent runs as, so any
-    // process - including one that never capped, and one that is not amux at all
+    // process - including one that never capped, and one that is not atrium at all
     // - could write it and look accounted for. The parent now derives that answer
     // itself from the kernel's process table and executable identity (see
     // `warden::Warden::judge_session`) and consults nothing written here.
@@ -482,7 +482,7 @@ pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()
 /// warning to a terminal it was about to tear down, and exited. The watchdog
 /// then woke on pipe EOF, called [`read_registry`] on a path that no longer
 /// existed, got an empty vec out of `unwrap_or_default`, killed nothing, and
-/// exited too. amux destroyed the recovery record at the exact moment it had
+/// exited too. atrium destroyed the recovery record at the exact moment it had
 /// just PROVED that record was needed.
 ///
 /// Rewriting rather than leaving the file as-is matters as much as keeping it:
@@ -500,7 +500,7 @@ pub fn settle_registry(path: &Path, survivors: &[u32], policy: &str) -> bool {
     }
 }
 
-/// The trust policy a session recorded, if any. Read by a nested amux to find
+/// The trust policy a session recorded, if any. Read by a nested atrium to find
 /// the ceiling it inherits.
 pub fn read_policy(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok().and_then(|t| {
@@ -534,31 +534,31 @@ pub fn pid_running(pid: u32) -> bool {
 }
 
 /// The watchdog loop: wait for `parent` to disappear, then tear down every group
-/// the registry names. Runs in a re-executed amux, detached from the terminal so
+/// the registry names. Runs in a re-executed atrium, detached from the terminal so
 /// a closed window cannot take it down with the session it is meant to outlive.
 /// `session` is the owner's [`crate::orphan::SessionKey`], passed down its argv
 /// at spawn. It is the half of the teardown that does not depend on a file: the
-/// registry is a record amux writes and can delete (and DID delete, on the one
+/// registry is a record atrium writes and can delete (and DID delete, on the one
 /// path where it had just proved panes survived), whereas the session key is
 /// stamped on the panes themselves and cannot be taken away by anything the
-/// dying amux does or fails to do.
+/// dying atrium does or fails to do.
 pub fn watchdog_main(_parent: u32, registry: &Path, session: Option<crate::orphan::SessionKey>) {
     // Wait on a PIPE, not on the parent's liveness.
     //
     // Two earlier attempts were wrong in instructive ways. `kill(parent, 0)`
-    // succeeds on a zombie, so a SIGKILLed amux looks alive forever. `getppid()`
+    // succeeds on a zombie, so a SIGKILLed atrium looks alive forever. `getppid()`
     // was meant to dodge that — children are reparented at death — but a zombie
-    // amux that nobody has reaped still shows as the parent, so that hung too.
+    // atrium that nobody has reaped still shows as the parent, so that hung too.
     //
-    // A file descriptor cannot lie. amux holds the write end of this pipe (our
+    // A file descriptor cannot lie. atrium holds the write end of this pipe (our
     // stdin) and never writes to it; the kernel closes every descriptor when a
     // process terminates, however it terminates. So this read returns EOF
-    // exactly when amux is gone — no polling, no liveness heuristic, and no
+    // exactly when atrium is gone — no polling, no liveness heuristic, and no
     // zombie state to reason about.
     let mut buf = [0u8; 1];
     loop {
         match std::io::Read::read(&mut std::io::stdin(), &mut buf) {
-            Ok(0) => break,    // EOF — amux is gone
+            Ok(0) => break,    // EOF — atrium is gone
             Ok(_) => continue, // stray byte; not a protocol, just ignore it
             Err(_) => break,
         }
@@ -576,8 +576,8 @@ pub fn watchdog_main(_parent: u32, registry: &Path, session: Option<crate::orpha
     let _ = std::fs::remove_file(registry);
     // AND THEN sweep for our own session key, whatever the registry said.
     //
-    // This is the point of the whole exercise. The registry is amux's own
-    // bookkeeping, and the failure that stranded 75 processes was amux deleting
+    // This is the point of the whole exercise. The registry is atrium's own
+    // bookkeeping, and the failure that stranded 75 processes was atrium deleting
     // it on the one path that had just PROVED panes survived teardown: this
     // function then woke on pipe EOF, read a file that was no longer there, got
     // an empty list out of `unwrap_or_default`, killed nothing and exited. A
@@ -591,12 +591,12 @@ pub fn watchdog_main(_parent: u32, registry: &Path, session: Option<crate::orpha
     }
 }
 
-/// Kill the trees of every session whose amux is gone, and remove its registry.
+/// Kill the trees of every session whose atrium is gone, and remove its registry.
 /// Returns how many registries were cleaned. This is what recovers a machine
 /// after a crash — or after a session that predates the watchdog entirely.
 /// Kill watchdogs whose session is gone.
 ///
-/// A watchdog blocked on its pipe exits by itself the moment amux dies, so this
+/// A watchdog blocked on its pipe exits by itself the moment atrium dies, so this
 /// should normally find nothing. One still present after its owner has gone is
 /// stuck — an older build that polled liveness, or a pipe that never closed —
 /// and is pure debris holding a process slot.
@@ -638,12 +638,12 @@ fn reap_orphan_watchdogs() -> usize {
 /// put down, and the pane groups the registries never mentioned.
 ///
 /// The third element is the point of the sweep and the reason this is the
-/// operator's self-heal: a registry only lists what amux wrote down and kept,
+/// operator's self-heal: a registry only lists what atrium wrote down and kept,
 /// so a session whose registry was deleted — the exact bug that stranded 75
 /// processes against a 511-slot machine-wide pty pool — leaves nothing here for
 /// the first two numbers to find. The marker on the panes themselves does not
 /// depend on any of that. Unrestricted: every dead owner, which is what an
-/// operator running `amux reap` is asking for.
+/// operator running `atrium reap` is asking for.
 pub fn reap_stale() -> (usize, usize, Vec<crate::orphan::Victim>) {
     let sessions = sweep_dir(&registry_dir());
     let watchdogs = reap_orphan_watchdogs();
@@ -674,7 +674,7 @@ fn sweep_dir(dir: &Path) -> usize {
         let owner = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_prefix("amux-session-"))
+            .and_then(|n| n.strip_prefix("atrium-session-"))
             .and_then(|n| n.strip_suffix(".pids"))
             .and_then(|n| n.parse::<u32>().ok());
         let Some(owner) = owner else { continue };
@@ -701,9 +701,9 @@ fn sweep_dir(dir: &Path) -> usize {
     cleaned
 }
 
-/// Re-exec amux as a detached watchdog for this session.
+/// Re-exec atrium as a detached watchdog for this session.
 ///
-/// The watchdog is amux's child, so when amux dies — however it dies — the
+/// The watchdog is atrium's child, so when atrium dies — however it dies — the
 /// watchdog is reparented to `init` and keeps running long enough to notice and
 /// clean up. It ignores SIGHUP so a closed terminal window cannot take down the
 /// very process meant to survive that window.
@@ -723,10 +723,10 @@ pub fn spawn_watchdog(registry: &Path) -> io::Result<std::process::Child> {
                 .into_iter()
                 .collect::<Vec<_>>(),
         )
-        // The death signal: amux keeps the write end of this pipe for its whole
+        // The death signal: atrium keeps the write end of this pipe for its whole
         // life and never writes to it. The caller MUST hold the returned Child
         // (and thus its stdin) alive, or the pipe closes immediately and the
-        // watchdog fires while amux is still running.
+        // watchdog fires while atrium is still running.
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -783,14 +783,14 @@ mod tests {
     /// would signal the process groups named by every live registry on the host.
     #[test]
     fn a_dead_owners_registry_is_swept() {
-        let dir = std::env::temp_dir().join(format!("amux-sweep-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atrium-sweep-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // No pgid lines, so nothing is signalled - this test is about the file.
         let dead = std::process::id() + 1_000_000; // never a live pid
-        let stale = dir.join(format!("amux-session-{dead}.pids"));
+        let stale = dir.join(format!("atrium-session-{dead}.pids"));
         std::fs::write(&stale, "policy=plan\n").unwrap();
         // A live owner's registry must survive the same sweep.
-        let mine = dir.join(format!("amux-session-{}.pids", std::process::id()));
+        let mine = dir.join(format!("atrium-session-{}.pids", std::process::id()));
         std::fs::write(&mine, "policy=plan\n").unwrap();
 
         assert_eq!(sweep_dir(&dir), 1, "exactly the dead owner's registry");
@@ -804,16 +804,16 @@ mod tests {
 
     /// The registry must survive exactly the teardown that proved it is needed.
     ///
-    /// This was one unconditional `remove_file`: amux computed `survivors`,
+    /// This was one unconditional `remove_file`: atrium computed `survivors`,
     /// deleted the file anyway, and the watchdog woke to an empty list. Revert
     /// `settle_registry` to that (`let _ = fs::remove_file(path); !survivors
     /// .is_empty()`) and the second half of this test fails — the file is gone
     /// and `read_registry` hands the watchdog nothing to kill.
     #[test]
     fn a_teardown_with_survivors_keeps_the_record_the_watchdog_needs() {
-        let dir = std::env::temp_dir().join(format!("amux-settle-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("atrium-settle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("amux-session-1.pids");
+        let path = dir.join("atrium-session-1.pids");
 
         // Clean teardown: nothing survived, so nothing is left behind.
         write_registry(&path, &[101, 102], "plan").unwrap();

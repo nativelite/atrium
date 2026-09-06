@@ -1,11 +1,11 @@
 //! Mass-spawn: open **N agent panes at once** in one balanced-grid window.
 //!
-//! amux's own `-n <N>` / `--grid <R>x<C>` flags are stripped off the front —
+//! atrium's own `-n <N>` / `--grid <R>x<C>` flags are stripped off the front —
 //! after `--identity` (see [`crate::identity::parse`]), before the hosted
 //! command begins — exactly the way the identity flag is. The first non-flag
 //! token starts the child; a later `-n` that belongs to the hosted program is
 //! never eaten. The grammar is
-//! `amux [--identity <name>] [-n <N> | --grid <R>x<C>] <command...>`.
+//! `atrium [--identity <name>] [-n <N> | --grid <R>x<C>] <command...>`.
 //!
 //! This module owns the two *pure* seams so the wiring is testable without a
 //! pty or a layout tree:
@@ -67,13 +67,13 @@ impl Grid {
     }
 }
 
-/// Extract amux's own `-n <N>` / `--grid <R>x<C>` flag from the front-loaded
+/// Extract atrium's own `-n <N>` / `--grid <R>x<C>` flag from the front-loaded
 /// argument vector (which [`crate::identity::parse`] has already stripped of
 /// `--identity`). Returns the requested [`Grid`] (if any) and the remaining
 /// vector — the hosted command and its args, untouched — or an `Err(msg)` with
 /// a clear reason for a bad value.
 ///
-/// Like the identity flag, the count/grid flag is amux's, so it is recognized
+/// Like the identity flag, the count/grid flag is atrium's, so it is recognized
 /// only as a *leading* option before the hosted command begins. The first
 /// non-flag token starts the command; everything from there is the child's, so
 /// a later `-n` the hosted program takes is never eaten.
@@ -114,7 +114,7 @@ pub fn parse(args: &[String]) -> Result<(Option<Grid>, Vec<String>), String> {
                 i += 1;
             }
             // First non-flag token: the hosted command starts here. Stop parsing
-            // amux options so the child owns the rest verbatim.
+            // atrium options so the child owns the rest verbatim.
             _ => return Ok((grid, args[i..].to_vec())),
         }
     }

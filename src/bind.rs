@@ -1,6 +1,6 @@
 //! The binder: pane session ids × live sessions → each pane's agent status.
 //!
-//! amux injects `--session-id <uuid>` when it launches an agent pane (§3.3 of
+//! atrium injects `--session-id <uuid>` when it launches an agent pane (§3.3 of
 //! the 0.3 design) and remembers that uuid on the pane. The transcript stem *is*
 //! the session id, so binding a pane to its agent's status collapses to an O(1)
 //! lookup: find the [`agsess::AgentSession`] whose `id` equals the pane's uuid
@@ -9,7 +9,7 @@
 //! This module is that lookup and nothing more — a **pure function** over the
 //! remembered ids and a `&[agsess::AgentSession]` snapshot, free of I/O so it is
 //! testable without a real `World`. A pane with no uuid (a shell, or an agent
-//! amux did not launch with the flag) never binds; a uuid with no matching
+//! atrium did not launch with the flag) never binds; a uuid with no matching
 //! transcript yet stays unbound until the file appears; a binding clears the
 //! moment the pane leaves the input set (its child exited).
 //!
@@ -19,9 +19,9 @@
 //! is then unit-tested against a trivial in-test stand-in — no real `World`, no
 //! I/O — while the app calls it with real sessions.
 
-/// The command file-stems amux treats as agents worth hosting with agent-aware
+/// The command file-stems atrium treats as agents worth hosting with agent-aware
 /// chrome (§3.3 step 0): status binding, layout, identity-env injection, and the
-/// `ctl` spawn allowlist. Claude Code plus the other agent CLIs amux can host. A
+/// `ctl` spawn allowlist. Claude Code plus the other agent CLIs atrium can host. A
 /// set so a new vendor is one entry, not a branch.
 ///
 /// Membership here is deliberately broad — it only says "this pane is an agent,
@@ -30,24 +30,24 @@
 pub const AGENT_STEMS: &[&str] = &["claude", "gemini", "codex", "aider", "cursor-agent"];
 
 /// The subset of [`AGENT_STEMS`] that speak Claude Code's CLI dialect. The flags
-/// amux injects at spawn — `--session-id`, the trust-posture flags
+/// atrium injects at spawn — `--session-id`, the trust-posture flags
 /// (`--permission-mode`, `--dangerously-skip-permissions`), and
 /// `--append-system-prompt` — plus the `~/.claude.json` folder-trust gate are all
 /// Claude-specific. Passing them to another vendor's CLI would break its launch,
-/// so amux only adds them for a claude stem. Every other agent launches with its
+/// so atrium only adds them for a claude stem. Every other agent launches with its
 /// command untouched and stays **unbound** (no status chrome) until per-vendor
 /// transcript/status parsing lands in `agsess` — see the board note for that
 /// deeper work.
 pub const CLAUDE_STEMS: &[&str] = &["claude"];
 
-/// Command flags that mean the *user* already chose a session identity, so amux
+/// Command flags that mean the *user* already chose a session identity, so atrium
 /// must not inject its own `--session-id` (it would override or conflict). Covers
 /// an explicit id (`--session-id`), a resume (`--resume`/`-r`), and a continue
 /// (`--continue`/`-c`).
 const USER_SESSION_ARGS: &[&str] = &["--session-id", "--resume", "-r", "--continue", "-c"];
 
 /// Is this pane an agent worth binding? True iff the `file_stem` of the command
-/// (its title, as amux already derives it) is in [`AGENT_STEMS`]. Non-agent
+/// (its title, as atrium already derives it) is in [`AGENT_STEMS`]. Non-agent
 /// panes (shells, editors) are never bound and never get agent chrome.
 pub fn is_agent_stem(stem: &str) -> bool {
     AGENT_STEMS.contains(&stem)
@@ -68,7 +68,7 @@ pub fn is_claude_stem(stem: &str) -> bool {
 /// `std::path::Path::file_stem` only treats `\` as a separator on Windows, so a
 /// Windows-authored fleet command like `C:\tools\claude.cmd` yields the stem
 /// `C:\tools\claude` on macOS/Linux — and the pane is then not recognized as an
-/// agent (no status chrome, no `--session-id`, no identity injection). amux fleet
+/// agent (no status chrome, no `--session-id`, no identity injection). atrium fleet
 /// configs are shared across platforms, so we split on **both** `/` and `\` on
 /// every OS, take the last component, then drop a single trailing extension.
 /// `claude`, `claude.exe`, `claude.cmd`, `C:\x\claude.exe`, and `/usr/bin/claude`
@@ -85,9 +85,9 @@ pub fn command_stem(cmd: &str) -> String {
     }
 }
 
-/// Did the user already pass a session-selecting flag? If so amux leaves the
+/// Did the user already pass a session-selecting flag? If so atrium leaves the
 /// command untouched — the user owns that id (a `--resume` reopens a transcript
-/// whose stem is the user's, not one amux minted), so no `--session-id` inject.
+/// whose stem is the user's, not one atrium minted), so no `--session-id` inject.
 pub fn has_user_session_arg(args: &[String]) -> bool {
     args.iter().any(|a| {
         USER_SESSION_ARGS.contains(&a.as_str())
@@ -98,7 +98,7 @@ pub fn has_user_session_arg(args: &[String]) -> bool {
     })
 }
 
-/// Decide whether amux should inject `--session-id <uuid>` for a pane launching
+/// Decide whether atrium should inject `--session-id <uuid>` for a pane launching
 /// `command`, and if so return the fresh uuid to inject and remember. `command`
 /// is the *user's* command vector (`command[0]` is the program, the rest args),
 /// before any Windows `cmd /C` shim wrapping — the agent decision is about what
@@ -140,8 +140,8 @@ impl Bindable for agsess::AgentSession {
 
 /// Resolve one pane's agent status from the live session snapshot.
 ///
-/// `pane_id` is the uuid amux injected at spawn, or `None` for a non-agent pane
-/// (a shell) or an agent pane amux did not bind. Returns `Some(status)` only
+/// `pane_id` is the uuid atrium injected at spawn, or `None` for a non-agent pane
+/// (a shell) or an agent pane atrium did not bind. Returns `Some(status)` only
 /// when a session whose id equals `pane_id` exists in `sessions`; otherwise
 /// `None` — the pane stays unbound and wears its local `PaneState` chrome.
 pub fn status_for<S: Bindable>(pane_id: Option<&str>, sessions: &[S]) -> Option<agsess::Status> {
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn binding_clears_when_the_pane_leaves_the_input_set() {
-        // Model a pane whose child exited: amux stops passing its uuid (None),
+        // Model a pane whose child exited: atrium stops passing its uuid (None),
         // so even though the transcript still lingers in the snapshot, the pane
         // no longer binds. This is the pure contract that only a live pane's id
         // can bind; the run loop drops exited panes so their id never arrives.
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn windows_style_path_stem_is_recognized_as_agent() {
-        // amux derives the title from the command stem; the inject decision must
+        // atrium derives the title from the command stem; the inject decision must
         // too. Both a Windows-style path and a Unix path resolve to `claude` on
         // EVERY host (this failed on macOS while the stem used Path::file_stem,
         // which keeps the backslashes off-Windows).
@@ -289,7 +289,7 @@ mod tests {
         for stem in ["gemini", "codex", "aider", "cursor-agent"] {
             assert!(is_agent_stem(stem), "{stem} should be an agent");
         }
-        // …including from a full path, exactly as amux derives the title.
+        // …including from a full path, exactly as atrium derives the title.
         assert!(is_agent_stem(
             std::path::Path::new("/usr/local/bin/gemini")
                 .file_stem()
@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn non_claude_agents_get_no_session_id() {
         // Recognized as agents, but their CLI does not understand `--session-id`,
-        // so amux must not mint one — they launch with the command untouched.
+        // so atrium must not mint one — they launch with the command untouched.
         assert_eq!(session_id_for(&cmd(&["gemini"])), None);
         assert_eq!(session_id_for(&cmd(&["codex", "--model", "o1"])), None);
         assert_eq!(session_id_for(&cmd(&["aider"])), None);

@@ -1,12 +1,12 @@
 //! A zero-dependency, non-cryptographic v4 UUID generator.
 //!
-//! amux binds each agent pane to the transcript its CLI writes by minting a
+//! atrium binds each agent pane to the transcript its CLI writes by minting a
 //! fresh session id and passing it as `claude --session-id <uuid>` (§3.3 of the
 //! 0.3 design). That id is an **identifier, not a secret** — uniqueness is all
 //! that is required, and the format must be a syntactically valid v4 UUID so the
 //! CLI accepts it and names its transcript `<uuid>.jsonl`.
 //!
-//! amux has no RNG crate (zero third-party deps), so entropy is assembled from
+//! atrium has no RNG crate (zero third-party deps), so entropy is assembled from
 //! std only: the wall clock's nanoseconds, a process-lifetime atomic counter (so
 //! two ids minted in the same nanosecond still differ), and the per-process seed
 //! behind [`std::collections::hash_map::RandomState`] (hashed, to spread bits).
@@ -73,7 +73,7 @@ pub fn v4() -> String {
 
 /// Mint an unguessable **capability token**: 32 bytes of OS entropy, hex-encoded
 /// to a 64-char string. Unlike [`v4`], this **is a secret** — it is the per-pane
-/// `AMUX_TOKEN` the ctl server matches to authenticate a request, so it must be
+/// `ATRIUM_TOKEN` the ctl server matches to authenticate a request, so it must be
 /// unpredictable, not merely unique.
 ///
 /// Entropy comes straight from the OS CSPRNG (`BCryptGenRandom` on Windows,

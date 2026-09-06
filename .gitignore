@@ -1,5 +1,5 @@
 /target
-# Cargo.lock is committed: amux is an application (a binary), so a pinned,
+# Cargo.lock is committed: atrium is an application (a binary), so a pinned,
 # reproducible dependency graph is checked in for outsider builds. (Library
 # crates in the org still gitignore theirs.) Updating an org-crate dep now means
 # `cargo update -p <crate>` + committing the refreshed Cargo.lock.

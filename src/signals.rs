@@ -1,7 +1,7 @@
 //! Termination-signal disposition — so a terminal that goes away does not
 //! orphan the agents.
 //!
-//! amux already tears its panes down correctly: when the event loop exits, it
+//! atrium already tears its panes down correctly: when the event loop exits, it
 //! kills every pane's pty. The problem was that only a *graceful* exit reached
 //! that code. A closed terminal window sends `SIGHUP`, whose default action
 //! terminates the process outright — the loop never unwinds, the teardown never
@@ -75,7 +75,7 @@ mod sys {
                 // exists to fix. Warn on stderr: `install()` runs at the top of
                 // main, before raw mode, so the line is readable.
                 eprintln!(
-                    "amux: warning: could not install a handler for signal {sig}; \
+                    "atrium: warning: could not install a handler for signal {sig}; \
                      agents may survive if this session is terminated"
                 );
             }

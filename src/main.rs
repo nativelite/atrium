@@ -1,8 +1,8 @@
-//! The amux binary: a dual-mode run loop — passthrough (0.1) and tiled (0.2).
+//! The atrium binary: a dual-mode run loop — passthrough (0.1) and tiled (0.2).
 //!
-//!     amux                      # panes run your shell (COMSPEC / $SHELL)
-//!     amux claude               # panes run `claude`
-//!     amux claude --continue    # any command + args
+//!     atrium                      # panes run your shell (COMSPEC / $SHELL)
+//!     atrium claude               # panes run `claude`
+//!     atrium claude --continue    # any command + args
 //!
 //! Ctrl+A then: c new window, n/p cycle, 1-9 switch windows, x kill focused
 //! pane, q quit; `"`/`%` split the focused pane, h/j/k/l or arrows move focus,
@@ -21,9 +21,9 @@
 //! changed bytes. Zoom is the escape hatch back to perfect fidelity for a TUI
 //! that the emulator can't render pixel-exact (wide glyphs, sixel, mouse).
 
-use amux::bar::{bar_paint, PaneInfo};
-use amux::input::{Action, Dir, PrefixScanner};
-use amux::layout::{self, Tree};
+use atrium::bar::{bar_paint, PaneInfo};
+use atrium::input::{Action, Dir, PrefixScanner};
+use atrium::layout::{self, Tree};
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -39,19 +39,19 @@ pub(crate) use overview::*;
 pub(crate) use panels::*;
 pub(crate) use tiled::*;
 
-/// A process-global, monotonic **agent id** stamped on every pane amux hosts —
+/// A process-global, monotonic **agent id** stamped on every pane atrium hosts —
 /// the stable key of the ctl spawn tree (`Pane.id` is only unique within a
 /// window; this is unique across the whole run). Incremented once per spawn.
 static NEXT_AGENT: AtomicUsize = AtomicUsize::new(0);
 
 /// The ctl channel address, set once at startup iff `--allow-ctl` was given.
-/// The spawn path reads it to inject `AMUX_CTL`/`AMUX_PANE` into each pane so an
-/// agent inside can drive `amux ctl`. `None` (unset) ⇒ ctl is off and every
-/// spawn is byte-identical to pre-ctl amux.
+/// The spawn path reads it to inject `ATRIUM_CTL`/`ATRIUM_PANE` into each pane so an
+/// agent inside can drive `atrium ctl`. `None` (unset) ⇒ ctl is off and every
+/// spawn is byte-identical to pre-ctl atrium.
 static CTL_ADDRESS: OnceLock<String> = OnceLock::new();
 /// Set when the ancestry cap lowered this session's posture. The cap runs in
 /// `main`, before the bus exists, so the notice is parked here and raised as a
-/// decision on the first loop tick - an agent quietly launching its own amux is
+/// decision on the first loop tick - an agent quietly launching its own atrium is
 /// something the operator should be asked about, not just told once on stderr.
 static CAP_NOTICE: OnceLock<String> = OnceLock::new();
 /// How often the warden re-reads what it snapshotted. Slow on purpose: a
@@ -59,13 +59,13 @@ static CAP_NOTICE: OnceLock<String> = OnceLock::new();
 const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Bind the per-process ctl endpoint and publish its address to [`CTL_ADDRESS`]
-/// so every pane spawned afterward is born with `AMUX_CTL`/`AMUX_PANE` in its
-/// env. Returns the [`amux::ipc::Listener`] to poll, or `None` on a bind failure
+/// so every pane spawned afterward is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
+/// env. Returns the [`atrium::ipc::Listener`] to poll, or `None` on a bind failure
 /// (surfaced in the bar, non-fatal). `CTL_ADDRESS` is a `OnceLock`, so only the
 /// first successful bind per process publishes the address.
-fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<amux::ipc::Listener> {
-    let addr = amux::ipc::default_address();
-    match amux::ipc::Listener::bind(&addr) {
+fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<atrium::ipc::Listener> {
+    let addr = atrium::ipc::default_address();
+    match atrium::ipc::Listener::bind(&addr) {
         Ok(l) => {
             let _ = CTL_ADDRESS.set(addr);
             Some(l)
@@ -80,31 +80,31 @@ fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<amux::ipc::Listener
 }
 
 /// Set once at startup from the `--trust` / `--skip-permissions` flags: how much
-/// amux relaxes the permission posture of every agent pane it spawns. Encoded as
+/// atrium relaxes the permission posture of every agent pane it spawns. Encoded as
 /// `0=Off`, `1=Edits` (`--trust`: acceptEdits + safe allowlist), `2=Skip`
 /// (`--skip-permissions`: full bypass). Read by the spawn path
 /// (`spawn_pane_full`) via [`trust_mode`].
 static AGENT_TRUST: AtomicU8 = AtomicU8::new(0);
 
 /// Decode [`AGENT_TRUST`] into the typed mode.
-fn trust_mode() -> amux::ctl::TrustMode {
+fn trust_mode() -> atrium::ctl::TrustMode {
     match AGENT_TRUST.load(Ordering::Relaxed) {
-        1 => amux::ctl::TrustMode::Edits,
-        2 => amux::ctl::TrustMode::Skip,
-        3 => amux::ctl::TrustMode::Plan,
-        4 => amux::ctl::TrustMode::Auto,
-        _ => amux::ctl::TrustMode::Off,
+        1 => atrium::ctl::TrustMode::Edits,
+        2 => atrium::ctl::TrustMode::Skip,
+        3 => atrium::ctl::TrustMode::Plan,
+        4 => atrium::ctl::TrustMode::Auto,
+        _ => atrium::ctl::TrustMode::Off,
     }
 }
 
 /// Publish the launch trust mode to the spawn path.
-fn set_trust_mode(m: amux::ctl::TrustMode) {
+fn set_trust_mode(m: atrium::ctl::TrustMode) {
     let code = match m {
-        amux::ctl::TrustMode::Off => 0,
-        amux::ctl::TrustMode::Edits => 1,
-        amux::ctl::TrustMode::Skip => 2,
-        amux::ctl::TrustMode::Plan => 3,
-        amux::ctl::TrustMode::Auto => 4,
+        atrium::ctl::TrustMode::Off => 0,
+        atrium::ctl::TrustMode::Edits => 1,
+        atrium::ctl::TrustMode::Skip => 2,
+        atrium::ctl::TrustMode::Plan => 3,
+        atrium::ctl::TrustMode::Auto => 4,
     };
     AGENT_TRUST.store(code, Ordering::Relaxed);
 }
@@ -113,7 +113,7 @@ fn next_agent_id() -> usize {
     NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// DEC synchronized-output (private mode 2026). amux wraps each composited frame
+/// DEC synchronized-output (private mode 2026). atrium wraps each composited frame
 /// it emits to the *real* terminal in these markers, so the outer terminal paints
 /// the whole frame (all tiled panes + the bar) atomically instead of showing it
 /// half-drawn — that half-drawn frame is the tiled "shutter". This is the emit
@@ -152,7 +152,7 @@ fn term_blank(t: &vterm::Term) -> bool {
 
 /// True if `bytes` contains a full-screen erase (`ESC[2J` or `ESC[3J`). Unlike a
 /// scroll, `2J`/`3J` ignore the scroll region and wipe the whole screen — the bar
-/// row included — so amux must repaint the bar after one.
+/// row included — so atrium must repaint the bar after one.
 fn clears_screen(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
 }
@@ -222,8 +222,8 @@ const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
 /// deliver anyway once the send has waited this long, so a queue never wedges.
 const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
 
-/// Max height (rows) of a spurious "shrink" amux ignores in the resize poll: the
-/// Windows Terminal ConPTY reports a few rows fewer once amux is on the alternate
+/// Max height (rows) of a spurious "shrink" atrium ignores in the resize poll: the
+/// Windows Terminal ConPTY reports a few rows fewer once atrium is on the alternate
 /// screen, and adopting it leaves a strip of stale content below the bar. A
 /// height-only shrink no larger than this is treated as that reservation, not a
 /// real resize. Generous enough to cover the observed reserve, small enough that a
@@ -265,7 +265,7 @@ fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
 }
 
 /// The **human** controls everything (Decision 3). A caller is human-privileged
-/// when it has no attributed pane, or when its pane is a *root* (one amux opened,
+/// when it has no attributed pane, or when its pane is a *root* (one atrium opened,
 /// `parent == None`, depth 0) — i.e. where the operator sits. A spawned worker
 /// (depth > 0) is scoped to its own subtree.
 fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
@@ -280,44 +280,44 @@ fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
     privilege_for(caller, pane_parent)
 }
 
-/// Lower `trust` to the ceiling of the amux session this one is nested under.
+/// Lower `trust` to the ceiling of the atrium session this one is nested under.
 ///
 /// Used by EVERY entry point that starts a session. It first lived inline in the
-/// single-pane path, which meant `amux fleet up X --trust skip` sailed straight
+/// single-pane path, which meant `atrium fleet up X --trust skip` sailed straight
 /// past it: `fleet` is dispatched before that code ever runs. An agent in a pane
 /// could escape the ceiling by launching a fleet instead of a pane - the ceiling
 /// held for one door and not the other.
-fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMode {
-    // A pane cannot escape its session's posture by launching its own amux.
+fn cap_trust_to_ancestor(mut trust: atrium::ctl::TrustMode) -> atrium::ctl::TrustMode {
+    // A pane cannot escape its session's posture by launching its own atrium.
     //
     // The ceiling hangs off process ANCESTRY, not the environment. An agent owns
-    // its environment, so an `AMUX_AGENT=1` marker or an inherited policy var
+    // its environment, so an `ATRIUM_AGENT=1` marker or an inherited policy var
     // dies to `env -u`; and it owns a spawned child's stdin, so it can answer the
     // skip confirmation just below on its own behalf. It cannot unset its own
     // parent. A double-fork still erases the trail - that case belongs to the
     // warden, which watches for sessions the cap could not account for.
-    match amux::warden::amux_ancestor() {
-        amux::warden::Ancestry::Amux(parent) => {
-            let inherited = amux::reap::read_policy(&amux::reap::registry_path(parent))
-                .and_then(|p| amux::ctl::TrustMode::from_policy_keyword(&p));
+    match atrium::warden::atrium_ancestor() {
+        atrium::warden::Ancestry::Atrium(parent) => {
+            let inherited = atrium::reap::read_policy(&atrium::reap::registry_path(parent))
+                .and_then(|p| atrium::ctl::TrustMode::from_policy_keyword(&p));
             // An UNREADABLE policy is not an absent ceiling. We know from the
             // kernel that we are nested; if the parent's registry has been deleted
             // or corrupted we still must not exceed a ceiling we cannot see. This
             // used to fall through with no cap at all, so `rm
-            // /tmp/amux-session-<parent>.pids` - one command, no double-fork, from
+            // /tmp/atrium-session-<parent>.pids` - one command, no double-fork, from
             // a pane running as the same uid - turned the ceiling off. Plan is the
             // safest posture that still leaves the session usable, and the warden
             // reports the deletion separately.
             let (ceiling, why) = match inherited {
                 Some(c) => (c, "whose session policy is"),
                 None => (
-                    amux::ctl::TrustMode::Plan,
+                    atrium::ctl::TrustMode::Plan,
                     "whose session policy could not be read, so the safe floor is",
                 ),
             };
             if trust.rank() > ceiling.rank() {
                 eprintln!(
-                    "amux: capped to {} - running inside another amux (pid {}) {} {}. \
+                    "atrium: capped to {} - running inside another atrium (pid {}) {} {}. \
                      A pane cannot raise its own posture; set it at the outer launch.",
                     ceiling.policy_label(),
                     parent,
@@ -325,7 +325,7 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
                     ceiling.policy_label()
                 );
                 let _ = CAP_NOTICE.set(format!(
-                    "a pane launched its own amux (pid {}) and was capped to {}",
+                    "a pane launched its own atrium (pid {}) and was capped to {}",
                     parent,
                     ceiling.policy_label()
                 ));
@@ -335,24 +335,24 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
         // The walk did not complete: no process table, or a hop whose executable
         // could not be identified. We cannot invent a ceiling - there may be no
         // parent at all, and capping every launch on an unreadable table would
-        // break amux in a bare terminal on any host where the probe fails. So the
+        // break atrium in a bare terminal on any host where the probe fails. So the
         // posture is left alone and the operator is told, which is the difference
         // between "cannot read a known parent's policy" (cap, above) and "cannot
         // tell whether a parent exists" (report, here).
-        amux::warden::Ancestry::Unknown => {
+        atrium::warden::Ancestry::Unknown => {
             eprintln!(
-                "amux: could not determine whether this session is nested inside \
-                 another amux; no ceiling was applied."
+                "atrium: could not determine whether this session is nested inside \
+                 another atrium; no ceiling was applied."
             );
             let _ = CAP_NOTICE.set(
                 "could not determine whether this session is nested inside another \
-                 amux, so no ceiling was applied"
+                 atrium, so no ceiling was applied"
                     .to_string(),
             );
         }
         // A top-level session, or a platform with no implementation (Windows -
-        // see `warden::amux_ancestor`, where that gap is written down).
-        amux::warden::Ancestry::NoneFound | amux::warden::Ancestry::Unsupported => {}
+        // see `warden::atrium_ancestor`, where that gap is written down).
+        atrium::warden::Ancestry::NoneFound | atrium::warden::Ancestry::Unsupported => {}
     }
     trust
 }
@@ -368,7 +368,7 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
 ///    mass-spawned session was classified as the operator. An agent could then
 ///    ask for `skip` — a full permission bypass — in a session the human had
 ///    deliberately set to `plan`.
-/// 2. amux's own documentation calls `--trust` "the mode spawned agents run in,
+/// 2. atrium's own documentation calls `--trust` "the mode spawned agents run in,
 ///    and the ceiling they are capped at". A ceiling that a pane can exceed is
 ///    not a ceiling, and the human cannot tell from the outside which panes could.
 ///
@@ -378,9 +378,9 @@ fn cap_trust_to_ancestor(mut trust: amux::ctl::TrustMode) -> amux::ctl::TrustMod
 /// where it is a visible, deliberate choice rather than something a pane can
 /// request. Returns the effective mode and a note when a request was capped.
 fn effective_mode(
-    requested: Option<amux::ctl::TrustMode>,
-    policy: amux::ctl::TrustMode,
-) -> (amux::ctl::TrustMode, Option<String>) {
+    requested: Option<atrium::ctl::TrustMode>,
+    policy: atrium::ctl::TrustMode,
+) -> (atrium::ctl::TrustMode, Option<String>) {
     match requested {
         None => (policy, None),
         Some(req) if req.rank() <= policy.rank() => (req, None),
@@ -406,7 +406,7 @@ fn privilege_for(caller: Option<usize>, pane_parent: Option<Option<usize>>) -> b
     match caller {
         // No authenticated caller is NOT the operator. This arm used to return
         // `true`, which inverted the gate: holding no credential granted strictly
-        // more than holding a worker's, so `env -u AMUX_TOKEN amux ctl ...`
+        // more than holding a worker's, so `env -u ATRIUM_TOKEN atrium ctl ...`
         // promoted you. `caller` is derived from the capability token, never
         // self-reported, so `None` means exactly "unauthenticated" and must be
         // the least trusted state, not the most.
@@ -427,40 +427,40 @@ pub(crate) struct Pane {
     pub(crate) id: usize,
     pub(crate) pty: pty::Pty,
     pub(crate) term: vterm::Term,
-    pub(crate) filter: amux::filter::Passthrough,
+    pub(crate) filter: atrium::filter::Passthrough,
     pub(crate) title: String,
     pub(crate) activity: bool,
     pub(crate) exited: bool,
-    /// The session id amux injected via `--session-id` when this pane is an
-    /// agent it launched (§3.3). `None` for shells and agents amux did not
+    /// The session id atrium injected via `--session-id` when this pane is an
+    /// agent it launched (§3.3). `None` for shells and agents atrium did not
     /// bind. The binder maps this to the pane's live `agsess::Status`.
     pub(crate) session_id: Option<String>,
-    /// When amux launched this pane (epoch ms, agsess clock). Used to *adopt* a
-    /// session for a non-claude agent pane: amux cannot hand it a `--session-id`,
+    /// When atrium launched this pane (epoch ms, agsess clock). Used to *adopt* a
+    /// session for a non-claude agent pane: atrium cannot hand it a `--session-id`,
     /// so after launch it associates the pane with the newest session discovered
     /// under the vendor's root *at or after* this instant (see
-    /// [`amux::vendors::adopt_session_for`]).
+    /// [`atrium::vendors::adopt_session_for`]).
     pub(crate) launch_ms: u64,
     /// The working directory this pane's agent was launched in, if known. A tie-
     /// breaker for session adoption (prefer a discovered session whose `cwd`
-    /// matches). `None` for panes opened in amux's own cwd.
+    /// matches). `None` for panes opened in atrium's own cwd.
     pub(crate) cwd: Option<String>,
     /// The credential identity **name** this pane's agent runs under, if any
     /// (path B). Only the name is stored — never the resolved secret. On every
-    /// spawn amux re-resolves the env via `akey` and injects it for that child
+    /// spawn atrium re-resolves the env via `akey` and injects it for that child
     /// alone; the resolved values live only for the spawn call and are dropped
     /// immediately. Surfaced in the chrome as a `·<name>` tag.
     pub(crate) identity: Option<String>,
     /// Process-global agent id (see [`NEXT_AGENT`]): the ctl spawn-tree key,
-    /// stable across windows. Injected into the pane as `AMUX_PANE` so an agent
+    /// stable across windows. Injected into the pane as `ATRIUM_PANE` so an agent
     /// inside can attribute its own `ctl spawn` calls.
     pub(crate) agent_id: usize,
     /// The pane's **capability token** — an unguessable secret injected into its
-    /// env as `AMUX_TOKEN` and matched by the ctl server to authenticate requests
+    /// env as `ATRIUM_TOKEN` and matched by the ctl server to authenticate requests
     /// from this pane (identity comes from the token, not the self-reported
-    /// `AMUX_PANE`). Empty for panes spawned before the ctl endpoint existed.
+    /// `ATRIUM_PANE`). Empty for panes spawned before the ctl endpoint existed.
     /// The pane's capability token, or `None` when OS entropy was unavailable at
-    /// spawn and amux refused to mint a guessable one. `None` must never
+    /// spawn and atrium refused to mint a guessable one. `None` must never
     /// authenticate: a pane without a token has no ctl access, by construction.
     pub(crate) token: Option<String>,
     /// The ctl role label this pane was spawned under (`dev_1`), if any. `None`
@@ -473,7 +473,7 @@ pub(crate) struct Pane {
     /// ctl-spawned worker. The `--max-depth` recursion guard is checked against
     /// this.
     pub(crate) depth: usize,
-    /// May this pane create teammates with `amux ctl spawn`?
+    /// May this pane create teammates with `atrium ctl spawn`?
     ///
     /// A capability, not an inference. It used to be implied by having ctl access
     /// at all, so every agent in a fleet could spawn - in a seven-agent review
@@ -528,41 +528,43 @@ impl Window {
 
 fn main() -> ExitCode {
     // Before anything else: a closed terminal window (SIGHUP) must reach the
-    // event loop's normal exit, not kill amux where it stands and orphan every
+    // event loop's normal exit, not kill atrium where it stands and orphan every
     // hosted agent onto `init`. Installed here so every path — single pane,
     // mass-spawn, `fleet up` — is covered.
-    amux::signals::install();
+    atrium::signals::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // Watchdog mode: a re-exec of amux that outlives this session and cleans up
+    // Watchdog mode: a re-exec of atrium that outlives this session and cleans up
     // if it dies in a way no handler can catch (SIGKILL, panic, OOM). Dispatched
     // before anything else — it must never touch the terminal.
-    if args.first().map(String::as_str) == Some(amux::reap::WATCHDOG_FLAG) {
+    if args.first().map(String::as_str) == Some(atrium::reap::WATCHDOG_FLAG) {
         let parent: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
         let registry = args.get(2).map(std::path::PathBuf::from);
         // The owner's session key, optional so an argv from an older build still
         // starts a watchdog (it just has nothing but the registry to go on).
-        let session = args.get(3).and_then(|s| amux::orphan::SessionKey::parse(s));
+        let session = args
+            .get(3)
+            .and_then(|s| atrium::orphan::SessionKey::parse(s));
         match (parent, registry) {
             (0, _) | (_, None) => return ExitCode::FAILURE,
             (parent, Some(reg)) => {
-                amux::reap::ignore_terminal_signals();
-                amux::reap::watchdog_main(parent, &reg, session);
+                atrium::reap::ignore_terminal_signals();
+                atrium::reap::watchdog_main(parent, &reg, session);
                 return ExitCode::SUCCESS;
             }
         }
     }
-    // `amux reap` cleans up after sessions that are already gone — a crash, or a
+    // `atrium reap` cleans up after sessions that are already gone — a crash, or a
     // session from before any of this existed.
     if args.first().map(String::as_str) == Some("reap") {
-        let (sessions, watchdogs, orphans) = amux::reap::reap_stale();
+        let (sessions, watchdogs, orphans) = atrium::reap::reap_stale();
         // Never silent about a kill: name every process group collected, and say
         // which owner it was orphaned by. An operator who runs this after losing
         // a machine's pty pool needs to see what it actually did.
         for v in &orphans {
-            println!("amux reap: killed orphaned pane group {v}");
+            println!("atrium reap: killed orphaned pane group {v}");
         }
         match (sessions, watchdogs, orphans.len()) {
-            (0, 0, 0) => println!("amux reap: nothing to clean up"),
+            (0, 0, 0) => println!("atrium reap: nothing to clean up"),
             (s, w, o) => {
                 let mut parts = Vec::new();
                 if s > 0 {
@@ -574,75 +576,75 @@ fn main() -> ExitCode {
                 if o > 0 {
                     parts.push(format!("{o} orphaned pane group(s)"));
                 }
-                println!("amux reap: cleaned up {}", parts.join(", "));
+                println!("atrium reap: cleaned up {}", parts.join(", "));
             }
         }
         return ExitCode::SUCCESS;
     }
-    // `amux fleet …` is its own command family (a saved roster of agents), not a
-    // hosted program — dispatch it before any of amux's flag parsing so `fleet`
+    // `atrium fleet …` is its own command family (a saved roster of agents), not a
+    // hosted program — dispatch it before any of atrium's flag parsing so `fleet`
     // and its subcommands are never mistaken for a command to host.
     if args.first().map(String::as_str) == Some("fleet") {
         return fleet_cmd(&args[1..]);
     }
-    // `amux ctl …` is the control-channel client: it connects to the running
-    // amux's `AMUX_CTL` endpoint, so it is a command family, not a hosted
+    // `atrium ctl …` is the control-channel client: it connects to the running
+    // atrium's `ATRIUM_CTL` endpoint, so it is a command family, not a hosted
     // program — dispatch it before flag parsing too.
     if args.first().map(String::as_str) == Some("ctl") {
-        return amux::ctl::ctl_cmd(&args[1..]);
+        return atrium::ctl::ctl_cmd(&args[1..]);
     }
-    // amux's own `--identity <name>` / `-I <name>` is stripped off the front,
+    // atrium's own `--identity <name>` / `-I <name>` is stripped off the front,
     // before the hosted command begins; it tags the initial agent pane and is
     // inherited by every split/new pane (stored, re-resolved per spawn). Only
     // the NAME is threaded through — never the resolved secret. We parse it
-    // *first* so amux's own meta-flags (`--help`, `--stdin-probe`) are still
-    // recognized when they follow an identity (`amux --identity work --help`).
-    let (identity, rest) = amux::identity::parse(&args);
-    // `--reap-orphans`: sweep this machine for pane groups whose amux is gone,
+    // *first* so atrium's own meta-flags (`--help`, `--stdin-probe`) are still
+    // recognized when they follow an identity (`atrium --identity work --help`).
+    let (identity, rest) = atrium::identity::parse(&args);
+    // `--reap-orphans`: sweep this machine for pane groups whose atrium is gone,
     // BEFORE taking the terminal, and print every one collected.
     //
     // Opt-in for this first release, deliberately. The sweep kills process
     // groups on evidence gathered from the machine, and the fail-safe direction
-    // is already "do not kill" (see `amux::orphan`), but a launch flag is not
+    // is already "do not kill" (see `atrium::orphan`), but a launch flag is not
     // where a wrong rule should first meet a user's machine. It also must never
     // be silent: a startup path that kills things without saying so is how the
     // last teardown bug stayed invisible for so long.
-    let (reap_orphans, rest) = amux::orphan::parse_flag(&rest);
+    let (reap_orphans, rest) = atrium::orphan::parse_flag(&rest);
     if reap_orphans {
-        for v in amux::orphan::sweep(None) {
-            eprintln!("amux: reaped orphaned pane group {v}");
+        for v in atrium::orphan::sweep(None) {
+            eprintln!("atrium: reaped orphaned pane group {v}");
         }
     }
     // `--version` / `-V`: the first thing anyone types when filing a bug, and
     // the last thing a release wants missing. It answers BEFORE the terminal is
     // taken — an unrecognized flag is otherwise treated as the command to host,
-    // so `amux --version` used to die on "stdin is not a terminal" when piped.
+    // so `atrium --version` used to die on "stdin is not a terminal" when piped.
     if matches!(
         rest.first().map(String::as_str),
         Some("--version") | Some("-V")
     ) {
-        println!("amux {}", env!("CARGO_PKG_VERSION"));
+        println!("atrium {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: amux [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
-             \x20      --reap-orphans: before starting, kill pane process groups whose amux is gone (prints each\n\
-             \x20               one). Off by default; `amux reap` does the same thing on its own.\n\
+            "usage: atrium [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+             \x20      --reap-orphans: before starting, kill pane process groups whose atrium is gone (prints each\n\
+             \x20               one). Off by default; `atrium reap` does the same thing on its own.\n\
              \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
              \x20               ceiling they are capped at (low→high: plan < accept < automode < skip):\n\
              \x20               `plan` read-only plan mode; `accept` (bare --trust) auto-accept edits + a safe\n\
              \x20               dev-command allowlist (build/test/run), anything else (curl, git push, rm outside\n\
              \x20               the dir) still prompts, visibly; `automode` claude's auto mode (hands-off edits +\n\
              \x20               commands with claude's guardrails); `skip` FULL bypass (--dangerously-skip-\n\
-             \x20               permissions, no gate — amux confirms it at launch). All pre-accept claude's\n\
-             \x20               folder-trust dialog. Extend the accept allowlist with AMUX_TRUST_ALLOW=\"a,b\".\n\
+             \x20               permissions, no gate — atrium confirms it at launch). All pre-accept claude's\n\
+             \x20               folder-trust dialog. Extend the accept allowlist with ATRIUM_TRUST_ALLOW=\"a,b\".\n\
              \x20               The policy is a CEILING for every caller: `ctl spawn --mode …` may match\n\
              \x20               it or de-escalate, never elevate. Raise it at launch, not mid-session.\n\
              \x20      --skip-permissions: alias for --trust skip.\n\
              \x20      --version, -V: print the version and exit.\n\
-             \x20      amux ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
-             \x20      (AMUX_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
+             \x20      atrium ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
+             \x20      (ATRIUM_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
              \x20      (mouse capture is OFF by default so text selection works; Ctrl+A m turns it on: click focuses a pane, wheel scrolls the hovered tile)"
         );
         return ExitCode::SUCCESS;
@@ -650,24 +652,24 @@ fn main() -> ExitCode {
     if rest.first().map(String::as_str) == Some("--stdin-probe") {
         return stdin_probe();
     }
-    // amux's own launch meta-flags (`--allow-ctl` / `--max-depth <N>` / `--trust`)
+    // atrium's own launch meta-flags (`--allow-ctl` / `--max-depth <N>` / `--trust`)
     // are stripped next — after `--identity`, before mass-spawn flags and the
     // hosted command. A bad `--max-depth` is a startup error, never a silent
     // fallback.
-    let (allow_ctl, max_depth, mut trust, rest) = match amux::ctl::parse_flags(&rest) {
+    let (allow_ctl, max_depth, mut trust, rest) = match atrium::ctl::parse_flags(&rest) {
         Ok(quad) => quad,
         Err(msg) => {
-            eprintln!("amux: {msg}");
+            eprintln!("atrium: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    // amux's own mass-spawn flags (`-n <N>` / `--grid <R>x<C>`) are stripped off
+    // atrium's own mass-spawn flags (`-n <N>` / `--grid <R>x<C>`) are stripped off
     // the front, after `--identity`, before the hosted command. A bad value is a
     // startup error, surfaced on stderr — never a silent fallback to one pane.
-    let (grid, rest) = match amux::spawn::parse(&rest) {
+    let (grid, rest) = match atrium::spawn::parse(&rest) {
         Ok(pair) => pair,
         Err(msg) => {
-            eprintln!("amux: {msg}");
+            eprintln!("atrium: {msg}");
             return ExitCode::FAILURE;
         }
     };
@@ -680,14 +682,14 @@ fn main() -> ExitCode {
     // the human confirm it once, in plain terms, *before* the TUI takes the
     // terminal (this reads stdin normally; the run loop takes raw mode after).
     trust = cap_trust_to_ancestor(trust);
-    if trust == amux::ctl::TrustMode::Skip && !confirm_skip_permissions() {
-        eprintln!("amux: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
+    if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
+        eprintln!("atrium: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
         return ExitCode::SUCCESS;
     }
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("amux: stdin/stdout must be a terminal: {e}");
+            eprintln!("atrium: stdin/stdout must be a terminal: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -707,12 +709,12 @@ fn main() -> ExitCode {
 /// Wait for the operator to acknowledge a fleet's banner before the TUI takes the
 /// screen. Returns false if they decline.
 ///
-/// Non-interactive callers (no tty on stdin, or `AMUX_YES=1`) proceed without
+/// Non-interactive callers (no tty on stdin, or `ATRIUM_YES=1`) proceed without
 /// asking - there is nobody to answer, and blocking a scripted launch forever is
 /// worse than not confirming it. The banner is still printed either way, so a log
 /// records what was granted.
 fn fleet_ack() -> bool {
-    if std::env::var_os("AMUX_YES").is_some() {
+    if std::env::var_os("ATRIUM_YES").is_some() {
         return true;
     }
     // SAFETY: isatty on a borrowed fd, no ownership taken.
@@ -725,7 +727,7 @@ fn fleet_ack() -> bool {
             return true;
         }
     }
-    eprint!("amux fleet: press Enter to start, or Ctrl+C to abort... ");
+    eprint!("atrium fleet: press Enter to start, or Ctrl+C to abort... ");
     let _ = std::io::Write::flush(&mut std::io::stderr());
     let mut line = String::new();
     // A read error (closed stdin) is not consent, but it is also not a reason to
@@ -765,28 +767,28 @@ fn run(
     term: &mut rawterm::Terminal,
     command: &[String],
     identity: Option<&str>,
-    grid: Option<amux::spawn::Grid>,
+    grid: Option<atrium::spawn::Grid>,
     // A pre-built initial window (the fleet loader spawns its own panes, one per
     // agent, each with its own identity/cwd). When `Some`, it is used verbatim
     // as the first window and `command`/`grid` are ignored for it — but they
     // still drive later `Ctrl+A c` new panes and splits (which host `command`
     // under `identity`), so a fleet's new panes open a shell as a scratch pane.
     initial_window: Option<Window>,
-    // ctl control plane (§ amux-ctl-control-plane): when `allow_ctl`, amux binds
+    // ctl control plane (§ atrium-ctl-control-plane): when `allow_ctl`, atrium binds
     // a per-process control endpoint and injects its address into every pane, so
-    // an agent inside a pane can `amux ctl spawn/list`. `max_depth` is the
+    // an agent inside a pane can `atrium ctl spawn/list`. `max_depth` is the
     // recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
     allow_ctl: bool,
     max_depth: usize,
-    // How amux relaxes each spawned agent's permissions: `Off`, `Edits`
+    // How atrium relaxes each spawned agent's permissions: `Off`, `Edits`
     // (`--trust`: acceptEdits + safe allowlist), or `Skip` (`--skip-permissions`:
     // full bypass). Published to the spawn path via `AGENT_TRUST` before the
     // first spawn.
-    trust: amux::ctl::TrustMode,
+    trust: atrium::ctl::TrustMode,
     // A pre-bound ctl endpoint. The fleet path binds it *before* spawning its
-    // panes (so they get `AMUX_CTL` in their env) and hands the listener here;
+    // panes (so they get `ATRIUM_CTL` in their env) and hands the listener here;
     // `None` means run() binds its own after the initial spawn (the default path).
-    mut ctl_listener: Option<amux::ipc::Listener>,
+    mut ctl_listener: Option<atrium::ipc::Listener>,
 ) -> ExitCode {
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
@@ -800,39 +802,39 @@ fn run(
 
     let mut windows: Vec<Window> = Vec::new();
     // The initial pane can fail to spawn (command missing) *or* fail to resolve
-    // its identity (no such target, vault locked). A spawn failure aborts amux
+    // its identity (no such target, vault locked). A spawn failure aborts atrium
     // (there is nothing to host); an identity-resolve failure is surfaced in the
     // bar and the pane spawns *without* the credential — never silently, and
     // never unauthenticated-without-saying-so (§7).
     let mut flash: Option<(String, Instant)> = None;
     // ctl control channel (opt-in). Bind the endpoint and publish its address to
     // the spawn path *before* the first pane is spawned, so every pane — the
-    // initial one included — is born with `AMUX_CTL`/`AMUX_PANE` in its
-    // environment. A bind failure is non-fatal: amux still runs, just without
+    // initial one included — is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
+    // environment. A bind failure is non-fatal: atrium still runs, just without
     // ctl, and says so in the bar (never silently unavailable).
     // Queue-until-idle deliveries for `ctl send` (flushed each tick).
     let mut pending_sends: Vec<PendingSend> = Vec::new();
-    // Operator-approved extra allowlist stems (AMUX_CTL_ALLOW); empty ⇒ the
+    // Operator-approved extra allowlist stems (ATRIUM_CTL_ALLOW); empty ⇒ the
     // built-in agents-only guard. Read once at startup.
     let ctl_extra_allow = if allow_ctl {
-        amux::ctl::extra_allow_from_env()
+        atrium::ctl::extra_allow_from_env()
     } else {
         Vec::new()
     };
     // Bind the endpoint here only if a caller hasn't already (the fleet path
-    // pre-binds so its panes get `AMUX_CTL`). `CTL_ADDRESS` is a `OnceLock`, so a
+    // pre-binds so its panes get `ATRIUM_CTL`). `CTL_ADDRESS` is a `OnceLock`, so a
     // pre-bind means this is a no-op.
     if allow_ctl && ctl_listener.is_none() {
         ctl_listener = bind_ctl(&mut flash);
     }
     // ctl audit log (design §5): in-memory always when ctl is on, mirrored to a
-    // JSONL file when the operator opts in via `AMUX_CTL_AUDIT`. A file that
+    // JSONL file when the operator opts in via `ATRIUM_CTL_AUDIT`. A file that
     // can't be opened is surfaced once in the bar; the in-memory log runs on.
     let mut ctl_audit = if allow_ctl {
-        let path = std::env::var(amux::ctl::ENV_AUDIT)
+        let path = std::env::var(atrium::ctl::ENV_AUDIT)
             .ok()
             .filter(|p| !p.is_empty());
-        let mut a = amux::audit::Audit::new(amux::audit::DEFAULT_CAP, path.as_deref());
+        let mut a = atrium::audit::Audit::new(atrium::audit::DEFAULT_CAP, path.as_deref());
         if let Some(err) = a.take_error() {
             if flash.is_none() {
                 flash = Some((format!("ctl audit: {err}"), Instant::now()));
@@ -840,7 +842,7 @@ fn run(
         }
         a
     } else {
-        amux::audit::Audit::in_memory()
+        atrium::audit::Audit::in_memory()
     };
     // A pre-built window (fleet) is used as-is; otherwise mass-spawn opens one
     // window of N tiles in a balanced grid, or the 0.1 single-pane path. All
@@ -857,7 +859,7 @@ fn run(
         Ok(w) => windows.push(w),
         Err(e) => {
             cleanup_screen(&mut out);
-            eprintln!("amux: cannot start {:?}: {e}", command[0]);
+            eprintln!("atrium: cannot start {:?}: {e}", command[0]);
             return ExitCode::FAILURE;
         }
     }
@@ -870,12 +872,12 @@ fn run(
     let mut scanner = PrefixScanner::new();
     // Mouse capture is OFF by default so the terminal's own **text selection**
     // works out of the box (dragging highlights, as in any shell) — the common
-    // case. `Ctrl+A m` toggles capture ON when you want the amux mouse: click to
+    // case. `Ctrl+A m` toggles capture ON when you want the atrium mouse: click to
     // focus the pane under the cursor, wheel to scroll the hovered tile. (With
     // capture on, native selection falls back to Shift-drag.) The scanner and the
     // terminal are kept in sync by the toggle.
     let mut mouse_on = false;
-    // Whether amux has forced the OUTER terminal's mouse reporting off because the
+    // Whether atrium has forced the OUTER terminal's mouse reporting off because the
     // focused pane does not want the mouse (a shell/WSL). A mouse app (claude)
     // enables motion tracking via passthrough, which leaks to the terminal; once
     // you switch to a non-mouse pane the terminal keeps sending motion events and
@@ -925,23 +927,23 @@ fn run(
     // projects root, polled on the loop's existing `Instant`-throttle pattern —
     // no threads. The *first* refresh uses `refresh_since(process_start_ms)` so
     // the cold history scan (agtop measures ~1.4 s for ~60 MB) never freezes
-    // keystrokes; amux can never care about a session that stopped writing
+    // keystrokes; atrium can never care about a session that stopped writing
     // before it started. Thereafter: bound panes tail ~1 s, discovery ~5 s
     // (accelerated to ~1 s while any agent pane is still unbound).
     // The shared board (coordination layer): source-of-truth team state, in-memory
-    // unless AMUX_BOARD names a snapshot file. Part of the ctl surface, so it is
+    // unless ATRIUM_BOARD names a snapshot file. Part of the ctl surface, so it is
     // already gated by `--allow-ctl`.
-    let mut board = match std::env::var_os(amux::board::ENV_BOARD) {
-        Some(p) if !p.is_empty() => amux::board::Board::with_file(std::path::PathBuf::from(p)),
-        _ => amux::board::Board::new(),
+    let mut board = match std::env::var_os(atrium::board::ENV_BOARD) {
+        Some(p) if !p.is_empty() => atrium::board::Board::with_file(std::path::PathBuf::from(p)),
+        _ => atrium::board::Board::new(),
     };
     // The shared pub/sub bus (coordination layer part 2): the team's event stream,
-    // in-memory unless AMUX_BUS names a snapshot file. Same ctl gating as the board.
-    let mut bus = match std::env::var_os(amux::bus::ENV_BUS) {
-        Some(p) if !p.is_empty() => amux::bus::Bus::with_file(std::path::PathBuf::from(p)),
-        _ => amux::bus::Bus::new(),
+    // in-memory unless ATRIUM_BUS names a snapshot file. Same ctl gating as the board.
+    let mut bus = match std::env::var_os(atrium::bus::ENV_BUS) {
+        Some(p) if !p.is_empty() => atrium::bus::Bus::with_file(std::path::PathBuf::from(p)),
+        _ => atrium::bus::Bus::new(),
     };
-    let mut world = amux::vendors::VendorWorlds::new();
+    let mut world = atrium::vendors::VendorWorlds::new();
     let process_start_ms = agsess::sessions::now_ms();
     world.refresh_since(process_start_ms);
     let mut last_agent_poll = Instant::now();
@@ -958,23 +960,23 @@ fn run(
     // clear wipes the drag). Sentinel start so the first frame counts as a change.
     // The crash registry: the pane process groups a watchdog should kill if this
     // process dies without running any teardown at all.
-    let registry_path = amux::reap::registry_path(std::process::id());
-    // The warden: tripwires, not gates. amux cannot stop an agent that can run
+    let registry_path = atrium::reap::registry_path(std::process::id());
+    // The warden: tripwires, not gates. atrium cannot stop an agent that can run
     // commands from launching an unconstrained one (it could run claude directly
-    // with no amux at all), so what it CAN do is notice - its own binary being
+    // with no atrium at all), so what it CAN do is notice - its own binary being
     // edited to remove the ceiling, the registry that ceiling is read from being
     // tampered with, or a session appearing that the ancestry cap did not explain.
-    let mut warden = amux::warden::Warden::new(registry_path.clone());
+    let mut warden = atrium::warden::Warden::new(registry_path.clone());
     let mut last_warden_check = Instant::now();
     let mut cap_notice_raised = false;
     let mut registered: Vec<u32> = Vec::new();
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
-    // tree outlives amux however it dies (TerminateProcess included); a no-op on
+    // tree outlives atrium however it dies (TerminateProcess included); a no-op on
     // unix (the process-group teardown + watchdog below already cover the tree).
     // Held for the whole run — dropping it (or the process exiting) fires the
-    // guarantee. Panes never inherit its handle, so they live until amux exits.
-    let session_job = amux::reap::SessionJob::create();
-    // Held for the whole run: dropping this Child closes the pipe amux uses as its
+    // guarantee. Panes never inherit its handle, so they live until atrium exits.
+    let session_job = atrium::reap::SessionJob::create();
+    // Held for the whole run: dropping this Child closes the pipe atrium uses as its
     // death signal, which would fire the watchdog early. Unix only — on Windows
     // the Job Object replaces it (a watchdog there can't signal a process group
     // and would block on its pipe forever, R5).
@@ -991,11 +993,11 @@ fn run(
         // 0. a termination signal (SIGHUP from a closed terminal window, or a
         // SIGTERM/SIGINT from outside) exits through this *normal* path, so the
         // pane teardown after the loop actually runs. Without it the default
-        // action killed amux outright and every hosted agent was orphaned onto
-        // `init` — see `amux::signals`.
-        if amux::signals::terminating() {
-            if std::env::var_os("AMUX_DEBUG").is_some() {
-                eprint!("[amux-dbg signal-quit]\r\n");
+        // action killed atrium outright and every hosted agent was orphaned onto
+        // `init` — see `atrium::signals`.
+        if atrium::signals::terminating() {
+            if std::env::var_os("ATRIUM_DEBUG").is_some() {
+                eprint!("[atrium-dbg signal-quit]\r\n");
             }
             break 'outer;
         }
@@ -1010,13 +1012,13 @@ fn run(
                 .collect();
             if cur != registered {
                 // Assign any newly-appeared pane to the session job so its whole
-                // tree is torn down with amux (no-op on unix). Only the new pids,
+                // tree is torn down with atrium (no-op on unix). Only the new pids,
                 // so a process is never re-assigned.
                 for pid in cur.iter().filter(|p| !registered.contains(p)) {
                     session_job.assign(*pid);
                 }
                 let _ =
-                    amux::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
+                    atrium::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
                 warden.registry_rewritten();
                 registered = cur;
             }
@@ -1031,8 +1033,8 @@ fn run(
                 if let Some(note) = CAP_NOTICE.get() {
                     if !cap_notice_raised {
                         cap_notice_raised = true;
-                        alerts.push(amux::warden::Alert {
-                            kind: "warden-nested-amux",
+                        alerts.push(atrium::warden::Alert {
+                            kind: "warden-nested-atrium",
                             detail: note.clone(),
                         });
                     }
@@ -1043,7 +1045,7 @@ fn run(
                     // should stop the operator rather than scroll past them.
                     let _ = bus.publish(
                         "warden",
-                        amux::bus::Kind::DecisionNeeded,
+                        atrium::bus::Kind::DecisionNeeded,
                         None,
                         &[("msg".to_string(), alert.detail.clone())],
                         agsess::sessions::now_ms(),
@@ -1051,7 +1053,7 @@ fn run(
                     force_repaint = true;
                 }
                 // There is no enforcement branch here any more, and that is a
-                // decision rather than an omission: `AMUX_WARDEN=enforce` used to
+                // decision rather than an omission: `ATRIUM_WARDEN=enforce` used to
                 // tear down anything judged an escapee, and both the judgement and
                 // the kill were unsound. `warden`'s module docs carry the full
                 // reasoning; the short version is that under a correct ancestry
@@ -1062,14 +1064,14 @@ fn run(
             // The watchdog is the unix answer to a death no handler can catch.
             // Windows does not need it and must not run it: the durable fix there
             // is a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, which the
-            // kernel honours however amux dies. A watchdog on Windows would spawn
-            // a second amux that cannot signal a process group (`reap`'s
+            // kernel honours however atrium dies. A watchdog on Windows would spawn
+            // a second atrium that cannot signal a process group (`reap`'s
             // non-unix `signal_group` returns false) and would sit blocked on its
             // pipe forever. The Job Object attaches just above (`session_job`),
             // in this same pane-set-changed block.
             #[cfg(unix)]
             if watchdog.is_none() && !registered.is_empty() {
-                watchdog = amux::reap::spawn_watchdog(&registry_path).ok();
+                watchdog = atrium::reap::spawn_watchdog(&registry_path).ok();
             }
         }
         // 1. keystrokes -> scanner -> focused pane / commands
@@ -1077,9 +1079,9 @@ fn run(
             Ok(b) => b,
             Err(_) => break,
         };
-        if !bytes.is_empty() && std::env::var_os("AMUX_DEBUG").is_some() {
+        if !bytes.is_empty() && std::env::var_os("ATRIUM_DEBUG").is_some() {
             let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            eprint!("[amux-dbg stdin {}]\r\n", hex.join(" "));
+            eprint!("[atrium-dbg stdin {}]\r\n", hex.join(" "));
         }
         // The command prompt captures keystrokes: while it is open, keys edit the
         // command line (not the panes), and the scanner is fed nothing. Enter opens
@@ -1219,7 +1221,7 @@ fn run(
                 let sel_seq = decisions_now.get(dsel).map(|e| e.seq);
                 let sel_from = decisions_now.get(dsel).and_then(|e| e.from.clone());
                 drop(decisions_now);
-                let scroll_max = bus.tail(amux::bus::RING_CAP).len().saturating_sub(1);
+                let scroll_max = bus.tail(atrium::bus::RING_CAP).len().saturating_sub(1);
                 // Up/down select a decision when there are any; otherwise they
                 // scroll the FYI history. PgUp/PgDn always scroll it.
                 let nav = |up: bool, decision_sel: &mut usize, feed_scroll: &mut usize| {
@@ -1453,7 +1455,7 @@ fn run(
                 Action::NewShellPane => {
                     // A plain shell in a new window — no identity, no trust posture
                     // (it's not an agent), but it still gets the ctl env injected,
-                    // so you can run `amux ctl board list` here and see it rendered.
+                    // so you can run `atrium ctl board list` here and see it rendered.
                     let shell = vec![default_shell()];
                     match spawn_window(
                         &shell,
@@ -1461,7 +1463,7 @@ fn run(
                         cols,
                         windows.len(),
                         None,
-                        amux::ctl::TrustMode::Off,
+                        atrium::ctl::TrustMode::Off,
                         &mut flash,
                     ) {
                         Ok(w) => {
@@ -1677,8 +1679,8 @@ fn run(
                     }
                 }
                 Action::Quit => {
-                    if std::env::var_os("AMUX_DEBUG").is_some() {
-                        eprint!("[amux-dbg quit-received]\r\n");
+                    if std::env::var_os("ATRIUM_DEBUG").is_some() {
+                        eprint!("[atrium-dbg quit-received]\r\n");
                     }
                     break 'outer;
                 }
@@ -1882,10 +1884,10 @@ fn run(
             force_repaint = true;
         }
 
-        // 4b. Keep the OUTER terminal's mouse reporting off unless amux itself
+        // 4b. Keep the OUTER terminal's mouse reporting off unless atrium itself
         //     turned it on (`Ctrl+A m`). A pane's own request no longer reaches
         //     the real terminal — `filter.rs` terminates the mouse modes with the
-        //     other host-level negotiations — so amux's own state is the whole
+        //     other host-level negotiations — so atrium's own state is the whole
         //     truth here, and this only has to re-assert it.
         //
         //     This used to defer to the focused pane (`mouse_wanted`), because a
@@ -1908,9 +1910,9 @@ fn run(
         if last_size_check.elapsed() >= Duration::from_millis(150) {
             last_size_check = Instant::now();
             if let Ok((r, c)) = term.size() {
-                // Windows Terminal's ConPTY reports a few rows FEWER once amux is
+                // Windows Terminal's ConPTY reports a few rows FEWER once atrium is
                 // in the alternate screen buffer (a persistent reservation), and
-                // adopting it makes amux redraw short — leaving a strip of stale
+                // adopting it makes atrium redraw short — leaving a strip of stale
                 // content below the bar (the initial full-screen draw was correct).
                 // Treat a small height-only shrink as that reservation and keep the
                 // current size; real resizes (width change, growth, or a large
@@ -2013,7 +2015,7 @@ fn run(
             }
         }
 
-        // 5c. session adoption. A claude pane binds via the `--session-id` amux
+        // 5c. session adoption. A claude pane binds via the `--session-id` atrium
         //     injected at spawn; a non-claude agent's CLI does not understand that
         //     flag, so its pane launches with `session_id == None` and would never
         //     bind. After each refresh, associate every still-unstamped non-claude
@@ -2036,7 +2038,7 @@ fn run(
                         // pool to this pane's own vendor via `AgentSession.vendor`,
                         // so a gemini pane can never adopt the newest claude session
                         // that happens to sit in the merged pool.
-                        let Some(vendor) = amux::vendors::vendor_for_stem(&p.title) else {
+                        let Some(vendor) = atrium::vendors::vendor_for_stem(&p.title) else {
                             continue;
                         };
                         if vendor == agsess::Vendor::ClaudeCode {
@@ -2048,7 +2050,7 @@ fn run(
                             .filter(|s| s.vendor == vendor)
                             .collect();
                         if let Some(id) =
-                            amux::vendors::adopt_session_for(&mine, p.cwd.as_deref(), p.launch_ms)
+                            atrium::vendors::adopt_session_for(&mine, p.cwd.as_deref(), p.launch_ms)
                         {
                             p.session_id = Some(id);
                         }
@@ -2269,24 +2271,24 @@ fn run(
         force_repaint = false;
     }
 
-    let dbg = std::env::var_os("AMUX_DEBUG").is_some();
+    let dbg = std::env::var_os("ATRIUM_DEBUG").is_some();
     // Kill process TREES, not processes. `pty.kill()` is SIGKILL to the direct
     // child alone, so everything an agent spawned — MCP servers, language
-    // servers, node helpers — outlived amux and was reparented onto init. That
-    // leaked on every clean quit, not just on a signal. See `amux::reap`.
+    // servers, node helpers — outlived atrium and was reparented onto init. That
+    // leaked on every clean quit, not just on a signal. See `atrium::reap`.
     let pids: Vec<u32> = windows
         .iter()
         .flat_map(|w| w.panes.iter().map(|p| p.pty.pid()))
         .filter(|p| *p != 0)
         .collect();
     for pid in &pids {
-        amux::reap::term_tree(*pid);
+        atrium::reap::term_tree(*pid);
     }
     if !pids.is_empty() {
-        std::thread::sleep(amux::reap::GRACE);
+        std::thread::sleep(atrium::reap::GRACE);
     }
     for pid in &pids {
-        amux::reap::kill_tree(*pid);
+        atrium::reap::kill_tree(*pid);
     }
     for w in windows.iter_mut() {
         // Still reap the direct child, so it does not linger as a zombie.
@@ -2299,13 +2301,13 @@ fn run(
     let survivors: Vec<u32> = pids
         .iter()
         .copied()
-        .filter(|p| amux::reap::tree_alive(*p))
+        .filter(|p| atrium::reap::tree_alive(*p))
         .collect();
     // A CLEAN teardown leaves nothing for the watchdog: emptying the registry
     // before it notices is what makes a normal quit silent.
     //
     // A teardown with survivors is the opposite case, and this used to delete
-    // the registry there too — unconditionally, on the one path where amux had
+    // the registry there too — unconditionally, on the one path where atrium had
     // just PROVED that pane groups outlived it. It then printed a warning to a
     // terminal `cleanup_screen` was about to tear down and exited; the watchdog
     // woke on pipe EOF, read a file that no longer existed, got an empty list
@@ -2314,11 +2316,11 @@ fn run(
     //
     // So: survivors mean the registry is REWRITTEN down to just those groups —
     // the watchdog then TERMs and KILLs precisely what is left, and a later
-    // `amux reap` finds the same short list rather than a stale full one. Panes
+    // `atrium reap` finds the same short list rather than a stale full one. Panes
     // that did die are dropped from it, because a dead pane's pgid can be reused.
-    if amux::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
+    if atrium::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
         eprintln!(
-            "amux: warning: {} pane process group(s) survived teardown: {:?}",
+            "atrium: warning: {} pane process group(s) survived teardown: {:?}",
             survivors.len(),
             survivors
         );
@@ -2326,18 +2328,18 @@ fn run(
     // Panes that are genuinely gone leave no stamp behind. A survivor keeps
     // its stamp — that is the marker the sweep needs to collect it later.
     for pid in pids.iter().filter(|p| !survivors.contains(p)) {
-        amux::orphan::unstamp(*pid);
+        atrium::orphan::unstamp(*pid);
     }
     if dbg {
-        eprint!("[amux-dbg killed]\r\n");
+        eprint!("[atrium-dbg killed]\r\n");
     }
     cleanup_screen(&mut out);
     if dbg {
-        eprint!("[amux-dbg cleaned]\r\n");
+        eprint!("[atrium-dbg cleaned]\r\n");
     }
     drop(windows);
     if dbg {
-        eprint!("[amux-dbg panes-dropped]\r\n");
+        eprint!("[atrium-dbg panes-dropped]\r\n");
     }
     ExitCode::SUCCESS
 }
@@ -2364,7 +2366,7 @@ fn status_label(s: agsess::Status) -> &'static str {
 /// pane that exists)? Such a decision routes to that agent — the human isn't
 /// urgently pinged for it — implementing worker→lead escalation before lead→human.
 /// A `to` naming no live pane, or no `to` at all, is human-facing.
-fn decision_for_agent(e: &amux::bus::Event, windows: &[Window]) -> bool {
+fn decision_for_agent(e: &atrium::bus::Event, windows: &[Window]) -> bool {
     e.fields.get("to").is_some_and(|to| {
         windows
             .iter()
@@ -2377,8 +2379,8 @@ fn decision_for_agent(e: &amux::bus::Event, windows: &[Window]) -> bool {
 /// Everything else mutates the fleet or its shared state (spawn, send, kill,
 /// board writes/claims, bus publish/subscribe/resolve) and requires an
 /// authenticated, token-matched caller.
-fn ctl_is_read_only(cmd: &amux::ctl::Cmd) -> bool {
-    use amux::ctl::{BoardOp, BusOp, Cmd};
+fn ctl_is_read_only(cmd: &atrium::ctl::Cmd) -> bool {
+    use atrium::ctl::{BoardOp, BusOp, Cmd};
     matches!(
         cmd,
         Cmd::List
@@ -2399,13 +2401,13 @@ fn apply_ctl(
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
     session_identity: Option<&str>,
-    audit: &mut amux::audit::Audit,
-    board: &mut amux::board::Board,
-    bus: &mut amux::bus::Bus,
+    audit: &mut atrium::audit::Audit,
+    board: &mut atrium::board::Board,
+    bus: &mut atrium::bus::Bus,
 ) -> String {
-    use amux::ctl::{self, Cmd};
+    use atrium::ctl::{self, Cmd};
 
     let mut req = match ctl::parse_request(line) {
         Ok(r) => r,
@@ -2431,7 +2433,7 @@ fn apply_ctl(
     // the caller *is* the pane whose minted token matches. This overwrites the
     // self-reported `caller`, so a pane cannot claim another pane's id or claim
     // operator (its own token forces its real, depth-scoped identity). A request
-    // with no token or a non-matching one is unauthenticated. Every pane amux
+    // with no token or a non-matching one is unauthenticated. Every pane atrium
     // spawns in a ctl session is born with a token (the endpoint binds before any
     // spawn), so a legitimate caller is never locked out; only an external or
     // token-stripped request is. See §4.1 of the whitepaper for the threat model
@@ -2455,7 +2457,7 @@ fn apply_ctl(
     // mutates the fleet or its shared state requires an authenticated caller.
     if !authenticated && !ctl_is_read_only(&req.cmd) {
         let reply = ctl::reply_err(
-            "unauthenticated: control request carries no valid pane token (AMUX_TOKEN)",
+            "unauthenticated: control request carries no valid pane token (ATRIUM_TOKEN)",
         );
         let (action, detail) = audit_label(&req);
         audit.record(None, action, &detail, false, "unauthenticated");
@@ -2495,29 +2497,29 @@ fn apply_ctl(
     reply
 }
 
-/// The server side of the control channel: turn one parsed [`amux::ctl::Request`]
+/// The server side of the control channel: turn one parsed [`atrium::ctl::Request`]
 /// into its JSON reply. `list`/`status` serialize the spawn tree (agsess status
 /// folded in); `spawn` opens a visible worker after the pure allowlist/depth
-/// guard ([`amux::ctl::evaluate_spawn`]) and the credential-delegation guard
-/// ([`amux::ctl::delegation_allowed`]); `send` enqueues a queue-until-idle
+/// guard ([`atrium::ctl::evaluate_spawn`]) and the credential-delegation guard
+/// ([`atrium::ctl::delegation_allowed`]); `send` enqueues a queue-until-idle
 /// delivery; `kill` tears down the target's subtree (the reap step reaps them).
 /// `send`/`status`/`kill` with a target are subtree-scoped.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_ctl(
-    req: amux::ctl::Request,
+    req: atrium::ctl::Request,
     windows: &mut Vec<Window>,
     rows: u16,
     cols: u16,
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
     session_identity: Option<&str>,
     privileged: bool,
-    board: &mut amux::board::Board,
-    bus: &mut amux::bus::Bus,
+    board: &mut atrium::board::Board,
+    bus: &mut atrium::bus::Bus,
 ) -> String {
-    use amux::ctl::{self, Cmd};
+    use atrium::ctl::{self, Cmd};
     let caller = req.caller;
 
     match req.cmd {
@@ -2586,12 +2588,12 @@ fn dispatch_ctl(
                     );
                 }
             }
-            // amux owns the permission posture. Two layers, both surfaced (never
+            // atrium owns the permission posture. Two layers, both surfaced (never
             // silent) in the reply `note`:
             //
             //  1. Strip RAW claude permission flags the agent slipped into the argv
             //     (`--dangerously-skip-permissions`, `--permission-mode`, …). Agents
-            //     request a mode through `--mode`, not raw flags, so amux stays the
+            //     request a mode through `--mode`, not raw flags, so atrium stays the
             //     single source of truth.
             //  2. Resolve the effective mode from the per-spawn `--mode` under the
             //     session policy: the **operator** (the human's root pane) may set
@@ -2639,13 +2641,13 @@ fn dispatch_ctl(
                 };
             // Pane cap (host-resource guard): the depth guard bounds recursion; this
             // bounds total *breadth* so a runaway fan-out can't exhaust the machine
-            // (agent processes dominate RAM, not amux). Host-derived, overridable
-            // with AMUX_MAX_PANES.
+            // (agent processes dominate RAM, not atrium). Host-derived, overridable
+            // with ATRIUM_MAX_PANES.
             let live = windows.iter().map(|w| w.panes.len()).sum::<usize>();
-            let cap = amux::resources::effective_cap();
+            let cap = atrium::resources::effective_cap();
             if live >= cap {
                 return ctl::reply_err(&format!(
-                    "pane cap reached ({live}/{cap}) — reap an agent or raise it with AMUX_MAX_PANES"
+                    "pane cap reached ({live}/{cap}) — reap an agent or raise it with ATRIUM_MAX_PANES"
                 ));
             }
             // Credential-delegation guard (§5): a worker may only pass down an
@@ -2685,7 +2687,7 @@ fn dispatch_ctl(
             let mut killed: Vec<usize> = Vec::new();
             for w in windows.iter_mut() {
                 for p in w.panes.iter_mut() {
-                    if amux::ctl::in_subtree(p.agent_id, id, &parents) {
+                    if atrium::ctl::in_subtree(p.agent_id, id, &parents) {
                         let _ = p.pty.kill();
                         p.exited = true;
                         killed.push(p.agent_id);
@@ -2716,14 +2718,14 @@ fn dispatch_ctl(
             match op {
                 ctl::BoardOp::Set { key, fields } => {
                     let e = board.set(&key, &fields, by.as_deref(), agsess::sessions::now_ms());
-                    ctl::reply_board_entry(&key, Some(amux::board::entry_to_value(&e)))
+                    ctl::reply_board_entry(&key, Some(atrium::board::entry_to_value(&e)))
                 }
                 ctl::BoardOp::Get { key } => {
-                    let entry = board.get(&key).map(amux::board::entry_to_value);
+                    let entry = board.get(&key).map(atrium::board::entry_to_value);
                     ctl::reply_board_entry(&key, entry)
                 }
                 ctl::BoardOp::List => {
-                    ctl::reply_board_list(amux::board::entries_to_value(&board.list()))
+                    ctl::reply_board_list(atrium::board::entries_to_value(&board.list()))
                 }
                 ctl::BoardOp::Del { key } => {
                     let deleted = board.del(&key);
@@ -2734,7 +2736,7 @@ fn dispatch_ctl(
                     // worker can't claim as someone else. Default the lease to the
                     // board's DEFAULT_LEASE_MS unless the caller set --ttl.
                     let owner = by.as_deref().unwrap_or("operator");
-                    let ttl = ttl_ms.unwrap_or(amux::board::DEFAULT_LEASE_MS);
+                    let ttl = ttl_ms.unwrap_or(atrium::board::DEFAULT_LEASE_MS);
                     let outcome = board.claim(&key, owner, ttl, agsess::sessions::now_ms());
                     ctl::reply_board_claim(&key, &outcome)
                 }
@@ -2768,7 +2770,7 @@ fn dispatch_ctl(
                     kind,
                     fields,
                 } => match bus.publish(&topic, kind, Some(&who), &fields, now) {
-                    Ok(e) => ctl::reply_bus_published(amux::bus::event_to_value(&e)),
+                    Ok(e) => ctl::reply_bus_published(atrium::bus::event_to_value(&e)),
                     Err(msg) => ctl::reply_err(&msg),
                 },
                 ctl::BusOp::Sub { topics } => {
@@ -2784,7 +2786,7 @@ fn dispatch_ctl(
                     // The new cursor is the max seq pulled, or `since` when empty,
                     // so it never rewinds.
                     let cursor = events.iter().map(|e| e.seq).max().unwrap_or(since);
-                    ctl::reply_bus_feed(amux::bus::events_to_value(&events), cursor)
+                    ctl::reply_bus_feed(atrium::bus::events_to_value(&events), cursor)
                 }
                 ctl::BusOp::Resolve { seq } => ctl::reply_bus_resolved(seq, bus.resolve(seq)),
             }
@@ -2793,7 +2795,7 @@ fn dispatch_ctl(
 }
 
 /// A subscriber's current topic set as a `Vec` (for the `sub`/`unsub` reply).
-fn current_subs(bus: &amux::bus::Bus, who: &str) -> Vec<String> {
+fn current_subs(bus: &atrium::bus::Bus, who: &str) -> Vec<String> {
     bus.subscriptions(who)
         .map(|s| s.iter().cloned().collect())
         .unwrap_or_default()
@@ -2812,8 +2814,8 @@ fn truncate(s: &str, n: usize) -> String {
 /// The audit `(action, detail)` for a request: a stable verb plus a compact,
 /// **secret-free** description (identity *names* only; `send` logs the text
 /// *length*, never the body).
-fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
-    use amux::ctl::Cmd;
+fn audit_label(req: &atrium::ctl::Request) -> (&'static str, String) {
+    use atrium::ctl::Cmd;
     match &req.cmd {
         Cmd::List => ("list", String::new()),
         Cmd::Status(sr) => (
@@ -2831,7 +2833,7 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
             let stem = sp
                 .argv
                 .first()
-                .map(|a| amux::bind::command_stem(a))
+                .map(|a| atrium::bind::command_stem(a))
                 .unwrap_or_default();
             (
                 "spawn",
@@ -2848,30 +2850,30 @@ fn audit_label(req: &amux::ctl::Request) -> (&'static str, String) {
         Cmd::Board(op) => (
             "board",
             match op {
-                amux::ctl::BoardOp::Set { key, fields } => {
+                atrium::ctl::BoardOp::Set { key, fields } => {
                     format!("set {key} fields={}", fields.len())
                 }
-                amux::ctl::BoardOp::Get { key } => format!("get {key}"),
-                amux::ctl::BoardOp::List => "list".to_string(),
-                amux::ctl::BoardOp::Del { key } => format!("del {key}"),
-                amux::ctl::BoardOp::Claim { key, .. } => format!("claim {key}"),
-                amux::ctl::BoardOp::Release { key } => format!("release {key}"),
+                atrium::ctl::BoardOp::Get { key } => format!("get {key}"),
+                atrium::ctl::BoardOp::List => "list".to_string(),
+                atrium::ctl::BoardOp::Del { key } => format!("del {key}"),
+                atrium::ctl::BoardOp::Claim { key, .. } => format!("claim {key}"),
+                atrium::ctl::BoardOp::Release { key } => format!("release {key}"),
             },
         ),
         Cmd::Bus(op) => (
             "bus",
             match op {
-                amux::ctl::BusOp::Pub {
+                atrium::ctl::BusOp::Pub {
                     topic,
                     kind,
                     fields,
                 } => {
                     format!("pub {topic} {} fields={}", kind.as_str(), fields.len())
                 }
-                amux::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
-                amux::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
-                amux::ctl::BusOp::Feed { since } => format!("feed since={since}"),
-                amux::ctl::BusOp::Resolve { seq } => format!("resolve {seq}"),
+                atrium::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
+                atrium::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
+                atrium::ctl::BusOp::Feed { since } => format!("feed since={since}"),
+                atrium::ctl::BusOp::Resolve { seq } => format!("resolve {seq}"),
             },
         ),
     }
@@ -2915,7 +2917,7 @@ fn audit_outcome(reply: &str) -> (bool, String) {
 /// sees everything; a worker sees only entries issued from within its own
 /// subtree (operator/`None`-caller entries are hidden from it).
 fn audit_reply(
-    audit: &amux::audit::Audit,
+    audit: &atrium::audit::Audit,
     windows: &[Window],
     caller: Option<usize>,
     privileged: bool,
@@ -2926,7 +2928,7 @@ fn audit_reply(
     } else if let Some(root) = caller {
         let parents = ctl_parents(windows);
         audit.view(tail, |e| match e.caller {
-            Some(c) => amux::ctl::in_subtree(c, root, &parents),
+            Some(c) => atrium::ctl::in_subtree(c, root, &parents),
             None => false, // operator actions are hidden from a worker
         })
     } else {
@@ -2938,14 +2940,14 @@ fn audit_reply(
         // `privilege_for` was fixed to remove, left standing in one call site.
         Vec::new()
     };
-    amux::ctl::reply_audit(entries, audit.oldest_seq(), audit.latest_seq())
+    atrium::ctl::reply_audit(entries, audit.oldest_seq(), audit.latest_seq())
 }
 
 /// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
 /// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
 fn reply_tree(
     windows: &[Window],
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
     root: Option<usize>,
 ) -> String {
     let parents = ctl_parents(windows);
@@ -2954,13 +2956,13 @@ fn reply_tree(
         .flat_map(|w| w.panes.iter())
         .filter(|p| match root {
             None => true,
-            Some(r) => amux::ctl::in_subtree(p.agent_id, r, &parents),
+            Some(r) => atrium::ctl::in_subtree(p.agent_id, r, &parents),
         })
         .collect();
     panes.sort_by_key(|p| p.agent_id);
-    let nodes: Vec<amux::ctl::TreeNode> = panes
+    let nodes: Vec<atrium::ctl::TreeNode> = panes
         .iter()
-        .map(|p| amux::ctl::TreeNode {
+        .map(|p| atrium::ctl::TreeNode {
             id: p.agent_id,
             parent: p.parent,
             role: p.role.as_deref(),
@@ -2969,7 +2971,7 @@ fn reply_tree(
             status: world.status_for(p.session_id.as_deref()).map(status_label),
         })
         .collect();
-    amux::ctl::reply_list(&nodes)
+    atrium::ctl::reply_list(&nodes)
 }
 
 /// Subtree-scope guard: `None` if the caller may act on `target`, else a ready
@@ -2984,10 +2986,10 @@ fn scope_denied(
         return None;
     }
     let root = caller?; // non-privileged implies a known caller pane
-    if amux::ctl::in_subtree(target, root, &ctl_parents(windows)) {
+    if atrium::ctl::in_subtree(target, root, &ctl_parents(windows)) {
         None
     } else {
-        Some(amux::ctl::reply_err(&format!(
+        Some(atrium::ctl::reply_err(&format!(
             "pane {target} is outside your subtree; a worker may only steer what it spawned"
         )))
     }
@@ -2997,12 +2999,12 @@ fn scope_denied(
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker_window(
     windows: &mut Vec<Window>,
-    sp: &amux::ctl::SpawnReq,
+    sp: &atrium::ctl::SpawnReq,
     caller: Option<usize>,
     new_depth: usize,
     rows: u16,
     cols: u16,
-    mode: amux::ctl::TrustMode,
+    mode: atrium::ctl::TrustMode,
     note: Option<&str>,
 ) -> String {
     let mut flash = None;
@@ -3028,9 +3030,9 @@ fn spawn_worker_window(
             // (which otherwise needs a manual terminal resize to correct).
             let last = windows.len() - 1;
             resize_window(&mut windows[last], rows, cols);
-            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
         }
-        Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
+        Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
     }
 }
 
@@ -3040,17 +3042,17 @@ fn spawn_worker_window(
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker_here(
     windows: &mut [Window],
-    sp: &amux::ctl::SpawnReq,
+    sp: &atrium::ctl::SpawnReq,
     caller: Option<usize>,
     new_depth: usize,
     rows: u16,
     cols: u16,
-    mode: amux::ctl::TrustMode,
+    mode: atrium::ctl::TrustMode,
     note: Option<&str>,
 ) -> String {
     let Some(caller_id) = caller else {
-        return amux::ctl::reply_err(
-            "`--here` needs a caller pane; run it from inside an amux pane",
+        return atrium::ctl::reply_err(
+            "`--here` needs a caller pane; run it from inside an atrium pane",
         );
     };
     // Locate the window holding the caller and that caller's per-window pane id.
@@ -3060,7 +3062,7 @@ fn spawn_worker_here(
             .find(|p| p.agent_id == caller_id)
             .map(|p| (i, p.id))
     }) else {
-        return amux::ctl::reply_err("`--here`: caller pane not found (rerun without --here)");
+        return atrium::ctl::reply_err("`--here`: caller pane not found (rerun without --here)");
     };
 
     let w = &mut windows[wi];
@@ -3104,9 +3106,9 @@ fn spawn_worker_here(
             // half-size and paints short (blank below), fixed only by a manual
             // terminal resize. Mirrors what the interactive split handlers do.
             resize_window(&mut windows[wi], rows, cols);
-            amux::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
         }
-        Err(e) => amux::ctl::reply_err(&format!("spawn failed: {e}")),
+        Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
     }
 }
 
@@ -3118,7 +3120,7 @@ fn spawn_worker_here(
 fn flush_sends(
     pending: &mut Vec<PendingSend>,
     windows: &mut [Window],
-    world: &amux::vendors::VendorWorlds,
+    world: &atrium::vendors::VendorWorlds,
 ) -> bool {
     if pending.is_empty() {
         return false;
@@ -3193,7 +3195,7 @@ fn spawn_window(
     cols: u16,
     _idx: usize,
     identity: Option<&str>,
-    mode: amux::ctl::TrustMode,
+    mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
     let pane = spawn_pane(
@@ -3226,7 +3228,7 @@ fn spawn_window_grid(
     command: &[String],
     rows: u16,
     cols: u16,
-    grid: amux::spawn::Grid,
+    grid: atrium::spawn::Grid,
     identity: Option<&str>,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
@@ -3273,11 +3275,11 @@ fn spawn_pane(
     cols: u16,
     id: usize,
     identity: Option<&str>,
-    mode: amux::ctl::TrustMode,
+    mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
     // The single-pane / split / grid path: no per-pane working directory (the
-    // child inherits amux's cwd, today's behavior). The fleet loader is the only
+    // child inherits atrium's cwd, today's behavior). The fleet loader is the only
     // caller that supplies a `cwd`; everyone else routes through here with `None`.
     spawn_pane_full(command, rows, cols, id, identity, None, mode, flash)
 }
@@ -3287,36 +3289,36 @@ fn spawn_pane(
 /// Split out from [`spawn_pane_full`] so the one rule that matters here can be
 /// asserted directly: **the session marker does not depend on ctl.** It used to,
 /// and that was the first of the two holes that stranded 75 processes holding
-/// 526 ptys against a machine-wide limit of 511. `AMUX_CTL`/`AMUX_PANE`/
-/// `AMUX_TOKEN` were pushed inside `if let (Some(addr), Some(token)) = …`, so a
-/// pane launched without `--allow-ctl` — the default — carried no amux
-/// environment whatsoever. Nothing on the process said it was ours, so once amux
+/// 526 ptys against a machine-wide limit of 511. `ATRIUM_CTL`/`ATRIUM_PANE`/
+/// `ATRIUM_TOKEN` were pushed inside `if let (Some(addr), Some(token)) = …`, so a
+/// pane launched without `--allow-ctl` — the default — carried no atrium
+/// environment whatsoever. Nothing on the process said it was ours, so once atrium
 /// was gone nothing could find it, and they had to be cleared by hand.
 ///
-/// `AMUX_SESSION` is deliberately NOT one of those credentials. `AMUX_TOKEN` is
+/// `ATRIUM_SESSION` is deliberately NOT one of those credentials. `ATRIUM_TOKEN` is
 /// a capability that must not leak; this is a label that is *meant* to be read —
-/// by the watchdog, by `amux reap`, by a human with `ps`. Holding it authorises
+/// by the watchdog, by `atrium reap`, by a human with `ps`. Holding it authorises
 /// nothing, and forging it can only nominate the forger's own process group for
-/// collection, and then only once the amux it names is already dead.
+/// collection, and then only once the atrium it names is already dead.
 fn pane_base_env(
-    session: Option<&amux::orphan::SessionKey>,
+    session: Option<&atrium::orphan::SessionKey>,
     ctl: Option<(&str, &str, &str)>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     if let Some(key) = session {
-        env.push((amux::orphan::ENV_SESSION.to_string(), key.encode()));
+        env.push((atrium::orphan::ENV_SESSION.to_string(), key.encode()));
     }
     if let Some((addr, pane, token)) = ctl {
-        env.push((amux::ctl::ENV_ADDRESS.to_string(), addr.to_string()));
-        env.push((amux::ctl::ENV_PANE.to_string(), pane.to_string()));
-        env.push((amux::ctl::ENV_TOKEN.to_string(), token.to_string()));
+        env.push((atrium::ctl::ENV_ADDRESS.to_string(), addr.to_string()));
+        env.push((atrium::ctl::ENV_PANE.to_string(), pane.to_string()));
+        env.push((atrium::ctl::ENV_TOKEN.to_string(), token.to_string()));
     }
     env
 }
 
 /// The shared spawn core: build the agent's launch (session-id inject, Windows
 /// shim wrapping, identity env resolution), then spawn it on a pty of the given
-/// size in the given working directory. Every pane amux hosts — the initial one,
+/// size in the given working directory. Every pane atrium hosts — the initial one,
 /// a split, a grid tile, and each fleet agent — is born here, so the identity /
 /// `--session-id` / effective-command discipline is written once and shared.
 ///
@@ -3333,14 +3335,14 @@ fn spawn_pane_full(
     id: usize,
     identity: Option<&str>,
     cwd: Option<&str>,
-    mode: amux::ctl::TrustMode,
+    mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
     // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This
     // title feeds is_claude/is_codex/vendor_tag, so the fix must live here.
-    let title = amux::bind::command_stem(&command[0]);
+    let title = atrium::bind::command_stem(&command[0]);
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands
@@ -3351,7 +3353,7 @@ fn spawn_pane_full(
     //                                the human confirmed it at launch).
     //   Plan (`plan`)              → `--permission-mode plan` (read-only).
     // `mode` is the *effective* mode for this pane: the session policy for the
-    // panes amux opens itself, or — for a ctl spawn — the per-spawn `--mode` after
+    // panes atrium opens itself, or — for a ctl spawn — the per-spawn `--mode` after
     // the operator-elevate / worker-cap governance in `apply_ctl`.
     // `--session-id`, `--append-system-prompt`, and the ~/.claude.json folder-trust
     // gate below are all Claude Code CLI specifics — injecting them into another
@@ -3361,44 +3363,44 @@ fn spawn_pane_full(
     // is vendor-aware). Any other agent still launches with its command untouched.
     // The broad `is_agent_stem` continues to govern vendor-neutral treatment like
     // the identity-env decision in `wants_env` below.
-    let is_claude = amux::bind::is_claude_stem(&title);
-    let is_codex = amux::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex);
-    let trusted_launch = (is_claude || is_codex) && mode != amux::ctl::TrustMode::Off;
+    let is_claude = atrium::bind::is_claude_stem(&title);
+    let is_codex = atrium::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex);
+    let trusted_launch = (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off;
     let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
         if is_claude {
             match mode {
-                amux::ctl::TrustMode::Edits => {
-                    v.extend(amux::trust::accept_edits_args(
-                        &amux::trust::extra_allow_from_env(),
+                atrium::ctl::TrustMode::Edits => {
+                    v.extend(atrium::trust::accept_edits_args(
+                        &atrium::trust::extra_allow_from_env(),
                     ));
                 }
-                amux::ctl::TrustMode::Auto => {
+                atrium::ctl::TrustMode::Auto => {
                     v.push("--permission-mode".to_string());
                     v.push("auto".to_string());
                 }
-                amux::ctl::TrustMode::Skip => {
-                    v.push(amux::ctl::SKIP_PERMISSIONS_FLAG.to_string());
+                atrium::ctl::TrustMode::Skip => {
+                    v.push(atrium::ctl::SKIP_PERMISSIONS_FLAG.to_string());
                 }
-                amux::ctl::TrustMode::Plan => {
+                atrium::ctl::TrustMode::Plan => {
                     v.push("--permission-mode".to_string());
                     v.push("plan".to_string());
                 }
-                amux::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
+                atrium::ctl::TrustMode::Off => unreachable!("trusted_launch implies not Off"),
             }
         } else if is_codex {
             // codex's approval/sandbox flags — its analog of the above. Guarded by
             // `is_codex` (not a bare `else`) so that if the claude/codex stem sets
             // ever overlap or a third vendor is added, codex flags reach ONLY a
             // codex pane — never silently some other agent's command.
-            v.extend(amux::trust::codex_trust_args(mode));
+            v.extend(atrium::trust::codex_trust_args(mode));
         }
         v
     } else {
         command.to_vec()
     };
     // When the ctl channel is live, teach every agent pane — the initial one and
-    // ctl-spawned workers alike — to delegate through `amux ctl` (visible panes)
+    // ctl-spawned workers alike — to delegate through `atrium ctl` (visible panes)
     // instead of its own invisible Task/background-agents tool. This is the
     // dependable layer: it is always in the agent's context (via
     // `--append-system-prompt`), so reliable delegation no longer hinges on a
@@ -3406,7 +3408,7 @@ fn spawn_pane_full(
     // the `--allowedTools` list cleanly rather than being read as one of its values.
     if is_claude && CTL_ADDRESS.get().is_some() {
         base.push("--append-system-prompt".to_string());
-        base.push(amux::ctl::AGENT_CTL_DIRECTIVE.to_string());
+        base.push(atrium::ctl::AGENT_CTL_DIRECTIVE.to_string());
     }
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
@@ -3420,25 +3422,25 @@ fn spawn_pane_full(
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        if let Err(e) = amux::trust::ensure_trusted(&dir) {
+        if let Err(e) = atrium::trust::ensure_trusted(&dir) {
             *flash = Some((format!("folder-trust: {e}"), Instant::now()));
         }
     }
-    // Agent-aware bind (§3.3): if this is an agent pane amux is launching and the
+    // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
     // user did not already pick a session, mint a uuid and append
     // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
     // wrapping, so the flag reaches claude, not the shim host). Remember the id.
-    let session_id = amux::bind::session_id_for(&base);
+    let session_id = atrium::bind::session_id_for(&base);
     let mut user_cmd: Vec<String> = base;
     if let Some(uuid) = &session_id {
         user_cmd.push("--session-id".to_string());
         user_cmd.push(uuid.clone());
     }
     let effective = effective_command(&user_cmd);
-    // Opt-in spawn diagnostic: `AMUX_SPAWN_LOG=<file>` appends the exact command
-    // (post trust-flags, post shim) amux launches for each pane, so a "why isn't
+    // Opt-in spawn diagnostic: `ATRIUM_SPAWN_LOG=<file>` appends the exact command
+    // (post trust-flags, post shim) atrium launches for each pane, so a "why isn't
     // this pane in the mode I expected" question is answered by data, not guesses.
-    if let Ok(path) = std::env::var("AMUX_SPAWN_LOG") {
+    if let Ok(path) = std::env::var("ATRIUM_SPAWN_LOG") {
         if !path.is_empty() {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -3455,15 +3457,15 @@ fn spawn_pane_full(
     let c = cols.max(1);
 
     // Stamp the process-global agent id now — it is both the pane's spawn-tree
-    // key and the `AMUX_PANE` value injected below, so an agent inside can
+    // key and the `ATRIUM_PANE` value injected below, so an agent inside can
     // attribute its own `ctl spawn` calls back to this pane.
     let agent_id = next_agent_id();
 
     // ctl env (non-secret): when the control channel is on, every pane learns
-    // the endpoint (`AMUX_CTL`) and its own id (`AMUX_PANE`). This is the base
+    // the endpoint (`ATRIUM_CTL`) and its own id (`ATRIUM_PANE`). This is the base
     // env; identity secrets (if any) are merged on top for this one spawn.
     // A per-pane capability token: 32 bytes of OS CSPRNG entropy (hex), so a
-    // sibling pane cannot guess or brute-force it. Injected as AMUX_TOKEN and
+    // sibling pane cannot guess or brute-force it. Injected as ATRIUM_TOKEN and
     // stored on the pane; the ctl server authenticates a request by matching it.
     // Peer-credential binding at the ipc layer (same-user endpoint) is the second
     // gate underneath this token — see `ipc.rs`.
@@ -3471,17 +3473,17 @@ fn spawn_pane_full(
     // environment at all, so it simply has no control-plane access. The old
     // behaviour minted a guessable token from non-crypto ids and injected it
     // anyway, which is strictly worse — a sibling pane could then forge it.
-    // `\r\n` because amux is in raw mode here.
-    let token = amux::uid::token();
+    // `\r\n` because atrium is in raw mode here.
+    let token = atrium::uid::token();
     if token.is_none() {
         eprint!(
-            "amux: warning: OS entropy unavailable; this pane is starting WITHOUT \
+            "atrium: warning: OS entropy unavailable; this pane is starting WITHOUT \
              ctl access rather than with a guessable capability token\r\n"
         );
     }
     let pane_id = agent_id.to_string();
     let base_env = pane_base_env(
-        amux::orphan::session_key().as_ref(),
+        atrium::orphan::session_key().as_ref(),
         match (CTL_ADDRESS.get(), token.as_ref()) {
             (Some(addr), Some(tok)) => Some((addr.as_str(), pane_id.as_str(), tok.as_str())),
             _ => None,
@@ -3491,7 +3493,7 @@ fn spawn_pane_full(
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge
     // — a pane tagged with an identity is exactly a pane spawned with its env.
-    let inject = amux::identity::wants_env(command, identity);
+    let inject = atrium::identity::wants_env(command, identity);
 
     // We RE-RESOLVE on every spawn — the resolved env (which contains secret
     // material) lives only in this local, is handed straight to the pty, and is
@@ -3542,12 +3544,12 @@ fn spawn_pane_full(
     // stranded — is one of those. So the env marker alone is blind to shells
     // here; the stamp covers every pane. It records the pane's own start token,
     // so a stale file cannot become a kill order against a recycled pid.
-    amux::orphan::stamp(pty.pid());
+    atrium::orphan::stamp(pty.pid());
     Ok(Pane {
         id,
         pty,
         term: vterm::Term::new(r as usize, c as usize),
-        filter: amux::filter::Passthrough::new(),
+        filter: atrium::filter::Passthrough::new(),
         title,
         activity: false,
         exited: false,
@@ -3572,7 +3574,7 @@ fn spawn_pane_full(
     })
 }
 
-/// Sanitize the terminal on exit and leave the alt screen. amux owns the alt
+/// Sanitize the terminal on exit and leave the alt screen. atrium owns the alt
 /// buffer (§ the run loop's `\x1b[?1049h` at start), but a hosted app may have
 /// left modes on — mouse reporting, bracketed paste, a hidden cursor, an
 /// altered scroll region, a non-default SGR. Leaving the alt screen alone does
@@ -3580,12 +3582,12 @@ fn spawn_pane_full(
 /// `?1049l` swap so the user's original shell comes back clean. Called on
 /// **every** exit path in `run` (normal quit, last-pane-exit, read error, and
 /// the initial-spawn failure).
-/// Every mouse-reporting mode amux ever turns off, in one place.
+/// Every mouse-reporting mode atrium ever turns off, in one place.
 ///
 /// This existed twice with DIFFERENT contents: the per-tick suppressor sent
 /// `?1015l` and `cleanup_screen` did not. So a hosted app that enabled
 /// urxvt-style reporting (1015) left the user's real shell emitting escape
-/// garbage on every click after amux exited — the one mode the exit path forgot.
+/// garbage on every click after atrium exited — the one mode the exit path forgot.
 /// Two lists that must agree will not stay in agreement; there is now one.
 const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
 
@@ -3607,7 +3609,7 @@ fn stdin_probe() -> ExitCode {
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("amux: not a terminal: {e}");
+            eprintln!("atrium: not a terminal: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -3704,7 +3706,7 @@ fn split_cmdline(line: &str) -> Vec<String> {
 /// included) are such shims, and `CreateProcessW` cannot launch them directly.
 #[cfg(windows)]
 fn effective_command(command: &[String]) -> Vec<String> {
-    use amux::resolve;
+    use atrium::resolve;
     let dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
@@ -3742,21 +3744,21 @@ mod tests {
     /// **A pane must carry the session marker whether or not ctl is on.**
     ///
     /// The marker used to be pushed inside the ctl block, so the DEFAULT launch
-    /// (no `--allow-ctl`) produced a pane with no amux environment at all —
+    /// (no `--allow-ctl`) produced a pane with no atrium environment at all —
     /// nothing identified the process as ours, so nothing could ever find it
-    /// again. Move the `AMUX_SESSION` push back inside the `if let Some((addr,
+    /// again. Move the `ATRIUM_SESSION` push back inside the `if let Some((addr,
     /// …)) = ctl` arm and the first assertion here fails, which is exactly the
     /// shipped bug.
     #[test]
     fn every_pane_is_marked_even_with_no_control_channel() {
-        let key = amux::orphan::SessionKey {
+        let key = atrium::orphan::SessionKey {
             owner: 17686,
             started: 99,
         };
         let bare = pane_base_env(Some(&key), None);
         assert_eq!(
             bare,
-            vec![("AMUX_SESSION".to_string(), "17686:99".to_string())],
+            vec![("ATRIUM_SESSION".to_string(), "17686:99".to_string())],
             "a pane without ctl must still be findable"
         );
 
@@ -3766,7 +3768,12 @@ mod tests {
         let names: Vec<&str> = full.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             names,
-            vec!["AMUX_SESSION", "AMUX_CTL", "AMUX_PANE", "AMUX_TOKEN"]
+            vec![
+                "ATRIUM_SESSION",
+                "ATRIUM_CTL",
+                "ATRIUM_PANE",
+                "ATRIUM_TOKEN"
+            ]
         );
         assert_eq!(full[3].1, "deadbeef");
     }
@@ -3778,7 +3785,7 @@ mod tests {
     fn a_pane_is_never_marked_with_a_key_we_could_not_compute() {
         assert!(pane_base_env(None, None).is_empty());
         let ctl_only = pane_base_env(None, Some(("/tmp/sock", "3", "deadbeef")));
-        assert!(!ctl_only.iter().any(|(k, _)| k == "AMUX_SESSION"));
+        assert!(!ctl_only.iter().any(|(k, _)| k == "ATRIUM_SESSION"));
         assert_eq!(ctl_only.len(), 3);
     }
 
@@ -3787,7 +3794,7 @@ mod tests {
     /// `caller` is derived from the capability token and is never self-reported,
     /// so `None` means exactly "unauthenticated". This arm returned `true`, which
     /// inverted the gate: holding NO credential granted strictly more than
-    /// holding a worker's, so `env -u AMUX_TOKEN amux ctl ...` promoted you.
+    /// holding a worker's, so `env -u ATRIUM_TOKEN atrium ctl ...` promoted you.
     ///
     /// This fails against the old code, which is the point — an earlier attempt
     /// at an integration test for the same fix passed with the fix REVERTED,
@@ -3809,7 +3816,7 @@ mod tests {
     /// classification stays correct while the spawn ignores it.
     #[test]
     fn a_fleet_agent_is_launched_with_the_paths_that_were_disclosed() {
-        use amux::fleet::{Agent, AgentPlan, Field, Grant, Reach};
+        use atrium::fleet::{Agent, AgentPlan, Field, Grant, Reach};
         let g = |raw: &str, given: &str, field| Grant {
             field,
             raw: raw.to_string(),
@@ -3860,7 +3867,7 @@ mod tests {
     /// session the human had set to `plan`.
     #[test]
     fn the_session_policy_caps_every_request() {
-        use amux::ctl::TrustMode;
+        use atrium::ctl::TrustMode;
         // Escalation is refused and explained, whoever asks.
         let (mode, note) = super::effective_mode(Some(TrustMode::Skip), TrustMode::Plan);
         assert_eq!(mode, TrustMode::Plan, "skip escaped a plan-mode session");
@@ -3873,7 +3880,7 @@ mod tests {
     /// and is the useful half of `--mode`.
     #[test]
     fn a_request_below_the_policy_is_honoured() {
-        use amux::ctl::TrustMode;
+        use atrium::ctl::TrustMode;
         let (mode, note) = super::effective_mode(Some(TrustMode::Plan), TrustMode::Skip);
         assert_eq!(mode, TrustMode::Plan);
         assert!(note.is_none(), "de-escalation should not be flagged");
@@ -4004,7 +4011,7 @@ mod tests {
 
     #[test]
     fn overview_panel_shows_window_headers_only_when_multiple_fleets() {
-        let bus = amux::bus::Bus::new();
+        let bus = atrium::bus::Bus::new();
         // One window: no "window 1" group header.
         let one = vec![ov_node(0, None, false), ov_node(0, None, false)];
         let r1 = strip_csi(&render_overview_panel(&[], &bus, &one, 0, 24, 100));
@@ -4023,11 +4030,11 @@ mod tests {
     fn feed_scroll_pages_back_through_history() {
         // Six FYI events, a 3-row feed. One row is the scroll hint, so two events
         // show at a time; scroll offsets the window toward older events.
-        let mut bus = amux::bus::Bus::new();
+        let mut bus = atrium::bus::Bus::new();
         for i in 1..=6u64 {
             bus.publish(
                 "t",
-                amux::bus::Kind::Fyi,
+                atrium::bus::Kind::Fyi,
                 Some("w"),
                 &[("msg".to_string(), format!("e{i}"))],
                 i,
@@ -4074,11 +4081,11 @@ mod tests {
     #[test]
     fn decision_detail_shows_the_full_question() {
         // The panel line can truncate; the detail bar must show the whole question.
-        let mut bus = amux::bus::Bus::new();
+        let mut bus = atrium::bus::Bus::new();
         let q = "Should the initial release be tagged 0.1.0 as a pre-release alpha or 1.0.0 as the first stable release";
         bus.publish(
             "ui",
-            amux::bus::Kind::DecisionNeeded,
+            atrium::bus::Kind::DecisionNeeded,
             Some("grace"),
             &[("q".to_string(), q.to_string())],
             1,
@@ -4100,7 +4107,7 @@ mod tests {
 
     #[test]
     fn ctl_read_ops_are_open_mutations_require_auth() {
-        use amux::ctl::{BoardOp, Cmd, KillReq};
+        use atrium::ctl::{BoardOp, Cmd, KillReq};
         // Reads are servable to an unauthenticated caller…
         assert!(ctl_is_read_only(&Cmd::List));
         assert!(ctl_is_read_only(&Cmd::Board(BoardOp::List)));
@@ -4131,23 +4138,23 @@ mod tests {
 
     #[test]
     fn collect_log_merges_bus_and_board_in_time_order() {
-        let mut bus = amux::bus::Bus::new();
+        let mut bus = atrium::bus::Bus::new();
         bus.publish(
             "ui",
-            amux::bus::Kind::Fyi,
+            atrium::bus::Kind::Fyi,
             Some("ada"),
             &[("msg".to_string(), "hi".to_string())],
             300,
         )
         .unwrap();
-        let mut board = amux::board::Board::new();
+        let mut board = atrium::board::Board::new();
         board.set(
             "title",
             &[("status".to_string(), "done".to_string())],
             Some("lead"),
             100,
         );
-        let world = amux::vendors::VendorWorlds::new(); // no sessions (unrefreshed)
+        let world = atrium::vendors::VendorWorlds::new(); // no sessions (unrefreshed)
         let rows = collect_log(&[], &world, &board, &bus);
         assert!(rows.len() >= 2, "bus + board rows present");
         assert!(

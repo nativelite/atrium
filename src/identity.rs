@@ -1,12 +1,12 @@
 //! Per-pane agent **identity** — the credential a pane's agent runs under
-//! (path B of the amux ⨯ akey design). amux resolves the identity's env via
+//! (path B of the atrium ⨯ akey design). atrium resolves the identity's env via
 //! `akey` at spawn and injects it into that one child's pty; the pane is
 //! tagged with the identity **name** only — never the secret.
 //!
 //! This module owns the two *pure* seams so the wiring is testable without a
 //! vault or a pty:
 //!
-//! * [`parse`] pulls `--identity <name>` / `-I <name>` out of amux's own
+//! * [`parse`] pulls `--identity <name>` / `-I <name>` out of atrium's own
 //!   argument vector, leaving the hosted command intact.
 //! * [`wants_env`] decides — for a given command and the active identity —
 //!   whether this spawn should inject a resolved credential env (i.e. it is an
@@ -47,12 +47,12 @@ pub fn palette_index(name: &str) -> u8 {
     IDENTITY_PALETTE[(h as usize) % IDENTITY_PALETTE.len()]
 }
 
-/// Extract amux's own `--identity <name>` (or short `-I <name>`) flag from the
+/// Extract atrium's own `--identity <name>` (or short `-I <name>`) flag from the
 /// front-loaded argument vector, returning the chosen identity (if any) and the
 /// remaining vector — the hosted command and its args, untouched.
 ///
-/// The flag is amux's, so it is only recognized as a *leading* option, before
-/// the hosted command begins: `amux [--identity <name>] [command args…]`. The
+/// The flag is atrium's, so it is only recognized as a *leading* option, before
+/// the hosted command begins: `atrium [--identity <name>] [command args…]`. The
 /// first non-flag token starts the command; everything from there on is the
 /// child's, so a later `-I` that belongs to the hosted program is never eaten.
 /// A trailing `--identity` with no value (or the glued `--identity=` with an
@@ -91,7 +91,7 @@ pub fn parse(args: &[String]) -> (Option<String>, Vec<String>) {
                 i += 1;
             }
             // First non-flag token: the hosted command starts here. Stop
-            // parsing amux options so the child owns the rest verbatim.
+            // parsing atrium options so the child owns the rest verbatim.
             _ => {
                 return (identity, args[i..].to_vec());
             }
@@ -101,7 +101,7 @@ pub fn parse(args: &[String]) -> (Option<String>, Vec<String>) {
 }
 
 /// Should this spawn inject a resolved credential env? True iff an identity is
-/// set **and** the command is an agent pane amux would bind (the same
+/// set **and** the command is an agent pane atrium would bind (the same
 /// agent-stem test [`crate::bind`] uses for `--session-id`). Non-agent panes
 /// (shells, editors) and no-identity spawns keep plain `spawn`.
 ///

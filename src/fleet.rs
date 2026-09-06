@@ -1,16 +1,16 @@
-//! The fleet loader — `amux fleet up <name>`, the saved-roster "swarm with
+//! The fleet loader — `atrium fleet up <name>`, the saved-roster "swarm with
 //! presets" feature (design doc §6b).
 //!
 //! A fleet is a named set of agents that come up **in-role** — identity, working
 //! directory, context dirs, and instructions — in one command. Its definition
-//! lives in a project-local `amux.fleet.json` (checked into the repo so a team
+//! lives in a project-local `atrium.fleet.json` (checked into the repo so a team
 //! shares the fleet), with a user-global fallback. The file is read **read-only**;
-//! amux never writes it.
+//! atrium never writes it.
 //!
 //! This module owns the *pure* seams so the wiring is testable without a pty, a
 //! vault, or a layout tree:
 //!
-//! * [`parse`] turns the `amux.fleet.json` text into the typed [`Fleets`] map
+//! * [`parse`] turns the `atrium.fleet.json` text into the typed [`Fleets`] map
 //!   (the §6b schema), rejecting a malformed file / missing `fleets` / a fleet
 //!   with zero agents with a clear message — the loader spawns nothing on error.
 //! * [`Agent::args`] is the pure arg-builder: an agent def → the argv it
@@ -37,7 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The whole `amux.fleet.json`: a name → [`Fleet`] map. Order-preserving so
+/// The whole `atrium.fleet.json`: a name → [`Fleet`] map. Order-preserving so
 /// `fleet ls` lists fleets in file order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fleets {
@@ -117,7 +117,7 @@ pub struct Agent {
     pub model: Option<String>,
     /// The reasoning effort (→ `--effort <effort>`).
     pub effort: Option<String>,
-    /// May this agent create teammates with `amux ctl spawn`? Defaults to
+    /// May this agent create teammates with `atrium ctl spawn`? Defaults to
     /// **false** for a fleet agent.
     ///
     /// Spawning was never a capability an agent had or lacked - it was implied by
@@ -139,7 +139,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// The **pure arg-builder**: the full launch argv for this agent, as amux
+    /// The **pure arg-builder**: the full launch argv for this agent, as atrium
     /// hands it to the spawn path — the base `cmd`, then the fleet extras in a
     /// fixed order. Each extra appears exactly when its field is set and is
     /// omitted when absent.
@@ -181,7 +181,7 @@ impl Agent {
     }
 }
 
-/// Parse an `amux.fleet.json` text into the typed [`Fleets`] map.
+/// Parse an `atrium.fleet.json` text into the typed [`Fleets`] map.
 ///
 /// Rejects, with a clear message and *no* partial result, any of:
 /// * malformed JSON (the `json` crate's line/column error is surfaced),
@@ -369,7 +369,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
 }
 
 /// The fleet-file name looked for in the current directory.
-pub const FILE_NAME: &str = "amux.fleet.json";
+pub const FILE_NAME: &str = "atrium.fleet.json";
 
 /// A located fleet file: the path we read and the directory that agent `cwd` /
 /// `add_dirs` are resolved against (the file's own directory).
@@ -379,14 +379,14 @@ pub struct Located {
     pub dir: PathBuf,
     /// True when this is the user-global file rather than a project-local one.
     ///
-    /// Its directory is `~/.config/amux`, which holds no project by
+    /// Its directory is `~/.config/atrium`, which holds no project by
     /// construction, so it is the wrong thing to measure "inside" against — see
     /// [`anchor_for`], which uses the invoking directory instead.
     pub global: bool,
 }
 
-/// The user-global fleet-file path (`%APPDATA%\amux\fleet.json` on Windows,
-/// `~/.config/amux/fleet.json` elsewhere), or `None` if the base dir is unset.
+/// The user-global fleet-file path (`%APPDATA%\atrium\fleet.json` on Windows,
+/// `~/.config/atrium/fleet.json` elsewhere), or `None` if the base dir is unset.
 pub fn global_path() -> Option<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -394,7 +394,7 @@ pub fn global_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.map(|b| b.join("amux").join("fleet.json"))
+    base.map(|b| b.join("atrium").join("fleet.json"))
 }
 
 /// A human-readable rendering of the global path for error messages, even when
@@ -404,15 +404,15 @@ fn global_path_display() -> String {
         Some(p) => p.display().to_string(),
         None => {
             if cfg!(windows) {
-                "%APPDATA%\\amux\\fleet.json".to_string()
+                "%APPDATA%\\atrium\\fleet.json".to_string()
             } else {
-                "~/.config/amux/fleet.json".to_string()
+                "~/.config/atrium/fleet.json".to_string()
             }
         }
     }
 }
 
-/// Locate the fleet file: `./amux.fleet.json` first, then the user-global
+/// Locate the fleet file: `./atrium.fleet.json` first, then the user-global
 /// fallback. Returns the located file, or a clear not-found error naming **both**
 /// locations. `cwd` is the current directory (injected so this is testable).
 pub fn discover(cwd: &Path) -> Result<Located, String> {
@@ -470,7 +470,7 @@ pub fn resolve_dir(base: &Path, dir: &str) -> PathBuf {
 // * The reach itself is a documented feature. README's own example grants
 //   `"../shared"` — a sibling checkout — and two independent attempts to ban
 //   "outside" paths broke that example, then broke the user-global fleet file
-//   (whose directory is `~/.config/amux`, so *every* useful path is outside it)
+//   (whose directory is `~/.config/atrium`, so *every* useful path is outside it)
 //   and a monorepo whose fleet file sits in `tools/`. A gate that refuses
 //   ordinary work is a gate people route around, and the routing-around is
 //   invisible.
@@ -482,7 +482,7 @@ pub fn resolve_dir(base: &Path, dir: &str) -> PathBuf {
 //   something.
 //
 // What this layer therefore guarantees, and nothing more: **every directory
-// amux itself grants an agent through `cwd`/`add_dirs` is resolved through
+// atrium itself grants an agent through `cwd`/`add_dirs` is resolved through
 // symlinks, classified against the anchor, and named on the screen the operator
 // acknowledges — and the child is handed the same resolved path that was
 // shown.** What it does not and cannot cover is listed on `Plan::build`.
@@ -583,7 +583,7 @@ fn presentable(p: PathBuf) -> PathBuf {
 }
 
 /// Resolve a path **through symlinks** to where it really lands, or `None` when
-/// amux cannot tell.
+/// atrium cannot tell.
 ///
 /// Never string surgery. A previous attempt at this defect banned `".."`
 /// lexically and its own test showed a symlink walking straight out of the tree
@@ -616,7 +616,7 @@ pub fn real_path(p: &Path) -> Option<PathBuf> {
     if let Ok(real) = std::fs::canonicalize(p) {
         return Some(presentable(real));
     }
-    // The path itself is a symlink amux could not follow (a dangling target, an
+    // The path itself is a symlink atrium could not follow (a dangling target, an
     // unreadable ancestor). Falling through to the walk below would place it at
     // the LINK's own location and report "inside" for a pointer to somewhere
     // unknown - and the moment the target is created, the grant is wherever that
@@ -675,7 +675,7 @@ const HOME_STORES: &[(&str, &str)] = &[
 /// operator can see is wrong, and a control the operator can see is wrong is one
 /// they learn to skip. For the same reason nothing here blocks: an earlier
 /// attempt refused `add_dirs: ["~/.claude/skills"]` — editing your own skills,
-/// which is a normal amux job — with no override anywhere.
+/// which is a normal atrium job — with no override anywhere.
 #[derive(Debug, Clone, Default)]
 pub struct Stores {
     roots: Vec<(PathBuf, &'static str)>,
@@ -742,7 +742,7 @@ pub enum Reach {
     Inside,
     /// Resolved to a path outside the anchor. Allowed — and always printed.
     Outside,
-    /// amux could not resolve it. Printed as loudly as `Outside`: a check that
+    /// atrium could not resolve it. Printed as loudly as `Outside`: a check that
     /// treats "cannot tell" as "fine" is the fail-open shape this repo keeps
     /// shipping.
     Unverifiable,
@@ -810,7 +810,7 @@ impl Grant {
     ///
     /// Only when all three of "inside", "exists" and "no credential store" hold.
     /// A path that does not exist is never quiet: a typo'd or `~`-prefixed entry
-    /// (amux does no tilde expansion, so `"~/notes"` becomes `<base>/~/notes`)
+    /// (atrium does no tilde expansion, so `"~/notes"` becomes `<base>/~/notes`)
     /// is exactly the entry most likely to be wrong, and counting it as inside
     /// is a positive false statement rather than a mere gap.
     pub fn is_quiet(&self) -> bool {
@@ -848,7 +848,7 @@ impl Grant {
     pub fn destination(&self) -> String {
         match &self.real {
             Some(r) => show_path(r),
-            None => "(amux cannot resolve this path)".to_string(),
+            None => "(atrium cannot resolve this path)".to_string(),
         }
     }
 
@@ -873,8 +873,8 @@ pub enum AnchorKind {
     Repo,
     /// The fleet file's own directory (no enclosing repo).
     FleetDir,
-    /// The directory `amux` was run from — used for the user-global fleet file,
-    /// whose own directory (`~/.config/amux`) contains no project at all.
+    /// The directory `atrium` was run from — used for the user-global fleet file,
+    /// whose own directory (`~/.config/atrium`) contains no project at all.
     InvokingDir,
 }
 
@@ -892,7 +892,7 @@ impl AnchorKind {
         match self {
             AnchorKind::Repo => "the enclosing git repository",
             AnchorKind::FleetDir => "the fleet file's own directory",
-            AnchorKind::InvokingDir => "the directory you ran amux in",
+            AnchorKind::InvokingDir => "the directory you ran atrium in",
         }
     }
 }
@@ -903,13 +903,13 @@ impl AnchorKind {
 /// measured and is wrong twice over. A monorepo whose fleet file lives in
 /// `tools/` marks every same-repo path OUTSIDE (18 loud lines for a 6-agent
 /// roster, scrolling the trust posture off a 24-row terminal), and the
-/// documented user-global file at `~/.config/amux/fleet.json` can produce
+/// documented user-global file at `~/.config/atrium/fleet.json` can produce
 /// *nothing but* OUTSIDE, because that directory holds no project by
 /// construction. A tag that appears on 100% of lines carries no information and
 /// trains the operator to skim past it — which is the whole control.
 ///
 /// So: the repo the file is checked into (the unit a reviewer already trusts),
-/// else the file's directory; and for the global file, the directory amux was
+/// else the file's directory; and for the global file, the directory atrium was
 /// run in, since that is the project the operator meant.
 ///
 /// The walk up stops short of `$HOME` and of any ancestor of it: a home
@@ -957,7 +957,7 @@ pub fn anchor_for(
 }
 
 /// One agent's disclosed launch: the label its pane wears, its credentials, its
-/// directories, and whether amux can see what it will do at all.
+/// directories, and whether atrium can see what it will do at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentPlan {
     /// The agent's name, already defanged — this is both the banner label and
@@ -965,7 +965,7 @@ pub struct AgentPlan {
     pub label: String,
     /// The identity (akey credential) this agent comes up on, if any.
     pub identity: Option<String>,
-    /// `Some(stem)` when `cmd` is not an agent CLI amux knows — a shell, a build
+    /// `Some(stem)` when `cmd` is not an agent CLI atrium knows — a shell, a build
     /// tool. See `Plan::build` for why that is disclosed.
     pub opaque: Option<String>,
     pub cwd: Option<Grant>,
@@ -1006,9 +1006,9 @@ struct Loud {
 ///   Only `d` is classified; walking the subtree is unbounded, racy, and still
 ///   wrong a second later. An add_dir grants its transitive symlink closure.
 /// * **Anything `cmd` does.** `vet_spawn_argv` refuses a literal `--add-dir` in
-///   `cmd`, but `["sh","-c","claude --add-dir ~/.ssh"]` is a shell command amux
+///   `cmd`, but `["sh","-c","claude --add-dir ~/.ssh"]` is a shell command atrium
 ///   neither parses nor should. That is why a non-agent `cmd` is disclosed as
-///   such: amux can bound the directories *it* grants, not what a program it
+///   such: atrium can bound the directories *it* grants, not what a program it
 ///   starts grants itself.
 /// * **The rest of the entry.** `prompt` and `kickoff` go into the child's argv
 ///   and are not shown here (they are text, not access).
@@ -1017,8 +1017,8 @@ struct Loud {
 ///   moves the grant; re-pointing a directory component of that resolved path
 ///   between the ack and the spawn still would. Closing it needs `openat`
 ///   /`O_NOFOLLOW` plumbing through the spawn path.
-/// * **It is not a sandbox.** Same-uid: everything amux can read the agent can
-///   read on its own (see `warden.rs`). This bounds what amux *hands over*, and
+/// * **It is not a sandbox.** Same-uid: everything atrium can read the agent can
+///   read on its own (see `warden.rs`). This bounds what atrium *hands over*, and
 ///   makes it visible at approval time. Nothing more.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Plan {
@@ -1202,7 +1202,7 @@ impl Plan {
             .collect();
         if !opaque.is_empty() {
             lines.push(format!(
-                "amux cannot see what these will read — they do not run an agent CLI: {}",
+                "atrium cannot see what these will read — they do not run an agent CLI: {}",
                 shorten(&opaque.join(", "), 200)
             ));
         }
@@ -1577,7 +1577,7 @@ mod tests {
 
     #[test]
     fn discover_finds_the_local_file_first() {
-        let td = std::env::temp_dir().join(format!("amux-fleet-disc-{}", std::process::id()));
+        let td = std::env::temp_dir().join(format!("atrium-fleet-disc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(&td).unwrap();
         std::fs::write(td.join(FILE_NAME), "{}").unwrap();
@@ -1594,25 +1594,25 @@ mod tests {
     #[test]
     fn discover_missing_names_both_locations() {
         // Point the *global* location at an empty dir for the duration. Without
-        // this the test reads the developer's real `~/.config/amux/fleet.json`
+        // this the test reads the developer's real `~/.config/atrium/fleet.json`
         // and fails the moment they have one — which is a supported, documented
         // setup, so the test was asserting "no global fleet file exists on this
         // machine" rather than the behaviour it means to cover.
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // BOTH variables, not just the unix one. `global_path` reads APPDATA on
         // Windows and XDG_CONFIG_HOME elsewhere, so overriding only XDG left this
-        // test reading the developer's real %APPDATA%\amux\fleet.json — it was
+        // test reading the developer's real %APPDATA%\atrium\fleet.json — it was
         // hermetic on exactly one platform, which is the same class of bug the
         // previous fix here was meant to close.
         let prev_appdata = std::env::var_os("APPDATA");
         let prev = std::env::var_os("XDG_CONFIG_HOME");
-        let empty = std::env::temp_dir().join(format!("amux-fleet-cfg-{}", std::process::id()));
+        let empty = std::env::temp_dir().join(format!("atrium-fleet-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
         std::env::set_var("XDG_CONFIG_HOME", &empty);
         std::env::set_var("APPDATA", &empty);
 
-        let td = std::env::temp_dir().join(format!("amux-fleet-none-{}", std::process::id()));
+        let td = std::env::temp_dir().join(format!("atrium-fleet-none-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&td);
         std::fs::create_dir_all(&td).unwrap();
         let found = discover(&td);
@@ -1652,7 +1652,7 @@ mod tests {
             static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let p =
-                std::env::temp_dir().join(format!("amux-reach-{tag}-{}-{n}", std::process::id()));
+                std::env::temp_dir().join(format!("atrium-reach-{tag}-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
             Tmp(real_path(&p).unwrap())
@@ -1744,7 +1744,7 @@ mod tests {
         // the grant is wherever that is.
         let t = Tmp::new("dangle");
         let base = t.dir("proj");
-        link(Path::new("/no-such-target-amux"), &base.join("ghost"));
+        link(Path::new("/no-such-target-atrium"), &base.join("ghost"));
         let g = probe(&base, &base, "./ghost");
         assert_eq!(g.reach, Reach::Unverifiable);
         assert_eq!(g.real, None);
@@ -1777,7 +1777,7 @@ mod tests {
 
     #[test]
     fn a_path_that_does_not_exist_yet_is_placed_but_never_quiet() {
-        // amux does no tilde or env expansion, so `"~/notes"` becomes
+        // atrium does no tilde or env expansion, so `"~/notes"` becomes
         // `<base>/~/notes`: a path that reads to a human as "my home directory"
         // and reaches nothing. Folding it into a terse "N inside" count is a
         // positive false statement about the entry most likely to be wrong.
@@ -1903,11 +1903,11 @@ mod tests {
 
     #[test]
     fn the_global_fleet_file_is_anchored_at_the_directory_you_ran_in() {
-        // `~/.config/amux/fleet.json`'s own directory holds no project by
+        // `~/.config/atrium/fleet.json`'s own directory holds no project by
         // construction, so anchoring there makes 100% of paths OUTSIDE — a tag
         // on every line carries no information at all.
         let t = Tmp::new("anchorglobal");
-        let cfgdir = t.dir("cfg/amux");
+        let cfgdir = t.dir("cfg/atrium");
         let work = t.dir("work");
         let a = anchor_for(&cfgdir, &work, true, None);
         assert_eq!(a.kind, AnchorKind::InvokingDir);
@@ -2017,9 +2017,9 @@ mod tests {
     #[test]
     fn an_agent_that_does_not_run_an_agent_cli_is_disclosed_as_opaque() {
         // `["sh","-c","claude --add-dir ~/.ssh"]` grants read access to the SSH
-        // keys through a channel amux does not parse and should not: the direct
+        // keys through a channel atrium does not parse and should not: the direct
         // `--add-dir` in `cmd` IS refused by vet_spawn_argv, which makes the
-        // shell wrapper a trap rather than an obscure edge. amux cannot close
+        // shell wrapper a trap rather than an obscure edge. atrium cannot close
         // it, so it says so on the banner instead of implying completeness.
         let t = Tmp::new("opaque");
         let base = t.dir("proj");

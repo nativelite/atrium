@@ -1,17 +1,17 @@
 ---
-name: amux-delegate
-description: Delegate an independent, substantial part of your work to a teammate agent (a claude in its own amux pane) via `amux ctl`, when it genuinely pays off. Use when running inside amux and part of the task is large and independent.
+name: atrium-delegate
+description: Delegate an independent, substantial part of your work to a teammate agent (a claude in its own atrium pane) via `atrium ctl`, when it genuinely pays off. Use when running inside atrium and part of the task is large and independent.
 ---
 
-# Delegating to a teammate agent (amux ctl)
+# Delegating to a teammate agent (atrium ctl)
 
-You are running inside amux, which lets you spawn teammate agents — each a real
-`claude` in its own visible pane — through the `amux ctl` command. You MAY hand
+You are running inside atrium, which lets you spawn teammate agents — each a real
+`claude` in its own visible pane — through the `atrium ctl` command. You MAY hand
 an independent part of your work to a teammate.
 
-**Delegate through `amux ctl` — NOT your built-in tools.** If you delegate, do it
-by running the `amux ctl spawn` shell command (below), never with your Task tool,
-"subagents", or "background agents" — those run invisibly, whereas an `amux ctl`
+**Delegate through `atrium ctl` — NOT your built-in tools.** If you delegate, do it
+by running the `atrium ctl spawn` shell command (below), never with your Task tool,
+"subagents", or "background agents" — those run invisibly, whereas an `atrium ctl`
 teammate is a visible pane the human can watch and steer. That visibility is the
 whole point.
 
@@ -22,12 +22,12 @@ that running it in parallel beats doing it yourself. If you could finish the wor
 about as fast as it takes to spawn, brief, monitor, and reap a teammate, just do
 it — delegation has real coordination overhead. Do NOT delegate parts that depend
 on each other, or small/quick work. (If you have been told to coordinate a team,
-use the amux-coordinate skill instead — there, delegating is the job.)
+use the atrium-coordinate skill instead — there, delegating is the job.)
 
 ## How to delegate
 
-    amux ctl spawn --role <short-name> -- claude
-    amux ctl send <short-name> "<the subtask>"
+    atrium ctl spawn --role <short-name> -- claude
+    atrium ctl send <short-name> "<the subtask>"
 
 A teammate starts **blank** — a fresh agent that cannot see this conversation,
 your goal, or your work in progress. Every `send` must be fully self-contained:
@@ -39,24 +39,24 @@ Write a short paragraph, not "do the auth part".
 Teammates leave artifacts on the shared filesystem (files, edits, commits) — they
 do NOT return a value to you.
 
-    amux ctl status [<role>]   # which teammates are working vs idle
-    amux ctl kill <role>       # reap a teammate once you have collected its part
+    atrium ctl status [<role>]   # which teammates are working vs idle
+    atrium ctl kill <role>       # reap a teammate once you have collected its part
 
 When a teammate reports idle, read the files it changed to see its work, then
 reap it — don't leave a finished teammate running.
 
 ## Full surface & discovery
 
-    amux ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
-    amux ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
+    atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
 
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles
 it beside you (vs a new window); `--mode` picks a teammate's permission mode
-(`plan`/`accept`/`automode`/`skip`), else it inherits the session policy — amux caps you
+(`plan`/`accept`/`automode`/`skip`), else it inherits the session policy — atrium caps you
 at that policy unless the human operator is directing, so use `--mode` rather than
 raw claude permission flags; `audit` prints your delegation ledger. Targets are a
-role name or a pane id; you can only reach your own subtree. Run `amux ctl` with
-no arguments (or `amux --help`) for the authoritative, current surface.
+role name or a pane id; you can only reach your own subtree. Run `atrium ctl` with
+no arguments (or `atrium --help`) for the authoritative, current surface.
 
 ## Depth & visibility
 

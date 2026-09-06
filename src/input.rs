@@ -34,7 +34,7 @@ pub enum Action {
     NewPane,
     /// Open a plain **shell** in a new window — `Ctrl+A !`. Unlike `NewPane`
     /// (which runs the launch command, e.g. claude), this gives you a shell to
-    /// drive `amux ctl` from and see its rendered output.
+    /// drive `atrium ctl` from and see its rendered output.
     NewShellPane,
     KillPane,
     /// Switch to pane index (0-based; from digits 1-9).
@@ -57,7 +57,7 @@ pub enum Action {
     ToggleBoard,
     /// Open the **command prompt** — `Ctrl+A :`. The host reads a line and opens a
     /// new pane running it, so any shell/program (`wsl`, `pwsh -NoLogo`, `claude`)
-    /// can be launched mid-session, not just the command amux was started with.
+    /// can be launched mid-session, not just the command atrium was started with.
     OpenPrompt,
     /// Toggle the **overview** — `Ctrl+A o`. A mission-control panel: the agent
     /// tree colored by status (working/waiting/idle/exited) with a selection

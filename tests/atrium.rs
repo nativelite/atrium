@@ -1,9 +1,9 @@
-//! Tests for amux: the pure prefix scanner and bar builder, then the real
-//! thing — amux itself spawned inside a `pty`, driven with keystrokes,
+//! Tests for atrium: the pure prefix scanner and bar builder, then the real
+//! thing — atrium itself spawned inside a `pty`, driven with keystrokes,
 //! its passthrough output read back. Deadline-bounded throughout.
 
-use amux::bar::{bar_paint, bar_text, PaneInfo};
-use amux::input::{Action, Dir, PrefixScanner};
+use atrium::bar::{bar_paint, bar_text, PaneInfo};
+use atrium::input::{Action, Dir, PrefixScanner};
 use std::time::{Duration, Instant};
 
 // --- prefix scanner ---------------------------------------------------------
@@ -319,7 +319,7 @@ fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
     // (12 -> 94, 13 -> 95). The tag's SGR is an absolute run beginning `reset +
     // fg` (then the themed bar bg); assert on that prefix so the test doesn't
     // couple to the exact bg truecolor value.
-    let idx = amux::identity::palette_index("work");
+    let idx = atrium::identity::palette_index("work");
     let fg_param = 90 + (idx - 8) as u16;
     let tag_prefix = format!("\x1b[0;{fg_param}");
     assert!(
@@ -359,8 +359,8 @@ fn bar_paint_colors_the_identity_tag_as_text_not_a_chip() {
 #[cfg(windows)]
 #[test]
 fn resolver_finds_shims_and_flags_shell_hosting() {
-    use amux::resolve::{needs_shell, resolve};
-    let td = std::env::temp_dir().join(format!("amux-resolve-{}", std::process::id()));
+    use atrium::resolve::{needs_shell, resolve};
+    let td = std::env::temp_dir().join(format!("atrium-resolve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&td);
     std::fs::create_dir_all(&td).unwrap();
     std::fs::write(td.join("claude.CMD"), "@echo shim").unwrap();
@@ -385,14 +385,14 @@ fn resolver_finds_shims_and_flags_shell_hosting() {
 
 #[test]
 fn filter_strips_win32_input_mode_requests() {
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let mut f = Passthrough::new();
     assert_eq!(f.feed(b"a\x1b[?9001hb\x1b[?9001lc"), b"abc".to_vec());
 }
 
 #[test]
 fn filter_passes_other_escapes_untouched() {
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let mut f = Passthrough::new();
     let input = b"\x1b[31mred\x1b[?25l\x1b[?9001x\x1b[2J";
     assert_eq!(f.feed(input), input.to_vec());
@@ -400,7 +400,7 @@ fn filter_passes_other_escapes_untouched() {
 
 #[test]
 fn filter_survives_splits_at_every_boundary() {
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let input = b"pre\x1b[?9001hmid\x1b[?9001lpost\x1b[?900";
     for cut in 0..=input.len() {
         let mut f = Passthrough::new();
@@ -413,9 +413,9 @@ fn filter_survives_splits_at_every_boundary() {
 
 #[test]
 fn filter_strips_alt_screen_toggles() {
-    // amux owns the alt screen: a pane's alt-buffer enter/leave — the modern
+    // atrium owns the alt screen: a pane's alt-buffer enter/leave — the modern
     // ?1049 and the legacy ?1047 / ?47 — must never reach the real terminal.
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let mut f = Passthrough::new();
     assert_eq!(
         f.feed(b"a\x1b[?1049hb\x1b[?1049lc\x1b[?1047hd\x1b[?1047le\x1b[?47hf\x1b[?47lg"),
@@ -427,7 +427,7 @@ fn filter_strips_alt_screen_toggles() {
 fn filter_strips_alt_screen_across_every_split() {
     // Each alt-screen sequence must survive a cut at any byte boundary; the
     // shorter ?47 has to co-exist with the longer ?1047/?1049 in the matcher.
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let input = b"pre\x1b[?1049hmid\x1b[?47lpost\x1b[?1047hend\x1b[?104";
     for cut in 0..=input.len() {
         let mut f = Passthrough::new();
@@ -443,7 +443,7 @@ fn filter_does_not_eat_a_prefix_that_resolves_to_a_non_strip_sequence() {
     // "\x1b[?104" is a prefix of "\x1b[?1049h" but "\x1b[?104x" is not any
     // strip sequence — it must pass through intact once resolved, even across
     // a split at the ambiguous boundary.
-    use amux::filter::Passthrough;
+    use atrium::filter::Passthrough;
     let input = b"\x1b[?104x";
     for cut in 0..=input.len() {
         let mut f = Passthrough::new();
@@ -453,11 +453,11 @@ fn filter_does_not_eat_a_prefix_that_resolves_to_a_non_strip_sequence() {
     }
 }
 
-// --- end to end: amux inside a pty ------------------------------------------
+// --- end to end: atrium inside a pty ------------------------------------------
 
-/// Environment that makes a spawned amux hermetic: point the user-global config
+/// Environment that makes a spawned atrium hermetic: point the user-global config
 /// location (both spellings) at a directory we control, so the child cannot read
-/// the developer's real `~/.config/amux/fleet.json` or `%APPDATA%\\amux\\`.
+/// the developer's real `~/.config/atrium/fleet.json` or `%APPDATA%\\atrium\\`.
 ///
 /// Passing `&[]` inherits the parent environment — it does NOT mean "empty env" —
 /// so a test that means to prove "no fleet file exists" was really proving "this
@@ -473,7 +473,7 @@ fn hermetic_env(dir: &std::path::Path) -> Vec<(String, String)> {
         // otherwise drawn and then wiped by the alt-screen switch on the next
         // line. A test's stdin IS a tty (it runs under a pty), so without this it
         // waits for a keypress nobody sends.
-        ("AMUX_YES".to_string(), "1".to_string()),
+        ("ATRIUM_YES".to_string(), "1".to_string()),
     ]
 }
 
@@ -540,28 +540,28 @@ fn wait_exit(p: &mut pty::Pty, secs: u64) -> i32 {
         if let Some(code) = p.try_wait().unwrap() {
             return code;
         }
-        assert!(Instant::now() < end, "amux did not exit in time");
+        assert!(Instant::now() < end, "atrium did not exit in time");
         // Keep draining like a real terminal would: a host that stops
         // reading would block any child mid-write.
         let _ = p.read_timeout(&mut buf, Duration::from_millis(100));
     }
 }
 
-/// `amux --version` answers on stdout with a zero exit, with no terminal.
+/// `atrium --version` answers on stdout with a zero exit, with no terminal.
 ///
 /// It is the first thing typed into a bug report, and until it existed an
-/// unrecognized flag fell through to "the command to host" — so `amux --version`
+/// unrecognized flag fell through to "the command to host" — so `atrium --version`
 /// died on "stdin/stdout must be a terminal" the moment anyone piped it. Both
 /// spellings, and after an `--identity`, since identity is stripped first.
 #[test]
 fn version_prints_without_a_terminal() {
-    let expected = format!("amux {}", env!("CARGO_PKG_VERSION"));
+    let expected = format!("atrium {}", env!("CARGO_PKG_VERSION"));
     for args in [
         vec!["--version"],
         vec!["-V"],
         vec!["--identity", "work", "--version"],
     ] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_amux"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
             .args(&args)
             .stdin(std::process::Stdio::null())
             .output()
@@ -575,8 +575,8 @@ fn version_prints_without_a_terminal() {
     }
 }
 
-/// amux hosting a one-shot command: output passes through, and when the
-/// only pane's child exits, amux itself exits cleanly.
+/// atrium hosting a one-shot command: output passes through, and when the
+/// only pane's child exits, atrium itself exits cleanly.
 #[test]
 fn passthrough_and_auto_exit() {
     let (shell, flag) = if cfg!(windows) {
@@ -585,22 +585,22 @@ fn passthrough_and_auto_exit() {
         ("sh", "-c")
     };
     let mut p = pty::Pty::spawn(
-        env!("CARGO_BIN_EXE_amux"),
-        &[shell, flag, "echo amux-e2e-marker"],
+        env!("CARGO_BIN_EXE_atrium"),
+        &[shell, flag, "echo atrium-e2e-marker"],
         24,
         80,
     )
     .unwrap();
-    let out = read_until(&mut p, b"amux-e2e-marker", Duration::from_secs(15));
+    let out = read_until(&mut p, b"atrium-e2e-marker", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-e2e-marker"),
+        contains(&out, b"atrium-e2e-marker"),
         "output: {:?}",
         String::from_utf8_lossy(&out)
     );
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
-/// Interactive session: keystrokes reach the hosted shell through amux,
+/// Interactive session: keystrokes reach the hosted shell through atrium,
 /// its response comes back, the bar is painted, and Ctrl+A q quits.
 #[test]
 fn interactive_roundtrip_bar_and_quit() {
@@ -611,7 +611,7 @@ fn interactive_roundtrip_bar_and_quit() {
     };
     let mut argv = vec![shell];
     argv.extend(args);
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
     // The bar names the pane after the command.
     let bar_needle: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
     let out = read_until(&mut p, bar_needle, Duration::from_secs(15));
@@ -620,10 +620,10 @@ fn interactive_roundtrip_bar_and_quit() {
         "no bar in: {:?}",
         String::from_utf8_lossy(&out)
     );
-    p.write(b"echo amux-rt-42\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-rt-42", Duration::from_secs(15));
+    p.write(b"echo atrium-rt-42\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-rt-42", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-rt-42"),
+        contains(&out, b"atrium-rt-42"),
         "output: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -642,7 +642,7 @@ fn new_pane_opens_and_switches() {
     };
     let mut argv = vec![shell];
     argv.extend(args);
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
     let one: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
     let out = read_until(&mut p, one, Duration::from_secs(15));
@@ -656,10 +656,10 @@ fn new_pane_opens_and_switches() {
     );
     // Switch back to 1 and prove the pane still talks.
     p.write(b"\x011").unwrap();
-    p.write(b"echo amux-np-9\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-np-9", Duration::from_secs(15));
+    p.write(b"echo atrium-np-9\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-np-9", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-np-9"),
+        contains(&out, b"atrium-np-9"),
         "pane 1 dead after switching: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -669,9 +669,9 @@ fn new_pane_opens_and_switches() {
 
 // --- tiling (0.2): splits, focus, zoom, kill-retile -------------------------
 
-/// Spawn amux hosting an interactive shell in a pty, returning it once the bar
+/// Spawn atrium hosting an interactive shell in a pty, returning it once the bar
 /// has appeared (the shell is up). Shared setup for the tiling e2e tests.
-fn spawn_amux_shell(rows: u16, cols: u16) -> pty::Pty {
+fn spawn_atrium_shell(rows: u16, cols: u16) -> pty::Pty {
     let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
         ("cmd", vec!["/Q"])
     } else {
@@ -679,7 +679,7 @@ fn spawn_amux_shell(rows: u16, cols: u16) -> pty::Pty {
     };
     let mut argv = vec![shell];
     argv.extend(args);
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, rows, cols).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, rows, cols).unwrap();
     let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
     read_until(&mut p, bar, Duration::from_secs(15));
     p
@@ -689,21 +689,21 @@ fn spawn_amux_shell(rows: u16, cols: u16) -> pty::Pty {
 /// round-trip: a marker echoed in each appears in the composited output.
 #[test]
 fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
-    let mut p = spawn_amux_shell(24, 100);
+    let mut p = spawn_atrium_shell(24, 100);
     // Echo a marker in the first pane, then split vertically and echo another
     // marker in the new (focused) pane.
-    p.write(b"echo amux-tileA\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-tileA", Duration::from_secs(15));
+    p.write(b"echo atrium-tileA\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-tileA", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-tileA"),
+        contains(&out, b"atrium-tileA"),
         "first pane silent: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01%").unwrap(); // split vertical -> focus the new pane
-    p.write(b"echo amux-tileB\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-tileB", Duration::from_secs(15));
+    p.write(b"echo atrium-tileB\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-tileB", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-tileB"),
+        contains(&out, b"atrium-tileB"),
         "second tile silent after split: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -716,29 +716,29 @@ fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
 /// marker in each and assert all four reach the composited frame.
 #[test]
 fn two_by_two_grid_has_four_live_panes() {
-    let mut p = spawn_amux_shell(30, 120);
+    let mut p = spawn_atrium_shell(30, 120);
     // Pane 1 (top-left after the splits below) — mark it before splitting so the
     // first shell is proven live.
-    p.write(b"echo amux-q1\r\n").unwrap();
-    read_until(&mut p, b"amux-q1", Duration::from_secs(15));
+    p.write(b"echo atrium-q1\r\n").unwrap();
+    read_until(&mut p, b"atrium-q1", Duration::from_secs(15));
     // Build the square: % (vertical) then " (horizontal on the right), then move
     // focus back to the left column with h and " to split it.
     p.write(b"\x01%").unwrap(); // now two columns, focus right
-    p.write(b"echo amux-q2\r\n").unwrap();
-    read_until(&mut p, b"amux-q2", Duration::from_secs(15));
+    p.write(b"echo atrium-q2\r\n").unwrap();
+    read_until(&mut p, b"atrium-q2", Duration::from_secs(15));
     p.write(b"\x01\"").unwrap(); // split right column -> focus bottom-right
-    p.write(b"echo amux-q3\r\n").unwrap();
-    read_until(&mut p, b"amux-q3", Duration::from_secs(15));
+    p.write(b"echo atrium-q3\r\n").unwrap();
+    read_until(&mut p, b"atrium-q3", Duration::from_secs(15));
     p.write(b"\x01h").unwrap(); // focus back to the left column
     p.write(b"\x01\"").unwrap(); // split it -> focus bottom-left
-    p.write(b"echo amux-q4\r\n").unwrap();
+    p.write(b"echo atrium-q4\r\n").unwrap();
     // Collect everything for a few seconds and assert all four markers appeared.
-    let out = read_until(&mut p, b"amux-q4", Duration::from_secs(15));
+    let out = read_until(&mut p, b"atrium-q4", Duration::from_secs(15));
     for m in [
-        &b"amux-q1"[..],
-        &b"amux-q2"[..],
-        &b"amux-q3"[..],
-        &b"amux-q4"[..],
+        &b"atrium-q1"[..],
+        &b"atrium-q2"[..],
+        &b"atrium-q3"[..],
+        &b"atrium-q4"[..],
     ] {
         assert!(
             contains(&out, m),
@@ -755,16 +755,16 @@ fn two_by_two_grid_has_four_live_panes() {
 /// focus back to the original pane makes *it* echo the next command.
 #[test]
 fn focus_movement_routes_input_to_the_focused_pane() {
-    let mut p = spawn_amux_shell(24, 100);
+    let mut p = spawn_atrium_shell(24, 100);
     p.write(b"\x01%").unwrap(); // split -> focus the new (right) pane
-    p.write(b"echo amux-right-pane\r\n").unwrap();
-    read_until(&mut p, b"amux-right-pane", Duration::from_secs(15));
+    p.write(b"echo atrium-right-pane\r\n").unwrap();
+    read_until(&mut p, b"atrium-right-pane", Duration::from_secs(15));
     // Move focus left (h) back to the original pane and run a distinct command.
     p.write(b"\x01h").unwrap();
-    p.write(b"echo amux-left-again\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-left-again", Duration::from_secs(15));
+    p.write(b"echo atrium-left-again\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-left-again", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-left-again"),
+        contains(&out, b"atrium-left-again"),
         "focus did not route back to the left pane: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -776,23 +776,23 @@ fn focus_movement_routes_input_to_the_focused_pane() {
 /// keeps round-tripping across both toggles.
 #[test]
 fn zoom_toggles_and_pane_stays_live() {
-    let mut p = spawn_amux_shell(24, 100);
+    let mut p = spawn_atrium_shell(24, 100);
     p.write(b"\x01%").unwrap(); // two tiles
-    p.write(b"echo amux-prezoom\r\n").unwrap();
-    read_until(&mut p, b"amux-prezoom", Duration::from_secs(15));
+    p.write(b"echo atrium-prezoom\r\n").unwrap();
+    read_until(&mut p, b"atrium-prezoom", Duration::from_secs(15));
     p.write(b"\x01z").unwrap(); // zoom the focused pane full-screen
-    p.write(b"echo amux-zoomed\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-zoomed", Duration::from_secs(15));
+    p.write(b"echo atrium-zoomed\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-zoomed", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-zoomed"),
+        contains(&out, b"atrium-zoomed"),
         "zoomed pane silent: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01z").unwrap(); // un-zoom back to tiled
-    p.write(b"echo amux-unzoomed\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-unzoomed", Duration::from_secs(15));
+    p.write(b"echo atrium-unzoomed\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-unzoomed", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-unzoomed"),
+        contains(&out, b"atrium-unzoomed"),
         "pane dead after un-zoom: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -804,18 +804,18 @@ fn zoom_toggles_and_pane_stays_live() {
 /// still live (and, being the sole pane, back in passthrough).
 #[test]
 fn kill_focused_pane_retiles_to_survivor() {
-    let mut p = spawn_amux_shell(24, 100);
-    p.write(b"echo amux-keepme\r\n").unwrap();
-    read_until(&mut p, b"amux-keepme", Duration::from_secs(15));
+    let mut p = spawn_atrium_shell(24, 100);
+    p.write(b"echo atrium-keepme\r\n").unwrap();
+    read_until(&mut p, b"atrium-keepme", Duration::from_secs(15));
     p.write(b"\x01%").unwrap(); // split -> focus new pane
-    p.write(b"echo amux-killme\r\n").unwrap();
-    read_until(&mut p, b"amux-killme", Duration::from_secs(15));
+    p.write(b"echo atrium-killme\r\n").unwrap();
+    read_until(&mut p, b"atrium-killme", Duration::from_secs(15));
     p.write(b"\x01x").unwrap(); // kill the focused (new) pane
                                 // The survivor takes over full-screen and still talks:
-    p.write(b"echo amux-survivor\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-survivor", Duration::from_secs(15));
+    p.write(b"echo atrium-survivor\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-survivor", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-survivor"),
+        contains(&out, b"atrium-survivor"),
         "survivor dead after kill/re-tile: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -825,7 +825,7 @@ fn kill_focused_pane_retiles_to_survivor() {
 
 // --- mass-spawn (0.5): -n / --grid open N panes at once ----------------------
 
-/// `amux -n 4 <shell>` opens ONE window of four tiled panes in a 2x2 grid. The
+/// `atrium -n 4 <shell>` opens ONE window of four tiled panes in a 2x2 grid. The
 /// composited frame shows all four pane labels (` 1:… ` .. ` 4:… ` in their top
 /// borders), and each pane round-trips: a marker echoed in each — reached by
 /// moving focus around the grid — appears in the output.
@@ -839,7 +839,7 @@ fn mass_spawn_n_four_opens_four_live_panes() {
     let mut argv = vec!["-n", "4", shell];
     argv.extend(args);
     // A big terminal so all four boxed tiles (and their labels) fit.
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 40, 160).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 40, 160).unwrap();
     let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
 
     // Four pane labels appear in the tiled frame: `1:<stem>` .. `4:<stem>`.
@@ -865,10 +865,10 @@ fn mass_spawn_n_four_opens_four_live_panes() {
     }
 
     // The focused (pane 1, top-left) shell round-trips.
-    p.write(b"echo amux-grid-p1\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-grid-p1", Duration::from_secs(15));
+    p.write(b"echo atrium-grid-p1\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-grid-p1", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-grid-p1"),
+        contains(&out, b"atrium-grid-p1"),
         "focused grid pane silent: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -876,10 +876,10 @@ fn mass_spawn_n_four_opens_four_live_panes() {
     // pane receiving input confirms four independent sessions, not one echoed
     // four times.
     p.write(b"\x01l").unwrap();
-    p.write(b"echo amux-grid-p2\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-grid-p2", Duration::from_secs(15));
+    p.write(b"echo atrium-grid-p2\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-grid-p2", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-grid-p2"),
+        contains(&out, b"atrium-grid-p2"),
         "second grid pane silent after focus move: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -888,19 +888,19 @@ fn mass_spawn_n_four_opens_four_live_panes() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
-/// An odd `-n` is a clean startup error, not a silent single pane: amux prints
+/// An odd `-n` is a clean startup error, not a silent single pane: atrium prints
 /// the reason and exits non-zero.
 #[test]
 fn mass_spawn_rejects_odd_n() {
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["-n", "3", "cmd"], 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["-n", "3", "cmd"], 24, 80).unwrap();
     // It must exit non-zero (bad argument), and not sit there hosting a shell.
     let code = wait_exit(&mut p, 15);
     assert_ne!(code, 0, "odd -n should be a startup error");
 }
 
-// --- fleet (0.6): `amux fleet up <name>` brings up a saved roster ------------
+// --- fleet (0.6): `atrium fleet up <name>` brings up a saved roster ------------
 
-/// `amux fleet up test` reads a temp `amux.fleet.json` with two shell agents and
+/// `atrium fleet up test` reads a temp `atrium.fleet.json` with two shell agents and
 /// brings up ONE tiled window with two panes. Both pane labels appear in the
 /// composited frame and each round-trips a marker — proving two live sessions,
 /// laid out by the loader. Hermetic: the agents run the shell, not claude.
@@ -911,9 +911,9 @@ fn fleet_up_opens_a_two_agent_window() {
     } else {
         ("sh", vec!["-i"])
     };
-    // A fleet file in a fresh temp dir; run amux with that dir as cwd so the
+    // A fleet file in a fresh temp dir; run atrium with that dir as cwd so the
     // loader's cwd-first discovery finds it.
-    let td = std::env::temp_dir().join(format!("amux-fleet-e2e-{}", std::process::id()));
+    let td = std::env::temp_dir().join(format!("atrium-fleet-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&td);
     std::fs::create_dir_all(&td).unwrap();
     let cmd_json = {
@@ -927,12 +927,12 @@ fn fleet_up_opens_a_two_agent_window() {
           {{ "name": "two", "cmd": [{cmd_json}] }}
         ] }} }} }}"#
     );
-    std::fs::write(td.join("amux.fleet.json"), fleet_json).unwrap();
+    std::fs::write(td.join("atrium.fleet.json"), fleet_json).unwrap();
 
-    // Launch amux via its own binary, spawned with the temp dir as its working
+    // Launch atrium via its own binary, spawned with the temp dir as its working
     // directory so `fleet up` discovers the local file. pty::spawn_full sets cwd.
     let mut p = pty::Pty::spawn_full(
-        env!("CARGO_BIN_EXE_amux"),
+        env!("CARGO_BIN_EXE_atrium"),
         &["fleet", "up", "test"],
         30,
         120,
@@ -958,19 +958,19 @@ fn fleet_up_opens_a_two_agent_window() {
     }
 
     // The focused (pane 1) shell round-trips.
-    p.write(b"echo amux-fleet-p1\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-fleet-p1", Duration::from_secs(15));
+    p.write(b"echo atrium-fleet-p1\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-fleet-p1", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-fleet-p1"),
+        contains(&out, b"atrium-fleet-p1"),
         "fleet pane 1 silent: {:?}",
         String::from_utf8_lossy(&out)
     );
     // Move focus to the second pane and prove it is live too.
     p.write(b"\x01l").unwrap();
-    p.write(b"echo amux-fleet-p2\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-fleet-p2", Duration::from_secs(15));
+    p.write(b"echo atrium-fleet-p2\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-fleet-p2", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-fleet-p2"),
+        contains(&out, b"atrium-fleet-p2"),
         "fleet pane 2 silent after focus move: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -980,14 +980,14 @@ fn fleet_up_opens_a_two_agent_window() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// `amux fleet up nope` with no fleet file is a clean error, not a hung window.
+/// `atrium fleet up nope` with no fleet file is a clean error, not a hung window.
 #[test]
 fn fleet_up_unknown_file_is_a_startup_error() {
-    let td = std::env::temp_dir().join(format!("amux-fleet-nofile-{}", std::process::id()));
+    let td = std::env::temp_dir().join(format!("atrium-fleet-nofile-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&td);
     std::fs::create_dir_all(&td).unwrap();
     let mut p = pty::Pty::spawn_full(
-        env!("CARGO_BIN_EXE_amux"),
+        env!("CARGO_BIN_EXE_atrium"),
         &["fleet", "up", "nope"],
         24,
         80,
@@ -1001,7 +1001,7 @@ fn fleet_up_unknown_file_is_a_startup_error() {
 
 // --- fleet disclosure: what the roster grants, on the screen it is approved on
 
-/// A fleet fixture plus the amux run over it, WITHOUT a pty.
+/// A fleet fixture plus the atrium run over it, WITHOUT a pty.
 ///
 /// `fleet up` is deliberately driven with a non-terminal stdin here: the ack is
 /// skipped (there is nobody to ask), the whole banner is still printed, and the
@@ -1016,7 +1016,7 @@ struct FleetLab {
 
 impl FleetLab {
     fn new(tag: &str) -> FleetLab {
-        let root = std::env::temp_dir().join(format!("amux-disc-{tag}-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("atrium-disc-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("proj")).unwrap();
         std::fs::create_dir_all(root.join("home")).unwrap();
@@ -1032,12 +1032,12 @@ impl FleetLab {
         p
     }
     fn file(&self, json: &str) {
-        std::fs::write(self.proj().join("amux.fleet.json"), json).unwrap();
+        std::fs::write(self.proj().join("atrium.fleet.json"), json).unwrap();
     }
-    /// Run `amux <args…>` in the fixture project with a fixture HOME and a
+    /// Run `atrium <args…>` in the fixture project with a fixture HOME and a
     /// fixture global-config location, and return `(exit code, stdout, stderr)`.
     fn run(&self, args: &[&str]) -> (i32, String, String) {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_amux"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
             .args(args)
             .current_dir(self.proj())
             .env("HOME", self.root.join("home"))
@@ -1188,7 +1188,10 @@ fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
     assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
     // And the banner as a whole still fits a terminal.
     assert!(
-        err.lines().filter(|l| l.starts_with("amux fleet:")).count() <= 8,
+        err.lines()
+            .filter(|l| l.starts_with("atrium fleet:"))
+            .count()
+            <= 8,
         "banner too tall: {err}"
     );
 }
@@ -1203,15 +1206,15 @@ fn double_prefix_reaches_the_child() {
     };
     let mut argv = vec![shell];
     argv.extend(args);
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
-    read_until(&mut p, b"amux", Duration::from_secs(15));
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
+    read_until(&mut p, b"atrium", Duration::from_secs(15));
     // Ctrl+A Ctrl+A -> literal 0x01 -> most shells show nothing fatal;
     // then a normal command still round-trips (the stream is not desynced).
     p.write(b"\x01\x01").unwrap();
-    p.write(b"echo amux-lit-7\r\n").unwrap();
-    let out = read_until(&mut p, b"amux-lit-7", Duration::from_secs(15));
+    p.write(b"echo atrium-lit-7\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-lit-7", Duration::from_secs(15));
     assert!(
-        contains(&out, b"amux-lit-7"),
+        contains(&out, b"atrium-lit-7"),
         "output: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -1221,22 +1224,22 @@ fn double_prefix_reaches_the_child() {
 
 // --- end to end: the ctl control channel (C1) -------------------------------
 
-/// Spawn `amux --allow-ctl <shell>` in a pty, with `AMUX_CTL_ALLOW` set so the
+/// Spawn `atrium --allow-ctl <shell>` in a pty, with `ATRIUM_CTL_ALLOW` set so the
 /// harmless shell counts as a spawnable worker, and return the pty once the bar
-/// (pane 1) is up. The hosted shell inherits `AMUX_CTL`/`AMUX_PANE`, so a client
+/// (pane 1) is up. The hosted shell inherits `ATRIUM_CTL`/`ATRIUM_PANE`, so a client
 /// typed into it drives the real channel — exactly as an agent-in-a-pane would.
-fn spawn_amux_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
+fn spawn_atrium_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
     let (shell, flag): (&str, &str) = if cfg!(windows) {
         ("cmd", "/Q")
     } else {
         ("sh", "-i")
     };
     let mut p = pty::Pty::spawn_full(
-        env!("CARGO_BIN_EXE_amux"),
+        env!("CARGO_BIN_EXE_atrium"),
         &["--allow-ctl", shell, flag],
         24,
         100,
-        &[("AMUX_CTL_ALLOW".to_string(), shell.to_string())],
+        &[("ATRIUM_CTL_ALLOW".to_string(), shell.to_string())],
         None,
     )
     .unwrap();
@@ -1245,14 +1248,14 @@ fn spawn_amux_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
     (p, shell, flag)
 }
 
-/// `amux ctl list`, run inside a live `--allow-ctl` amux pane, connects over the
+/// `atrium ctl list`, run inside a live `--allow-ctl` atrium pane, connects over the
 /// real channel and returns the org chart as JSON — proving the whole loop:
 /// bind → inject env → client connect → non-blocking server drain → reply.
 #[test]
-fn ctl_list_roundtrips_through_a_live_amux() {
-    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
-    p.write(format!("\"{amux}\" ctl list\r\n").as_bytes())
+fn ctl_list_roundtrips_through_a_live_atrium() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl list\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"\"tree\"", Duration::from_secs(20));
     assert!(
@@ -1264,14 +1267,14 @@ fn ctl_list_roundtrips_through_a_live_amux() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `amux ctl spawn -- <shell>` opens a *visible* new worker window: after the
+/// `atrium ctl spawn -- <shell>` opens a *visible* new worker window: after the
 /// call the bar gains a second pane entry. This is the C1 "an in-pane
 /// `ctl spawn` opens a visible worker" done-criterion, end to end.
 #[test]
 fn ctl_spawn_opens_a_visible_worker_window() {
-    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
-    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
     let out = read_until(&mut p, two, Duration::from_secs(20));
@@ -1288,10 +1291,10 @@ fn ctl_spawn_opens_a_visible_worker_window() {
 /// the channel — the guard reaches the client as a JSON error, no worker opens.
 #[test]
 fn ctl_spawn_off_the_allowlist_is_refused() {
-    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     // `whoami` is a real binary on both platforms but not an agent/allowlisted.
-    p.write(format!("\"{amux}\" ctl spawn -- whoami\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl spawn -- whoami\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"allowlist", Duration::from_secs(20));
     assert!(
@@ -1303,13 +1306,13 @@ fn ctl_spawn_off_the_allowlist_is_refused() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `amux ctl status <id>` returns a target's status as JSON. Pane 0 is always
+/// `atrium ctl status <id>` returns a target's status as JSON. Pane 0 is always
 /// the initial pane (agent ids are process-global from 0), so this is stable.
 #[test]
 fn ctl_status_reports_a_pane() {
-    let (mut p, _shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
-    p.write(format!("\"{amux}\" ctl status 0\r\n").as_bytes())
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl status 0\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"\"pane\":0", Duration::from_secs(20));
     assert!(
@@ -1321,20 +1324,20 @@ fn ctl_status_reports_a_pane() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `amux ctl send <role> <text>` delivers the text to the worker as input. We
+/// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the
 /// send actually reached the worker's pty (the caller's command echo lives in a
 /// different window, so it can't produce a false positive).
 #[test]
 fn ctl_send_delivers_a_task_to_a_worker() {
-    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
-    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     read_until(&mut p, two, Duration::from_secs(20)); // worker window opened
-    p.write(format!("\"{amux}\" ctl send dev_1 echo WORKERMARK7\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl send dev_1 echo WORKERMARK7\r\n").as_bytes())
         .unwrap();
     p.write(b"\x012").unwrap(); // Ctrl+A 2 -> watch the worker window
     let out = read_until(&mut p, b"WORKERMARK7", Duration::from_secs(20));
@@ -1347,14 +1350,14 @@ fn ctl_send_delivers_a_task_to_a_worker() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `amux ctl spawn --here` succeeds over the channel (tiles the worker beside its
+/// `atrium ctl spawn --here` succeeds over the channel (tiles the worker beside its
 /// caller): the reply carries the worker's role, proving the split-placement path
 /// ran end to end.
 #[test]
 fn ctl_spawn_here_succeeds() {
-    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
-    p.write(format!("\"{amux}\" ctl spawn --here --role dev_1 -- {shell}\r\n").as_bytes())
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl spawn --here --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"\"role\":\"dev_1\"", Duration::from_secs(20));
     assert!(
@@ -1368,19 +1371,19 @@ fn ctl_spawn_here_succeeds() {
 
 // --- end to end: the ctl control channel (C3) -------------------------------
 
-/// `amux ctl kill <role>` tears down the worker over the live channel: spawn a
+/// `atrium ctl kill <role>` tears down the worker over the live channel: spawn a
 /// worker in a new window, then kill it by role — the reply carries the
 /// `killed` set (the torn-down subtree), proving `kill` ran end to end and the
 /// reap path took the worker's window down.
 #[test]
 fn ctl_kill_tears_down_a_worker() {
-    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
-    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     read_until(&mut p, two, Duration::from_secs(20)); // worker window opened
-    p.write(format!("\"{amux}\" ctl kill dev_1\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl kill dev_1\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"\"killed\"", Duration::from_secs(20));
     assert!(
@@ -1392,18 +1395,18 @@ fn ctl_kill_tears_down_a_worker() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `amux ctl audit` returns the recorded control-request log. After a spawn the
+/// `atrium ctl audit` returns the recorded control-request log. After a spawn the
 /// log holds a `spawn` entry; the operator (the initial root pane) sees it —
 /// proving requests are recorded and the log is readable live over the channel.
 #[test]
 fn ctl_audit_records_requests() {
-    let (mut p, shell, _flag) = spawn_amux_ctl_shell();
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
-    p.write(format!("\"{amux}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     read_until(&mut p, two, Duration::from_secs(20)); // spawn recorded
-    p.write(format!("\"{amux}\" ctl audit\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" ctl audit\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"\"audit\"", Duration::from_secs(20));
     assert!(
@@ -1415,10 +1418,10 @@ fn ctl_audit_records_requests() {
     let _ = wait_exit(&mut p, 15);
 }
 
-// --- process lifecycle (F13): amux must not orphan its agents ---------------
+// --- process lifecycle (F13): atrium must not orphan its agents ---------------
 
 /// Read a pid the hosted shell prints for itself, so the test can watch that
-/// exact process after amux is gone. Unix-only: the whole property is about
+/// exact process after atrium is gone. Unix-only: the whole property is about
 /// POSIX signal disposition.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
@@ -1431,11 +1434,11 @@ fn pid_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// The pid of a process's parent. amux is located this way — as the parent of
+/// The pid of a process's parent. atrium is located this way — as the parent of
 /// the shell it hosts — rather than by scanning for its own binary name: the
-/// integration tests run in parallel, so several amux processes share this test
+/// integration tests run in parallel, so several atrium processes share this test
 /// harness as their parent and a name scan can match somebody else's. (It did:
-/// an earlier version of this test SIGHUP'd another test's amux and made that
+/// an earlier version of this test SIGHUP'd another test's atrium and made that
 /// test fail instead of this one.)
 #[cfg(unix)]
 fn parent_of(pid: u32) -> Option<u32> {
@@ -1447,26 +1450,26 @@ fn parent_of(pid: u32) -> Option<u32> {
 }
 
 /// **Closing the terminal window must not orphan the agents.** A terminal that
-/// goes away sends SIGHUP; amux's teardown (which kills every pane) only runs
+/// goes away sends SIGHUP; atrium's teardown (which kills every pane) only runs
 /// when the event loop exits normally, so without a handler the default action
-/// kills amux outright and every hosted agent is reparented to init and runs on
+/// kills atrium outright and every hosted agent is reparented to init and runs on
 /// — invisibly, and in a real fleet, billably. Observed live on macOS: ten agent
 /// processes still resident 19 minutes after the operator closed the window.
 #[cfg(unix)]
 #[test]
 fn sighup_does_not_orphan_hosted_panes() {
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-i"], 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["sh", "-i"], 24, 80).unwrap();
 
     // Have the hosted shell tell us its own pid, so we can watch it directly.
     // The marker is split across two quoted strings so the shell's echo of the
-    // typed line ("echo \"$m\"\"=$$\"") cannot contain `amuxpid=` — only the
+    // typed line ("echo \"$m\"\"=$$\"") cannot contain `atriumpid=` — only the
     // command's actual output does. Without that, read_until matches the echo
     // and returns before the shell has run anything.
-    p.write(b"m=amuxpid; echo \"$m\"\"=$$\"\r\n").unwrap();
-    let out = read_until(&mut p, b"amuxpid=", Duration::from_secs(15));
+    p.write(b"m=atriumpid; echo \"$m\"\"=$$\"\r\n").unwrap();
+    let out = read_until(&mut p, b"atriumpid=", Duration::from_secs(15));
     let text = String::from_utf8_lossy(&out);
     let shell_pid: u32 = text
-        .split("amuxpid=")
+        .split("atriumpid=")
         .nth(1)
         .and_then(|s| {
             let d: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -1475,9 +1478,9 @@ fn sighup_does_not_orphan_hosted_panes() {
         .unwrap_or_else(|| panic!("no shell pid in: {text:?}"));
     assert!(pid_alive(shell_pid), "hosted shell never came up");
 
-    let amux = parent_of(shell_pid).expect("could not locate the amux process");
+    let atrium = parent_of(shell_pid).expect("could not locate the atrium process");
     let _ = std::process::Command::new("kill")
-        .args(["-HUP", &amux.to_string()])
+        .args(["-HUP", &atrium.to_string()])
         .status();
 
     // The pane must go with it. Poll rather than sleep a fixed time.
@@ -1491,7 +1494,7 @@ fn sighup_does_not_orphan_hosted_panes() {
     let _ = std::process::Command::new("kill")
         .args(["-KILL", &shell_pid.to_string()])
         .status();
-    panic!("pane {shell_pid} survived SIGHUP to amux {amux} — orphaned agent");
+    panic!("pane {shell_pid} survived SIGHUP to atrium {atrium} — orphaned agent");
 }
 
 /// **Closing a full-screen overlay must repaint the pane** (F10).
@@ -1501,11 +1504,11 @@ fn sighup_does_not_orphan_hosted_panes() {
 /// already had. An app that only repaints on a real dimension change (or that
 /// is mid-turn and defers) correctly does nothing, and the operator is left
 /// staring at a blank screen with just the status bar. Reported on macOS after
-/// pressing `g` on a board decision; the fix paints from amux's own emulator
+/// pressing `g` on a board decision; the fix paints from atrium's own emulator
 /// instead of asking the child.
 ///
 /// `sh` never redraws on SIGWINCH, which makes it the perfect probe: if the
-/// prompt comes back, amux painted it.
+/// prompt comes back, atrium painted it.
 #[test]
 fn closing_an_overlay_repaints_the_pane() {
     let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
@@ -1515,9 +1518,9 @@ fn closing_an_overlay_repaints_the_pane() {
     };
     let mut argv = vec![shell];
     argv.extend(args);
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv, 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
 
-    // A marker on screen that only amux can bring back. Written so `repaint=marker`
+    // A marker on screen that only atrium can bring back. Written so `repaint=marker`
     // appears in the command's OUTPUT but not in the typed line itself, so the
     // match below can't be satisfied by the input echo: sh uses `$m` indirection;
     // cmd escapes the `=` with a caret (`repaint^=marker` on the line → `repaint=
@@ -1542,7 +1545,7 @@ fn closing_an_overlay_repaints_the_pane() {
     read_until(&mut p, b"board", Duration::from_secs(10));
 
     // Close it. That is a real view transition, so the pane must come back —
-    // painted by amux, because `sh` will not repaint itself.
+    // painted by atrium, because `sh` will not repaint itself.
     p.write(b"\x01b").unwrap();
     let back = read_until(&mut p, b"repaint=marker", Duration::from_secs(10));
     assert!(
@@ -1575,13 +1578,13 @@ fn quitting_kills_the_panes_whole_process_tree() {
     // is what this reproduces.
     //
     // The grandchild reports its own pid to a file keyed by this test process, so
-    // the test never has to guess which amux is its own. Scanning the process
+    // the test never has to guess which atrium is its own. Scanning the process
     // table for that is racy under the parallel suite and picks somebody else's.
-    let marker = std::env::temp_dir().join(format!("amux-tree-{}.pid", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("atrium-tree-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
     let mut p =
-        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+        pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["sh", "-c", &script], 24, 80).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let grandkid: u32 = loop {
@@ -1619,20 +1622,20 @@ fn quitting_kills_the_panes_whole_process_tree() {
     );
 }
 
-/// **A SIGKILLed amux must not leave the tree behind** (lifecycle layer 4).
+/// **A SIGKILLed atrium must not leave the tree behind** (lifecycle layer 4).
 ///
 /// Signal handlers cannot run on `SIGKILL`, a panic, or an OOM kill, so no
-/// teardown inside amux can cover them — the whole tree simply leaks. The
-/// watchdog is a re-exec of amux that outlives the session: when amux vanishes
+/// teardown inside atrium can cover them — the whole tree simply leaks. The
+/// watchdog is a re-exec of atrium that outlives the session: when atrium vanishes
 /// it kills every process group the crash registry names. This is the only layer
-/// that covers a death amux cannot observe.
+/// that covers a death atrium cannot observe.
 #[cfg(unix)]
 #[test]
-fn a_sigkilled_amux_still_takes_its_tree_down() {
-    let marker = std::env::temp_dir().join(format!("amux-kill9-{}.pid", std::process::id()));
+fn a_sigkilled_atrium_still_takes_its_tree_down() {
+    let marker = std::env::temp_dir().join(format!("atrium-kill9-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
-    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["sh", "-c", &script], 24, 80).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let grandkid: u32 = loop {
@@ -1650,11 +1653,11 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
     // Give the loop a tick to register the pane and start the watchdog.
     std::thread::sleep(Duration::from_millis(600));
 
-    // The one death amux cannot handle.
-    let amux = p.pid();
-    assert!(amux != 0, "no amux pid");
+    // The one death atrium cannot handle.
+    let atrium = p.pid();
+    assert!(atrium != 0, "no atrium pid");
     let _ = std::process::Command::new("kill")
-        .args(["-KILL", &amux.to_string()])
+        .args(["-KILL", &atrium.to_string()])
         .status();
 
     // Watchdog poll (250ms) + SIGTERM + grace (750ms), with room to spare.
@@ -1670,10 +1673,10 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
         .args(["-KILL", &grandkid.to_string()])
         .status();
     let _ = std::fs::remove_file(&marker);
-    panic!("tree survived SIGKILL of amux {amux} — watchdog did not clean up");
+    panic!("tree survived SIGKILL of atrium {atrium} — watchdog did not clean up");
 }
 
-/// The same SIGKILL, with the registry taken away first — which is what amux
+/// The same SIGKILL, with the registry taken away first — which is what atrium
 /// itself used to do.
 ///
 /// Teardown computed which pane groups had survived and then deleted the
@@ -1690,15 +1693,15 @@ fn a_sigkilled_amux_still_takes_its_tree_down() {
 ///
 /// Revert check: drop the `orphan::sweep` call at the end of
 /// `reap::watchdog_main` and this fails with "tree survived", while
-/// `a_sigkilled_amux_still_takes_its_tree_down` above keeps passing, because
+/// `a_sigkilled_atrium_still_takes_its_tree_down` above keeps passing, because
 /// that one still has its registry.
 #[cfg(unix)]
 #[test]
-fn a_sigkilled_amux_takes_its_tree_down_even_with_no_registry() {
-    let marker = std::env::temp_dir().join(format!("amux-noreg-{}.pid", std::process::id()));
+fn a_sigkilled_atrium_takes_its_tree_down_even_with_no_registry() {
+    let marker = std::env::temp_dir().join(format!("atrium-noreg-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let script = format!("sleep 600 & echo $! > {} ; wait", marker.display());
-    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["sh", "-c", &script], 24, 80).unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let grandkid: u32 = loop {
@@ -1716,18 +1719,18 @@ fn a_sigkilled_amux_takes_its_tree_down_even_with_no_registry() {
     // Let the loop register the pane, write the registry and start the watchdog.
     std::thread::sleep(Duration::from_millis(800));
 
-    let amux = p.pid();
-    assert!(amux != 0, "no amux pid");
-    let registry = amux::reap::registry_path(amux);
+    let atrium = p.pid();
+    assert!(atrium != 0, "no atrium pid");
+    let registry = atrium::reap::registry_path(atrium);
     assert!(
         registry.exists(),
-        "amux should have written {} before we take it away",
+        "atrium should have written {} before we take it away",
         registry.display()
     );
     std::fs::remove_file(&registry).expect("remove the registry");
 
     let _ = std::process::Command::new("kill")
-        .args(["-KILL", &amux.to_string()])
+        .args(["-KILL", &atrium.to_string()])
         .status();
 
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -1742,33 +1745,33 @@ fn a_sigkilled_amux_takes_its_tree_down_even_with_no_registry() {
         .args(["-KILL", &grandkid.to_string()])
         .status();
     let _ = std::fs::remove_file(&marker);
-    panic!("tree survived SIGKILL of amux {amux} with its registry deleted");
+    panic!("tree survived SIGKILL of atrium {atrium} with its registry deleted");
 }
 
 /// Every pane is born marked, whether or not the control channel is on.
 ///
 /// The default launch has no `--allow-ctl`, and that is exactly the case that
-/// used to produce a pane with no amux environment at all. Read back from inside
+/// used to produce a pane with no atrium environment at all. Read back from inside
 /// the pane rather than from `ps`, because on macOS `ps -E` will not show a
 /// shell's environment to anyone — which is a fact about `ps`, not about whether
 /// the variable is there.
 ///
-/// Revert check: move the `AMUX_SESSION` push in `pane_base_env` back inside the
+/// Revert check: move the `ATRIUM_SESSION` push in `pane_base_env` back inside the
 /// `if let Some((addr, …)) = ctl` arm and this fails — the pane echoes an empty
 /// line where the key should be.
 #[cfg(unix)]
 #[test]
 fn a_pane_launched_without_ctl_still_carries_the_session_marker() {
-    let out = std::env::temp_dir().join(format!("amux-mark-{}.txt", std::process::id()));
+    let out = std::env::temp_dir().join(format!("atrium-mark-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let script = format!(
-        "printf '[%s]\\n' \"$AMUX_SESSION\" > {} ; sleep 600",
+        "printf '[%s]\\n' \"$ATRIUM_SESSION\" > {} ; sleep 600",
         out.display()
     );
     // No --allow-ctl: the default posture, and the one that used to be unmarked.
     let mut p =
-        pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &["sh", "-c", &script], 24, 80).unwrap();
-    let amux = p.pid();
+        pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &["sh", "-c", &script], 24, 80).unwrap();
+    let atrium = p.pid();
 
     let deadline = Instant::now() + Duration::from_secs(15);
     let seen = loop {
@@ -1792,13 +1795,13 @@ fn a_pane_launched_without_ctl_still_carries_the_session_marker() {
         .unwrap_or("");
     assert!(
         !key.is_empty(),
-        "a pane spawned without --allow-ctl carried no AMUX_SESSION (got {seen:?})"
+        "a pane spawned without --allow-ctl carried no ATRIUM_SESSION (got {seen:?})"
     );
-    let parsed = amux::orphan::SessionKey::parse(key)
-        .unwrap_or_else(|| panic!("AMUX_SESSION is not a well-formed key: {key:?}"));
+    let parsed = atrium::orphan::SessionKey::parse(key)
+        .unwrap_or_else(|| panic!("ATRIUM_SESSION is not a well-formed key: {key:?}"));
     assert_eq!(
-        parsed.owner, amux,
-        "the marker must name the amux that spawned the pane"
+        parsed.owner, atrium,
+        "the marker must name the atrium that spawned the pane"
     );
 }
 
@@ -1806,9 +1809,9 @@ fn a_pane_launched_without_ctl_still_carries_the_session_marker() {
 //
 // The Windows counterparts of the two tests above. There is no process group and
 // no watchdog on Windows; the guarantee is a Job Object with
-// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` that amux holds for its whole life, so the
-// kernel terminates every pane and everything a pane spawned the instant amux's
-// handle closes — however amux exits.
+// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` that atrium holds for its whole life, so the
+// kernel terminates every pane and everything a pane spawned the instant atrium's
+// handle closes — however atrium exits.
 
 /// A pane script that spawns a long-lived grandchild (`ping`), records its pid to
 /// `marker`, and waits on it — the Windows analog of `sleep 600 & echo $! ; wait`.
@@ -1852,7 +1855,7 @@ fn read_marker_pid(marker: &std::path::Path, within: Duration) -> u32 {
 fn wait_pid_gone(pid: u32, within: Duration) -> bool {
     let deadline = Instant::now() + within;
     while Instant::now() < deadline {
-        if !amux::reap::pid_alive(pid) {
+        if !atrium::reap::pid_alive(pid) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -1861,20 +1864,20 @@ fn wait_pid_gone(pid: u32, within: Duration) -> bool {
 }
 
 /// **A clean `Ctrl+A q` kills the pane's whole tree on Windows** (acceptance #2).
-/// amux exits, its last handle to the session Job Object closes, and
+/// atrium exits, its last handle to the session Job Object closes, and
 /// kill-on-close terminates the pane and its grandchild together.
 #[cfg(windows)]
 #[test]
 fn quitting_kills_the_pane_tree_windows() {
-    let marker = std::env::temp_dir().join(format!("amux-wtree-{}.pid", std::process::id()));
+    let marker = std::env::temp_dir().join(format!("atrium-wtree-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let argv = ping_grandchild_argv(&marker);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv_ref, 24, 80).unwrap();
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv_ref, 24, 80).unwrap();
 
     let grandkid = read_marker_pid(&marker, Duration::from_secs(25));
     assert!(
-        amux::reap::pid_alive(grandkid),
+        atrium::reap::pid_alive(grandkid),
         "grandchild died before the test began"
     );
 
@@ -1891,27 +1894,27 @@ fn quitting_kills_the_pane_tree_windows() {
     assert!(gone, "pane grandchild {grandkid} survived a clean quit");
 }
 
-/// **A hard-killed amux still takes its tree down on Windows** (acceptance #3).
+/// **A hard-killed atrium still takes its tree down on Windows** (acceptance #3).
 /// `taskkill /F` is `TerminateProcess` — uncatchable, no teardown runs — but the
-/// kernel closes amux's job handle on exit, so kill-on-close fires anyway. This
+/// kernel closes atrium's job handle on exit, so kill-on-close fires anyway. This
 /// is the death mode no macOS mechanism can match.
 #[cfg(windows)]
 #[test]
-fn hard_killed_amux_still_takes_its_tree_down_windows() {
-    let marker = std::env::temp_dir().join(format!("amux-wkill-{}.pid", std::process::id()));
+fn hard_killed_atrium_still_takes_its_tree_down_windows() {
+    let marker = std::env::temp_dir().join(format!("atrium-wkill-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
     let argv = ping_grandchild_argv(&marker);
     let argv_ref: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_amux"), &argv_ref, 24, 80).unwrap();
+    let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv_ref, 24, 80).unwrap();
 
     let grandkid = read_marker_pid(&marker, Duration::from_secs(25));
     // Give the run loop a tick to register + assign the pane to the job.
     std::thread::sleep(Duration::from_millis(800));
 
-    let amux = p.pid();
-    assert!(amux != 0, "no amux pid");
+    let atrium = p.pid();
+    assert!(atrium != 0, "no atrium pid");
     let _ = std::process::Command::new("taskkill")
-        .args(["/F", "/PID", &amux.to_string()])
+        .args(["/F", "/PID", &atrium.to_string()])
         .status();
 
     let gone = wait_pid_gone(grandkid, Duration::from_secs(12));
@@ -1923,29 +1926,29 @@ fn hard_killed_amux_still_takes_its_tree_down_windows() {
     let _ = std::fs::remove_file(&marker);
     assert!(
         gone,
-        "tree survived taskkill /F of amux {amux} — kill-on-close did not fire"
+        "tree survived taskkill /F of atrium {atrium} — kill-on-close did not fire"
     );
 }
 
-/// **A pane cannot raise its own posture by launching its own amux.**
+/// **A pane cannot raise its own posture by launching its own atrium.**
 ///
 /// The trust ceiling governs `ctl spawn`, but an agent that can run commands can
-/// sidestep ctl entirely: `amux --trust skip claude` is just a shell command, and
-/// a fresh amux session sets its own policy. That escape made the ceiling half a
+/// sidestep ctl entirely: `atrium --trust skip claude` is just a shell command, and
+/// a fresh atrium session sets its own policy. That escape made the ceiling half a
 /// ceiling.
 ///
 /// The cap hangs off process ANCESTRY rather than the environment, because an
-/// agent owns its environment — an `AMUX_AGENT=1` marker or an inherited policy
+/// agent owns its environment — an `ATRIUM_AGENT=1` marker or an inherited policy
 /// variable dies to `env -u`. It cannot unset its own parent.
 ///
 /// Here the outer session is `plan`; the inner launch asks for `skip` and must be
 /// refused down to `plan`, saying so.
 #[cfg(unix)]
 #[test]
-fn a_nested_amux_cannot_raise_its_own_trust() {
-    let amux = env!("CARGO_BIN_EXE_amux");
+fn a_nested_atrium_cannot_raise_its_own_trust() {
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let mut p = pty::Pty::spawn(
-        amux,
+        atrium,
         &["--allow-ctl", "--trust", "plan", "sh", "-i"],
         24,
         80,
@@ -1957,12 +1960,12 @@ fn a_nested_amux_cannot_raise_its_own_trust() {
     std::thread::sleep(Duration::from_millis(600));
 
     // The escape attempt, exactly as an agent would make it.
-    p.write(format!("\"{amux}\" --trust skip sh -i\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" --trust skip sh -i\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
     assert!(
         contains(&out, b"capped to"),
-        "a nested amux was allowed to elevate itself: {:?}",
+        "a nested atrium was allowed to elevate itself: {:?}",
         String::from_utf8_lossy(&out)
     );
 
@@ -1981,19 +1984,19 @@ fn a_nested_amux_cannot_raise_its_own_trust() {
 #[cfg(unix)]
 #[test]
 fn a_nested_fleet_up_is_capped_like_a_pane() {
-    let amux = env!("CARGO_BIN_EXE_amux");
-    let td = std::env::temp_dir().join(format!("amux-nestfleet-{}", std::process::id()));
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let td = std::env::temp_dir().join(format!("atrium-nestfleet-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&td);
     std::fs::create_dir_all(&td).unwrap();
     // A fleet file that asks for full bypass — as an agent-authored one might.
     std::fs::write(
-        td.join("amux.fleet.json"),
+        td.join("atrium.fleet.json"),
         r#"{"fleets":{"esc":{"trust":"skip","agents":[{"name":"a","cmd":["sh","-i"]}]}}}"#,
     )
     .unwrap();
 
     let mut p = pty::Pty::spawn(
-        amux,
+        atrium,
         &["--allow-ctl", "--trust", "plan", "sh", "-i"],
         24,
         80,
@@ -2003,7 +2006,7 @@ fn a_nested_fleet_up_is_capped_like_a_pane() {
     read_until(&mut p, b"outer=up", Duration::from_secs(15));
     std::thread::sleep(Duration::from_millis(600));
 
-    p.write(format!("cd {} && \"{amux}\" fleet up esc\r\n", td.display()).as_bytes())
+    p.write(format!("cd {} && \"{atrium}\" fleet up esc\r\n", td.display()).as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
     assert!(
@@ -2017,24 +2020,24 @@ fn a_nested_fleet_up_is_capped_like_a_pane() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// **An `exec -a amux` shim must not shadow the real parent** (same-uid escape).
+/// **An `exec -a atrium` shim must not shadow the real parent** (same-uid escape).
 ///
-/// The ancestry walk decided "is this hop an amux?" by comparing `ps -eo comm=`
-/// against the string `"amux"`. Measured on macOS 25.6.0, `ps -o comm=` prints
-/// **argv[0]**, which the watched process chooses: `exec -a amux /bin/sh` reports
-/// `comm=amux` while the kernel's `proc_pidpath` still says `/bin/sh`. So a pane
-/// could interpose a fake "amux" between itself and the session it is nested in;
+/// The ancestry walk decided "is this hop an atrium?" by comparing `ps -eo comm=`
+/// against the string `"atrium"`. Measured on macOS 25.6.0, `ps -o comm=` prints
+/// **argv[0]**, which the watched process chooses: `exec -a atrium /bin/sh` reports
+/// `comm=atrium` while the kernel's `proc_pidpath` still says `/bin/sh`. So a pane
+/// could interpose a fake "atrium" between itself and the session it is nested in;
 /// the walk stopped at the fake, read the fake's (nonexistent, or agent-authored)
 /// registry, and applied no ceiling. One line, no double-fork.
 ///
 /// Identity is now the executable FILE the kernel reports — `(st_dev, st_ino)` —
-/// so a shim has to actually *be* the amux binary, which caps by itself.
+/// so a shim has to actually *be* the atrium binary, which caps by itself.
 #[cfg(unix)]
 #[test]
 fn an_argv0_shim_does_not_shadow_the_real_parent() {
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let mut p = pty::Pty::spawn(
-        amux,
+        atrium,
         &["--allow-ctl", "--trust", "plan", "sh", "-i"],
         24,
         80,
@@ -2044,16 +2047,18 @@ fn an_argv0_shim_does_not_shadow_the_real_parent() {
     read_until(&mut p, b"outer=up", Duration::from_secs(15));
     std::thread::sleep(Duration::from_millis(700));
 
-    // Replace the pane shell with one that LOOKS like amux to `ps`, then launch
-    // the real amux underneath it. The trailing `; :` matters: with a single
+    // Replace the pane shell with one that LOOKS like atrium to `ps`, then launch
+    // the real atrium underneath it. The trailing `; :` matters: with a single
     // command `sh -c` execs it in place, which would leave the shim out of the
     // chain entirely and quietly turn this into a test of nothing.
-    p.write(format!("exec -a amux /bin/sh -c '\"{amux}\" --trust skip sh -i; :'\r\n").as_bytes())
-        .unwrap();
+    p.write(
+        format!("exec -a atrium /bin/sh -c '\"{atrium}\" --trust skip sh -i; :'\r\n").as_bytes(),
+    )
+    .unwrap();
     let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
     assert!(
         contains(&out, b"capped to"),
-        "an argv[0] shim shadowed the real amux parent and lifted the ceiling: {:?}",
+        "an argv[0] shim shadowed the real atrium parent and lifted the ceiling: {:?}",
         String::from_utf8_lossy(&out)
     );
 
@@ -2065,7 +2070,7 @@ fn an_argv0_shim_does_not_shadow_the_real_parent() {
 ///
 /// The cap read the parent's policy from disk and, finding nothing, applied no
 /// ceiling at all. The registry is mode 0644 at a fixed path owned by the same
-/// uid the agent runs as, so `rm -f /tmp/amux-session-$PPID.pids` turned the
+/// uid the agent runs as, so `rm -f /tmp/atrium-session-$PPID.pids` turned the
 /// ceiling off — one command, no double-fork, no forgery.
 ///
 /// The kernel still says we are nested, and that half cannot be deleted. An
@@ -2073,9 +2078,9 @@ fn an_argv0_shim_does_not_shadow_the_real_parent() {
 #[cfg(unix)]
 #[test]
 fn deleting_the_parents_registry_does_not_lift_the_ceiling() {
-    let amux = env!("CARGO_BIN_EXE_amux");
+    let atrium = env!("CARGO_BIN_EXE_atrium");
     let mut p = pty::Pty::spawn(
-        amux,
+        atrium,
         &["--allow-ctl", "--trust", "plan", "sh", "-i"],
         24,
         80,
@@ -2085,11 +2090,12 @@ fn deleting_the_parents_registry_does_not_lift_the_ceiling() {
     read_until(&mut p, b"outer=up", Duration::from_secs(15));
     std::thread::sleep(Duration::from_millis(700));
 
-    // The pane shell's parent IS the outer amux, so its registry is one `rm`
+    // The pane shell's parent IS the outer atrium, so its registry is one `rm`
     // away. Then make the escape attempt.
-    p.write(b"rm -f /tmp/amux-session-$PPID.pids\r\n").unwrap();
+    p.write(b"rm -f /tmp/atrium-session-$PPID.pids\r\n")
+        .unwrap();
     std::thread::sleep(Duration::from_millis(300));
-    p.write(format!("\"{amux}\" --trust skip sh -i\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" --trust skip sh -i\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
     assert!(
@@ -2107,7 +2113,7 @@ fn deleting_the_parents_registry_does_not_lift_the_ceiling() {
 /// The cap reads the parent's policy from a registry on disk — deliberately, so
 /// it is not an environment variable an agent can `env -u`. But the registry was
 /// addressed through `std::env::temp_dir()`, i.e. `$TMPDIR`, which the agent also
-/// owns. So `TMPDIR=/tmp/x amux --trust skip` walked the ancestry correctly, then
+/// owns. So `TMPDIR=/tmp/x atrium --trust skip` walked the ancestry correctly, then
 /// looked for the parent's file under the CHILD's TMPDIR, found nothing, and
 /// capped nothing. One variable, no double-fork.
 ///
@@ -2116,12 +2122,12 @@ fn deleting_the_parents_registry_does_not_lift_the_ceiling() {
 #[cfg(unix)]
 #[test]
 fn a_redirected_tmpdir_does_not_lift_the_ceiling() {
-    let amux = env!("CARGO_BIN_EXE_amux");
-    let decoy = std::env::temp_dir().join(format!("amux-decoy-{}", std::process::id()));
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let decoy = std::env::temp_dir().join(format!("atrium-decoy-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&decoy);
 
     let mut p = pty::Pty::spawn(
-        amux,
+        atrium,
         &["--allow-ctl", "--trust", "plan", "sh", "-i"],
         24,
         80,
@@ -2134,7 +2140,7 @@ fn a_redirected_tmpdir_does_not_lift_the_ceiling() {
     // The escape, exactly as reported.
     p.write(
         format!(
-            "TMPDIR={} \"{amux}\" --trust skip sh -i\r\n",
+            "TMPDIR={} \"{atrium}\" --trust skip sh -i\r\n",
             decoy.display()
         )
         .as_bytes(),

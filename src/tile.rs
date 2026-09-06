@@ -44,7 +44,7 @@ pub enum PaneState {
 }
 
 impl PaneState {
-    /// The border/title style for this state — the shared amux theme, so a
+    /// The border/title style for this state — the shared atrium theme, so a
     /// tile border and a bar entry in the same color mean the same thing. Vivid
     /// truecolor for high contrast (focused must jump out from idle at a glance).
     fn style(self) -> Style {
@@ -85,7 +85,7 @@ pub struct PaneView<'a> {
     pub index: usize,
     pub title: &'a str,
     pub state: PaneState,
-    /// The bound agent's status, if this is an unfocused agent pane amux bound.
+    /// The bound agent's status, if this is an unfocused agent pane atrium bound.
     /// `None` for shells, focused panes, and agents still awaiting their
     /// transcript. Attention chrome (§4.2) reads only this.
     pub agent: Option<AgentMark>,
