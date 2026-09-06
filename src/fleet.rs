@@ -597,6 +597,22 @@ fn presentable(p: PathBuf) -> PathBuf {
 /// "cannot tell" must never render as "inside", the fail-open shape this
 /// codebase has shipped five times.
 pub fn real_path(p: &Path) -> Option<PathBuf> {
+    // A `..` only has a well-defined target if the directory it pops from exists.
+    // unix's `canonicalize` enforces that (it fails on a missing component, so the
+    // walk below returns None); **Windows' `canonicalize` collapses `..` lexically
+    // before touching the filesystem**, so `<missing>/..` resolves and would report
+    // "inside" — the fail-open shape this codebase has shipped five times. Guard it
+    // on both platforms with a filesystem check (not string surgery): if any `..`
+    // pops a path that does not exist, where it lands cannot be known → None.
+    {
+        let mut prefix = PathBuf::new();
+        for comp in p.components() {
+            if matches!(comp, std::path::Component::ParentDir) && !prefix.exists() {
+                return None;
+            }
+            prefix.push(comp);
+        }
+    }
     if let Ok(real) = std::fs::canonicalize(p) {
         return Some(presentable(real));
     }
