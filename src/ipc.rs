@@ -3147,23 +3147,159 @@ mod tests {
         let start = Instant::now();
         // stall is generous (the drip always makes progress); the TOTAL budget is
         // the only thing that can end this.
-        let e = sys::exchange(
-            &mut c,
-            r#"{"cmd":"list"}"#,
-            Duration::from_secs(5),
-            Duration::from_millis(600),
-        )
-        .expect_err("a reply that never ends must be an error");
+        // Run the exchange on its own thread with a hard cap. If the total
+        // deadline is ever removed this test would otherwise hang FOREVER —
+        // `cargo test` has no per-test timeout and this repo has no CI to kill
+        // it, so the failure mode of the guard would be a wedged machine rather
+        // than a red test.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = thread::spawn(move || {
+            let r = sys::exchange(
+                &mut c,
+                r#"{"cmd":"list"}"#,
+                Duration::from_secs(5),
+                Duration::from_millis(600),
+            );
+            let _ = tx.send(r.map(|_| ()).map_err(|e| (e.kind(), e.to_string())));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the total deadline must end the exchange; it did not return");
+        let _ = probe.join();
+        let e = outcome.expect_err("a reply that never ends must be an error");
         let took = start.elapsed();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        drop(c);
         let _ = hostile.join();
         let _ = std::fs::remove_file(&addr);
-        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert_eq!(e.0, io::ErrorKind::TimedOut, "{}", e.1);
+        assert!(
+            e.1.contains("never finished"),
+            "the TOTAL deadline must be what fired, not the stall: {}",
+            e.1
+        );
         assert!(
             took < Duration::from_secs(3),
             "the total deadline must fire on schedule, took {took:?}"
         );
+    }
+
+    /// **The other half of the client's two budgets.** The test above drives the
+    /// TOTAL deadline with a server that never stops talking. This drives the
+    /// STALL deadline with a server that never starts: it accepts the connection
+    /// and then says nothing at all, ever — a wedged amux, or the endpoint
+    /// squatter of D8 sitting on the socket without answering.
+    ///
+    /// Delete the stall check from `read_reply` and this case falls through to
+    /// the total budget instead. In shipping that is `REPLY_DEADLINE` 30 s
+    /// against `REPLY_STALL` 5 s, so `amux ctl` would hang for half a minute on
+    /// a dead control plane. Nothing caught that removal before this test.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_endpoint_is_bounded_by_the_stall_deadline() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let addr = test_addr(47010);
+        let _ = std::fs::remove_file(&addr);
+        let listener = UnixListener::bind(&addr).expect("bind");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let mute = thread::spawn(move || {
+            if let Ok((s, _)) = listener.accept() {
+                // Hold it open and never write a byte.
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                drop(s);
+            }
+        });
+
+        let mut c = UnixStream::connect(&addr).expect("connect");
+        c.set_nonblocking(true).expect("nonblocking");
+        let start = Instant::now();
+        // Same watchdog reasoning as above: without it, deleting the stall check
+        // wedges the run rather than reddening it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = thread::spawn(move || {
+            let r = sys::exchange(
+                &mut c,
+                r#"{"cmd":"list"}"#,
+                Duration::from_millis(400),
+                Duration::from_secs(20),
+            );
+            let _ = tx.send(r.map(|_| ()).map_err(|e| (e.kind(), e.to_string())));
+        });
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the stall deadline must end the exchange; it did not return");
+        let _ = probe.join();
+        let took = start.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = mute.join();
+        let _ = std::fs::remove_file(&addr);
+
+        let e = outcome.expect_err("a server that never answers must be an error");
+        assert_eq!(e.0, io::ErrorKind::TimedOut, "{}", e.1);
+        assert!(
+            e.1.contains("no reply"),
+            "the STALL deadline must be what fired, not the 20 s total: {}",
+            e.1
+        );
+        assert!(
+            took < Duration::from_secs(3),
+            "the stall deadline must fire on schedule, took {took:?}"
+        );
+    }
+
+    /// **The outbox has to be big enough to be an outbox.**
+    /// `a_full_outbox_refuses_the_newest_and_keeps_every_inflight_reply` sizes
+    /// its client list as `MAX_OUTBOX + 1`, so it proves the refusal *policy* at
+    /// any capacity — including a capacity of one, which it passes happily. That
+    /// left the number itself unpinned: shrinking `MAX_OUTBOX` to 1 broke no
+    /// test, while turning every second concurrent slow reader into an error.
+    ///
+    /// Panes are slow readers by nature. This pins the floor behaviourally: four
+    /// clients that have each asked and are each reading nothing must all be
+    /// given their reply, not refused.
+    #[cfg(unix)]
+    #[test]
+    fn several_slow_readers_are_served_at_once() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        const CONCURRENT: usize = 4;
+        let addr = test_addr(47011);
+        let mut server = Listener::bind(&addr).expect("bind");
+        let pad = "z".repeat(200_000);
+
+        let mut clients: Vec<UnixStream> = Vec::new();
+        for i in 0..CONCURRENT {
+            let mut c = UnixStream::connect(&addr).expect("connect");
+            c.write_all(format!("{{\"cmd\":\"c{i}\"}}\n").as_bytes())
+                .expect("write");
+            c.flush().ok();
+            clients.push(c);
+        }
+
+        let mut served = 0usize;
+        let start = Instant::now();
+        while served < CONCURRENT && start.elapsed() < Duration::from_secs(4) {
+            if server.poll().expect("poll").is_some() {
+                server
+                    .respond(&format!("{{\"ok\":true,\"pad\":\"{pad}\"}}"))
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "reply {} of {CONCURRENT} was refused ({e}) — MAX_OUTBOX is \
+                         {MAX_OUTBOX}, too small to hold the slow readers a pane \
+                         tree produces",
+                            served + 1
+                        )
+                    });
+                served += 1;
+            }
+        }
+        drop(clients);
+        let _ = std::fs::remove_file(&addr);
+        assert_eq!(served, CONCURRENT, "not every slow reader was served");
     }
 
     /// **The OS fact behind the client's shape.** On macOS,
@@ -3290,6 +3426,14 @@ mod tests {
         assert!(
             unix.contains("REFUSAL_REPORT_EVERY"),
             "refusal reporting must be rate limited"
+        );
+        // Naming the constant is not the same as honouring it: setting the
+        // interval to zero restores the unbounded write that this guard exists
+        // to prevent, and the source check above stays green through it.
+        assert!(
+            super::wire::REFUSAL_REPORT_EVERY >= Duration::from_millis(250),
+            "a zero or near-zero refusal interval reinstates an unbounded \
+             terminal write whose rate is chosen by whoever is connecting"
         );
     }
 
