@@ -463,6 +463,64 @@ fn q3b_a_non_reading_client_does_not_block_the_loop() {
     );
 }
 
+/// **The real `amux ctl` binary sends a >8 KiB request end to end.** Everything
+/// above drives `request()`/`Listener` in-process; this drives the *actual*
+/// `amux ctl` executable as a separate process (no PTY needed — it reads its
+/// endpoint from `AMUX_CTL`), so the D4 fix is proven through the shipped binary,
+/// not just the library. On the pre-fix code this deadlocks; here the server
+/// receives the full 20 KB payload and the client exits success.
+#[test]
+fn real_amux_ctl_binary_delivers_a_20kb_request() {
+    use std::process::{Command, Stdio};
+
+    let a = addr("realbin");
+    let mut server = Listener::bind(&a).expect("bind");
+    let payload = "X".repeat(20 * 1024); // 20 KB, no interior newline
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_amux"))
+        .args(["ctl", "send", "1", &payload])
+        .env("AMUX_CTL", &a)
+        .env("AMUX_PANE", "1")
+        .env("AMUX_TOKEN", "test-token")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the real `amux ctl` binary");
+
+    let mut seen: Option<String> = None;
+    let served = pump(&mut server, Duration::from_secs(15), |s| {
+        if let Ok(Some(req)) = s.poll() {
+            let _ = s.respond(r#"{"ok":true}"#);
+            seen = Some(req);
+            return true;
+        }
+        false
+    });
+    let _ = pump(&mut server, Duration::from_secs(2), |s| {
+        let _ = s.poll();
+        false
+    });
+    let out = child.wait_with_output().expect("wait for amux ctl");
+    let req = seen.unwrap_or_default();
+    println!(
+        "[REALBIN] served={served} request_bytes={} exit={:?}",
+        req.len(),
+        out.status.code()
+    );
+    assert!(
+        served,
+        "the real `amux ctl` binary never delivered its request"
+    );
+    assert!(
+        req.contains(&payload),
+        "the 20 KB payload was not delivered intact through the real binary (req_len={}, exit={:?})",
+        req.len(),
+        out.status.code()
+    );
+    // Bonus end-to-end: with an ok reply, the client exits success.
+    assert_eq!(out.status.code(), Some(0), "amux ctl did not exit success");
+}
+
 // ---------------------------------------------------------------------------
 // D5 / D6 / D7 — the Windows counterparts of the unix-only exploit tests.
 //   D6/D7 need a MALICIOUS SERVER (amux is the client, via request());
