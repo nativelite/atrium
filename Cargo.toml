@@ -1,6 +1,6 @@
 [package]
 name = "amux"
-version = "0.23.0"
+version = "0.30.0"
 edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-09-06
+
 ### Added
 - **`amux reap` collects orphaned pane groups, and the watchdog no longer
   depends on a file to find them.** Every pane now carries
@@ -111,6 +113,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently disappearing.
 - **A deleted session registry is reported.** Only a *changed* file alerted, so
   the stronger tamper — deleting it — was silent.
+- **On Windows, any `ctl` request or reply larger than 8 KiB deadlocked.**
+  `PIPE_NOWAIT` writes are all-or-nothing: a `WriteFile` whose length exceeds the
+  free buffer space writes *zero* bytes, not a partial. Both the server's reply
+  path and the client's write loop handed the OS the whole remaining payload, so
+  anything over one pipe buffer wrote nothing, forever, and the exchange hung —
+  measured as a hard wall at exactly 8192 bytes (1 KiB fine; 8192, 12k, 20k and
+  32k all delivered 0). Every write is now capped to one pipe buffer, which
+  always fits once the reader has drained; sizes 1 KiB through 32 KiB are
+  delivered intact. Invisible from a Mac: the module type-checked against
+  `--target x86_64-pc-windows-msvc` for weeks and this only appeared the first
+  time it was executed on Windows hardware.
 
 ### Changed
 - **`capped_by=` is gone from the session registry, and nothing self-declares any
@@ -136,6 +149,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   primitive. `warden`'s module docs carry the full reasoning, including the part
   that has not changed: at the same uid nothing proves a descendant is *honouring*
   a ceiling, and this is a tripwire, not a boundary.
+
+### Security
+- **The `ctl` control channel was audited end to end, and the nine defects the
+  audit found are closed on both platforms.** `amux ctl` reaches a running amux
+  over a unix socket or a Windows named pipe, served by the single 15 ms event
+  loop that drives every pane — so a defect there is not a slow command, it is
+  every pane in every window frozen. What was wrong:
+
+  * **A reply larger than the socket buffer was silently cut in half.**
+    `respond()` called `write_all` on a *non-blocking* socket, which returns
+    `WouldBlock` after a partial write, so `amux ctl audit` on a real fleet
+    printed half a JSON document and exited failure. Replies now go to a
+    per-client outbox, flushed a slice per tick, and a writer that stalls is
+    dropped on a deadline instead of parked forever.
+  * **One silent client could take the whole channel out.** Connect, send
+    nothing, hold the single accepted slot — no token required, so the denial
+    was available pre-auth to anything that could reach the endpoint. There is
+    now a bounded pool (`MAX_SLOTS = 8`) with a deadline on every slot. Refusals
+    are counted and announced at a bounded rate, replacing an `eprint!` from
+    inside the accept loop — an unbounded terminal write on the run-loop thread,
+    at whatever rate an attacker connects.
+  * **A hostile endpoint could make `amux ctl` allocate without limit, and a
+    truncated reply came back as success.** The client accumulated until a
+    newline that never arrived (64 MiB pushed in 250 ms became a 67 MB `String`),
+    and EOF before a newline returned `Ok` over a half-read answer. `MAX_REPLY`
+    now caps the reply, EOF without a newline is an error, and three budgets
+    bound the exchange — a stall deadline, a total deadline, and the poll
+    interval — read by both platforms from one place instead of four unrelated
+    literals.
+  * **An oversize request took the one code path that skipped the cap.** The
+    newline branch of the framer did not check `MAX_REQUEST`; it does now, and
+    answers with a bounded error rather than growing a buffer.
+  * **Windows: flushing a reply blocked the entire multiplexer.** `respond()`
+    called `FlushFileBuffers`, which does not return until the client reads, so
+    one `ctl` client that asked a question and never read the answer froze every
+    pane. The flush could not simply be deleted — `respond()` disconnects
+    immediately after, and `DisconnectNamedPipe` discards data the client has not
+    read, so removing it alone would have traded a visible hang for silent reply
+    loss. The disconnect is now deferred through a `Writing`/`Draining` state
+    machine. Measured on Windows: `respond()` returns in 2.3 ms against a
+    non-reading client, where before it never returned.
+  * **Windows: a short `WriteFile` was reported as a complete reply, and any
+    request over 8 KiB lost its head.** Message mode discarded the remainder of a
+    message the 8 KiB read could not hold and handed the run loop a fragment
+    beginning mid-payload. Byte mode with a reassembling framer replaces it, and
+    a short write is now reported instead of returned as `Ok`.
+
+  The unix hardening was then mutation-tested — nineteen one-line mutations
+  against the shipping code, applied and reverted one at a time. Fifteen were
+  caught by a precisely-named test; the four that were not exposed guards that
+  could not fail, including one whose failure mode was to hang `cargo test`
+  forever with no CI to kill it. All four are fixed and re-checked against the
+  mutation that had survived them. The Windows half was written on a Mac and
+  executed on a Windows box before it shipped; `tests/win_ipc_verify.rs` records
+  the raw `(ok, n, err)` triples the OS actually returns.
+
+  **What this does not claim, by design.** Every mitigation here admits a process
+  running as the *same user*, which is exactly what a hosted agent is: peer-cred,
+  mode 0600 and the Windows SDDL bound the damage, they do not prevent it.
+  Defending against a same-user attacker is an explicit **non-goal** — amux's
+  scope is fleet and agent safety (a pane cannot impersonate a sibling or claim
+  operator, credentials stay scoped) plus keeping a *different* user off a shared
+  box. A process already running as you has won by far easier paths: your env,
+  your files, `~/.claude.json`, your OS vault. So the unix endpoint tripwire (a
+  `(dev, ino)` re-stat, which announces a socket swapped underneath amux) is a
+  cheap bonus the unix path happens to afford, and its absence on Windows — where
+  a named pipe has no `(dev, ino)` and a same-user process can add an instance
+  under amux's name — is a documented non-goal, not an open defect. Closing it
+  would need the server to authenticate itself to its clients with real crypto,
+  which is over-engineering for a single-user local tool.
+- **On Windows, a `..` that popped a directory which does not exist reported the
+  path as *inside* the fleet's granted tree.** `real_path` relied on
+  `canonicalize` failing for a missing component, which holds on unix; Windows
+  collapses `..` *lexically* before touching the filesystem, so
+  `<base>/not-created/..` resolved to `<base>` and the reachability guard
+  answered `Inside` — the cannot-tell-renders-as-inside fail-open the module
+  exists to prevent, on the path that decides which directories a fleet discloses
+  and hands an agent via `--add-dir`. Every `..` must now pop a directory that
+  actually exists (a filesystem check, not the lexical surgery the module rightly
+  forbids) or the answer is `Unverifiable`. Unix behaviour is unchanged, and
+  `link/..` still resolves through the filesystem.
 
 ## [0.23.0] - 2026-09-01
 
