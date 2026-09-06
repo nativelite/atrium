@@ -6,3 +6,7 @@
 
 # Workflow worktrees and agent scratch — never part of the tree.
 .claude/
+
+# Python bytecode from dev.py — a build artifact, never checked in.
+__pycache__/
+*.pyc
