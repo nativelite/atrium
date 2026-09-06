@@ -23,6 +23,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enforces this in the kernel.
 
 ### Fixed
+- **The pty stranding that made amux degrade until reboot was never amux's
+  bug.** `pty-rs` leaked a terminal into every child it spawned: it set
+  `FD_CLOEXEC` on the master and checked the result, but `fcntl` is variadic in
+  C and was declared there as a plain three-argument function — on Apple ARM64
+  a variadic argument travels on the stack while a fixed one travels in a
+  register, so the flag never reached the kernel, and `fcntl` returned 0, so
+  the error check reported success on a call that did nothing. The slave had no
+  `FD_CLOEXEC` at all. Every pane child therefore inherited its own master on
+  fd 3 and a second slave on fd 4, and a pane that outlived its amux pinned
+  terminals nothing could reclaim — the holders are already exiting, blocked
+  revoking a controlling terminal another process still holds open, sitting in
+  state `E` where SIGKILL does not touch them. That is what drained the pool to
+  526 ptys against macOS's 511-slot limit, and why the only known recovery was
+  a reboot. Fixed upstream in `pty-rs` `c0caa6d`; this is the dependency bump.
+
+  The two lifecycle tests that failed intermittently
+  (`a_sigkilled_amux_still_takes_its_tree_down` and its no-registry twin) were
+  never wrong about teardown. The watchdog woke on pipe EOF and killed the
+  group correctly in under 800ms; the tests were timing out against corpses
+  that could not finish exiting, because `kill -0` cannot tell a process stuck
+  mid-exit from a live one. The suite goes from 68/70 to 70/70, adds zero
+  stuck processes and zero leaked ptys per run (previously 4+ and ~10), and
+  runs in 5s instead of 13-16s — with no change to amux's own code.
 - **A clean teardown deleted the crash registry even when panes had survived
   it.** The `remove_file` ran unconditionally, immediately after the check that
   had just proved survivors existed — so on the one path where recovery was
