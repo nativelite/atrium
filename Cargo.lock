@@ -3,73 +3,64 @@
 version = 3
 
 [[package]]
-name = "abus"
-version = "0.1.0"
-source = "git+https://github.com/nativelite/abus?branch=main#4f947792508b434eab3e09ea2019e806bfb2a8bc"
-dependencies = [
- "json",
-]
-
-[[package]]
-name = "agsess"
-version = "0.1.0"
-source = "git+https://github.com/nativelite/agsess?branch=main#72589e5fc2f08915b7877ecfb849f946f406d93a"
-dependencies = [
- "json",
-]
-
-[[package]]
-name = "akey"
-version = "0.2.1"
-source = "git+https://github.com/nativelite/akey?branch=main#e2f6231b3d3ef5e0f45b3b36555c7fcb29f7a5fb"
-dependencies = [
- "cred",
- "json",
-]
-
-[[package]]
-name = "amux"
+name = "atrium"
 version = "0.30.0"
 dependencies = [
- "abus",
- "agsess",
- "akey",
- "ansi",
- "json",
- "pty",
- "rawterm",
- "vterm",
+ "nativelite-abus",
+ "nativelite-agsess",
+ "nativelite-akey",
+ "nativelite-ansi",
+ "nativelite-json",
+ "nativelite-pty",
+ "nativelite-rawterm",
+ "nativelite-vterm",
 ]
 
 [[package]]
-name = "ansi"
+name = "nativelite-abus"
 version = "0.1.0"
-source = "git+https://github.com/nativelite/ansi-rs?branch=main#4082a87641bf414c98834b3867f09a668748e555"
-
-[[package]]
-name = "cred"
-version = "0.1.0"
-source = "git+https://github.com/nativelite/cred-rs?branch=main#dea6ea484076bd8ae95638edd85e625cb8233ddd"
-
-[[package]]
-name = "json"
-version = "0.1.0"
-source = "git+https://github.com/nativelite/json-rs?branch=main#bcbbeb7a995a3ae2ca0b0475a2b8eb9f5b0b9e42"
-
-[[package]]
-name = "pty"
-version = "0.3.0"
-source = "git+https://github.com/nativelite/pty-rs?branch=main#c0caa6d3a70047930b67de120c52480c7f388fb3"
-
-[[package]]
-name = "rawterm"
-version = "0.2.1"
-source = "git+https://github.com/nativelite/rawterm-rs?branch=main#0d26f1efad5314e147e0c2ac0e0cd62730be16fa"
-
-[[package]]
-name = "vterm"
-version = "0.3.0"
-source = "git+https://github.com/nativelite/vterm-rs?branch=main#e53c1c8444de9859b6e6db9fe2e4d1e5195ede1b"
 dependencies = [
- "ansi",
+ "nativelite-json",
+]
+
+[[package]]
+name = "nativelite-agsess"
+version = "0.1.0"
+dependencies = [
+ "nativelite-json",
+]
+
+[[package]]
+name = "nativelite-akey"
+version = "0.2.1"
+dependencies = [
+ "nativelite-cred",
+ "nativelite-json",
+]
+
+[[package]]
+name = "nativelite-ansi"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-cred"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-json"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-pty"
+version = "0.3.0"
+
+[[package]]
+name = "nativelite-rawterm"
+version = "0.2.1"
+
+[[package]]
+name = "nativelite-vterm"
+version = "0.3.0"
+dependencies = [
+ "nativelite-ansi",
 ]

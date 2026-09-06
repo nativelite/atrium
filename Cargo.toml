@@ -1,5 +1,5 @@
 [package]
-name = "amux"
+name = "atrium"
 version = "0.30.0"
 edition = "2021"
 rust-version = "1.70"
@@ -11,16 +11,21 @@ categories = ["command-line-utilities"]
 
 # nativelite app rule: zero THIRD-PARTY dependencies; org crates only.
 [dependencies]
-abus = { git = "https://github.com/nativelite/abus", branch = "main" }
-pty = { git = "https://github.com/nativelite/pty-rs", branch = "main" }
-akey = { git = "https://github.com/nativelite/akey", branch = "main" }
-rawterm = { git = "https://github.com/nativelite/rawterm-rs", branch = "main" }
-ansi = { git = "https://github.com/nativelite/ansi-rs", branch = "main" }
-vterm = { git = "https://github.com/nativelite/vterm-rs", branch = "main" }
-agsess = { git = "https://github.com/nativelite/agsess", branch = "main" }
-json = { git = "https://github.com/nativelite/json-rs", branch = "main" }
+abus = { package = "nativelite-abus", version = "0.1", path = "../abus" }
+pty = { package = "nativelite-pty", version = "0.3", path = "../pty-rs" }
+akey = { package = "nativelite-akey", version = "0.2", path = "../akey" }
+rawterm = { package = "nativelite-rawterm", version = "0.2", path = "../rawterm-rs" }
+ansi = { package = "nativelite-ansi", version = "0.1", path = "../ansi-rs" }
+vterm = { package = "nativelite-vterm", version = "0.3", path = "../vterm-rs" }
+agsess = { package = "nativelite-agsess", version = "0.1", path = "../agsess" }
+json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
 
 [lib]
+# Internal library name kept as `amux` on purpose: nothing outside this crate
+# depends on it, and the whole crate's ~200 `amux::` paths + the runtime
+# contract (AMUX_* env vars, `amux-*` IPC/file prefixes, process-ancestry
+# detection) rename together in a separate, run-tested pass. The crate PUBLISHES
+# as `atrium` (the [package] name), which is what resolves the crates.io collision.
 name = "amux"
 path = "src/lib.rs"
 

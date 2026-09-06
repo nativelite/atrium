@@ -2,9 +2,10 @@
 """nativelite zero-dependency guard, app variant (stdlib Python only).
 
 Apps compose nativelite's own crates, so ``[dependencies]`` entries are
-allowed **iff** they are git dependencies on ``github.com/nativelite/``
-repos. Anything else — a crates.io name, a foreign git URL — fails. Build-
-and dev-dependency tables must be empty, as for library packages.
+allowed **iff** they are org crates: either a ``package = "nativelite-*"``
+registry dep (with a version: the crates.io publish form) or a git dep on
+``github.com/nativelite/``. Anything else (a third-party crates.io name, a
+foreign git URL) fails. Build- and dev-dependency tables must be empty.
 """
 from __future__ import annotations
 
@@ -20,11 +21,21 @@ def check_manifest() -> list[str]:
     data = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))
     problems: list[str] = []
     for name, spec in (data.get("dependencies") or {}).items():
-        git = spec.get("git") if isinstance(spec, dict) else None
-        if not git or not git.startswith(ORG_PREFIX):
+        if not isinstance(spec, dict):
             problems.append(
-                f"[dependencies] {name!r} must be a git dependency on "
-                f"{ORG_PREFIX}*, found: {spec!r}"
+                f"[dependencies] {name!r} must be a nativelite org crate, "
+                f"found: {spec!r}"
+            )
+            continue
+        git = spec.get("git")
+        pkg = spec.get("package") or ""
+        org_git = bool(git) and git.startswith(ORG_PREFIX)
+        org_pkg = pkg.startswith("nativelite-") and bool(spec.get("version"))
+        if not (org_git or org_pkg):
+            problems.append(
+                f"[dependencies] {name!r} must be a nativelite crate "
+                f"(package = 'nativelite-*' with a version, or an org git dep); "
+                f"found: {spec!r}"
             )
     for table in ("build-dependencies", "dev-dependencies"):
         if data.get(table):
