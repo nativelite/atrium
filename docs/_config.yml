@@ -1,7 +1,0 @@
-# GitHub Pages config for the atrium documentation.
-# Serve Pages from this /docs folder (repo Settings -> Pages -> Source: /docs)
-# once the repository is public. Uses a built-in GitHub Pages theme, so no extra
-# gems or build steps are needed. index.md is the landing page.
-title: atrium
-description: "tmux for coding agents: a zero-dependency multi-agent terminal."
-theme: jekyll-theme-cayman
