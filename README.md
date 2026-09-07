@@ -65,6 +65,27 @@ cargo install --path .
 Requires a recent stable Rust toolchain. Windows is the reference platform
 (ConPTY); macOS and Linux run too (see [Design and scope](#design-and-scope)).
 
+### Set up the coordination skills
+
+The control plane and fleets rely on two Claude Code skills that teach a hosted
+`claude` how to use `atrium ctl`. **Without them, an agent does not know the
+control plane exists**, so install them before running `--allow-ctl` sessions or
+`atrium fleet up`. They live in this repo under [`skills/`](skills/):
+
+```bash
+# from a checkout of this repo (clone it first if you installed via crates.io):
+cp -r skills/atrium-delegate skills/atrium-coordinate ~/.claude/skills/
+# Windows: copy skills\atrium-delegate and skills\atrium-coordinate
+#          into %USERPROFILE%\.claude\skills\
+```
+
+- **`atrium-delegate`**: an agent hands off a substantial *independent* piece of
+  work when it genuinely pays, and does small or dependent work inline.
+- **`atrium-coordinate`**: casts an agent as a coordinator that splits a task
+  across a team, delegates every part, monitors, collects, and reaps.
+
+Plain single-pane use (`atrium claude`) needs neither.
+
 ## Quickstart
 
 ```bash
@@ -220,7 +241,9 @@ semantics, the trust ladder, and the **7-point security model** live in
 [docs/trust-and-security.md](docs/trust-and-security.md). Two Claude Code skills,
 [`atrium-delegate`](skills/atrium-delegate) and
 [`atrium-coordinate`](skills/atrium-coordinate), teach an agent to actually use
-`ctl`.
+`ctl`. **Install them first** (see [Set up the coordination
+skills](#set-up-the-coordination-skills)), or a hosted agent will not know the
+control plane exists.
 
 ## Reference
 
