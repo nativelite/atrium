@@ -51,12 +51,15 @@ the screen diffing, and the status reader are all nativelite crates.
 ## Install
 
 ```bash
-# From source (works today):
-git clone https://github.com/nativelite/atrium && cd atrium
-cargo install --path .        # installs the `atrium` command
-
-# Once published to crates.io:
 cargo install atrium
+```
+
+That builds and installs the `atrium` command from crates.io. To build from a
+local checkout instead:
+
+```bash
+git clone https://github.com/nativelite/atrium && cd atrium
+cargo install --path .
 ```
 
 Requires a recent stable Rust toolchain. Windows is the reference platform
