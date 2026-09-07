@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent-aware status — atrium docs</title>
+<meta name="description" content="atrium documentation: Agent-aware status. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html" class="active">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<h1>Agent-aware status</h1>
+<p>When atrium launches an agent pane, it binds that pane to the agent's own session and lets the agent's real status tint the pane's chrome. In a grid of agents, this lets you see at a glance which one is stuck waiting on you. This page covers the three status signals atrium renders, how the session bind works, and exactly what atrium can and cannot see.</p>
+<h2>The three status signals</h2>
+<p>atrium surfaces an agent's state in three places, so a blocked agent shows up whether its pane is focused, tiled in the background, or in a window you are not currently viewing.</p>
+<h3>Border color (unfocused, tiled panes)</h3>
+<table><thead><tr><th>Color</th><th>Meaning</th></tr></thead><tbody><tr><td>Bright yellow</td><td>The agent is waiting on your approval.</td></tr><tr><td>Grey</td><td>Waiting for a prompt, or idle.</td></tr><tr><td>Default</td><td>Working.</td></tr></tbody></table>
+<p>The focused pane keeps its normal bright-cyan border. A blocked agent in the pane you are already looking at needs no nagging, so it is left alone.</p>
+<h3>Title badge</h3>
+<p>The pane's top-edge label gains a single marker:</p>
+<ul><li><code> 2:claude ? </code> when the agent is waiting on you.</li><li><code> 2:claude ~ </code> while the agent is working.</li><li>Nothing when the agent is idle.</li></ul>
+<h3>Status bar</h3>
+<p>A window whose bound agent is waiting shows <code>?</code> next to its name, and the bar appends <code>| N waiting</code>. This means a blocked agent in a backgrounded window still surfaces, even when it is off-screen.</p>
+<h2>How the bind works</h2>
+<p>When atrium spawns an agent pane, it mints a fresh session id and passes <code>claude --session-id &lt;uuid&gt;</code>. If you already supplied a session-selecting flag such as <code>--resume</code>, <code>--continue</code>, or <code>--session-id</code>, the id is yours and atrium leaves it alone.</p>
+<p>Claude Code writes its transcript as <code>&lt;uuid&gt;.jsonl</code>, so atrium knows the exact file to watch. This is a direct lookup with no guessing, even when several agents share one directory.</p>
+<p>The status itself is derived by the <a href="https://github.com/nativelite/agsess"><code>agsess</code></a> crate, which reads those transcript files read-only.</p>
+<h2>What atrium can and cannot see</h2>
+<p>atrium reads the status of Claude Code sessions it launched, and nothing more.</p>
+<h3>What it reads</h3>
+<ul><li>Only the session transcript files (<code>*.jsonl</code>) that Claude Code writes under your own <code>~/.claude/projects</code>, on your own disk.</li><li>Only the transcripts for sessions atrium started via <code>--session-id</code>.</li></ul>
+<p>It is read-only and status only: the border and bar render whether an agent is working, waiting, or idle, and never any conversation text. No prompt and no reply ever leaks from one pane into another pane's chrome. No credential file is ever opened, and there is no network path at all.</p>
+<h3>What it does not see</h3>
+<ul><li>An agent you started inside a shell pane (<code>$ claude</code>). That pane's title is your shell, so atrium never binds it. This is a documented v1 limitation.</li><li>Agents running in other tools.</li><li>Sessions you run outside atrium entirely. That is what <a href="https://github.com/nativelite/agtop"><code>agtop</code></a> is for.</li><li>Anything that would require credentials.</li></ul>
+<p>Because a pane atrium did not launch as an agent is never bound, non-agent panes (shells, <code>vim</code>, <code>cmd</code>) never acquire agent chrome and never cost a scan.</p>
+<h2>The waiting inference and <code>permissionMode</code></h2>
+<p>The waiting-on-you status is an inference over the transcript tail, gated by Claude Code's <code>permissionMode</code>. On a machine running mostly in <code>auto</code> mode, the loud yellow border correctly stays quiet: auto mode does not block on the human, so there is nothing to surface. The yellow is reserved for the sessions where an agent is genuinely blocked.</p>
+<p>A future opt-in hook can replace the inference with a certainty. It is not part of this release.</p>
+<h2>See also</h2>
+<ul><li><a href="https://github.com/nativelite/atrium#readme">atrium README</a></li><li><a href="identity.html">Agent identity</a></li><li><a href="control-plane.html">The control plane</a></li></ul>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

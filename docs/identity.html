@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credential identity — atrium docs</title>
+<meta name="description" content="atrium documentation: Credential identity. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html" class="active">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<h1>Credential identity</h1>
+<p>atrium can launch an agent pane under a chosen credential identity, so a single grid of agents can run under different keys or federation profiles at once. Only the identity's name is ever shown; the secret behind it is never displayed, cached, logged, or persisted.</p>
+<h2>Launching under an identity</h2>
+<p>Pass <code>--identity &lt;name&gt;</code> (short form <code>-I &lt;name&gt;</code>) when you launch an agent:</p>
+<pre><code>atrium --identity work claude      # a static key stored in your OS vault
+atrium --identity wif:prod claude  # a Workload Identity Federation profile</code></pre>
+<p>The identity is resolved for that one child and injected into its environment. It never touches atrium's sibling panes, and atrium itself makes no network calls.</p>
+<h2>Static key vs <code>wif:</code> profile</h2>
+<p>A <code>&lt;name&gt;</code> can name one of two kinds of credential:</p>
+<ul><li><b>Static key.</b> A plain key name (for example <code>work</code>) refers to a static key stored in your OS vault.</li><li><b>Workload Identity Federation.</b> A <code>wif:&lt;name&gt;</code> name (for example <code>wif:prod</code>) refers to a Workload Identity Federation profile.</li></ul>
+<p>The two read apart at a glance in the pane's tag: <code>·wif:prod</code> for a federation profile versus <code>·work</code> for a static key. That visible distinction surfaces the credential-precedence footgun, a leftover static key silently shadowing a WIF profile, so you can catch it.</p>
+<h2>How resolution works</h2>
+<p>atrium resolves the target's environment through the <a href="https://github.com/nativelite/akey"><code>akey</code></a> crate:</p>
+<ul><li>A key name becomes <code>ANTHROPIC_API_KEY</code>.</li><li>A <code>wif:&lt;name&gt;</code> profile becomes the five documented federation variables.</li></ul>
+<p>The resolved environment is injected into that one child through the pty (<code>pty::Pty::spawn_with_env</code>). The credential is set for that agent alone.</p>
+<h2>Lifetime and inheritance</h2>
+<p>The identity applies to the initial agent pane and is inherited by every split and new pane created from it. Identity is fixed for a pane's lifetime, because a running process's environment cannot change after it starts. To re-identify a pane you respawn it, which is an explicit, visible action.</p>
+<h2>What is shown: names only</h2>
+<p>Only the <i>name</i> of an identity is ever rendered.</p>
+<ul><li>A <code>·&lt;name&gt;</code> tag rides in the pane's top border (for example <code>2:claude ·work</code>) and appears next to the window's entry in the bar.</li><li>The tag renders as <b>colored text</b>: the identity color is used as the name's foreground, matching the pane border, in both the border and the reverse-video bar. It is never a filled color chip.</li><li>The text is always drawn. Color is a redundant accessibility channel, never the only signal, so the identity is legible without relying on color.</li></ul>
+<h2>The hard guarantee: names, never secrets</h2>
+<p>The resolved environment is re-fetched on every spawn, handed straight to the child, and dropped. It is:</p>
+<ul><li>never cached on the pane,</li><li>never logged,</li><li>never persisted,</li><li>never present in <code>ATRIUM_DEBUG</code> traces.</li></ul>
+<p>A screen-shared grid leaks no key and no token. It shows only the labels you typed.</p>
+<h2>Resolve failure is visible</h2>
+<p>If an identity cannot be resolved (no such target, or the vault is locked), the reason is flashed in the bar and the agent spawns <i>without</i> the credential. You are told what happened rather than running unauthenticated by surprise. atrium never leaves an agent silently unauthenticated.</p>
+<h2>Scope</h2>
+<p>Non-agent panes (shells, editors) and no-identity spawns are unaffected: they use the plain spawn path and carry no tag.</p>
+<p>Identity is not limited to a single interactive launch. It also works with <a href="fleets.html">fleets</a> and with <a href="control-plane.html">the control plane</a> via <code>ctl spawn --identity</code>, so a whole fleet or a remotely spawned pane can carry the same credential guarantees.</p>
+<p>See also the <a href="https://github.com/nativelite/atrium#readme">atrium README</a>.</p>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — atrium docs</title>
+<meta name="description" content="atrium documentation: Architecture. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html" class="active">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<h1>Architecture</h1>
+<p>atrium is a multi-agent terminal, "tmux for coding agents," that hosts your own CLIs in switchable, splittable panes. It is small and faithful by design: a passthrough first, an emulator only when it has to tile, built entirely on the nativelite stack with zero third-party dependencies. See the <a href="https://github.com/nativelite/atrium#readme">project overview</a> for usage and keys.</p>
+<h2>The zero-dependency stack</h2>
+<p>atrium is assembled from five nativelite crates, each doing exactly one thing. There are no third-party runtime dependencies, all the way down.</p>
+<ul><li><b>pty</b>: pseudo-terminals. Spawns and drives the child processes (your agent, your shell) behind each pane.</li><li><b>rawterm</b>: raw input and events. Reads keystrokes as raw bytes so they can flow back to the focused pane undecoded.</li><li><b>ansi</b>: VT parsing and screen diff. Parses the terminal byte stream and computes minimal screen updates.</li><li><b>vterm</b>: the terminal-emulator core. The screen model atrium falls back to when it must tile panes.</li><li><b>agsess</b>: read-only agent session status. Reports whether a pane's agent is working or waiting on you, without ever writing to the session.</li></ul>
+<h2>Passthrough first, emulator only when tiling</h2>
+<p>atrium is a passthrough first and an emulator only when it must tile.</p>
+<p>In passthrough, the active pane's VT byte stream goes straight to your real terminal, and keystrokes flow back undecoded via <code>rawterm</code>'s raw-bytes read. Nothing sits between the pane and the screen.</p>
+<p>On Windows, ConPTY maintains every pane's screen itself and repaints it in full on resize. Because of that, switching to a passthrough pane is just a resize nudge, and background panes cost nothing to track.</p>
+<p>A pinned scroll region protects the bar row: it pins the bar, so panes believe the terminal is one row shorter and cannot touch it.</p>
+<h2>Two host-level subtleties</h2>
+<p>atrium is the host for the consoles it spawns, so it has to handle two host-level details correctly. Each was found the hard way, by its own test suite.</p>
+<h3>Terminating the win32-input-mode request</h3>
+<p>A pane's console asks <i>its host</i> to switch to win32-input-mode (<code>ESC[?9001h</code>). atrium is that host, so the request is terminated at atrium. Tunneled through, it would flip atrium's own input encoding and every hotkey would go dark.</p>
+<h3>Running inside another ConPTY</h3>
+<p>Everything runs correctly even when atrium is itself hosted inside another ConPTY. The end-to-end tests rely on this: they run atrium inside a <code>pty</code> and drive it with keystrokes.</p>
+<h2>Correctness</h2>
+<p>atrium is verified with pure unit tests over its logic and end-to-end tests over the real thing.</p>
+<h3>Pure units</h3>
+<ul><li><b>Prefix scanner</b>: chunk-split safe, literal-prefix, and command/forward interleaving, including split and focus-move commands.</li><li><b>Bar builder</b>: marker priority, including the <code>?</code> waiting mark and the fleet count.</li><li><b>Tiled compositor</b>: box borders, title badges, and liveness plus agent-status tinting.</li><li><b>Binder</b>: pane-id by sessions into status, a pure mapping.</li><li><b>Mode-request filter</b>: verified at every possible chunk split.</li></ul>
+<h3>End-to-end</h3>
+<p>atrium runs inside a <code>pty</code>, driven with real keystrokes:</p>
+<ul><li>Passthrough of a one-shot command and auto-exit.</li><li>An interactive shell round-trip with the bar present and <code>Ctrl+A q</code> quitting cleanly.</li><li>Literal-prefix delivery.</li></ul>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

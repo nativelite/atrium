@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The control plane (ctl) — atrium docs</title>
+<meta name="description" content="atrium documentation: The control plane (ctl). tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html" class="active">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<h1>The control plane (ctl)</h1>
+<p>A <a href="fleets.html">fleet</a> is a <i>saved</i> org chart; <b><code>ctl</code></b> builds one <b>live</b>, and lets an agent (or you) <i>drive</i> it. With <code>--allow-ctl</code>, a pane can <b>spawn</b>, <b>send</b> to, <b>observe</b>, and <b>kill</b> other agent panes, turning atrium from a viewer of agents into a <b>runtime</b> for them.</p>
+<h2>What ctl is</h2>
+<p>The point of doing this inside atrium is legibility. Every agent ctl creates is a visible, killable pane with a status border, listed in the org chart. Because the whole hierarchy is on screen and controllable, atrium coordination stays legible in a way opaque subagents are not.</p>
+<p>The shape it is built for is one human, a couple of coordinators, and a wide bench of workers:</p>
+<pre><code>  you (a shell/agent pane)
+   └─ hand an initiative to →
+      lead_a, lead_b          (coordinators)
+        └─ each splits it across →
+           dev_1, dev_2, …    (workers, each its own pane)</code></pre>
+<p>Trust posture (how hands-off spawned agents run, and the ceiling they are capped at) is set with <code>--trust</code> and is covered separately; see <a href="trust-and-security.html">trust and security</a>.</p>
+<h2>Turning it on</h2>
+<p>The control plane is <b>opt-in and off by default</b>. Without <code>--allow-ctl</code> the channel is not bound and <code>atrium ctl</code> refuses; a session that did not ask for it is unchanged.</p>
+<pre><code>atrium --allow-ctl claude                 # bind the control channel
+atrium --allow-ctl --trust claude         # …and launch every agent trusted + hands-off
+atrium --allow-ctl --max-depth 3 claude   # cap spawn recursion (default 6; 0 = unlimited)</code></pre>
+<p><code>--max-depth &lt;N&gt;</code> bounds spawn recursion so a self-spawning agent cannot fork-bomb the machine. The default is <code>6</code>; <code>0</code> removes the cap. Width is never capped, only recursion depth.</p>
+<p>When ctl is on, atrium opens a <b>per-instance control channel</b> (a <b>named pipe</b> on Windows, a <b>unix socket</b> elsewhere; zero-dep, non-blocking-drained in the run loop) and injects two env vars into <b>every</b> pane it spawns:</p>
+<ul><li><b><code>ATRIUM_CTL</code></b>: the channel endpoint. <code>atrium ctl</code> connects here.</li><li><b><code>ATRIUM_PANE</code></b>: the caller pane's agent id, so the server attributes each request to its place in the spawn tree.</li></ul>
+<p>Any process in a pane (a shell command, or an agent via a tool or hook) issues control by running <b><code>atrium ctl &lt;cmd&gt;</code></b>, which speaks one JSON request per line and prints the one-line JSON reply.</p>
+<h2>The command surface</h2>
+<p>Targets are a pane <b>id</b> (its numeric agent id) or a <b>role</b> label (<code>dev_1</code>); an ambiguous role is a clear error.</p>
+<table><thead><tr><th>Command</th><th>Does</th><th>Reply</th></tr></thead><tbody><tr><td><code>atrium ctl spawn [--role R] [--identity X] [--here|--window] -- &lt;cmd…&gt;</code></td><td>Open a visible worker running <code>&lt;cmd&gt;</code> (a new window, or <code>--here</code> tiled beside the caller), tagged <code>R</code>, optionally under credential identity <code>X</code>.</td><td><code>{"ok":true,"pane":3,"role":"dev_1","session":"…"}</code></td></tr><tr><td><code>atrium ctl list</code></td><td>The live org chart: every pane with parent, role, depth, and <code>agsess</code> status.</td><td><code>{"ok":true,"tree":[{"id":0,"parent":null,"role":null,"title":"claude","depth":0,"status":"idle"},…]}</code></td></tr><tr><td><code>atrium ctl send &lt;target&gt; &lt;text…&gt;</code></td><td>Deliver <code>&lt;text&gt;</code> to a pane's agent as a submitted prompt. <b>Queued until the target is idle</b> (agsess-gated), so it never lands mid-turn.</td><td><code>{"ok":true,"target":3,"queued":true}</code></td></tr><tr><td><code>atrium ctl status [&lt;target&gt;]</code></td><td>One target's status, or (no target) a roll-up of the caller's subtree. Backed by <code>agsess</code>: <code>working</code> / <code>waiting-approval</code> / <code>waiting-prompt</code> / <code>idle</code> (or <code>null</code> if unbound).</td><td><code>{"ok":true,"pane":3,"status":"working"}</code></td></tr><tr><td><code>atrium ctl kill &lt;target&gt;</code></td><td>Terminate a worker <b>and its whole subtree</b> (a lead's kill reaps its ICs). The dead panes' windows re-tile or close on the next tick.</td><td><code>{"ok":true,"killed":[3,4,5]}</code></td></tr><tr><td><code>atrium ctl audit [N]</code></td><td>The control-request log (most recent <code>N</code>, or all), for reconstructing a run.</td><td><code>{"ok":true,"audit":[{"seq":1,"caller":0,"action":"spawn","detail":"role=dev_1 argv=claude identity=-","ok":true,"note":"pane=1"},…]}</code></td></tr><tr><td><code>atrium ctl board set &lt;key&gt; &lt;field=value…&gt;</code></td><td>Merge fields into the shared board (create if absent); an empty value clears a field.</td><td><code>{"ok":true,"key":"auth","entry":{"by":"dev_1","ms":…,"fields":{"status":"DONE","owner":"Max"}}}</code></td></tr><tr><td><code>atrium ctl board get &lt;key&gt;</code> / <code>list</code> / <code>del &lt;key&gt;</code></td><td>Read one entry, roll up the whole board, or remove an entry.</td><td><code>{"ok":true,"board":[{"key":"auth","by":"dev_1","fields":{"status":"DONE"}},…]}</code></td></tr><tr><td><code>atrium ctl bus pub &lt;topic&gt; [--decision] &lt;field=value…&gt;</code></td><td>Publish a structured event to <code>topic</code>. Default urgency <code>fyi</code>; <code>--decision</code> marks an escalation that needs a human answer.</td><td><code>{"ok":true,"event":{"seq":7,"topic":"deploy","kind":"fyi","from":"dev_1","fields":{"msg":"merged"}}}</code></td></tr><tr><td><code>atrium ctl bus sub &lt;topic…&gt;</code> / <code>unsub [&lt;topic…&gt;]</code></td><td>Subscribe (merged; <code>*</code> = firehose) or unsubscribe (empty ⇒ all) the caller.</td><td><code>{"ok":true,"subscribed":["deploy","*"]}</code></td></tr><tr><td><code>atrium ctl bus feed [--since &lt;seq&gt;]</code></td><td>Pull the caller's subscribed events with <code>seq &gt; since</code> (no echo of your own); returns a <code>cursor</code> to resume from.</td><td><code>{"ok":true,"feed":[{"seq":7,"topic":"deploy",…}],"cursor":7}</code></td></tr><tr><td><code>atrium ctl bus resolve &lt;seq&gt;</code></td><td>Mark a <code>decision_needed</code> event answered (clears the bar/panel escalation).</td><td><code>{"ok":true,"seq":7,"resolved":true}</code></td></tr></tbody></table>
+<h2>The board: shared source of truth</h2>
+<p><code>send</code> is the ephemeral message stream ("I just shipped auth"); the <b>board</b> is the durable current truth (<code>auth: DONE, owner: Max, url: …</code>). It answers <i>"what is currently true?"</i>.</p>
+<p>It is a schemaless <b><code>key → fields</code></b> tracker living in the atrium daemon. Because atrium is the single broker process every pane talks to, it is a plain map behind the pipe: <b>single writer, no locking, no consensus.</b> A coordinating lead sets tasks and reads <code>board list</code> for status/owner/blocker instead of re-scraping each teammate's transcript; teammates update their own entry as they work.</p>
+<p>The board is part of the ctl surface, so it is gated by <code>--allow-ctl</code>. Set <b><code>ATRIUM_BOARD=&lt;file&gt;</code></b> to persist it across restarts (in-memory otherwise). Every write records who made it (in the <code>audit</code> log and the entry's <code>by</code>), but the board is shared by the whole session; there are no per-teammate walls.</p>
+<h2>The bus: the team's event stream</h2>
+<p>If the board answers <i>"what is currently true?"</i>, the <b>bus</b> answers <i>"what just happened, and does anyone need to act?"</i>. A teammate <b>publishes a structured event to a topic</b> (<code>bus pub deploy msg=shipping url=…</code>); teammates <b>pull</b> the topics they <b>subscribe</b> to (<code>bus sub deploy</code> then <code>bus feed</code>). State-only coordination means polling the board; the bus lets a finished worker <i>notify</i> without everyone re-checking.</p>
+<p>Two urgency classes carry the visibility-vs-approval split:</p>
+<ul><li><b><code>fyi</code></b>: the default; cheap, lands on the feed.</li><li><b><code>decision_needed</code></b>: set with <code>--decision</code>; an escalation that needs a human or lead answer.</li></ul>
+<p>Open decisions surface <b>actively</b>: the <code>Ctrl+A b</code> panel lists them first and the status bar shows <code>N decisions need you</code>, so you do not have to be looking. <code>bus resolve &lt;seq&gt;</code> clears one once answered.</p>
+<p><b>Backpressure is designed in, not bolted on</b>, because unread messages cost attention:</p>
+<ul><li><b>No echo</b> of your own events.</li><li><b>Pull, not push</b>: you only pay for topics you subscribed to.</li><li><b>Per-agent rate cap</b> of 20 events / 10 s, so one looping worker cannot storm the team.</li><li><b>Bounded ring</b> of the oldest 512 events, then they fall off.</li></ul>
+<p>Like the board, the bus lives in the single broker process (a plain in-memory log, no locking), is gated by <code>--allow-ctl</code>, records who sent each event, and persists across restarts with <b><code>ATRIUM_BUS=&lt;file&gt;</code></b>.</p>
+<h2>A worked run: initiative to leads to ICs</h2>
+<pre><code># You launch the control plane, trusted so the fleet runs hands-off. With
+# --trust, every ctl-spawned agent also comes up trusted (no per-action prompts),
+# so a lead can drive its ICs without you clicking through dialogs.
+atrium --allow-ctl --trust claude
+
+# From your pane, hand the initiative to two coordinators:
+atrium ctl spawn --role lead_a -- claude
+atrium ctl spawn --role lead_b -- claude
+atrium ctl send lead_a "Own the parser rewrite. Split it across two ICs, TDD."
+atrium ctl send lead_b "Own the docs refresh. One IC is enough."
+
+# lead_a, from its own pane, builds its team beside it (--here) and tasks them:
+atrium ctl spawn --here --role dev_1 -- claude
+atrium ctl spawn --here --role dev_2 -- claude
+atrium ctl send dev_1 "Rewrite the tokenizer, tests first."
+atrium ctl send dev_2 "Rewrite the AST builder, tests first."
+
+# lead_a coordinates by status, not by scraping terminals:
+atrium ctl status            # roll-up of lead_a's own subtree
+atrium ctl status dev_1      # one IC (lead_b's team is out of scope, refused)
+
+# When an IC is done, its lead reaps it (and anything under it):
+atrium ctl kill dev_1
+
+# You see all of it, any time: the org chart and the full trail:
+atrium ctl list
+atrium ctl audit</code></pre>
+<p>The multiplier: many workers, coordinated by a few of them, driven by one human, and every level is a pane you can watch, redirect, zoom into (<code>Ctrl+A z</code>), or kill. <code>ctl</code> is the small verb layer; the panes, tiling, identity injection, and <code>agsess</code> status it stands on already existed.</p>
+<h2>Delegation skills: atrium-delegate and atrium-coordinate</h2>
+<p><code>ctl</code> is the mechanism; two Claude Code skills (in <code>skills/</code>) are the instruction layer that makes an agent <i>use</i> it. Copy the directories into <code>~/.claude/skills/</code> and any atrium-hosted claude picks them up. They exist because the trigger is <b>who decides to delegate</b>:</p>
+<ul><li><b><code>atrium-delegate</code></b> (ambient / discretionary): the agent <i>may</i> hand off an independent, substantial part when it genuinely pays, and does small or dependent work inline. On its own a capable agent usually judges it can do the work itself (which is correct), so this fires rarely by design. Its real value is discoverability: without it, an agent does not know <code>atrium ctl</code> exists at all.</li><li><b><code>atrium-coordinate</code></b> (directed): for when you <i>want</i> fan-out. It casts the agent as a coordinator that splits the work, delegates <b>every</b> part, monitors, collects, and reaps, instead of implementing inline. This is the reliable lever: on a task where the ambient skill chose inline every time, coordinate mode fanned out every time.</li></ul>
+<p>Drop a spawned lead straight into coordinate mode by telling it to coordinate:</p>
+<pre><code>atrium ctl spawn --role lead -- claude
+atrium ctl send lead "Coordinate this across a team, one teammate per part: &lt;the initiative&gt;"</code></pre>
+<p>or, from your own pane, just say "coordinate this across a team: …" and let the skill surface.</p>
+<h2>See also</h2>
+<ul><li><a href="https://github.com/nativelite/atrium#readme">README</a>: atrium overview and the full feature set.</li><li><a href="trust-and-security.html">trust and security</a>: the <code>--trust</code> ladder and the ctl security model.</li><li><a href="fleets.html">fleets</a>: saved rosters (<code>atrium fleet up</code>), the persisted org chart.</li><li><a href="identity.html">credential identity</a>: per-pane credentials via <code>--identity</code> and <code>akey</code>.</li></ul>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

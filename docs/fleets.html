@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fleets and mass-spawn — atrium docs</title>
+<meta name="description" content="atrium documentation: Fleets and mass-spawn. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html" class="active">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<h1>Fleets and mass-spawn</h1>
+<p>atrium can open a whole grid of agent panes from one command. Use <b>mass-spawn</b> to launch N copies of the <i>same</i> command in one window, or a <b>fleet</b> to bring up a squad of <i>different, named</i> agents, each already in-role. See the <a href="https://github.com/nativelite/atrium#readme">project README</a> for the wider tour.</p>
+<h2>Mass-spawn</h2>
+<p><code>-n &lt;N&gt;</code> and <code>--grid &lt;R&gt;x&lt;C&gt;</code> open a grid of agent panes in one window, instead of splitting N times by hand.</p>
+<pre><code>atrium -n 4 claude                   # 2x2: four agents in a square
+atrium -n 6 claude                   # 2x3
+atrium -n 8 claude                   # 2x4
+atrium --grid 2x3 claude             # the same 2x3, shape given explicitly
+atrium --identity work -n 4 claude   # four panes, all under the `work` identity</code></pre>
+<h3><code>-n &lt;N&gt;</code></h3>
+<p><code>-n</code> takes a <b>positive multiple of 2</b> (2, 4, 6, 8, and so on). An odd or zero N is a clear startup error (<code>-n must be a positive multiple of 2</code>), never a silent fall back to one pane.</p>
+<p>The shape is balanced automatically: rows are the factor of N closest to <code>sqrt(N)</code>, cols are <code>N / rows</code>. The grid is therefore never taller than it is wide.</p>
+<h3><code>--grid &lt;R&gt;x&lt;C&gt;</code></h3>
+<p><code>--grid</code> sets the dimensions yourself. The product must be at least 2.</p>
+<h3>What every tile shares</h3>
+<ul><li><b>Every tile runs the same command, each its own session.</b> Each agent pane gets its own <code>--session-id</code>, so the agent-aware chrome binds each one independently.</li><li><b>All under one identity.</b> If <code>--identity</code> is given, every pane runs under it. See <a href="identity.html">credential identity</a>.</li></ul>
+<p>Everything after spawn is the ordinary tiled window: <code>hjkl</code> and arrows move focus, <code>z</code> zooms, <code>x</code> kills and re-tiles, and the status/identity chrome plus <code>q</code> quit all work exactly as for a hand-split grid.</p>
+<p>For a saved roster of named agents, each with its own identity, working dir, and instructions, use a fleet.</p>
+<h2>Fleets</h2>
+<p>Mass-spawn opens N copies of <i>one</i> command. A <b>fleet</b> brings up a squad of <i>different, named</i> agents, each already in-role with its own identity, working directory, extra context dirs, and instructions, from one command.</p>
+<pre><code>atrium fleet up review-crew   # bring up the whole squad, each on its identity
+atrium fleet ls               # list the fleet names in the file</code></pre>
+<h3>Where the fleet file lives</h3>
+<p>A fleet lives in <b><code>atrium.fleet.json</code></b>, looked for in this order:</p>
+<ol><li>The <b>current directory</b> first. Check it into the repo so a team shares the fleet.</li><li>A <b>user-global fallback</b>: <code>%APPDATA%\atrium\fleet.json</code> on Windows, <code>~/.config/atrium/fleet.json</code> elsewhere.</li></ol>
+<p>The file is read <b>read-only</b>. atrium never writes it.</p>
+<h2>The JSON format</h2>
+<pre><code>{
+  "fleets": {
+    "review-crew": {
+      "grid": "2x2",
+      "identity": "work",
+      "agents": [
+        {
+          "name": "reviewer",
+          "cmd": ["claude"],
+          "identity": "wif:prod",
+          "cwd": "./review",
+          "add_dirs": ["../shared", "./specs"],
+          "prompt": "You review PRs for safety.",
+          "model": "opus",
+          "effort": "high"
+        },
+        { "name": "builder", "cmd": ["claude"], "cwd": "./app" }
+      ]
+    }
+  }
+}</code></pre>
+<h3>Fleet-level fields</h3>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td><code>grid</code></td><td>optional</td><td>An <code>RxC</code> layout that must fit the agent count. Omit it and the window auto-grids from the number of agents.</td></tr><tr><td><code>identity</code></td><td>optional</td><td>A default <code>akey</code> identity for every agent. A per-agent <code>identity</code> overrides it.</td></tr><tr><td><code>allow_ctl</code></td><td>optional</td><td>Bring <a href="control-plane.html">the control plane</a> up, as <code>--allow-ctl</code> does.</td></tr><tr><td><code>trust</code></td><td>optional</td><td>The trust posture the whole fleet runs at.</td></tr></tbody></table>
+<p><b><code>identity</code></b> is resolved via <code>akey</code> and injected per pane exactly as <code>--identity</code> does. The pane shows the <code>·&lt;name&gt;</code> tag (the <b>name</b> only, never a secret), and a resolve failure is flashed and the pane runs without it, never silently unauthenticated. See <a href="identity.html">credential identity</a>.</p>
+<p><b><code>allow_ctl</code></b> matters because a fleet whose agents coordinate is dead without it, and silently so: the panes come up and publish into a bus that is not there. If the file is the complete definition of a spin-up, this belongs in it.</p>
+<p><b><code>trust</code></b> takes one of <code>plan</code>, <code>accept</code>, <code>automode</code>, or <code>skip</code>. A fleet is launched to run hands-off, so it needs one; declaring it here keeps it with the roster it applies to and out of a flag you retype every launch. <code>--trust</code> on the command line wins when given. It is a <b>request, not an override</b>: if this atrium is itself running inside another atrium, the outer session's policy still caps it. See <a href="trust-and-security.html">trust and security</a>.</p>
+<h3>Per-agent fields</h3>
+<p>Each agent needs a <b><code>name</code></b> and a <b><code>cmd</code></b> (command plus args). Everything else is optional.</p>
+<table><thead><tr><th>Field</th><th>Maps to</th><th>Meaning</th></tr></thead><tbody><tr><td><code>name</code></td><td>required</td><td>The agent's name in the roster.</td></tr><tr><td><code>cmd</code></td><td>required</td><td>Command and args, for example <code>["claude"]</code>.</td></tr><tr><td><code>identity</code></td><td><code>--identity</code></td><td>Overrides the fleet-level <code>identity</code> for this agent.</td></tr><tr><td><code>cwd</code></td><td>spawn directory</td><td>The agent is spawned here, so its <code>CLAUDE.md</code> auto-loads. Resolved relative to the fleet file's directory; absolute paths are used as-is.</td></tr><tr><td><code>add_dirs</code></td><td><code>claude --add-dir …</code></td><td>Extra trees the agent may read.</td></tr><tr><td><code>prompt</code></td><td><code>--append-system-prompt</code></td><td>Extra system-prompt text.</td></tr><tr><td><code>model</code></td><td><code>--model</code></td><td>The model to run.</td></tr><tr><td><code>effort</code></td><td><code>--effort</code></td><td>The reasoning effort.</td></tr><tr><td><code>can_spawn</code></td><td><code>ctl spawn</code> capability</td><td>May this agent create teammates? <b>Defaults to <code>false</code>.</b></td></tr></tbody></table>
+<p><b><code>can_spawn</code></b> is a capability the roster grants, not something implied by having ctl access. A depth cap bounds how far a fan-out goes, but never says who may start one, so the right to create teammates is declared here.</p>
+<p>Each agent still gets its own <code>--session-id</code>, so the agent-aware chrome binds each pane independently.</p>
+<h2>The grant disclosure</h2>
+<p><code>add_dirs</code> becomes <code>claude --add-dir</code>, that is, read access. A fleet file is often written by an agent and approved by a human <i>by running it</i>. So before <code>fleet up</code> blocks for your Enter, atrium resolves every <code>cwd</code> and <code>add_dirs</code> entry <b>through symlinks</b> and names the ones that are not plain subdirectories of the anchor.</p>
+<p>For each such entry the disclosure names:</p>
+<ul><li>where it really lands,</li><li>whether it exists yet,</li><li>whether atrium could not resolve it at all,</li><li>whether it is (or contains) a known credential store such as <code>~/.ssh</code>.</li></ul>
+<p>The identity each agent comes up on is named too. Identical grants across agents are printed once, and the last line before the prompt names the destinations, so a tall roster cannot scroll the point away. The child is then spawned with exactly the resolved paths that were shown.</p>
+<h3>The anchor</h3>
+<p>The <b>anchor</b> is what "outside" is measured against. It is the repository the fleet file is checked into, else the file's own directory. For the user-global file the anchor is the directory you ran <code>atrium</code> in, since <code>~/.config/atrium</code> holds no project.</p>
+<h3>Nothing here refuses</h3>
+<p>A sibling checkout (<code>"../shared"</code> above) is a legitimate, documented use. A gate that blocks ordinary work is one people route around invisibly. The disclosure makes the reach <i>visible</i>, and the Enter is the approval.</p>
+<h3>What the disclosure does not cover</h3>
+<ul><li>A symlink <b>inside</b> a granted directory. <code>--add-dir d</code> grants <code>d</code>'s whole subtree, including links out of it.</li><li>Anything a <code>cmd</code> does for itself. <code>["sh","-c","claude --add-dir ~/.ssh"]</code> is a shell command atrium does not parse; an agent whose <code>cmd</code> is not an agent CLI is flagged as unreadable for exactly this reason.</li><li>The <code>prompt</code> or <code>kickoff</code> text.</li><li>A directory component of a resolved path re-pointed between the ack and the spawn (a TOCTOU repoint).</li></ul>
+<p><b>atrium is not a sandbox.</b> At the same uid an agent can read anything atrium can. This mechanism bounds and discloses what atrium <i>hands over</i>; it does not confine what a running agent then does. See <a href="trust-and-security.html">trust and security</a>.</p>
+<h2>Error handling</h2>
+<p><b>Errors spawn nothing.</b> There is no partial fleet: if the launch cannot proceed, no pane comes up. The error cases are:</p>
+<ul><li>no file (the message names both locations),</li><li>malformed JSON,</li><li>an unknown fleet name,</li><li>a fleet with zero agents,</li><li>a grid that does not fit the agent count,</li><li>a <code>cwd</code> that is not a directory.</li></ul>
+<p>Each is a clear startup error. <b>Unknown fields are ignored</b>, so the format can grow without breaking older files.</p>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

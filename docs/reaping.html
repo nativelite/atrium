@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orphaned panes and reaping — atrium docs</title>
+<meta name="description" content="atrium documentation: Orphaned panes and reaping. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html" class="active">reaping</a></div>
+<h1>Orphaned panes and reaping</h1>
+<p>atrium makes sure a pane's whole process tree dies when the pane does, and sweeps up any pane whose owning atrium is provably gone. This page explains the mechanism, the safety conditions, and the commands and diagnostics involved.</p>
+<h2>The problem: cleaning up a pane's process tree</h2>
+<p>A pane child is a session leader (it is started with <code>setsid</code>), so atrium tears down whole process <b>groups</b> rather than a single process. A pipe-EOF watchdog does the teardown again if atrium dies in a way no handler can catch.</p>
+<p>This is the unix reconstruction of what Windows gets for free from a Job Object (<code>JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE</code>), which is kernel-enforced. The reconstruction is deliberately weaker in two ways worth stating plainly:</p>
+<ul><li>A process group is only advisory: a child can call <code>setsid()</code> to leave it.</li><li>The watchdog can only kill what the crash registry names.</li></ul>
+<h2>The session marker</h2>
+<p>Every pane carries a marker, <code>ATRIUM_SESSION=&lt;owner pid&gt;:&lt;owner start time&gt;</code>, injected whether or not the control channel is on. atrium also writes a small stamp file to cover the case where a pane clears its own environment.</p>
+<p>The marker records who owns the pane (the owning atrium's pid) and when that owner started, so a dead owner can be told apart from a live one and from pid reuse.</p>
+<h2>The three conditions for collecting a pane</h2>
+<p>A pane is collected only when <b>all three</b> conditions hold. Any ambiguity means skip.</p>
+<ol><li>It carries the marker.</li><li>It is its own process-group leader: a pane root that atrium created, not a descendant that wandered into the group. The group is what gets killed, so this guards against killing more than atrium owns.</li><li>Its owner is provably gone, not merely unreachable. <code>kill(pid, 0)</code> succeeds on a zombie, so liveness uses <code>pid_running</code>; the start time defeats pid reuse; and the identity check is <code>proc_pidpath</code> plus <code>(dev, ino)</code>, never <code>argv[0]</code>, which is forgeable on macOS.</li></ol>
+<h2>Why <code>ppid == 1</code> is the wrong test</h2>
+<p>The obvious cheap test, "an orphan is a process whose <code>ppid == 1</code>", is wrong, and atrium does not use it.</p>
+<p>A child is reparented (its <code>ppid</code> becomes 1) only when its parent <b>finishes</b> exiting. An atrium stuck mid-exit never gets there, so its panes keep pointing at a corpse and <code>ppid == 1</code> never becomes true. That stuck-mid-exit case is exactly the population that strands ptys, so the cheap test misses precisely the panes that need collecting.</p>
+<h2>Commands</h2>
+<h3><code>atrium reap</code></h3>
+<p><code>atrium reap</code> sweeps every dead owner and names each victim and why. Concurrent sessions are safe by construction: a live session's panes fail condition 3 (their owner is still running), so one session's reap never touches another's panes.</p>
+<h3><code>atrium --reap-orphans</code></h3>
+<p><code>atrium --reap-orphans</code> runs the same sweep before starting. It is opt-in for now and always prints what it killed.</p>
+<h3>Windows</h3>
+<p>On Windows none of this is compiled. The Job Object already gives the guarantee, kernel-enforced, so there is nothing to reconstruct.</p>
+<h2>Diagnostics</h2>
+<p>Two flags help when a pane or the terminal is misbehaving:</p>
+<ul><li><code>atrium --stdin-probe</code> prints the hex of whatever your terminal actually delivers for a few seconds. It is the fastest way to answer "what does this keyboard or terminal send?".</li><li><code>ATRIUM_DEBUG=1</code> adds stage markers to stderr: stdin arrivals, pane output, and shutdown steps.</li></ul>
+<h2>See also</h2>
+<ul><li><a href="https://github.com/nativelite/atrium#readme">atrium README</a></li></ul>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>
