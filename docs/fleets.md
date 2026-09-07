@@ -112,6 +112,19 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 
 Each agent still gets its own `--session-id`, so the agent-aware chrome binds each pane independently.
 
+## Designate a lead
+
+A fleet is not a row of agents each doing its own thing next to the others. That is how work gets dropped: no one owns the whole, no part gets reviewed, and a stuck worker just sits. The shape a fleet is *for* is **one lead that coordinates the team and drives it to completion**, a bench of workers, and usually an adversarial reviewer. Give one agent a lead persona and let it split the initiative, assign one part per teammate, watch progress, send each finished part to the reviewer, and mark a part done only once the reviewer clears it.
+
+This works because of how `fleet up` wires the panes: every fleet agent comes up as an **operator** pane (it has no parent in the spawn tree), so any agent may drive any other over the control plane. The lead can `atrium ctl status <teammate>`, `atrium ctl send <teammate> ...`, read the whole `atrium ctl board list`, and ask the reviewer to check any part. atrium hands every fleet agent the *capability*; the `prompt` and `kickoff` decide **who uses it as the lead**. So the lead role is not a field, it is a brief: cast one agent as the coordinator and the others as workers.
+
+Two things have to be in place or the coordination silently does nothing:
+
+- **`allow_ctl: true`**, so the board and bus exist and every pane is told about `atrium ctl`. Without it the panes come up, the kickoffs tell them to publish to a bus that is not there, and nothing happens.
+- **The coordination skills** installed, so a hosted claude reaches for `ctl` reliably instead of not knowing it exists. Install them once from the [nativelite marketplace](https://github.com/nativelite/marketplace): `/plugin marketplace add nativelite/marketplace` then `/plugin install atrium@nativelite`.
+
+A leaderless fleet with the skills missing is exactly the setup that comes up looking busy and finishes nothing. See [the control plane](control-plane.md) for the `ctl` surface the lead drives, and a complete worked roster in [`examples/atrium.fleet.json`](https://github.com/nativelite/atrium/tree/main/examples).
+
 ## The grant disclosure
 
 `add_dirs` becomes `claude --add-dir`, that is, read access. A fleet file is often written by an agent and approved by a human *by running it*. So before `fleet up` blocks for your Enter, atrium resolves every `cwd` and `add_dirs` entry **through symlinks** and names the ones that are not plain subdirectories of the anchor.
