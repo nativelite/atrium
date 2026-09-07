@@ -6,7 +6,7 @@
         {
           "name": "claude",
           "cmd": ["claude"],
-          "kickoff": "You are the baseline pane. Say hello, then wait. This pane should light up in the Ctrl+A o overview immediately (no vendor tag)."
+          "kickoff": "You are the baseline pane. Say hello, then wait. This pane should light up in the Ctrl+A o overview immediately, with no vendor tag."
         },
         {
           "name": "codex",
