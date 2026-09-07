@@ -70,10 +70,16 @@ Requires a recent stable Rust toolchain. Windows is the reference platform
 The control plane and fleets rely on two Claude Code skills that teach a hosted
 `claude` how to use `atrium ctl`. **Without them, an agent does not know the
 control plane exists**, so install them before running `--allow-ctl` sessions or
-`atrium fleet up`. They live in this repo under [`skills/`](skills/):
+`atrium fleet up`. The easiest way is the nativelite marketplace:
+
+```
+/plugin marketplace add nativelite/marketplace
+/plugin install atrium@nativelite
+```
+
+Or copy the skill folders by hand from this repo's [`skills/`](skills/):
 
 ```bash
-# from a checkout of this repo (clone it first if you installed via crates.io):
 cp -r skills/atrium-delegate skills/atrium-coordinate ~/.claude/skills/
 # Windows: copy skills\atrium-delegate and skills\atrium-coordinate
 #          into %USERPROFILE%\.claude\skills\
@@ -119,6 +125,10 @@ A pane whose process exits closes itself; when the last one exits, atrium exits.
 > identity), `-n <N>` (N agent panes, N a positive multiple of 2), `--grid <R>x<C>`
 > (explicit grid), `--allow-ctl` (the [control plane](#coordinating-agents-the-control-plane)),
 > `--trust <policy>` (hands-off posture).
+
+Before agents can **coordinate or delegate** across panes (any `--allow-ctl`
+session or `atrium fleet up`), install the coordination skills once: see
+[Set up the coordination skills](#set-up-the-coordination-skills).
 
 ## Concepts
 
