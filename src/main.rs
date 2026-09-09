@@ -129,7 +129,7 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 const DRAIN_READS_PER_TICK: usize = 64;
 
 /// Draw the animated startup splash for a passthrough pane that has not painted
-/// yet — a centered `a m u x` wordmark and a spinner, so the agent's boot reads
+/// yet — a centered `a t r i u m` wordmark and a spinner, so the agent's boot reads
 /// as *loading*, not a hang. Written straight to the terminal and wrapped in
 /// synchronized output so each frame is atomic (no flicker from the per-frame
 /// clear); the drain wipes it on the pane's first real bytes.

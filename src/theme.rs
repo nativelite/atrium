@@ -38,11 +38,13 @@ pub const IDLE: Color = Color::Rgb(150, 152, 165);
 /// The keys hint — dimmer still, so it recedes behind live state.
 pub const KEYS: Color = Color::Rgb(120, 122, 135);
 
-// --- splash wordmark gradient (cool: cyan → azure → indigo → violet) -------
-/// One RGB stop per letter of `a m u x`, a cool left-to-right sweep.
-pub const SPLASH_GRADIENT: [(u8, u8, u8); 4] = [
+// --- splash wordmark gradient (cool: cyan → violet) ------------------------
+/// One RGB stop per letter of `a t r i u m`, a cool left-to-right sweep.
+pub const SPLASH_GRADIENT: [(u8, u8, u8); 6] = [
     (60, 230, 255),  // a — cyan
-    (60, 160, 255),  // m — azure
-    (120, 120, 255), // u — indigo
-    (185, 100, 255), // x — violet
+    (85, 204, 255),  // t
+    (110, 178, 255), // r
+    (135, 152, 255), // i
+    (160, 126, 255), // u
+    (185, 100, 255), // m — violet
 ];

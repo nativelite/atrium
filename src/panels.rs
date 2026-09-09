@@ -518,13 +518,13 @@ pub(crate) fn draw_startup_splash(
         return;
     }
     let spin = SPIN[frame % SPIN.len()];
-    let brand = "a m u x";
-    // The wordmark with a cool per-letter gradient (cyan → azure → indigo →
-    // violet), the same palette as the themed chrome. Escapes don't count toward
-    // width, so the visible run is still exactly `brand` (7 cols) — `bcol` below
-    // centers on that.
+    let brand = "a t r i u m";
+    // The wordmark with a cool per-letter gradient (cyan → violet), the same
+    // palette as the themed chrome. Escapes don't count toward width, so the
+    // visible run is still exactly `brand` (11 cols) — `bcol` below centers on
+    // that.
     let mut brand_colored = String::new();
-    for (i, ch) in ['a', 'm', 'u', 'x'].iter().enumerate() {
+    for (i, ch) in ['a', 't', 'r', 'i', 'u', 'm'].iter().enumerate() {
         if i > 0 {
             brand_colored.push_str("\x1b[0m "); // plain space between letters
         }
