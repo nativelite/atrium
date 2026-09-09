@@ -518,36 +518,125 @@ pub(crate) fn draw_startup_splash(
         return;
     }
     let spin = SPIN[frame % SPIN.len()];
-    let brand = "a t r i u m";
-    // The wordmark with a cool per-letter gradient (cyan → violet), the same
-    // palette as the themed chrome. Escapes don't count toward width, so the
-    // visible run is still exactly `brand` (11 cols) — `bcol` below centers on
-    // that.
-    let mut brand_colored = String::new();
-    for (i, ch) in ['a', 't', 'r', 'i', 'u', 'm'].iter().enumerate() {
-        if i > 0 {
-            brand_colored.push_str("\x1b[0m "); // plain space between letters
+    let g = atrium::theme::SPLASH_GRADIENT;
+    const TAG: &str = "where your agents gather";
+    // Frame chrome: a dim steel-indigo wall; the roof is gradient-lit instead
+    // (an atrium is a court open to the sky, so the roof reads as a skylight).
+    const STEEL: &str = "\x1b[38;2;96;104;156m";
+
+    // The spaced per-letter wordmark ("a t r i u m", 11 visible cols) — the
+    // small-terminal fallback. Escapes never count toward width.
+    let spaced = || -> String {
+        let mut s = String::new();
+        for (i, ch) in ['a', 't', 'r', 'i', 'u', 'm'].iter().enumerate() {
+            if i > 0 {
+                s.push_str("\x1b[0m ");
+            }
+            let (r, gr, b) = g[i];
+            s.push_str(&format!("\x1b[1;38;2;{r};{gr};{b}m{ch}"));
         }
-        let (r, g, b) = atrium::theme::SPLASH_GRADIENT[i];
-        brand_colored.push_str(&format!("\x1b[1;38;2;{r};{g};{b}m{ch}"));
-    }
-    brand_colored.push_str("\x1b[0m");
-    let sub = format!("{spin}  starting your agent…  {spin}");
-    let mid = (rows / 2).max(1);
-    let bcol = (cols.saturating_sub(brand.chars().count()) / 2) + 1;
-    let scol = (cols.saturating_sub(sub.chars().count()) / 2) + 1;
+        s.push_str("\x1b[0m");
+        s
+    };
+    // The bold half-block wordmark, one gradient stop per letter, two rows,
+    // visible width 23.
+    const TOP: [&str; 6] = ["▄▀█", "▀█▀", "█▀█", "█", "█ █", "█▀▄▀█"];
+    const BOT: [&str; 6] = ["█▀█", "░█░", "█▀▄", "█", "█▄█", "█░▀░█"];
+    let block_row = |set: &[&str; 6]| -> String {
+        let mut s = String::new();
+        for (i, cell) in set.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+            }
+            let (r, gr, b) = g[i];
+            s.push_str(&format!("\x1b[1;38;2;{r};{gr};{b}m{cell}"));
+        }
+        s.push_str("\x1b[0m");
+        s
+    };
+    // The dim tagline, padded to exactly `w` visible cols.
+    let tag_line = |w: usize| -> (String, usize) {
+        let pad = w.saturating_sub(TAG.chars().count());
+        let (l, r) = (pad / 2, pad - pad / 2);
+        (
+            format!(
+                "{}\x1b[2;38;2;150;154;170m{TAG}\x1b[0m{}",
+                " ".repeat(l),
+                " ".repeat(r)
+            ),
+            w,
+        )
+    };
+    // The spinner line: spin(1) + 2 spaces + "starting your agent…"(20) = 23.
+    let spin_line = || -> (String, usize) {
+        (
+            format!("\x1b[38;2;60;230;255m{spin}  starting your agent…\x1b[0m"),
+            23,
+        )
+    };
+
+    // Build the richest variant that fits, as `(visible_line, visible_width)`
+    // pairs; a single centered emit follows.
+    let lines: Vec<(String, usize)> = if cols >= 33 && rows >= 12 {
+        // Full framed "court": bold wordmark + tagline inside heavy walls, a
+        // gradient skylight roof (cut-corner accents), the spinner beneath.
+        const INNER: usize = 29; // content cols between the two walls
+        const W: usize = INNER + 2; // 31 total incl. the wall glyphs
+        let wall = |inner: String| (format!("{STEEL}┃\x1b[0m{inner}{STEEL}┃\x1b[0m"), W);
+        let blank = || wall(" ".repeat(INNER));
+        let pad3 = |row: String| format!("   {row}   "); // 23 + 6 = 29 = INNER
+                                                         // Roof: `┏╸`, a gradient-swept dashed skylight, `╺┓`.
+        let dashes = INNER - 2;
+        let mut roof = format!("{STEEL}┏╸\x1b[0m");
+        for i in 0..dashes {
+            let (r, gr, b) = g[(i * 6) / dashes.max(1)];
+            roof.push_str(&format!("\x1b[38;2;{r};{gr};{b}m┈"));
+        }
+        roof.push_str(&format!("{STEEL}╺┓\x1b[0m"));
+        let (tag, _) = tag_line(INNER);
+        vec![
+            (roof, W),
+            blank(),
+            wall(pad3(block_row(&TOP))),
+            wall(pad3(block_row(&BOT))),
+            blank(),
+            wall(tag),
+            blank(),
+            (format!("{STEEL}┗{}┛\x1b[0m", "━".repeat(INNER)), W),
+            (String::new(), 0),
+            spin_line(),
+        ]
+    } else if cols >= 25 && rows >= 6 {
+        // Medium: bold wordmark + tagline + spinner, no frame.
+        vec![
+            (block_row(&TOP), 23),
+            (block_row(&BOT), 23),
+            (String::new(), 0),
+            tag_line(TAG.chars().count()),
+            (String::new(), 0),
+            spin_line(),
+        ]
+    } else {
+        // Small: the spaced wordmark (+ tagline if it fits) + spinner.
+        let mut v = vec![(spaced(), 11)];
+        if rows >= 5 && cols >= TAG.chars().count() {
+            v.push((String::new(), 0));
+            v.push(tag_line(TAG.chars().count()));
+        }
+        v.push((String::new(), 0));
+        v.push(spin_line());
+        v
+    };
+
     // Appended into the tick's single synchronized frame (with the bar), NOT a
-    // frame of its own — so the whole screen (wordmark *and* bar) repaints
-    // atomically. Drawing the splash on its own write path used to `2J`-clear the
-    // bar a beat before the bar's separate frame repainted it, which read as the
-    // white bar flashing on startup. No `?2026`/flush here: the caller wraps the
-    // composite in `SYNC_BEGIN`/`SYNC_END` and flushes once. `?25l` hides the
-    // cursor so it doesn't blink next to the spinner; the agent restores it
-    // (`?25h`) at the handoff in the drain.
-    let _ = write!(
-        out,
-        "\x1b[?25l\x1b[2J\x1b[{mid};{bcol}H{brand_colored}\
-         \x1b[{};{scol}H\x1b[2;36m{sub}\x1b[0m",
-        mid + 1
-    );
+    // frame of its own — so the whole screen repaints atomically. No `?2026`/
+    // flush here: the caller wraps the composite in `SYNC_BEGIN`/`SYNC_END` and
+    // flushes once. `?25l` hides the cursor so it doesn't blink next to the
+    // spinner; the agent restores it (`?25h`) at the handoff in the drain.
+    let top = (rows.saturating_sub(lines.len()) / 2).max(1);
+    let _ = write!(out, "\x1b[?25l\x1b[2J");
+    for (i, (line, w)) in lines.iter().enumerate() {
+        let col = (cols.saturating_sub(*w) / 2) + 1;
+        let _ = write!(out, "\x1b[{};{col}H{line}", top + i);
+    }
 }
