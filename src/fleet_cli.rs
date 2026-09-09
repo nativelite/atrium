@@ -1,5 +1,6 @@
 use crate::*;
 use atrium::layout::Tree;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -95,6 +96,67 @@ pub(crate) fn fsan(s: &str) -> String {
     atrium::fleet::sanitize(s)
 }
 
+/// Path to the Claude Code settings file: ~/.claude/settings.json on all platforms.
+fn settings_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    home.map(|h| h.join(".claude").join("settings.json"))
+}
+
+/// Check if context-mode@context-mode is enabled in ~/.claude/settings.json.
+/// Returns true if enabled or settings not found/unreadable (best-effort).
+/// Prints a warning and install hint if it's missing (but continues).
+fn preflight_context_mode() {
+    let path = match settings_path() {
+        Some(p) => p,
+        None => return, // No home dir, skip check
+    };
+
+    if !path.exists() {
+        return; // Settings file doesn't exist yet, skip check
+    }
+
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return, // Can't read, skip check (best-effort)
+    };
+
+    let root = match json::parse(&text) {
+        Ok(v) => v,
+        Err(_) => return, // Malformed JSON, skip check
+    };
+
+    let obj = match root.as_object() {
+        Some(o) => o,
+        None => return, // Top-level not an object, skip check
+    };
+
+    let enabled = match obj.iter().find(|(k, _)| k == "enabledPlugins") {
+        Some((_, v)) => v,
+        None => return, // No enabledPlugins key, skip check
+    };
+
+    // enabledPlugins is either an array ["pkg@name", …] (older format) or an
+    // object {"pkg@name": true, …} (current Claude Code format). Both are valid.
+    let has_context_mode = if let Some(arr) = enabled.as_array() {
+        arr.iter().any(|p| {
+            p.as_str()
+                .map_or(false, |s| s == "context-mode@context-mode")
+        })
+    } else if let Some(map) = enabled.as_object() {
+        map.iter().any(|(k, _)| k == "context-mode@context-mode")
+    } else {
+        return; // unexpected shape, skip check
+    };
+
+    if !has_context_mode {
+        eprintln!("atrium fleet: warning: context-mode@context-mode not in enabledPlugins");
+        eprintln!("  run: /plugin install context-mode@context-mode");
+    }
+}
+
 /// List the fleet names in the discovered fleet file, in file order. A missing
 /// file or a malformed one is a clear error on stderr (non-zero exit).
 pub(crate) fn fleet_ls() -> ExitCode {
@@ -185,6 +247,18 @@ pub(crate) fn fleet_up(
             return ExitCode::FAILURE;
         }
     };
+
+    // Preflight: warn if context-mode plugin is missing — but ONLY when this
+    // fleet actually opts in (provider == ContextMode). No-context fleets and
+    // codex-only fleets must never see this nag. Best-effort, non-fatal.
+    if fleet
+        .context
+        .as_ref()
+        .map(|c| c.provider == atrium::context::Provider::ContextMode)
+        .unwrap_or(false)
+    {
+        preflight_context_mode();
+    }
 
     // A fleet may declare its own posture, and the command line wins when it says
     // anything. A fleet exists to run hands-off, so it NEEDS a posture — and
@@ -405,7 +479,7 @@ pub(crate) fn fleet_up(
     } else {
         None
     };
-    let window = match spawn_fleet_window(&fleet, &plan, grid, rows, cols, &mut flash) {
+    let window = match spawn_fleet_window(&fleet, &plan, grid, rows, cols, name, &cwd, &mut flash) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("atrium fleet: cannot start fleet \"{}\": {e}", fsan(name));
@@ -463,20 +537,87 @@ pub(crate) fn fleet_launch(
     (agent.args(&dirs), cwd, disclosed.label.clone())
 }
 
+/// Compute (and create) the stable per-fleet context directory.
+///
+/// Preference order:
+///   1. `<cwd>\.atrium\ctx\<name>\` — local, beside the fleet file.
+///   2. `%APPDATA%\atrium\ctx\<name>\` on Windows /
+///      `$XDG_STATE_HOME/atrium/ctx/<name>/` on Unix
+///      (falls back to `~/.local/state` when `XDG_STATE_HOME` is unset).
+///
+/// The directory is created (best-effort) before being returned; a failure
+/// there is non-fatal — the fleet still launches, and spawn-wire injects
+/// the path regardless so the agents can create their own files inside it.
+pub(crate) fn fleet_ctx_dir(cwd: &std::path::Path, fleet_name: &str) -> std::path::PathBuf {
+    // Sanitize for filesystem use: keep alphanumerics, hyphens, underscores,
+    // and dots; replace everything else with '_'. An empty result gets a
+    // placeholder so we never build a path with an empty component.
+    let safe: String = fleet_name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "_fleet".to_string()
+    } else {
+        safe
+    };
+
+    // Primary: cwd-local .atrium/ctx/<name>/
+    let primary = cwd.join(".atrium").join("ctx").join(&safe);
+    if std::fs::create_dir_all(&primary).is_ok() {
+        return primary;
+    }
+
+    // Fallback: user-scoped state directory.
+    #[cfg(windows)]
+    let fallback_base = std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| cwd.to_path_buf());
+
+    #[cfg(not(windows))]
+    let fallback_base = std::env::var("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".local").join("state"))
+                .unwrap_or_else(|_| cwd.to_path_buf())
+        });
+
+    let fallback = fallback_base.join("atrium").join("ctx").join(&safe);
+    let _ = std::fs::create_dir_all(&fallback);
+    fallback
+}
+
 /// Build the fleet's tiled window: one pane per agent, laid out on `grid`
 /// (agents fill leaf ids `0..n` row-major). Each pane runs the agent's `cmd`
 /// plus its fleet args (`--add-dir`/`--append-system-prompt`/`--model`/
 /// `--effort`), under its identity (per-agent, else the fleet default), in its
 /// resolved `cwd`. If any agent fails to spawn, the panes already started are
 /// killed and the whole window is abandoned — never a partial fleet.
+///
+/// `fleet_name` and `cwd` are used to derive the shared context directory
+/// (`ctx_dir`) via [`fleet_ctx_dir`]; spawn-wire threads `ctx_dir` into each
+/// pane's environment via `context_env`.
 pub(crate) fn spawn_fleet_window(
     fleet: &atrium::fleet::Fleet,
     plan: &atrium::fleet::Plan,
     grid: atrium::spawn::Grid,
     rows: u16,
     cols: u16,
+    fleet_name: &str,
+    cwd: &std::path::Path,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
+    // Stable, writable directory shared by every pane in this fleet instance.
+    // Computed once here so all panes agree on a single root; spawn-wire
+    // picks this up and injects it as CONTEXT_MODE_DIR via context_env.
+    let ctx_dir = fleet_ctx_dir(cwd, fleet_name);
     let tree = Tree::grid(grid.rows, grid.cols);
     // Rough per-cell inner size (minus the one-cell border on each side); the
     // caller's resize_window fixes it exactly right after.
@@ -494,6 +635,13 @@ pub(crate) fn spawn_fleet_window(
         // and the safe default is the one that surprises nobody.
         let can_spawn = agent.can_spawn.unwrap_or(false);
         let (command, cwd, role) = fleet_launch(agent, disclosed);
+        // Per-agent context vars: derive the shared ctx_dir endpoint and the
+        // agent's role name, then let context_env map (provider, share) →
+        // CONTEXT_MODE_DIR / CONTEXT_MODE_SESSION_SUFFIX. Provider::None / absent context block → empty vec.
+        let ctx_vars: Vec<(String, String)> = match &fleet.context {
+            Some(cfg) => atrium::context::context_env(cfg, &ctx_dir, &agent.name),
+            None => vec![],
+        };
         // Per-agent identity else the fleet default.
         let identity = agent.identity.as_deref().or(fleet.identity.as_deref());
         match spawn_pane_full(
@@ -505,6 +653,7 @@ pub(crate) fn spawn_fleet_window(
             cwd.as_deref(),
             trust_mode(),
             flash,
+            &ctx_vars,
         ) {
             Ok(mut pane) => {
                 // Tag the pane with the agent's fleet name as its role, so the
@@ -535,7 +684,7 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::up_alias;
+    use super::{preflight_context_mode, up_alias};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -580,5 +729,13 @@ mod tests {
             }
             other => panic!("expected a usage error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preflight_silently_skips_missing_settings() {
+        // The preflight check is best-effort: if settings.json doesn't exist,
+        // no warning is printed. This test just verifies the function doesn't panic
+        // when called — actual output verification would require mocking file I/O.
+        preflight_context_mode();
     }
 }

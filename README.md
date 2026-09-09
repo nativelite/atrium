@@ -206,10 +206,13 @@ atrium fleet ls               # list the fleets in the file
 
 A fleet is defined in **`atrium.fleet.json`** (checked into the repo, or a
 user-global fallback). Each agent gets a `name`, a `cmd`, and optional `cwd`,
-`add_dirs`, `prompt`, `model`, `effort`, `identity`, and `can_spawn`. Before it
-launches, atrium **discloses every directory the roster grants** (resolved through
-symlinks) and waits for your Enter. Errors spawn nothing, never a partial fleet.
-Full spec and the JSON schema: [docs/fleets.md](docs/fleets.md).
+`add_dirs`, `prompt`, `model`, `effort`, `identity`, and `can_spawn`. A fleet
+can also declare a **shared knowledge backend** (e.g. context-mode) so a
+designated indexer agent keeps the team's knowledge fresh and every other agent
+can search it. Before it launches, atrium **discloses every directory the roster
+grants** (resolved through symlinks) and waits for your Enter. Errors spawn
+nothing, never a partial fleet. Full spec and the JSON schema:
+[docs/fleets.md](docs/fleets.md).
 
 ## Coordinating agents: the control plane
 

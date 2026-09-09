@@ -85,6 +85,7 @@ The file is read **read-only**. atrium never writes it.
 | `identity` | optional | A default `akey` identity for every agent. A per-agent `identity` overrides it. |
 | `allow_ctl` | optional | Bring [the control plane](control-plane.md) up, as `--allow-ctl` does. |
 | `trust` | optional | The trust posture the whole fleet runs at. |
+| `context` | optional | Shared knowledge and memory backend for the fleet (see [Shared context](#shared-context)). |
 
 **`identity`** is resolved via `akey` and injected per pane exactly as `--identity` does. The pane shows the `·<name>` tag (the **name** only, never a secret), and a resolve failure is flashed and the pane runs without it, never silently unauthenticated. See [credential identity](identity.md).
 
@@ -124,6 +125,94 @@ Two things have to be in place or the coordination silently does nothing:
 - **The coordination skills** installed, so a hosted claude reaches for `ctl` reliably instead of not knowing it exists. Install them once from the [nativelite marketplace](https://github.com/nativelite/marketplace): `/plugin marketplace add nativelite/marketplace` then `/plugin install atrium@nativelite`.
 
 A leaderless fleet with the skills missing is exactly the setup that comes up looking busy and finishes nothing. See [the control plane](control-plane.md) for the `ctl` surface the lead drives, and a complete worked roster in [`examples/atrium.fleet.json`](https://github.com/nativelite/atrium/tree/main/examples).
+
+## Shared context: indexing and sharing knowledge across the fleet
+
+A fleet working together on a shared codebase or problem benefits from a **shared knowledge repository** — a searchable index of documentation, design decisions, relevant code, or conversation history that every agent can consult without re-reading or re-exploring the same ground.
+
+The shared context model splits work into two roles:
+
+- **Indexing (one agent per fleet)**: A **lead or designated indexer** (usually the lead or a dedicated recon agent) is responsible for populating and maintaining the knowledge base. This agent reads widely, summarizes decisions, and feeds the index.
+- **Consuming (all other agents)**: Every other agent in the fleet has read access to the shared context and pulls from it to inform their work, without the cost or latency of exploring from scratch.
+
+This avoids the loss of work and rediscovered decisions that plague leaderless fleets, and scales better than each agent re-exploring the same problem space.
+
+### Configuring a shared context
+
+A fleet declares its shared context backend at the fleet level (not per-agent):
+
+```json
+{
+  "fleets": {
+    "review-crew": {
+      "allow_ctl": true,
+      "trust": "accept",
+      "context": {
+        "provider": "context-mode",
+        "share": "knowledge"
+      },
+      "agents": [
+        {
+          "name": "lead",
+          "cmd": ["claude"],
+          "can_spawn": true,
+          "prompt": "You index shared knowledge…"
+        },
+        {
+          "name": "worker",
+          "cmd": ["claude"],
+          "prompt": "You consult shared knowledge…"
+        }
+      ]
+    }
+  }
+}
+```
+
+**Field meanings:**
+
+- **`provider`**: The backend that hosts the shared knowledge. `"context-mode"` is the current provider, backed by Claude Code's context-mode MCP server. Reserved for future providers (e.g., a native knowledge system). **This is provider-neutral by design**.
+- **`share`**: The sharing mode for this fleet's context. One of: `"knowledge"` (shared knowledge/content index + private per-agent session memory, the default), `"full"` (shared knowledge AND shared session memory across the fleet), or `"none"` (no context provisioning). Fleet isolation is automatic: each fleet gets its own isolated context store under `.atrium/ctx/<fleet-name>/`.
+
+### The indexer role
+
+Designate one agent — usually the **lead** — as the **indexer**. This agent's job is to:
+
+1. **Ingest and summarize**: Read design docs, specs, existing code, and ongoing conversation. Extract the key facts and decisions.
+2. **Keep the index current**: As new information arrives (a decision is made, a pattern emerges), feed it into the shared context.
+3. **Make it discoverable**: Organize the knowledge so other agents can search and find what they need.
+
+In the fleet file, the indexer is simply the agent who has the prompt and kickoff guiding this behavior:
+
+```json
+{
+  "name": "lead",
+  "cmd": ["claude"],
+  "prompt": "You maintain the shared knowledge base. Read widely, summarize decisions and designs, and keep the index fresh. Feed new insights to the shared context with `/ctx-index` or equivalent.",
+  "kickoff": "Start by ingesting the project spec and existing docs into the shared context. As we work, keep it current."
+}
+```
+
+Other agents run with prompts that direct them to **read** the shared context:
+
+```json
+{
+  "name": "implementer",
+  "cmd": ["claude"],
+  "prompt": "You read the shared knowledge base to understand the design before you code. Consult `/ctx` to search shared docs before asking questions."
+}
+```
+
+### What the shared context is NOT
+
+- **Not a replacement for the control plane.** The control plane (`atrium ctl`) is for coordination and task tracking; shared context is for knowledge. A fleet uses both.
+- **Not automatic.** An agent does not magically absorb knowledge; the indexer must deliberately feed it.
+- **Not mandatory.** A small fleet or a synchronous team that talks often may not need it. Add shared context when the fleet grows or when knowledge is getting lost.
+- **Not a sandbox.** Every agent consults the same knowledge base; there is no per-agent filtering. Use agent prompts to guide who contributes.
+
+### Implementation and versioning
+
+The `context` block is part of the frozen v1 contract, backed by the context-mode MCP server. The `provider` and `share` fields are stable. Each fleet automatically gets its own isolated context store under `.atrium/ctx/<fleet-name>/`, managed by the backend — no manual namespace configuration needed.
 
 ## The grant disclosure
 

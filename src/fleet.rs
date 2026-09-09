@@ -89,6 +89,11 @@ pub struct Fleet {
     /// reviewable definition of a spin-up, the control plane belongs in it rather
     /// than in a flag the operator has to remember.
     pub allow_ctl: Option<bool>,
+    /// Optional context-mode configuration for the whole fleet. Absent → no
+    /// context injection; present → [`crate::context::parse_block`] resolves the
+    /// provider and share level tolerantly (unknown values warn to stderr and
+    /// degrade, never reject the file).
+    pub context: Option<crate::context::ContextCfg>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -253,6 +258,8 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         None => None,
     };
 
+    let context = get("context").map(|v| crate::context::parse_block(name, v));
+
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
     let agent_items = agents_val
@@ -271,6 +278,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         trust,
         allow_ctl,
         identity,
+        context,
         agents,
     })
 }
@@ -1691,6 +1699,7 @@ mod tests {
             identity: None,
             trust: None,
             allow_ctl: None,
+            context: None,
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -1950,6 +1959,7 @@ mod tests {
             identity: None,
             trust: None,
             allow_ctl: None,
+            context: None,
             agents,
         };
         let anchor = Anchor {
@@ -2189,5 +2199,58 @@ mod tests {
         let g = probe(&base, &base, inner.to_str().unwrap());
         assert_eq!(g.reach, Reach::Inside);
         assert!(g.is_quiet());
+    }
+
+    // --- context block -------------------------------------------------------
+
+    #[test]
+    fn context_block_absent_is_none() {
+        let f =
+            parse(r#"{ "fleets": { "f": { "agents": [{ "name": "a", "cmd": ["claude"] }] } } }"#)
+                .unwrap();
+        assert_eq!(f.get("f").unwrap().context, None);
+    }
+
+    #[test]
+    fn context_block_with_known_provider_and_share() {
+        let f = parse(
+            r#"{ "fleets": { "f": {
+              "context": { "provider": "context-mode", "share": "full" },
+              "agents": [{ "name": "a", "cmd": ["claude"] }]
+            } } }"#,
+        )
+        .unwrap();
+        let ctx = f.get("f").unwrap().context.as_ref().unwrap();
+        assert_eq!(ctx.provider, crate::context::Provider::ContextMode);
+        assert_eq!(ctx.share, crate::context::Share::Full);
+    }
+
+    #[test]
+    fn context_block_unknown_provider_degrades_not_errors() {
+        // An unknown provider must warn to stderr and degrade — it must never
+        // reject the fleet file, since the file is otherwise valid.
+        let f = parse(
+            r#"{ "fleets": { "f": {
+              "context": { "provider": "not-a-real-provider" },
+              "agents": [{ "name": "a", "cmd": ["claude"] }]
+            } } }"#,
+        )
+        .unwrap();
+        let ctx = f.get("f").unwrap().context.as_ref().unwrap();
+        assert_eq!(ctx.provider, crate::context::Provider::None);
+        assert_eq!(ctx.share, crate::context::Share::Knowledge); // default
+    }
+
+    #[test]
+    fn context_block_unknown_share_degrades_to_knowledge() {
+        let f = parse(
+            r#"{ "fleets": { "f": {
+              "context": { "provider": "context-mode", "share": "not-a-share" },
+              "agents": [{ "name": "a", "cmd": ["claude"] }]
+            } } }"#,
+        )
+        .unwrap();
+        let ctx = f.get("f").unwrap().context.as_ref().unwrap();
+        assert_eq!(ctx.share, crate::context::Share::Knowledge);
     }
 }

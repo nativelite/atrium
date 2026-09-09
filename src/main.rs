@@ -3299,7 +3299,7 @@ fn spawn_pane(
     // The single-pane / split / grid path: no per-pane working directory (the
     // child inherits atrium's cwd, today's behavior). The fleet loader is the only
     // caller that supplies a `cwd`; everyone else routes through here with `None`.
-    spawn_pane_full(command, rows, cols, id, identity, None, mode, flash)
+    spawn_pane_full(command, rows, cols, id, identity, None, mode, flash, &[])
 }
 
 /// The non-secret environment every pane is born with.
@@ -3355,6 +3355,7 @@ fn spawn_pane_full(
     cwd: Option<&str>,
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
+    extra_env: &[(String, String)],
 ) -> std::io::Result<Pane> {
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
@@ -3500,13 +3501,14 @@ fn spawn_pane_full(
         );
     }
     let pane_id = agent_id.to_string();
-    let base_env = pane_base_env(
+    let mut base_env = pane_base_env(
         atrium::orphan::session_key().as_ref(),
         match (CTL_ADDRESS.get(), token.as_ref()) {
             (Some(addr), Some(tok)) => Some((addr.as_str(), pane_id.as_str(), tok.as_str())),
             _ => None,
         },
     );
+    base_env.extend_from_slice(extra_env);
 
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge
