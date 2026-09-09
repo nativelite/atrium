@@ -628,7 +628,9 @@ fn main() -> ExitCode {
     }
     if rest.first().map(String::as_str) == Some("--help") {
         eprintln!(
-            "usage: atrium [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [command [args...]]\n\
+            "usage: atrium [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [up <fleet> | command [args...]]\n\
+             \x20      up <fleet>: launch a saved fleet under the leading flags (alias for `atrium fleet up <fleet>`),\n\
+             \x20               e.g. `atrium --trust automode up context-build`. Put session flags BEFORE `up`.\n\
              \x20      --reap-orphans: before starting, kill pane process groups whose atrium is gone (prints each\n\
              \x20               one). Off by default; `atrium reap` does the same thing on its own.\n\
              \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
@@ -673,6 +675,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `atrium [--identity X] [--trust <policy>] [--allow-ctl] up <name>` is the
+    // ergonomic alias for `atrium fleet up <name>`: the launch flags atrium just
+    // parsed become the fleet's posture. Without this, `up` falls through to the
+    // hosted-program path below — atrium runs a bogus program called `up`, the
+    // fleet never launches through `fleet_up`, and its agents come up in regular
+    // mode because the session trust was never set. `atrium fleet up …` (the
+    // early dispatch above) still serves the flags-after-name form.
+    if let Some(result) = up_alias(&rest) {
+        return match result {
+            Ok(name) => fleet_up(name, allow_ctl, max_depth, trust),
+            Err(msg) => {
+                eprintln!("atrium: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let command: Vec<String> = if rest.is_empty() {
         vec![default_shell()]
     } else {

@@ -43,6 +43,46 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// Is `rest` — the tokens left after atrium's own leading launch flags are
+/// stripped — the top-level `up <name>` fleet alias?
+///
+/// `atrium fleet up <name> [flags]` is the canonical launch, but the flags-first
+/// form operators actually reach for is `atrium --trust automode up <name>`: the
+/// session posture reads left-to-right and `up <name>` names the fleet. Without a
+/// dispatch for it, atrium parses `--trust automode` as a global flag and then
+/// hosts `up` as a *program* — the fleet never launches through [`fleet_up`], so
+/// its trust is never set and every agent comes up in regular mode. This is the
+/// pure decision behind that dispatch (tested here; wired in `main`):
+///
+/// - `["up", <name>]` → `Some(Ok(name))` — launch that fleet with the leading
+///   `--trust`/`--allow-ctl`/`--max-depth` atrium already parsed.
+/// - `["up"]` or `["up", "-x", …]` → `Some(Err(usage))` — no fleet name.
+/// - `["up", <name>, <extra>, …]` → `Some(Err(usage))` — flags belong BEFORE
+///   `up`; point back at the leading form (or `atrium fleet up` for after-name
+///   flags) rather than silently ignoring them.
+/// - anything else → `None` — not the alias; host it as a program as before.
+pub(crate) fn up_alias(rest: &[String]) -> Option<Result<&str, String>> {
+    if rest.first().map(String::as_str) != Some("up") {
+        return None;
+    }
+    match rest.get(1) {
+        Some(name) if !name.starts_with('-') => {
+            if rest.len() > 2 {
+                Some(Err(format!(
+                    "up: put session flags before `up` (e.g. `atrium --trust automode up {name}`), \
+                     or use `atrium fleet up {name} --trust …`; unexpected {:?}",
+                    rest[2]
+                )))
+            } else {
+                Some(Ok(name.as_str()))
+            }
+        }
+        _ => Some(Err(
+            "up <name>: needs a fleet name (try `atrium fleet ls`)".to_string()
+        )),
+    }
+}
+
 /// Defang a fleet-file string before it reaches the terminal.
 ///
 /// Every string in `atrium.fleet.json` is attacker-shaped in the workflow this
@@ -491,4 +531,54 @@ pub(crate) fn spawn_fleet_window(
         zoomed: false,
         next_id: fleet.agents.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::up_alias;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn up_name_is_the_alias() {
+        // `atrium --trust automode up context-build`: after the leading flags are
+        // stripped, `rest` is `["up", "context-build"]` — the alias, launching
+        // that fleet with the trust atrium already parsed.
+        assert_eq!(
+            up_alias(&v(&["up", "context-build"])),
+            Some(Ok("context-build"))
+        );
+    }
+
+    #[test]
+    fn non_up_is_not_the_alias() {
+        // A real hosted program is left alone (host it as before, never a fleet).
+        assert_eq!(up_alias(&v(&["claude", "--model", "opus"])), None);
+        assert_eq!(up_alias(&[]), None);
+    }
+
+    #[test]
+    fn up_without_a_name_is_a_usage_error() {
+        assert!(matches!(up_alias(&v(&["up"])), Some(Err(_))));
+        // A flag where the name should be is not a name.
+        assert!(matches!(up_alias(&v(&["up", "--trust"])), Some(Err(_))));
+    }
+
+    #[test]
+    fn flags_after_the_name_are_rejected_with_a_pointer() {
+        // Flags belong BEFORE `up`; trailing tokens are a usage error, not a
+        // silent drop (dropping them is exactly how the posture went missing).
+        let args = v(&["up", "context-build", "--allow-ctl"]);
+        match up_alias(&args) {
+            Some(Err(msg)) => {
+                assert!(
+                    msg.contains("before `up`"),
+                    "message should redirect: {msg}"
+                );
+            }
+            other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
 }
