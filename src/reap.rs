@@ -185,6 +185,24 @@ mod sys {
         pid_alive(pid)
     }
 
+    /// True when `pid` is a member of any Job Object (including atrium's).
+    /// Passing a null job handle to `IsProcessInJob` queries membership in ANY job.
+    pub fn pid_in_any_job(pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut in_job: i32 = 0;
+            IsProcessInJob(h, core::ptr::null_mut(), &mut in_job);
+            CloseHandle(h);
+            in_job != 0
+        }
+    }
+
     // --- Job Object teardown (kill-on-close) --------------------------------
     //
     // Windows has no process groups, but a Job Object with
@@ -206,6 +224,7 @@ mod sys {
         fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> Handle;
         fn SetInformationJobObject(job: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn CloseHandle(h: Handle) -> i32;
         fn GetLastError() -> u32;
@@ -216,6 +235,7 @@ mod sys {
     const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
     const PROCESS_SET_QUOTA: u32 = 0x0100;
     const PROCESS_TERMINATE: u32 = 0x0001;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
 
     // `usize` is correct for `SIZE_T` / `ULONG_PTR` on both 32- and 64-bit.
     #[repr(C)]
@@ -531,6 +551,13 @@ pub fn pid_alive(pid: u32) -> bool {
 /// for. Anything deciding "is this session still here" must use this.
 pub fn pid_running(pid: u32) -> bool {
     sys::pid_running(pid)
+}
+
+/// True when `pid` is a member of any Windows Job Object — including atrium's
+/// kill-on-close job. Always false on unix (no Job Objects).
+#[cfg(not(unix))]
+pub fn pid_in_any_job(pid: u32) -> bool {
+    sys::pid_in_any_job(pid)
 }
 
 /// The watchdog loop: wait for `parent` to disappear, then tear down every group

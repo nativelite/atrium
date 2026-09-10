@@ -1863,6 +1863,23 @@ fn wait_pid_gone(pid: u32, within: Duration) -> bool {
     false
 }
 
+/// Block until `pid` is a member of a Windows Job Object, or `within` elapses.
+/// Returns true once membership is confirmed; false if the deadline passes first.
+/// This replaces a fixed sleep when waiting for atrium's run loop to call
+/// `session_job.assign()` — the poll terminates as soon as the assignment is
+/// observable, so slow CI machines get as much time as they need.
+#[cfg(windows)]
+fn wait_in_any_job(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if atrium::reap::pid_in_any_job(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 /// **A clean `Ctrl+A q` kills the pane's whole tree on Windows** (acceptance #2).
 /// atrium exits, its last handle to the session Job Object closes, and
 /// kill-on-close terminates the pane and its grandchild together.
@@ -1908,8 +1925,15 @@ fn hard_killed_atrium_still_takes_its_tree_down_windows() {
     let p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv_ref, 24, 80).unwrap();
 
     let grandkid = read_marker_pid(&marker, Duration::from_secs(25));
-    // Give the run loop a tick to register + assign the pane to the job.
-    std::thread::sleep(Duration::from_millis(800));
+    // Wait until atrium's run loop has assigned the pane to the Job Object.
+    // The grandchild inherits Job membership from PowerShell once PowerShell is
+    // assigned, so polling grandkid is the first observable evidence of assignment.
+    // Ceiling of 15 s handles slow CI; on a fast machine this returns in <100 ms.
+    let assigned = wait_in_any_job(grandkid, Duration::from_secs(15));
+    assert!(
+        assigned,
+        "grandkid {grandkid} never joined a Job Object — run loop stalled"
+    );
 
     let atrium = p.pid();
     assert!(atrium != 0, "no atrium pid");
