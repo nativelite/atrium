@@ -430,6 +430,12 @@ pub(crate) struct Pane {
     pub(crate) filter: atrium::filter::Passthrough,
     pub(crate) title: String,
     pub(crate) activity: bool,
+    /// When this pane last produced output, on a **monotonic** clock. Stamped in
+    /// the run loop wherever `activity` is set; the ctl `list`/`status` reply
+    /// reports `now - last_activity` as `idle_ms` (via [`atrium::ipc::idle_ms`]),
+    /// splitting the overloaded "idle" into busy vs. genuinely-stale. Monotonic so
+    /// an NTP step can't make idle jump or go negative. Initialized at spawn.
+    pub(crate) last_activity: std::time::Instant,
     pub(crate) exited: bool,
     /// The session id atrium injected via `--session-id` when this pane is an
     /// agent it launched (§3.3). `None` for shells and agents atrium did not
@@ -1765,6 +1771,10 @@ fn run(
                         // Always feed the emulator so a later switch/split/zoom
                         // renders the current screen without a repaint nudge.
                         pane.term.feed(&buf[..n]);
+                        // This pane just produced output → it is active now. Stamp
+                        // the monotonic activity clock for ctl `idle_ms` (covers the
+                        // focused pane and any background pane in the active window).
+                        pane.last_activity = std::time::Instant::now();
                         // Track whether this pane's app wants the mouse (so scroll
                         // routes to it, not a bare shell).
                         if let Some(m) = sniff_mouse_mode(&buf[..n]) {
@@ -1856,6 +1866,7 @@ fn run(
                         break;
                     }
                     pane.term.feed(&buf[..n]);
+                    pane.last_activity = std::time::Instant::now();
                     if let Some(m) = sniff_mouse_mode(&buf[..n]) {
                         pane.mouse_wanted = m;
                     }
@@ -2407,6 +2418,7 @@ fn ctl_is_read_only(cmd: &atrium::ctl::Cmd) -> bool {
             | Cmd::Board(BoardOp::Get { .. })
             | Cmd::Board(BoardOp::List)
             | Cmd::Bus(BusOp::Feed { .. })
+            | Cmd::Bus(BusOp::Topics)
     )
 }
 
@@ -2557,9 +2569,13 @@ fn dispatch_ctl(
                 if let Some(deny) = scope_denied(windows, caller, privileged, id) {
                     return deny;
                 }
-                let status = pane_by_agent(windows, id)
-                    .and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label));
-                ctl::reply_status_one(id, status)
+                let pane = pane_by_agent(windows, id);
+                let status =
+                    pane.and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label));
+                let idle = pane
+                    .map(|p| atrium::ipc::idle_ms(p.last_activity, std::time::Instant::now()))
+                    .unwrap_or(0);
+                ctl::reply_status_one(id, status, idle)
             }
         },
         Cmd::Send(sr) => {
@@ -2788,7 +2804,13 @@ fn dispatch_ctl(
                     kind,
                     fields,
                 } => match bus.publish(&topic, kind, Some(&who), &fields, now) {
-                    Ok(e) => ctl::reply_bus_published(atrium::bus::event_to_value(&e)),
+                    Ok(e) => {
+                        // No-echo-accurate: how many *other* subscribers receive
+                        // it (the publisher is excluded), so the client can warn on
+                        // a publish that reached nobody.
+                        let subs = bus.subscriber_count(&e.topic, Some(&who));
+                        ctl::reply_bus_published(atrium::bus::event_to_value(&e), subs)
+                    }
                     Err(msg) => ctl::reply_err(&msg),
                 },
                 ctl::BusOp::Sub { topics } => {
@@ -2807,6 +2829,7 @@ fn dispatch_ctl(
                     ctl::reply_bus_feed(atrium::bus::events_to_value(&events), cursor)
                 }
                 ctl::BusOp::Resolve { seq } => ctl::reply_bus_resolved(seq, bus.resolve(seq)),
+                ctl::BusOp::Topics => ctl::reply_bus_topics(bus.topics_with_counts()),
             }
         }
     }
@@ -2892,6 +2915,7 @@ fn audit_label(req: &atrium::ctl::Request) -> (&'static str, String) {
                 atrium::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
                 atrium::ctl::BusOp::Feed { since } => format!("feed since={since}"),
                 atrium::ctl::BusOp::Resolve { seq } => format!("resolve {seq}"),
+                atrium::ctl::BusOp::Topics => "topics".to_string(),
             },
         ),
     }
@@ -2978,6 +3002,9 @@ fn reply_tree(
         })
         .collect();
     panes.sort_by_key(|p| p.agent_id);
+    // One monotonic reading for the whole snapshot so every node's idle is
+    // measured against the same instant (no per-pane clock drift within a reply).
+    let now = std::time::Instant::now();
     let nodes: Vec<atrium::ctl::TreeNode> = panes
         .iter()
         .map(|p| atrium::ctl::TreeNode {
@@ -2987,6 +3014,7 @@ fn reply_tree(
             title: &p.title,
             depth: p.depth,
             status: world.status_for(p.session_id.as_deref()).map(status_label),
+            idle_ms: atrium::ipc::idle_ms(p.last_activity, now),
         })
         .collect();
     atrium::ctl::reply_list(&nodes)
@@ -3572,6 +3600,9 @@ fn spawn_pane_full(
         filter: atrium::filter::Passthrough::new(),
         title,
         activity: false,
+        // A fresh pane is "active" (idle 0) until proven idle; stamped forward on
+        // every output byte in the run loop.
+        last_activity: std::time::Instant::now(),
         exited: false,
         session_id,
         launch_ms: agsess::sessions::now_ms(),

@@ -153,6 +153,10 @@ pub enum BusOp {
     Feed { since: u64 },
     /// Mark a `decision_needed` event answered.
     Resolve { seq: u64 },
+    /// List the active topics with their subscriber counts — discoverability, so
+    /// a publisher can see which topics exist and who is actually listening before
+    /// firing into the void.
+    Topics,
 }
 
 /// A `spawn` request's payload.
@@ -946,9 +950,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                         .max(0) as u64;
                     BusOp::Resolve { seq }
                 }
+                Some("topics") => BusOp::Topics,
                 other => {
                     return Err(format!(
-                        "bus op must be pub|sub|unsub|feed|resolve (got {other:?})"
+                        "bus op must be pub|sub|unsub|feed|resolve|topics (got {other:?})"
                     ))
                 }
             };
@@ -1047,10 +1052,19 @@ pub fn reply_board_release(key: &str, released: bool) -> String {
     .to_string()
 }
 
-/// `{"ok":true,"event":<event>}` — a bus `pub` result (the stored event, built
-/// by [`crate::bus::event_to_value`]).
-pub fn reply_bus_published(event: Value) -> String {
-    obj(vec![("ok", Value::Bool(true)), ("event", event)]).to_string()
+/// `{"ok":true,"event":<event>,"subscribers":<n>}` — a bus `pub` result: the
+/// stored event (built by [`crate::bus::event_to_value`]) plus how many *other*
+/// subscribers will receive it (no-echo: the publisher is excluded). `subscribers`
+/// is an **additive** field — existing consumers that read only `event`/`ok` are
+/// unaffected — and the client turns a `0` into a STDERR warning
+/// ([`zero_sub_warning`]), never touching this stdout JSON.
+pub fn reply_bus_published(event: Value, subscribers: usize) -> String {
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("event", event),
+        ("subscribers", i(subscribers)),
+    ])
+    .to_string()
 }
 
 /// `{"ok":true,"subscribed":[<topic>,…]}` — the caller's full topic set after a
@@ -1085,6 +1099,86 @@ pub fn reply_bus_resolved(seq: u64, resolved: bool) -> String {
         ("resolved", Value::Bool(resolved)),
     ])
     .to_string()
+}
+
+/// `{"ok":true,"topics":[{"topic":<t>,"subs":<n>},…]}` — the active bus topics
+/// and how many subscribers each has, for `bus topics` discoverability. The
+/// server passes `(topic, subscriber_count)` pairs already ordered (the bus keeps
+/// them in a `BTreeMap`, so this is topic-sorted and deterministic).
+///
+/// Discoverability is the fix for the exact footgun that stranded a teammate:
+/// publishing to a topic nobody follows looks identical to publishing to a live
+/// one. `bus topics` makes the roster of live topics — and who is actually
+/// listening — visible before you publish.
+pub fn reply_bus_topics(topics: Vec<(String, usize)>) -> String {
+    let arr = topics
+        .into_iter()
+        .map(|(topic, subs)| obj(vec![("topic", s(&topic)), ("subs", i(subs))]))
+        .collect();
+    obj(vec![
+        ("ok", Value::Bool(true)),
+        ("topics", Value::Array(arr)),
+    ])
+    .to_string()
+}
+
+/// Below this many milliseconds a pane is "active enough" that showing an idle
+/// duration is just noise — the status render suppresses idle under it, so only a
+/// *meaningfully* idle pane grows an `idle …` marker. (Contract W2: split the
+/// overloaded "idle" into busy / idle-at-prompt / stale.)
+pub const IDLE_RENDER_MIN_MS: u64 = 10_000;
+
+/// Humanize an idle duration for the status line: `"12s"`, `"4m"`, `"1h3m"`,
+/// `"2d"`. Coarse on purpose — the question a reader asks is "how stale is this
+/// pane", not "how many seconds exactly", so past an hour the seconds and past a
+/// day the minutes stop earning their width.
+pub fn humanize_idle(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        if m == 0 {
+            format!("{h}h")
+        } else {
+            format!("{h}h{m}m")
+        }
+    } else {
+        let (d, h) = (secs / 86_400, (secs % 86_400) / 3600);
+        if h == 0 {
+            format!("{d}d")
+        } else {
+            format!("{d}d{h}h")
+        }
+    }
+}
+
+/// The stderr advisory for a `bus pub` whose reply reports **0 subscribers** —
+/// `Some("warning: published to '<topic>' with 0 subscribers")` — or `None` when
+/// the reply is not a zero-subscriber `bus pub` (any subscriber count, a missing
+/// `subscribers` field from an older daemon, or a non-pub reply).
+///
+/// This is the silent-drop footgun made loud, but kept OFF stdout: the JSON reply
+/// on stdout stays byte-clean for consumers that `json::parse` it, and the client
+/// ([`ctl_cmd`]) prints this to STDERR. Pure and side-effect-free so it unit-tests
+/// without a daemon.
+pub fn zero_sub_warning(reply: &str) -> Option<String> {
+    let v = json::parse(reply).ok()?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    // Only a pub reply carries a single `event`; require an explicit 0 count so a
+    // legacy reply without the additive field never warns.
+    let event = v.get("event")?;
+    if v.get("subscribers").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    let topic = event.get("topic").and_then(Value::as_str).unwrap_or("?");
+    Some(format!(
+        "warning: published to '{topic}' with 0 subscribers"
+    ))
 }
 
 /// `{"ok":true,"pane":<id>,"role":<role|null>,"session":<sid|null>,"note":<note|null>}`.
@@ -1153,17 +1247,23 @@ pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> Str
     .to_string()
 }
 
-/// `{"ok":true,"pane":<id>,"status":"<label>"}` — a single target's status.
-pub fn reply_status_one(pane: usize, status: Option<&str>) -> String {
+/// `{"ok":true,"pane":<id>,"status":"<label>","idle_ms":<n>}` — a single target's
+/// status. `idle_ms` is the same **additive** u64-millisecond field as on
+/// [`reply_list`] nodes (`0` when active); the baseline `{pane,status}` keys are
+/// unchanged.
+pub fn reply_status_one(pane: usize, status: Option<&str>, idle_ms: u64) -> String {
     obj(vec![
         ("ok", Value::Bool(true)),
         ("pane", i(pane)),
         ("status", status.map(s).unwrap_or(Value::Null)),
+        ("idle_ms", Value::Number(Number::Int(idle_ms as i64))),
     ])
     .to_string()
 }
 
-/// One node in the org chart, as the run loop knows it.
+/// One node in the org chart, as the run loop knows it. `idle_ms` is how long
+/// (monotonic ms) since the pane last produced output — `0` for an active pane —
+/// computed by the run loop via [`crate::ipc::idle_ms`].
 pub struct TreeNode<'a> {
     pub id: usize,
     pub parent: Option<usize>,
@@ -1171,9 +1271,13 @@ pub struct TreeNode<'a> {
     pub title: &'a str,
     pub depth: usize,
     pub status: Option<&'a str>,
+    pub idle_ms: u64,
 }
 
-/// `{"ok":true,"tree":[{id,parent,role,title,depth,status}, …]}`
+/// `{"ok":true,"tree":[{id,parent,role,title,depth,status,idle_ms}, …]}`. The
+/// baseline keys `{id,parent,role,title,depth,status}` are unchanged; `idle_ms`
+/// is an **additive** node field (u64 milliseconds, `0` when active) so consumers
+/// that ignore unknown keys still parse.
 pub fn reply_list(nodes: &[TreeNode]) -> String {
     let arr = nodes
         .iter()
@@ -1185,6 +1289,7 @@ pub fn reply_list(nodes: &[TreeNode]) -> String {
                 ("title", s(n.title)),
                 ("depth", i(n.depth)),
                 ("status", n.status.map(s).unwrap_or(Value::Null)),
+                ("idle_ms", Value::Number(Number::Int(n.idle_ms as i64))),
             ])
         })
         .collect();
@@ -1226,7 +1331,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
                  \x20      | board claim <key> [--ttl secs] | board release <key>\n\
-                 \x20      | bus pub <topic> [--decision] [--to <role>] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq>"
+                 \x20      | bus pub <topic> [--decision] [--to <role>] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
             );
             return ExitCode::FAILURE;
         }
@@ -1246,6 +1351,12 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                     None => println!("{reply}"),
                 },
                 _ => println!("{reply}"),
+            }
+            // A non-fatal advisory to STDERR (never stdout, which carries the JSON
+            // reply): a `bus pub` that reached zero subscribers. Fires in both the
+            // human and `--json` paths — stdout stays clean for `json::parse`.
+            if let Some(warning) = zero_sub_warning(&reply) {
+                eprintln!("atrium ctl: {warning}");
             }
             let ok = json::parse(&reply)
                 .ok()
@@ -1362,7 +1473,27 @@ fn render_bus(reply: &str) -> Option<String> {
         ));
         return Some(body);
     }
-    // pub → the single stored event.
+    // topics → the active-topic roster with subscriber counts.
+    if let Some(arr) = v.get("topics").and_then(Value::as_array) {
+        if arr.is_empty() {
+            return Some("  (no active topics)".to_string());
+        }
+        let body = arr
+            .iter()
+            .map(|t| {
+                let topic = t.get("topic").and_then(Value::as_str).unwrap_or("?");
+                let subs = t.get("subs").and_then(Value::as_i64).unwrap_or(0);
+                format!("  \x1b[1m{topic}\x1b[0m  subs={subs}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(body);
+    }
+    // pub → the single stored event. The zero-subscriber warning is deliberately
+    // NOT rendered here: stdout carries the JSON reply that consumers `json::parse`,
+    // so the warning goes to STDERR via [`zero_sub_warning`] in the client path
+    // ([`ctl_cmd`]) — mixing it into stdout would corrupt every existing `bus pub`
+    // consumer. The additive `subscribers` field in the reply is ignored here.
     if let Some(event) = v.get("event") {
         return Some(render_event_line(event));
     }
@@ -1845,9 +1976,11 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                         .map_err(|_| format!("bus resolve: seq must be a number, got {tok:?}"))?;
                     pairs.push(("seq", Value::Number(Number::Int(seq.max(0)))));
                 }
+                // No arguments: the op token alone (already pushed) is the request.
+                "topics" => {}
                 other => {
                     return Err(format!(
-                        "bus op must be pub|sub|unsub|feed|resolve (got {other:?})"
+                        "bus op must be pub|sub|unsub|feed|resolve|topics (got {other:?})"
                     ))
                 }
             }
@@ -1869,6 +2002,130 @@ mod tests {
 
     fn v(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- W1: bus topics reply + render ----------------------------------
+
+    #[test]
+    fn reply_bus_topics_shape_is_topic_and_subs() {
+        let json = reply_bus_topics(vec![("deploy".to_string(), 2), ("billing".to_string(), 0)]);
+        let parsed = json::parse(&json).unwrap();
+        assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
+        let arr = parsed.get("topics").and_then(Value::as_array).unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].get("topic").and_then(Value::as_str), Some("deploy"));
+        assert_eq!(arr[0].get("subs").and_then(Value::as_i64), Some(2));
+        assert_eq!(arr[1].get("topic").and_then(Value::as_str), Some("billing"));
+        assert_eq!(arr[1].get("subs").and_then(Value::as_i64), Some(0));
+    }
+
+    #[test]
+    fn render_bus_topics_lists_topic_and_count() {
+        let json = reply_bus_topics(vec![("deploy".to_string(), 3)]);
+        let view = render_bus(&json).expect("topics reply must render");
+        assert!(view.contains("deploy"), "names the topic: {view:?}");
+        assert!(view.contains("subs=3"), "shows the count: {view:?}");
+    }
+
+    #[test]
+    fn render_bus_topics_empty_is_explicit() {
+        let json = reply_bus_topics(vec![]);
+        assert_eq!(render_bus(&json).as_deref(), Some("  (no active topics)"));
+    }
+
+    /// `atrium ctl bus topics` round-trips argv → request → parsed `BusOp::Topics`.
+    #[test]
+    fn bus_topics_builds_and_parses() {
+        let req = build_request(&v(&["bus", "topics"]), None).expect("build");
+        match parse_request(&req).expect("parse").cmd {
+            Cmd::Bus(BusOp::Topics) => {}
+            other => panic!("expected BusOp::Topics, got {other:?}"),
+        }
+    }
+
+    /// Existing bus ops still parse — the new op is purely additive (criterion [2]).
+    #[test]
+    fn existing_bus_ops_unaffected_by_topics_addition() {
+        let req = build_request(&v(&["bus", "feed", "--since", "3"]), None).unwrap();
+        assert!(matches!(
+            parse_request(&req).unwrap().cmd,
+            Cmd::Bus(BusOp::Feed { since: 3 })
+        ));
+    }
+
+    #[test]
+    fn reply_status_one_carries_idle_ms_additively() {
+        let json = reply_status_one(2, Some("working"), 7_000);
+        let v = json::parse(&json).unwrap();
+        assert_eq!(v.get("pane").and_then(Value::as_i64), Some(2));
+        assert_eq!(v.get("status").and_then(Value::as_str), Some("working"));
+        assert_eq!(v.get("idle_ms").and_then(Value::as_i64), Some(7_000));
+    }
+
+    // ---- W1: zero-subscriber warning is STDERR-only, never in stdout -----
+
+    /// The warning is a client-side STDERR advisory derived from the reply, NOT
+    /// part of the rendered stdout view — so stdout stays byte-clean for consumers
+    /// that `json::parse` a `bus pub` reply (locked criterion [1]).
+    #[test]
+    fn zero_sub_warning_fires_with_exact_text_on_zero_subscribers() {
+        let reply = r#"{"ok":true,"event":{"seq":7,"topic":"ghost","kind":"fyi","from":"dev_1","fields":{"m":"hi"}},"subscribers":0}"#;
+        assert_eq!(
+            zero_sub_warning(reply).as_deref(),
+            Some("warning: published to 'ghost' with 0 subscribers")
+        );
+        // And it is NOT smuggled into the stdout render.
+        let view = render_bus(reply).expect("pub reply must render");
+        assert!(
+            !view.contains("warning:"),
+            "warning must not be on stdout: {view:?}"
+        );
+    }
+
+    #[test]
+    fn zero_sub_warning_silent_when_subscribers_present() {
+        let reply = r#"{"ok":true,"event":{"seq":7,"topic":"deploy","kind":"fyi","from":"dev_1","fields":{"m":"hi"}},"subscribers":2}"#;
+        assert_eq!(
+            zero_sub_warning(reply),
+            None,
+            "no warning when there are subs"
+        );
+    }
+
+    /// Backward compatibility: an old daemon reply with NO `subscribers` field
+    /// must never warn, and the event still renders on stdout unchanged.
+    #[test]
+    fn zero_sub_warning_backward_compatible_without_field() {
+        let reply = r#"{"ok":true,"event":{"seq":7,"topic":"deploy","kind":"fyi","from":"dev_1","fields":{"m":"hi"}}}"#;
+        assert_eq!(zero_sub_warning(reply), None, "legacy reply must not warn");
+        let view = render_bus(reply).expect("legacy pub reply must still render");
+        assert!(
+            view.contains("deploy"),
+            "legacy reply still shows the event: {view:?}"
+        );
+    }
+
+    // ---- W2: idle rendering helpers (pure idle_ms lives in ipc.rs) -------
+
+    #[test]
+    fn humanize_idle_scales_by_magnitude() {
+        assert_eq!(humanize_idle(0), "0s");
+        assert_eq!(humanize_idle(12_000), "12s");
+        assert_eq!(humanize_idle(59_000), "59s");
+        assert_eq!(humanize_idle(60_000), "1m");
+        assert_eq!(humanize_idle(4 * 60_000), "4m");
+        assert_eq!(humanize_idle(3_600_000), "1h");
+        assert_eq!(humanize_idle(3_600_000 + 3 * 60_000), "1h3m");
+        assert_eq!(humanize_idle(2 * 86_400_000), "2d");
+        assert_eq!(humanize_idle(86_400_000 + 3_600_000), "1d1h");
+    }
+
+    #[test]
+    fn idle_render_threshold_keeps_active_panes_quiet() {
+        // A pane idle under the threshold should not be surfaced as idle; at or
+        // past it, it should. (The pure monotonic idle_ms is unit-tested in ipc.rs.)
+        assert!(5_000 < IDLE_RENDER_MIN_MS);
+        assert!(20_000 >= IDLE_RENDER_MIN_MS);
     }
 
     #[test]
@@ -2816,6 +3073,7 @@ mod tests {
             title: "claude",
             depth: 0,
             status: Some("working"),
+            idle_ms: 4_000,
         }];
         let listed = reply_list(&nodes);
         let v = json::parse(&listed).unwrap();
@@ -2823,6 +3081,12 @@ mod tests {
             v.get("tree").and_then(Value::as_array).map(<[_]>::len),
             Some(1)
         );
+        // W2 criterion [4]: idle_ms is additive; baseline node keys are untouched.
+        let node = &v.get("tree").and_then(Value::as_array).unwrap()[0];
+        assert_eq!(node.get("idle_ms").and_then(Value::as_i64), Some(4_000));
+        for key in ["id", "parent", "role", "title", "depth", "status"] {
+            assert!(node.get(key).is_some(), "baseline key {key:?} must remain");
+        }
 
         let err = reply_err("nope");
         let v = json::parse(&err).unwrap();

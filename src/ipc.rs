@@ -67,6 +67,19 @@ pub fn default_address() -> String {
     sys::default_address(std::process::id())
 }
 
+/// Idle duration in **milliseconds** from a **monotonic** clock: `now - last`,
+/// saturating to `0` when `now` precedes `last`.
+///
+/// The daemon stamps a pane's last activity as a [`std::time::Instant`] when it
+/// reads output from that pane, and computes idle here at status-reply time.
+/// `Instant` is monotonic — unlike wall-clock `SystemTime`, an NTP step or clock
+/// skew can never make idle jump forward or go negative — which is precisely why
+/// the status field is derived from it. Pure (no clock read of its own), so it
+/// unit-tests with two constructed instants; `=0` for a just-active pane.
+pub fn idle_ms(last: std::time::Instant, now: std::time::Instant) -> u64 {
+    now.saturating_duration_since(last).as_millis() as u64
+}
+
 /// The server endpoint. Owns the OS handle/socket and the parked connections.
 pub struct Listener {
     sys: sys::Listener,
@@ -2180,6 +2193,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_ms_is_monotonic_and_saturating() {
+        let t0 = Instant::now();
+        // now after the stamp → the elapsed millis.
+        assert_eq!(idle_ms(t0, t0 + Duration::from_millis(4_000)), 4_000);
+        // just-active pane (now == last) → 0.
+        assert_eq!(idle_ms(t0, t0), 0);
+        // now BEFORE the stamp (a non-monotonic surprise) → 0, never a wrap.
+        assert_eq!(idle_ms(t0 + Duration::from_millis(4_000), t0), 0);
+    }
 
     /// A unique endpoint per test (tests run in parallel; a shared per-pid name
     /// would collide). Platform-appropriate: a named pipe on Windows, a temp
