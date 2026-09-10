@@ -167,6 +167,16 @@ fn preflight_context_mode() {
     }
 }
 
+/// A control-plane-enabled fleet with no spawn-capable agent is almost always a
+/// misconfigured lead: the coordinator comes up unable to create the very
+/// teammates it exists to manage, and the gap stays invisible until the first
+/// mid-run `ctl spawn` is denied. Worth a launch-time warning, where the roster
+/// can still be fixed. `can_spawn` stays explicit and default-false by design —
+/// this only surfaces the likely-misconfigured case, it grants nothing.
+fn ctl_without_spawner(allow_ctl: bool, spawner_count: usize) -> bool {
+    allow_ctl && spawner_count == 0
+}
+
 /// List the fleet names in the discovered fleet file, in file order. A missing
 /// file or a malformed one is a clear error on stderr (non-zero exit).
 pub(crate) fn fleet_ls() -> ExitCode {
@@ -442,6 +452,17 @@ pub(crate) fn fleet_up(
             format!(" ({})", spawners.join(", "))
         }
     );
+    // A control-plane fleet where nobody may spawn is almost always a
+    // misconfigured lead: the coordinator comes up unable to create the very
+    // teammates it exists to manage, and the gap stays invisible until the
+    // first mid-run spawn is denied. Surface it here, where the roster can
+    // still be fixed.
+    if ctl_without_spawner(allow_ctl, spawners.len()) {
+        eprintln!(
+            "atrium fleet: warning: ctl is on but no agent may spawn teammates \
+             — if this fleet coordinates by spawning, set \"can_spawn\": true on its lead"
+        );
+    }
     // The last line before the block, so it cannot scroll: it NAMES the
     // destinations rather than counting them. A surviving summary line that
     // omits the payload is the one thing an operator is guaranteed to read and
@@ -694,7 +715,7 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{plugin_value_enabled, preflight_context_mode, up_alias};
+    use super::{ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -775,5 +796,23 @@ mod tests {
     #[test]
     fn plugin_enabled_string_is_disabled() {
         assert!(!plugin_value_enabled(&json::parse("\"yes\"").unwrap()));
+    }
+
+    #[test]
+    fn ctl_fleet_without_a_spawner_warns() {
+        // A coordinating fleet (ctl on) with no spawn-capable agent is the
+        // misconfigured-lead case that stranded a real run.
+        assert!(ctl_without_spawner(true, 0));
+    }
+
+    #[test]
+    fn ctl_fleet_with_a_spawner_is_fine() {
+        assert!(!ctl_without_spawner(true, 1));
+    }
+
+    #[test]
+    fn no_ctl_never_warns() {
+        // Without the control plane there are no teammates to spawn — silence.
+        assert!(!ctl_without_spawner(false, 0));
     }
 }
