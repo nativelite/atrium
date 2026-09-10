@@ -875,8 +875,20 @@ fn run(
     let initial = match initial_window {
         Some(w) => Ok(w),
         None => match grid {
-            Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
-            None => spawn_window(command, rows, cols, 0, identity, trust_mode(), &mut flash),
+            // Startup panes (created before the session Job exists) enroll via the
+            // run loop's lazy pass on the first tick — status quo; not a
+            // kill-after-spawn race. Hence `None` here.
+            Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash, None),
+            None => spawn_window(
+                command,
+                rows,
+                cols,
+                0,
+                identity,
+                trust_mode(),
+                &mut flash,
+                None,
+            ),
         },
     };
     match initial {
@@ -1125,6 +1137,7 @@ fn run(
                             identity,
                             trust_mode(),
                             &mut flash,
+                            Some(&session_job),
                         ) {
                             Ok(w) => {
                                 windows.push(w);
@@ -1459,6 +1472,7 @@ fn run(
                         identity,
                         trust_mode(),
                         &mut flash,
+                        Some(&session_job),
                     ) {
                         Ok(w) => {
                             windows.push(w);
@@ -1489,6 +1503,7 @@ fn run(
                         None,
                         atrium::ctl::TrustMode::Off,
                         &mut flash,
+                        Some(&session_job),
                     ) {
                         Ok(w) => {
                             windows.push(w);
@@ -1732,6 +1747,7 @@ fn run(
                             &mut ctl_audit,
                             &mut board,
                             &mut bus,
+                            &session_job,
                         );
                         let _ = listener.respond(&reply);
                         prev_master = None;
@@ -2436,6 +2452,7 @@ fn apply_ctl(
     audit: &mut atrium::audit::Audit,
     board: &mut atrium::board::Board,
     bus: &mut atrium::bus::Bus,
+    job: &atrium::reap::SessionJob,
 ) -> String {
     use atrium::ctl::{self, Cmd};
 
@@ -2521,6 +2538,7 @@ fn apply_ctl(
         privileged,
         board,
         bus,
+        job,
     );
     let (ok, note) = audit_outcome(&reply);
     audit.record(caller, action, &detail, ok, &note);
@@ -2548,6 +2566,7 @@ fn dispatch_ctl(
     privileged: bool,
     board: &mut atrium::board::Board,
     bus: &mut atrium::bus::Bus,
+    job: &atrium::reap::SessionJob,
 ) -> String {
     use atrium::ctl::{self, Cmd};
     let caller = req.caller;
@@ -2699,9 +2718,13 @@ fn dispatch_ctl(
                 return ctl::reply_err(&msg);
             }
             if sp.new_window {
-                spawn_worker_window(windows, &sp, caller, new_depth, rows, cols, effective, note)
+                spawn_worker_window(
+                    windows, &sp, caller, new_depth, rows, cols, effective, note, job,
+                )
             } else {
-                spawn_worker_here(windows, &sp, caller, new_depth, rows, cols, effective, note)
+                spawn_worker_here(
+                    windows, &sp, caller, new_depth, rows, cols, effective, note, job,
+                )
             }
         }
         Cmd::Kill(kr) => {
@@ -3052,6 +3075,7 @@ fn spawn_worker_window(
     cols: u16,
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
+    job: &atrium::reap::SessionJob,
 ) -> String {
     let mut flash = None;
     match spawn_window(
@@ -3062,6 +3086,7 @@ fn spawn_worker_window(
         sp.identity.as_deref(),
         mode,
         &mut flash,
+        Some(job),
     ) {
         Ok(mut w) => {
             let pane = &mut w.panes[0];
@@ -3095,6 +3120,7 @@ fn spawn_worker_here(
     cols: u16,
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
+    job: &atrium::reap::SessionJob,
 ) -> String {
     let Some(caller_id) = caller else {
         return atrium::ctl::reply_err(
@@ -3134,6 +3160,9 @@ fn spawn_worker_here(
             pane.depth = new_depth;
             let agent_id = pane.agent_id;
             let session = pane.session_id.clone();
+            // Enroll this ctl-spawned pane in the session Job synchronously (same
+            // #94 guarantee as spawn_window; idempotent, unix no-op, graceful).
+            job.assign(pane.pty.pid());
             w.panes.push(pane);
             w.next_id += 1;
             // Re-tile the WHOLE window into a balanced near-square grid over all
@@ -3243,6 +3272,7 @@ fn spawn_window(
     identity: Option<&str>,
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
+    job: Option<&atrium::reap::SessionJob>,
 ) -> std::io::Result<Window> {
     let pane = spawn_pane(
         command,
@@ -3253,6 +3283,14 @@ fn spawn_window(
         mode,
         flash,
     )?;
+    // Enroll a RUNTIME-spawned pane in the session Job synchronously, before it is
+    // returned, so a pane spawned mid-loop is torn down with atrium even if atrium
+    // is killed the same instant (#94). `job` is `None` for pre-run-loop/startup
+    // panes, which the run loop's lazy pass enrolls as before (status quo).
+    // Idempotent + a no-op on unix + graceful on failure (never blocks the pane).
+    if let Some(j) = job {
+        j.assign(pane.pty.pid());
+    }
     Ok(Window {
         panes: vec![pane],
         tree: Tree::new(0),
@@ -3277,6 +3315,7 @@ fn spawn_window_grid(
     grid: atrium::spawn::Grid,
     identity: Option<&str>,
     flash: &mut Option<(String, Instant)>,
+    job: Option<&atrium::reap::SessionJob>,
 ) -> std::io::Result<Window> {
     let tree = Tree::grid(grid.rows, grid.cols);
     let n = grid.total();
@@ -3296,7 +3335,14 @@ fn spawn_window_grid(
             trust_mode(),
             flash,
         ) {
-            Ok(pane) => panes.push(pane),
+            Ok(pane) => {
+                // Runtime-grid panes enroll synchronously (see spawn_window); a
+                // startup grid passes `None` and rides the lazy pass (status quo).
+                if let Some(j) = job {
+                    j.assign(pane.pty.pid());
+                }
+                panes.push(pane);
+            }
             Err(e) => {
                 // Tear down whatever we already started — a partial grid is not
                 // a coherent window.
