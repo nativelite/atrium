@@ -146,7 +146,9 @@ fn preflight_context_mode() {
                 .map_or(false, |s| s == "context-mode@context-mode")
         })
     } else if let Some(map) = enabled.as_object() {
-        map.iter().any(|(k, _)| k == "context-mode@context-mode")
+        // Value must be JSON boolean true; false/missing/non-bool => disabled.
+        map.iter()
+            .any(|(k, v)| k == "context-mode@context-mode" && v.as_bool().unwrap_or(false))
     } else {
         return; // unexpected shape, skip check
     };
