@@ -727,6 +727,8 @@ fn main() -> ExitCode {
         max_depth,
         trust,
         None,
+        // The default (non-fleet) path declares no topic vocabulary: soft-gate.
+        None,
     )
 }
 
@@ -813,6 +815,11 @@ fn run(
     // panes (so they get `ATRIUM_CTL` in their env) and hands the listener here;
     // `None` means run() binds its own after the initial spawn (the default path).
     mut ctl_listener: Option<atrium::ipc::Listener>,
+    // The fleet's declared canonical topic vocabulary (fleet config `"topics": []`),
+    // if any. `Some` ⇒ the bus enforces strict topic admission (agents route only
+    // on declared topics); `None` ⇒ topics are soft-gated (a novel topic needs
+    // `--new`). The default, non-fleet path passes `None`.
+    canonical_topics: Option<Vec<String>>,
 ) -> ExitCode {
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
@@ -979,6 +986,12 @@ fn run(
         Some(p) if !p.is_empty() => atrium::bus::Bus::with_file(std::path::PathBuf::from(p)),
         _ => atrium::bus::Bus::new(),
     };
+    // A fleet that declared a topic vocabulary switches the bus to strict
+    // admission; without one it stays soft-gated. Set before any pane is spawned,
+    // so the very first publish is already governed by the right policy.
+    if let Some(topics) = &canonical_topics {
+        bus.set_canonical(topics);
+    }
     let mut world = atrium::vendors::VendorWorlds::new();
     let process_start_ms = agsess::sessions::now_ms();
     world.refresh_since(process_start_ms);
@@ -2862,7 +2875,11 @@ fn dispatch_ctl(
                     topic,
                     kind,
                     fields,
-                } => match bus.publish(&topic, kind, Some(&who), &fields, now) {
+                    create,
+                } => match bus
+                    .admit_topic(&topic, create)
+                    .and_then(|()| bus.publish(&topic, kind, Some(&who), &fields, now))
+                {
                     Ok(e) => {
                         // No-echo-accurate: how many *other* subscribers receive
                         // it (the publisher is excluded), so the client can warn on
@@ -2896,8 +2913,17 @@ fn dispatch_ctl(
                     Err(msg) => ctl::reply_err(&msg),
                 },
                 ctl::BusOp::Sub { topics } => {
-                    bus.subscribe(&who, &topics);
-                    ctl::reply_bus_subscribed(current_subs(bus, &who))
+                    // A declared (strict) fleet gates subscriptions too: you may
+                    // only listen on a declared topic. The soft-gate admits any
+                    // topic for *listening* (create=true), so subscribing to a
+                    // not-yet-published topic is fine — only publishing into the
+                    // void needs the deliberate --new.
+                    if let Some(bad) = topics.iter().find_map(|t| bus.admit_topic(t, true).err()) {
+                        ctl::reply_err(&bad)
+                    } else {
+                        bus.subscribe(&who, &topics);
+                        ctl::reply_bus_subscribed(current_subs(bus, &who))
+                    }
                 }
                 ctl::BusOp::Unsub { topics } => {
                     bus.unsubscribe(&who, &topics);
@@ -2990,8 +3016,10 @@ fn audit_label(req: &atrium::ctl::Request) -> (&'static str, String) {
                     topic,
                     kind,
                     fields,
+                    create,
                 } => {
-                    format!("pub {topic} {} fields={}", kind.as_str(), fields.len())
+                    let new = if *create { " --new" } else { "" };
+                    format!("pub {topic}{new} {} fields={}", kind.as_str(), fields.len())
                 }
                 atrium::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
                 atrium::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),

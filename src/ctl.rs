@@ -144,6 +144,10 @@ pub enum BusOp {
         topic: String,
         kind: crate::bus::Kind,
         fields: Vec<(String, String)>,
+        /// The `--new` intent: the caller means to create a not-yet-seen topic.
+        /// Only meaningful under the soft-gate (no declared vocabulary); a
+        /// declared fleet ignores it (no `--new` escape).
+        create: bool,
     },
     /// Subscribe the caller to `topics` (merged); `*` is the firehose.
     Sub { topics: Vec<String> },
@@ -919,10 +923,12 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let create = v.get("create").and_then(Value::as_bool).unwrap_or(false);
                     BusOp::Pub {
                         topic,
                         kind,
                         fields,
+                        create,
                     }
                 }
                 Some("sub") | Some("unsub") => {
@@ -1334,7 +1340,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
                  \x20      | board claim <key> [--ttl secs] | board release <key>\n\
-                 \x20      | bus pub <topic> [--decision] [--to <role>] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
+                 \x20      | bus pub <topic> [--decision] [--to <role>] [--new] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
             );
             return ExitCode::FAILURE;
         }
@@ -1892,12 +1898,19 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                     // joined across tokens) — the structured payload.
                     let mut kind = crate::bus::Kind::Fyi;
                     let mut fields: Vec<(String, String)> = Vec::new();
+                    let mut create = false;
                     let mut i = 3.min(args.len());
                     while i < args.len() {
                         let a = &args[i];
                         match a.as_str() {
                             "--decision" => {
                                 kind = crate::bus::Kind::DecisionNeeded;
+                                i += 1;
+                            }
+                            "--new" => {
+                                // Deliberately create a not-yet-seen topic (soft-gate
+                                // only; a declared fleet rejects off-list regardless).
+                                create = true;
                                 i += 1;
                             }
                             "--to" => {
@@ -1935,6 +1948,9 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                     }
                     pairs.push(("kind", s(kind.as_str())));
                     pairs.push(("fields", fields_to_value(fields)));
+                    if create {
+                        pairs.push(("create", Value::Bool(true)));
+                    }
                 }
                 "sub" | "unsub" => {
                     let topics: Vec<Value> = args[2.min(args.len())..]
@@ -2356,6 +2372,7 @@ mod tests {
                 topic,
                 kind,
                 fields,
+                ..
             }) => {
                 assert_eq!(topic, "deploy");
                 assert_eq!(kind, crate::bus::Kind::Fyi, "defaults to fyi");
@@ -2378,6 +2395,25 @@ mod tests {
             Cmd::Bus(BusOp::Pub { kind, .. }) => {
                 assert_eq!(kind, crate::bus::Kind::DecisionNeeded)
             }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_bus_pub_new_flag_sets_create() {
+        let with = parse_request(
+            &build_request(&v(&["bus", "pub", "adhoc", "--new", "msg=hi"]), None).unwrap(),
+        )
+        .unwrap();
+        match with.cmd {
+            Cmd::Bus(BusOp::Pub { create, .. }) => assert!(create, "--new sets create"),
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+        let without =
+            parse_request(&build_request(&v(&["bus", "pub", "adhoc", "msg=hi"]), None).unwrap())
+                .unwrap();
+        match without.cmd {
+            Cmd::Bus(BusOp::Pub { create, .. }) => assert!(!create, "default is create=false"),
             other => panic!("expected bus pub, got {other:?}"),
         }
     }

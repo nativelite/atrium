@@ -533,6 +533,9 @@ pub(crate) fn fleet_up(
         max_depth,
         trust,
         ctl_listener,
+        // A fleet may declare a canonical topic vocabulary; when it does, the bus
+        // runs strict. Absent ⇒ soft-gate.
+        fleet.topics.clone(),
     )
 }
 

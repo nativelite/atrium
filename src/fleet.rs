@@ -94,6 +94,13 @@ pub struct Fleet {
     /// provider and share level tolerantly (unknown values warn to stderr and
     /// degrade, never reject the file).
     pub context: Option<crate::context::ContextCfg>,
+    /// Optional canonical bus-topic vocabulary. When present, the fleet DECLARES
+    /// how its agents talk: the bus runs strict — publishing or subscribing to a
+    /// topic outside this list is rejected, so the roster converges on one shared
+    /// set instead of fragmenting into `review` / `review-gate` / `reviews`.
+    /// Absent → the bus is soft-gated (a novel topic needs an explicit `--new`).
+    /// Names are normalized (lowercased/trimmed) by the bus.
+    pub topics: Option<Vec<String>>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -260,6 +267,27 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
 
     let context = get("context").map(|v| crate::context::parse_block(name, v));
 
+    // Optional canonical bus-topic vocabulary (declares strict-mode topics).
+    let topics = match get("topics") {
+        Some(v) => {
+            let arr = v
+                .as_array()
+                .ok_or_else(|| format!("fleet {name:?}: \"topics\" must be an array of strings"))?;
+            let mut out = Vec::with_capacity(arr.len());
+            for t in arr {
+                out.push(
+                    t.as_str()
+                        .ok_or_else(|| {
+                            format!("fleet {name:?}: every \"topics\" entry must be a string")
+                        })?
+                        .to_string(),
+                );
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
     let agent_items = agents_val
@@ -279,6 +307,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         allow_ctl,
         identity,
         context,
+        topics,
         agents,
     })
 }
@@ -1545,6 +1574,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fleet_can_declare_a_canonical_topic_vocabulary() {
+        let f = parse(
+            r#"{ "fleets": { "a": { "topics": ["build", "review"],
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            f.get("a").unwrap().topics,
+            Some(vec!["build".to_string(), "review".to_string()]),
+            "declared topics parse in order; the bus normalizes them"
+        );
+    }
+
+    #[test]
+    fn a_non_array_topics_is_a_clear_error() {
+        let err = parse(
+            r#"{ "fleets": { "a": { "topics": "build",
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("topics"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn absent_topics_leaves_the_fleet_soft_gated() {
+        let f =
+            parse(r#"{ "fleets": { "a": { "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#)
+                .unwrap();
+        assert_eq!(f.get("a").unwrap().topics, None);
+    }
+
+    #[test]
     fn a_non_bool_allow_ctl_is_a_clear_error() {
         let err = parse(
             r#"{ "fleets": { "a": { "allow_ctl": "yes", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
@@ -1700,6 +1761,7 @@ mod tests {
             trust: None,
             allow_ctl: None,
             context: None,
+            topics: None,
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -1960,6 +2022,7 @@ mod tests {
             trust: None,
             allow_ctl: None,
             context: None,
+            topics: None,
             agents,
         };
         let anchor = Anchor {
