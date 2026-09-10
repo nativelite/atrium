@@ -105,6 +105,15 @@ fn settings_path() -> Option<PathBuf> {
     home.map(|h| h.join(".claude").join("settings.json"))
 }
 
+/// Returns `true` iff `v` is the JSON boolean `true`.
+///
+/// Strict boolean semantics: JSON numbers, strings, null, and arrays are all
+/// `false` — this is not JavaScript truthiness. Only an explicit `true` in the
+/// settings JSON counts as "enabled".
+fn plugin_value_enabled(v: &json::Value) -> bool {
+    v.as_bool().unwrap_or(false)
+}
+
 /// Check if context-mode@context-mode is enabled in ~/.claude/settings.json.
 /// Returns true if enabled or settings not found/unreadable (best-effort).
 /// Prints a warning and install hint if it's missing (but continues).
@@ -146,9 +155,8 @@ fn preflight_context_mode() {
                 .map_or(false, |s| s == "context-mode@context-mode")
         })
     } else if let Some(map) = enabled.as_object() {
-        // Value must be JSON boolean true; false/missing/non-bool => disabled.
         map.iter()
-            .any(|(k, v)| k == "context-mode@context-mode" && v.as_bool().unwrap_or(false))
+            .any(|(k, v)| k == "context-mode@context-mode" && plugin_value_enabled(v))
     } else {
         return; // unexpected shape, skip check
     };
@@ -686,7 +694,7 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{preflight_context_mode, up_alias};
+    use super::{plugin_value_enabled, preflight_context_mode, up_alias};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -739,5 +747,33 @@ mod tests {
         // no warning is printed. This test just verifies the function doesn't panic
         // when called — actual output verification would require mocking file I/O.
         preflight_context_mode();
+    }
+
+    // -- plugin_value_enabled pure seam --------------------------------------
+
+    #[test]
+    fn plugin_enabled_boolean_true_is_enabled() {
+        assert!(plugin_value_enabled(&json::parse("true").unwrap()));
+    }
+
+    #[test]
+    fn plugin_enabled_boolean_false_is_disabled() {
+        assert!(!plugin_value_enabled(&json::parse("false").unwrap()));
+    }
+
+    #[test]
+    fn plugin_enabled_null_is_disabled() {
+        assert!(!plugin_value_enabled(&json::parse("null").unwrap()));
+    }
+
+    #[test]
+    fn plugin_enabled_number_is_disabled() {
+        // JS truthiness would consider 1 true — strict JSON boolean must not.
+        assert!(!plugin_value_enabled(&json::parse("1").unwrap()));
+    }
+
+    #[test]
+    fn plugin_enabled_string_is_disabled() {
+        assert!(!plugin_value_enabled(&json::parse("\"yes\"").unwrap()));
     }
 }
