@@ -2545,6 +2545,35 @@ fn apply_ctl(
     reply
 }
 
+/// A bus message carrying a `to` field is a directed hand-off. The bus is
+/// pull-based, so an idle target never sees it until it runs `bus feed` — and if
+/// it isn't subscribed to that topic, not even then. So a routed publish also
+/// queues a best-effort wake that carries the content itself. Returns
+/// `(target-role, wake-text)` when the message is routed, else `None`. Pure: the
+/// role resolution and scope-gating stay at the call site, where a routed wake
+/// gets the same scope check as `ctl send` and so grants no new reach.
+fn routed_wake(
+    fields: &std::collections::BTreeMap<String, String>,
+    topic: &str,
+    seq: u64,
+    kind: atrium::bus::Kind,
+    who: &str,
+) -> Option<(String, String)> {
+    let to = fields.get("to")?;
+    // The human-readable payload lives in `msg` (fyi) or `q` (a decision); fall
+    // back to a pointer if a routed message carried neither.
+    let body = fields
+        .get("msg")
+        .or_else(|| fields.get("q"))
+        .map(String::as_str)
+        .unwrap_or("(see: atrium ctl bus feed)");
+    let text = format!(
+        "[atrium bus #{seq} {} / {who} -> you on \"{topic}\"] {body}",
+        kind.as_str()
+    );
+    Some((to.clone(), text))
+}
+
 /// The server side of the control channel: turn one parsed [`atrium::ctl::Request`]
 /// into its JSON reply. `list`/`status` serialize the spawn tree (agsess status
 /// folded in); `spawn` opens a visible worker after the pure allowlist/depth
@@ -2832,6 +2861,29 @@ fn dispatch_ctl(
                         // it (the publisher is excluded), so the client can warn on
                         // a publish that reached nobody.
                         let subs = bus.subscriber_count(&e.topic, Some(&who));
+                        // A message routed to a role (`--to`) is DELIVERED, not just
+                        // recorded: without this an idle target never acts on it (it
+                        // sits unseen on the pull-based bus). Best-effort and scope-
+                        // gated exactly like `ctl send`, so it grants no new reach;
+                        // the message still lives on the bus as the durable record.
+                        if let Some((to, text)) =
+                            routed_wake(&e.fields, &e.topic, e.seq, e.kind, &who)
+                        {
+                            let candidates = ctl_candidates(windows);
+                            if let Ok(tid) = ctl::resolve_target(&to, &candidates) {
+                                if caller != Some(tid)
+                                    && scope_denied(windows, caller, privileged, tid).is_none()
+                                {
+                                    pending.push(PendingSend {
+                                        target: tid,
+                                        text,
+                                        queued_at: Instant::now(),
+                                        written: 0,
+                                        text_written_at: None,
+                                    });
+                                }
+                            }
+                        }
                         ctl::reply_bus_published(atrium::bus::event_to_value(&e), subs)
                     }
                     Err(msg) => ctl::reply_err(&msg),
@@ -3836,7 +3888,42 @@ fn effective_command(command: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_base_env, privilege_for};
+    use super::{pane_base_env, privilege_for, routed_wake};
+
+    fn wake_fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn routed_message_wakes_the_target_with_its_content() {
+        // The footgun this fixes: a `--to` message sat unseen on the bus and an
+        // idle target never acted on it. The wake must carry the content so the
+        // target does not have to be subscribed to the topic to receive it.
+        let f = wake_fields(&[("to", "lead"), ("msg", "ship it")]);
+        let (to, text) =
+            routed_wake(&f, "ctl-fixes", 42, atrium::bus::Kind::Fyi, "reviewer").unwrap();
+        assert_eq!(to, "lead");
+        assert!(text.contains("ship it"), "carries the content: {text}");
+        assert!(text.contains("reviewer"), "names the sender");
+        assert!(text.contains("ctl-fixes"), "names the topic");
+        assert!(text.contains("#42"), "carries the seq to resolve/reference");
+    }
+
+    #[test]
+    fn a_decision_question_is_the_body_when_no_msg() {
+        let f = wake_fields(&[("to", "lead"), ("q", "combined or split?")]);
+        let (_, text) = routed_wake(&f, "t", 1, atrium::bus::Kind::DecisionNeeded, "gate").unwrap();
+        assert!(text.contains("combined or split?"));
+    }
+
+    #[test]
+    fn an_unrouted_publish_wakes_nobody() {
+        let f = wake_fields(&[("msg", "broadcast")]);
+        assert!(routed_wake(&f, "t", 1, atrium::bus::Kind::Fyi, "lead").is_none());
+    }
 
     /// **A pane must carry the session marker whether or not ctl is on.**
     ///
