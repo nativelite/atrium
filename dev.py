@@ -36,6 +36,14 @@ ROOT = Path(__file__).resolve().parent
 PY = sys.executable
 WINDOWS = os.name == "nt"
 
+#: The sibling crate atrium depends on by path (the bus/board coordination core).
+#: `cargo test`/`cargo fmt` in this package do NOT descend into a path dependency,
+#: so without folding it into the gate here an abus regression — the bus size cap
+#: or the topic-admission policy — would sail through untested and unformatted.
+#: Skipped gracefully if the sibling isn't present (e.g. a vendored checkout that
+#: only ships atrium).
+ABUS_MANIFEST = ROOT.parent / "abus" / "Cargo.toml"
+
 #: Wall-clock budget for one `cargo test` invocation. Generous on purpose: this
 #: is a backstop against a deadlock, not a performance assertion (the suite runs
 #: in ~15 s), so raising it on a slow or cold machine costs nothing.
@@ -139,7 +147,16 @@ def _name_the_hang(args: tuple[str, ...], timeout: int) -> None:
 
 def test() -> int:
     print(f"# test budget: {TEST_TIMEOUT}s per invocation (ATRIUM_TEST_TIMEOUT)")
-    for args in (("cargo", "test", "--all-targets"), ("cargo", "test", "--doc")):
+    invocations = [("cargo", "test", "--all-targets"), ("cargo", "test", "--doc")]
+    # Fold in the sibling abus crate so its coordination tests are part of the
+    # gate, not a manual afterthought (see ABUS_MANIFEST).
+    if ABUS_MANIFEST.exists():
+        mp = ("--manifest-path", str(ABUS_MANIFEST))
+        invocations += [
+            ("cargo", "test", *mp, "--all-targets"),
+            ("cargo", "test", *mp, "--doc"),
+        ]
+    for args in invocations:
         code = run(*args, timeout=TEST_TIMEOUT)
         if code == TIMED_OUT:
             _name_the_hang(args, TEST_TIMEOUT)
@@ -154,7 +171,12 @@ def build() -> int:
 
 
 def fmt() -> int:
-    return run("cargo", "fmt", "--check")
+    code = run("cargo", "fmt", "--check")
+    if code or not ABUS_MANIFEST.exists():
+        return code
+    # The sibling crate is formatted by the same gate; a drift in abus is a gate
+    # failure here, not something only a hand-run would catch.
+    return run("cargo", "fmt", "--check", "--manifest-path", str(ABUS_MANIFEST))
 
 
 def guard() -> int:
