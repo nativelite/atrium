@@ -111,6 +111,8 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 
 **`can_spawn`** is a capability the roster grants, not something implied by having ctl access. A depth cap bounds how far a fan-out goes, but never says who may start one, so the right to create teammates is declared here.
 
+If a fleet turns the control plane on (`allow_ctl`) and coordinates by spawning teammates, set `"can_spawn": true` on its **lead** — a coordinator without it comes up unable to create the teammates it manages, and the denial only surfaces on its first `ctl spawn`. atrium warns at launch when a ctl-enabled fleet has no spawn-capable agent, but the fix is in the roster.
+
 Each agent still gets its own `--session-id`, so the agent-aware chrome binds each pane independently.
 
 ## Designate a lead
