@@ -2567,8 +2567,15 @@ fn routed_wake(
         .or_else(|| fields.get("q"))
         .map(String::as_str)
         .unwrap_or("(see: atrium ctl bus feed)");
+    // The terse-headline convention: long evidence rides a `detail=<pointer>`
+    // (board key / path / URL), surfaced after the headline so the target knows
+    // where to look without the bus line carrying the whole payload.
+    let tail = fields
+        .get("detail")
+        .map(|d| format!(" (detail: {d})"))
+        .unwrap_or_default();
     let text = format!(
-        "[atrium bus #{seq} {} / {who} -> you on \"{topic}\"] {body}",
+        "[atrium bus #{seq} {} / {who} -> you on \"{topic}\"] {body}{tail}",
         kind.as_str()
     );
     Some((to.clone(), text))

@@ -741,7 +741,10 @@ Share fast-moving events on the bus, not just durable state on the board: \
 atrium ctl bus pub TOPIC field=value posts an update to a topic, add --decision \
 when something needs a decision, and atrium ctl bus sub TOPIC then atrium ctl \
 bus feed pulls what teammates published on the topics you follow. Post fyi \
-updates freely. Route a decision to the teammate who should answer it with \
+updates freely. Keep each message a terse headline: put long evidence (tables, \
+diffs, logs) behind a pointer with detail=board:KEY or detail=PATH rather \
+than pasting it inline — over-long messages are rejected to keep the feed \
+readable. Route a decision to the teammate who should answer it with \
 --to ROLE: a design question for the lead is atrium ctl bus pub TOPIC --decision \
 --to lead q=your question, which reaches the lead first instead of the human. \
 Reserve a plain --decision with no --to for things that truly need the human. \
