@@ -352,6 +352,108 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Extract sibling (`../name`) path-dep directory names from a `Cargo.toml`.
+///
+/// Scans every line for `path = "../<name>"` patterns — handles both the
+/// standalone key-value form and the inline-table form (`{ ..., path = "..." }`).
+/// Only direct siblings are returned: `../name` with no inner `/`. Paths that go
+/// deeper (`../../x`) or stay local (`./x`) are ignored. Missing/unreadable file
+/// → empty list, so non-Cargo repos are unaffected.
+pub fn sibling_path_deps(cargo_toml: &Path) -> Vec<String> {
+    let text = match std::fs::read_to_string(cargo_toml) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let mut deps: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let bytes = line.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            // Find the next occurrence of the literal "path" on this line.
+            let Some(rel) = line[pos..].find("path") else {
+                break;
+            };
+            let abs = pos + rel;
+            pos = abs + 4; // always advance past the found "path"
+                           // Require a word boundary before "path": start-of-line or a
+                           // delimiter character — rules out substrings like "xpath".
+            let before = if abs == 0 { b' ' } else { bytes[abs - 1] };
+            if !matches!(before, b' ' | b'\t' | b',' | b'{') {
+                continue;
+            }
+            // After "path": optional whitespace, then '='.
+            let rest = line[pos..].trim_start();
+            let Some(rest) = rest.strip_prefix('=') else {
+                continue;
+            };
+            let rest = rest.trim_start();
+            // Opening quote (double or single).
+            let inner = if let Some(s) = rest.strip_prefix('"') {
+                s
+            } else if let Some(s) = rest.strip_prefix('\'') {
+                s
+            } else {
+                continue;
+            };
+            // Value up to closing quote.
+            let path_val = inner.split(['"', '\'']).next().unwrap_or("");
+            // Keep only direct siblings: `../name` with no further `/`.
+            if let Some(name) = path_val.strip_prefix("../") {
+                if !name.is_empty() && !name.contains('/') {
+                    let owned = name.to_string();
+                    if !deps.contains(&owned) {
+                        deps.push(owned);
+                    }
+                }
+            }
+        }
+    }
+    deps
+}
+
+/// After `ensure` creates a worktree, junction every sibling path-dep into the
+/// **worktree-parent** directory so that `../<name>` resolves correctly from
+/// inside the worktree.
+///
+/// For a worktree at `<base>/<fleet>/<wt>/`, Cargo resolves `../abus` as
+/// `<base>/<fleet>/abus`. The real crate is at `<repo-parent>/abus`. This
+/// function creates a junction/symlink `<base>/<fleet>/abus → <repo-parent>/abus`
+/// for every `../`-prefixed path dep found in the repo's `Cargo.toml`.
+///
+/// Idempotent — an already-present target is left alone. Returns human-readable
+/// warnings for missing sources or failed junctions; never aborts the launch.
+pub fn junction_sibling_deps(cwd: &Path, plan: &WorktreePlan) -> Vec<String> {
+    let deps = sibling_path_deps(&cwd.join("Cargo.toml"));
+    if deps.is_empty() {
+        return Vec::new();
+    }
+    let Some(repo_parent) = cwd.parent() else {
+        return Vec::new();
+    };
+    let Some(wt_parent) = plan.dir.parent() else {
+        return Vec::new();
+    };
+    let mut warns = Vec::new();
+    for dep in deps {
+        let src = repo_parent.join(&dep);
+        let dst = wt_parent.join(&dep);
+        if dst.exists() {
+            continue; // idempotent
+        }
+        if !src.exists() {
+            warns.push(format!(
+                "sibling dep {dep:?}: source {} not found, skipped",
+                src.display()
+            ));
+            continue;
+        }
+        if let Err(e) = link_dir(&src, &dst) {
+            warns.push(format!("sibling dep {dep:?}: junction failed: {e}"));
+        }
+    }
+    warns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +760,69 @@ mod tests {
         ensure(&r.repo, &plan).unwrap();
         let warns = seed(&r.repo, &plan.dir, &["nope.env".to_string()]);
         assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("not found"), "got: {warns:?}");
+    }
+
+    // --- sibling path-dep auto-junction ----------------------------------------
+
+    #[test]
+    fn sibling_path_deps_finds_only_direct_parent_relative_paths() {
+        let dir = std::env::temp_dir().join(format!("atrium-pd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cargo = dir.join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "[dependencies]\nabus = { path = \"../abus\" }\nlocal = { path = \"local-crate\" }\ndeep = { path = \"../../deep\" }\n",
+        )
+        .unwrap();
+        let deps = sibling_path_deps(&cargo);
+        assert!(deps.contains(&"abus".to_string()), "direct sibling found");
+        assert!(
+            !deps.iter().any(|d| d == "local-crate"),
+            "non-sibling excluded"
+        );
+        assert!(
+            !deps.iter().any(|d| d.contains("..")),
+            "deeper path excluded"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn junction_sibling_deps_links_sibling_and_is_idempotent() {
+        let r = Repo::new("junction");
+        // A fake sibling crate beside the repo.
+        let sibling = r.root.join("my-dep");
+        std::fs::create_dir_all(&sibling).unwrap();
+        // Cargo.toml in the repo referencing it.
+        std::fs::write(
+            r.repo.join("Cargo.toml"),
+            "[dependencies]\nmy-dep = { path = \"../my-dep\" }\n",
+        )
+        .unwrap();
+        let plan = r.plan("worker");
+        ensure(&r.repo, &plan).unwrap();
+        let warns = junction_sibling_deps(&r.repo, &plan);
+        assert!(warns.is_empty(), "no warnings: {warns:?}");
+        let dst = plan.dir.parent().unwrap().join("my-dep");
+        assert!(dst.exists(), "junction created at <wt-parent>/my-dep");
+        // Idempotent: calling again leaves the existing junction alone.
+        let warns2 = junction_sibling_deps(&r.repo, &plan);
+        assert!(warns2.is_empty(), "idempotent second call: {warns2:?}");
+    }
+
+    #[test]
+    fn junction_sibling_deps_warns_on_missing_source() {
+        let r = Repo::new("junction-miss");
+        std::fs::write(
+            r.repo.join("Cargo.toml"),
+            "[dependencies]\nx = { path = \"../no-such-crate\" }\n",
+        )
+        .unwrap();
+        let plan = r.plan("worker");
+        ensure(&r.repo, &plan).unwrap();
+        let warns = junction_sibling_deps(&r.repo, &plan);
+        assert_eq!(warns.len(), 1, "one warning for the missing source");
         assert!(warns[0].contains("not found"), "got: {warns:?}");
     }
 }

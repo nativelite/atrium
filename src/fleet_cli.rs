@@ -716,6 +716,9 @@ pub(crate) fn fleet_up(
                     for w in atrium::worktree::seed(&cwd, &p.dir, seeds) {
                         eprintln!("atrium fleet: worktree \"{}\": {w}", fsan(&p.name));
                     }
+                    for w in atrium::worktree::junction_sibling_deps(&cwd, p) {
+                        eprintln!("atrium fleet: worktree \"{}\": {w}", fsan(&p.name));
+                    }
                 }
                 Err(e) => {
                     eprintln!(
