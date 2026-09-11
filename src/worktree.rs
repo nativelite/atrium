@@ -227,7 +227,7 @@ run no git worktree commands, commit on your current branch, \
 and announce results tersely on the bus.";
 
 /// Render the norms text for a worktree agent (substitutes name and branch).
-pub(crate) fn worktree_norms(name: &str, branch: &str) -> String {
+pub fn worktree_norms(name: &str, branch: &str) -> String {
     WORKTREE_AGENT_NORMS
         .replace("{name}", name)
         .replace("{branch}", branch)
