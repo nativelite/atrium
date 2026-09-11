@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Developing atrium with atrium: the dev-fleet pattern — atrium docs</title>
+<meta name="description" content="atrium documentation: Developing atrium with atrium: the dev-fleet pattern. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html" class="active">dev fleet</a><a href="reaping.html">reaping</a></div>
+<h1>Developing atrium with atrium: the dev-fleet pattern</h1>
+<p>&gt; <b>This page documents what this very fleet embodies.</b> The atrium-dev fleet &gt; runs atrium to develop atrium — each worker in its own per-agent worktree, &gt; coordinating over the board and bus, gating every push with <code>python dev.py &gt; check</code>. The pattern is repeatable for any multi-concern Rust (or other &gt; compiled) repo.</p>
+<h2>The bootstrap moment</h2>
+<p>The first time you run a worktree fleet, atrium does not yet know about worktrees (or the feature you are adding). You use the <i>currently installed</i> binary — the old atrium — to launch a fleet that produces the new atrium. Once the work is merged and the new binary is built and installed, the next fleet launch uses the upgraded atrium to develop the next feature. This is the bootstrap cycle:</p>
+<pre><code>develop-in-worktrees
+  → python dev.py check  (the sole gate; there is no CI)
+  → git add -A &amp;&amp; git commit
+  → integrator merges all branches to main
+  → cargo install --path . --force   ← must stop atrium first
+  → restart atrium with the new binary</code></pre>
+<p><b>Why stop first.</b> On Windows the running <code>.exe</code> is locked — you cannot overwrite it in place. <code>cargo install --force</code> will fail unless the old process has exited. The pattern is: finish the fleet run, <code>cargo install</code>, then launch the next fleet with the new binary.</p>
+<h2>The fleet config</h2>
+<p>A dev-fleet for atrium looks like this:</p>
+<pre><code>{
+  "fleets": {
+    "atrium-dev": {
+      "allow_ctl": true,
+      "trust": "automode",
+      "worktrees": true,
+      "worktree_seed": [".env"],
+      "agents": [
+        { "name": "lead",       "cmd": ["claude"],  "can_spawn": true },
+        { "name": "trust",      "cmd": ["claude"] },
+        { "name": "norms",      "cmd": ["claude"] },
+        { "name": "seed",       "cmd": ["claude"] },
+        { "name": "scaffold",   "cmd": ["claude"] },
+        { "name": "docs",       "cmd": ["claude"] },
+        { "name": "reviewer",   "cmd": ["claude"] },
+        { "name": "integrator", "cmd": ["claude"] }
+      ]
+    }
+  }
+}</code></pre>
+<p><code>"worktrees": true</code> is the full fan-out shorthand: every agent gets its own branch and directory, named after itself. The lead and integrator can stay in the main tree by giving them an explicit <code>"worktree": ""</code> — or they can have their own trees too and commit only to coordinate; that is a team call. The key principle is <b>one concern per worktree</b> so one agent's WIP can never fail another agent's <code>dev.py check</code> gate.</p>
+<h2>Per-agent isolation in a Rust repo</h2>
+<p>Without worktrees, a fleet's agents all write to <b>one</b> working tree, and <code>cargo fmt --check</code> — which runs first in <code>dev.py check</code> — fails the <b>whole</b> tree the moment any agent leaves unformatted code. A different agent's clean, review-passed work cannot commit until the offender is fixed. This is "gate contamination" (bus #105 from the ctl-fixes fleet: <i>"your ctl.rs pure seams FAIL cargo fmt --check … is NOT dev.py-green"</i>).</p>
+<p>With <code>"worktrees": true</code>, each agent checks out its own copy of <code>HEAD</code>:</p>
+<pre><code>.atrium-worktrees/
+  atrium-dev/
+    trust/      ← branch: atrium/atrium-dev/trust
+    norms/      ← branch: atrium/atrium-dev/norms
+    seed/       ← branch: atrium/atrium-dev/seed
+    scaffold/   ← branch: atrium/atrium-dev/scaffold
+    docs/       ← branch: atrium/atrium-dev/docs
+    reviewer/
+    integrator/</code></pre>
+<p>Each of those directories is a full git worktree. An agent that leaves WIP unformatted in its tree fails only <b>its own</b> gate; every other agent's <code>dev.py check</code> runs in isolation and stays green.</p>
+<p>The worktrees are created <b>before</b> any pane spawns, so atrium fails fast if git is unavailable or the repo is not a git repository. They are placed as a <b>sibling</b> of the repo (<code>../.atrium-worktrees/&lt;fleet&gt;/</code>) so they never show up as untracked files inside the repo itself.</p>
+<h2>The sibling relative-path-dep pitfall</h2>
+<p>When a Cargo project references a sibling repo via a relative path — for example a dev-dependency declared as <code>path = "../atrium-skill-kit"</code> — that path is <b>resolved from the worktree's directory</b>, not from the main repo root. A worktree at <code>../.atrium-worktrees/atrium-dev/seed/</code> would look for <code>../atrium-skill-kit</code> one level up from itself, landing at <code>../.atrium-worktrees/atrium-dev/atrium-skill-kit/</code>, which does not exist. <code>cargo build</code> in that worktree fails immediately with a <code>No such file or directory</code> error.</p>
+<p><b>The fix: <code>worktree_seed</code> with a junction.</b> Add the sibling to the seed list:</p>
+<pre><code>"worktree_seed": ["../atrium-skill-kit"]</code></pre>
+<p>The seed function resolves the source relative to the main repo root (<code>cwd</code>): <code>cwd.join("../atrium-skill-kit")</code> → the real sibling. The destination resolves relative to the worktree directory (<code>dir</code>): <code>dir.join("../atrium-skill-kit")</code> → the slot beside the worktree where <code>cargo</code> expects it. On Windows this link is created as an <b>NTFS junction</b> (no admin rights needed), on Unix as a <b>symlink</b>. A hardlink falls back to a copy only when both junction and symlink fail. The result: every worktree can <code>cargo build</code> immediately, and edits to the linked sibling propagate to all trees that share it.</p>
+<p>Build caches are explicitly <b>not</b> seeded — they can be shared via the <code>CARGO_TARGET_DIR</code> env var set on agents that want it, or left isolated so each tree builds independently. Both are valid and neither is a default.</p>
+<h2>Worktree behavior norms</h2>
+<p>A fleet running under <code>"trust": "automode"</code> lets agents run autonomously — but <code>automode</code> is model-gated: Claude Haiku reports "this model does not have automode." A mixed fleet (Sonnet lead + Haiku workers) therefore sets a <b>per-agent trust override</b> on the Haiku agents:</p>
+<pre><code>{ "name": "docs", "cmd": ["claude", "--model", "haiku"], "trust": "accept" }</code></pre>
+<p>The <code>"trust"</code> field is a <b>request</b>, capped to the session ceiling. An agent can de-escalate (run at <code>accept</code> under an <code>automode</code> session), but never escalate past what the human approved at launch. atrium prints any effective difference in the pre-flight banner so the operator always knows what posture each agent actually runs under.</p>
+<p>Under <code>"trust": "accept"</code>, agents land in <code>acceptEdits</code> mode with an allow-list of safe commands. The allow-list was extended to include the <b>git coordination loop</b> a worktree fleet runs on, so agents do not prompt on every commit:</p>
+<table><thead><tr><th>Allowed (hands-off)</th><th>NOT allowed (still prompts)</th></tr></thead><tbody><tr><td><code>git status</code></td><td><code>git push</code> (network)</td></tr><tr><td><code>git log</code></td><td><code>git reset</code> (destructive)</td></tr><tr><td><code>git diff</code></td><td><code>git clean</code> (destructive)</td></tr><tr><td><code>git branch</code></td><td><code>git push --force</code></td></tr><tr><td><code>git show</code></td><td></td></tr><tr><td><code>git add</code></td><td></td></tr><tr><td><code>git commit</code></td><td></td></tr><tr><td><code>git merge</code></td><td></td></tr><tr><td><code>git worktree</code></td><td></td></tr></tbody></table>
+<p>The scoping is deliberate: inspect, stage, commit, merge, and manage worktrees are all local and reversible; network and destructive git operations stay a visible prompt even under the most permissive session policy.</p>
+<h2>The <code>.claude</code> scaffold</h2>
+<p>Each worktree receives a committed <code>.claude/</code> directory that seeds it with the context the agent needs without carrying session-level settings:</p>
+<p><b><code>.claude/settings.json</code></b> — a project-level settings file committed alongside the code. It carries the Claude Code tool allowlist for this worktree (matching what the trust layer allows via the fleet's <code>accept</code> posture), any MCP plugins the agent needs, and the model/effort defaults appropriate for this role. Being committed to the branch, it travels with <code>git worktree add</code> and is present the instant the agent's pane opens.</p>
+<p><b><code>CLAUDE.md</code></b> — the agent's standing instructions for this worktree. It declares the agent's scope ("you own <code>src/worktree.rs</code>"), links the one-file ownership discipline, and names the files the agent must NOT touch (those claimed by teammates on the board). A minimal CLAUDE.md entry looks like:</p>
+<pre><code># seed — worktree.rs owner
+
+You own `src/worktree.rs` only. Do not edit files owned by other agents (check
+`atrium ctl board list`). Gate every push: `python dev.py check` must be green.</code></pre>
+<p>Together, settings.json and CLAUDE.md mean the agent never has to be told its role via the kickoff prompt alone — the files are always there and always correct for the branch it is on.</p>
+<h2>Claim before you build</h2>
+<p>A worktree stops gate contamination, but two worktrees can still produce a merge conflict if both edit the same file. The protocol is simple:</p>
+<ol><li><b>Claim your file</b> on the board before touching it: <code>atrium ctl board claim src/worktree.rs</code></li><li><b>Check the board</b> before opening any file you did not claim: <code>atrium ctl board list</code></li><li><b>Post a blocker</b> if you need a file owned by someone else: <code>atrium ctl bus pub atrium-dev --decision --to &lt;owner&gt; q="need to touch X"</code></li></ol>
+<p>Board claims are leased and auto-renewed while you work; if a claim is denied, it names who holds it. The board + bus are the same primitives the fleet uses for everything else — worktree isolation does not add new coordination overhead, it just uses what is already there.</p>
+<h2>The development loop end-to-end</h2>
+<pre><code>1.  atrium fleet atrium-dev     # launches fleet; creates worktrees off HEAD
+2.  [each agent] claim your file on the board
+3.  [each agent] write failing test → make it pass → cargo fmt
+4.  [each agent] python dev.py check  (green → commit on your branch)
+5.  [reviewer]   inspect diff; post pass or blockers on the bus
+6.  [integrator] merge all green branches to main; resolve any conflicts
+7.  [all]        fleet run ends; clean worktrees are auto-removed
+8.  cargo install --path . --force   ← after fleet exits (Windows: exe unlocked)
+9.  Launch next fleet with the new binary</code></pre>
+<p>Step 4 is the <b>sole gate</b> — there is no CI. Running the local check before every commit is what protects <code>main</code>, and every package ships a <code>dev.py</code> so the check runs in seconds. The check order is:</p>
+<pre><code>cargo fmt --check  →  cargo clippy  →  cargo test</code></pre>
+<p>Formatting runs first because it is the fastest filter and the most common cause of gate contamination in a multi-agent tree. Fix it before running tests.</p>
+<h2>When the fleet is the product</h2>
+<p>The atrium-dev fleet is particularly self-referential: it uses atrium's board and bus to coordinate agents that are adding new atrium features, running inside worktrees that the new atrium code will create. The running atrium binary is the old one. The new one lives in the worktrees until it is merged, installed, and restarted.</p>
+<p>This means the fleet cannot dogfood the very features it is landing until the next restart. It can, however, verify them: <code>cargo test</code> in any worktree runs the unit tests (pure seam + effectful git tests) for the new code, giving confidence before the binary is ever installed.</p>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>
