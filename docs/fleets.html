@@ -20,7 +20,7 @@
 </div></header>
 
 <main class="wrap doc">
-<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html" class="active">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="reaping.html">reaping</a></div>
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html" class="active">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="reaping.html">reaping</a></div>
 <h1>Fleets and mass-spawn</h1>
 <p>atrium can open a whole grid of agent panes from one command. Use <b>mass-spawn</b> to launch N copies of the <i>same</i> command in one window, or a <b>fleet</b> to bring up a squad of <i>different, named</i> agents, each already in-role. See the <a href="https://github.com/nativelite/atrium#readme">project README</a> for the wider tour.</p>
 <h2>Mass-spawn</h2>
@@ -70,7 +70,7 @@ atrium fleet ls               # list the fleet names in the file</code></pre>
   }
 }</code></pre>
 <h3>Fleet-level fields</h3>
-<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td><code>grid</code></td><td>optional</td><td>An <code>RxC</code> layout that must fit the agent count. Omit it and the window auto-grids from the number of agents.</td></tr><tr><td><code>identity</code></td><td>optional</td><td>A default <code>akey</code> identity for every agent. A per-agent <code>identity</code> overrides it.</td></tr><tr><td><code>allow_ctl</code></td><td>optional</td><td>Bring <a href="control-plane.html">the control plane</a> up, as <code>--allow-ctl</code> does.</td></tr><tr><td><code>trust</code></td><td>optional</td><td>The trust posture the whole fleet runs at.</td></tr></tbody></table>
+<table><thead><tr><th>Field</th><th>Required</th><th>Meaning</th></tr></thead><tbody><tr><td><code>grid</code></td><td>optional</td><td>An <code>RxC</code> layout that must fit the agent count. Omit it and the window auto-grids from the number of agents.</td></tr><tr><td><code>identity</code></td><td>optional</td><td>A default <code>akey</code> identity for every agent. A per-agent <code>identity</code> overrides it.</td></tr><tr><td><code>allow_ctl</code></td><td>optional</td><td>Bring <a href="control-plane.html">the control plane</a> up, as <code>--allow-ctl</code> does.</td></tr><tr><td><code>trust</code></td><td>optional</td><td>The trust posture the whole fleet runs at.</td></tr><tr><td><code>context</code></td><td>optional</td><td>Shared knowledge and memory backend for the fleet (see <a href="#shared-context">Shared context</a>).</td></tr></tbody></table>
 <p><b><code>identity</code></b> is resolved via <code>akey</code> and injected per pane exactly as <code>--identity</code> does. The pane shows the <code>·&lt;name&gt;</code> tag (the <b>name</b> only, never a secret), and a resolve failure is flashed and the pane runs without it, never silently unauthenticated. See <a href="identity.html">credential identity</a>.</p>
 <p><b><code>allow_ctl</code></b> matters because a fleet whose agents coordinate is dead without it, and silently so: the panes come up and publish into a bus that is not there. If the file is the complete definition of a spin-up, this belongs in it.</p>
 <p><b><code>trust</code></b> takes one of <code>plan</code>, <code>accept</code>, <code>automode</code>, or <code>skip</code>. A fleet is launched to run hands-off, so it needs one; declaring it here keeps it with the roster it applies to and out of a flag you retype every launch. <code>--trust</code> on the command line wins when given. It is a <b>request, not an override</b>: if this atrium is itself running inside another atrium, the outer session's policy still caps it. See <a href="trust-and-security.html">trust and security</a>.</p>
@@ -78,6 +78,7 @@ atrium fleet ls               # list the fleet names in the file</code></pre>
 <p>Each agent needs a <b><code>name</code></b> and a <b><code>cmd</code></b> (command plus args). Everything else is optional.</p>
 <table><thead><tr><th>Field</th><th>Maps to</th><th>Meaning</th></tr></thead><tbody><tr><td><code>name</code></td><td>required</td><td>The agent's name in the roster.</td></tr><tr><td><code>cmd</code></td><td>required</td><td>Command and args, for example <code>["claude"]</code>.</td></tr><tr><td><code>identity</code></td><td><code>--identity</code></td><td>Overrides the fleet-level <code>identity</code> for this agent.</td></tr><tr><td><code>cwd</code></td><td>spawn directory</td><td>The agent is spawned here, so its <code>CLAUDE.md</code> auto-loads. Resolved relative to the fleet file's directory; absolute paths are used as-is.</td></tr><tr><td><code>add_dirs</code></td><td><code>claude --add-dir …</code></td><td>Extra trees the agent may read.</td></tr><tr><td><code>prompt</code></td><td><code>--append-system-prompt</code></td><td>Extra system-prompt text.</td></tr><tr><td><code>model</code></td><td><code>--model</code></td><td>The model to run.</td></tr><tr><td><code>effort</code></td><td><code>--effort</code></td><td>The reasoning effort.</td></tr><tr><td><code>can_spawn</code></td><td><code>ctl spawn</code> capability</td><td>May this agent create teammates? <b>Defaults to <code>false</code>.</b></td></tr></tbody></table>
 <p><b><code>can_spawn</code></b> is a capability the roster grants, not something implied by having ctl access. A depth cap bounds how far a fan-out goes, but never says who may start one, so the right to create teammates is declared here.</p>
+<p>If a fleet turns the control plane on (<code>allow_ctl</code>) and coordinates by spawning teammates, set <code>"can_spawn": true</code> on its <b>lead</b> — a coordinator without it comes up unable to create the teammates it manages, and the denial only surfaces on its first <code>ctl spawn</code>. atrium warns at launch when a ctl-enabled fleet has no spawn-capable agent, but the fix is in the roster.</p>
 <p>Each agent still gets its own <code>--session-id</code>, so the agent-aware chrome binds each pane independently.</p>
 <h2>Designate a lead</h2>
 <p>A fleet is not a row of agents each doing its own thing next to the others. That is how work gets dropped: no one owns the whole, no part gets reviewed, and a stuck worker just sits. The shape a fleet is <i>for</i> is <b>one lead that coordinates the team and drives it to completion</b>, a bench of workers, and usually an adversarial reviewer. Give one agent a lead persona and let it split the initiative, assign one part per teammate, watch progress, send each finished part to the reviewer, and mark a part done only once the reviewer clears it.</p>
@@ -85,6 +86,60 @@ atrium fleet ls               # list the fleet names in the file</code></pre>
 <p>Two things have to be in place or the coordination silently does nothing:</p>
 <ul><li><b><code>allow_ctl: true</code></b>, so the board and bus exist and every pane is told about <code>atrium ctl</code>. Without it the panes come up, the kickoffs tell them to publish to a bus that is not there, and nothing happens.</li><li><b>The coordination skills</b> installed, so a hosted claude reaches for <code>ctl</code> reliably instead of not knowing it exists. Install them once from the <a href="https://github.com/nativelite/marketplace">nativelite marketplace</a>: <code>/plugin marketplace add nativelite/marketplace</code> then <code>/plugin install atrium@nativelite</code>.</li></ul>
 <p>A leaderless fleet with the skills missing is exactly the setup that comes up looking busy and finishes nothing. See <a href="control-plane.html">the control plane</a> for the <code>ctl</code> surface the lead drives, and a complete worked roster in <a href="https://github.com/nativelite/atrium/tree/main/examples"><code>examples/atrium.fleet.json</code></a>.</p>
+<h2>Shared context: indexing and sharing knowledge across the fleet</h2>
+<p>A fleet working together on a shared codebase or problem benefits from a <b>shared knowledge repository</b> — a searchable index of documentation, design decisions, relevant code, or conversation history that every agent can consult without re-reading or re-exploring the same ground.</p>
+<p>The shared context model splits work into two roles:</p>
+<ul><li><b>Indexing (one agent per fleet)</b>: A <b>lead or designated indexer</b> (usually the lead or a dedicated recon agent) is responsible for populating and maintaining the knowledge base. This agent reads widely, summarizes decisions, and feeds the index.</li><li><b>Consuming (all other agents)</b>: Every other agent in the fleet has read access to the shared context and pulls from it to inform their work, without the cost or latency of exploring from scratch.</li></ul>
+<p>This avoids the loss of work and rediscovered decisions that plague leaderless fleets, and scales better than each agent re-exploring the same problem space.</p>
+<h3>Configuring a shared context</h3>
+<p>A fleet declares its shared context backend at the fleet level (not per-agent):</p>
+<pre><code>{
+  "fleets": {
+    "review-crew": {
+      "allow_ctl": true,
+      "trust": "accept",
+      "context": {
+        "provider": "context-mode",
+        "share": "knowledge"
+      },
+      "agents": [
+        {
+          "name": "lead",
+          "cmd": ["claude"],
+          "can_spawn": true,
+          "prompt": "You index shared knowledge…"
+        },
+        {
+          "name": "worker",
+          "cmd": ["claude"],
+          "prompt": "You consult shared knowledge…"
+        }
+      ]
+    }
+  }
+}</code></pre>
+<p><b>Field meanings:</b></p>
+<ul><li><b><code>provider</code></b>: The backend that hosts the shared knowledge. <code>"context-mode"</code> is the current provider, backed by Claude Code's context-mode MCP server. Reserved for future providers (e.g., a native knowledge system). <b>This is provider-neutral by design</b>.</li><li><b><code>share</code></b>: The sharing mode for this fleet's context. One of: <code>"knowledge"</code> (shared knowledge/content index + private per-agent session memory, the default), <code>"full"</code> (shared knowledge AND shared session memory across the fleet), or <code>"none"</code> (no context provisioning). Fleet isolation is automatic: each fleet gets its own isolated context store under <code>.atrium/ctx/&lt;fleet-name&gt;/</code>.</li></ul>
+<h3>The indexer role</h3>
+<p>Designate one agent — usually the <b>lead</b> — as the <b>indexer</b>. This agent's job is to:</p>
+<ol><li><b>Ingest and summarize</b>: Read design docs, specs, existing code, and ongoing conversation. Extract the key facts and decisions.</li><li><b>Keep the index current</b>: As new information arrives (a decision is made, a pattern emerges), feed it into the shared context.</li><li><b>Make it discoverable</b>: Organize the knowledge so other agents can search and find what they need.</li></ol>
+<p>In the fleet file, the indexer is simply the agent who has the prompt and kickoff guiding this behavior:</p>
+<pre><code>{
+  "name": "lead",
+  "cmd": ["claude"],
+  "prompt": "You maintain the shared knowledge base. Read widely, summarize decisions and designs, and keep the index fresh. Feed new insights to the shared context with `/ctx-index` or equivalent.",
+  "kickoff": "Start by ingesting the project spec and existing docs into the shared context. As we work, keep it current."
+}</code></pre>
+<p>Other agents run with prompts that direct them to <b>read</b> the shared context:</p>
+<pre><code>{
+  "name": "implementer",
+  "cmd": ["claude"],
+  "prompt": "You read the shared knowledge base to understand the design before you code. Consult `/ctx` to search shared docs before asking questions."
+}</code></pre>
+<h3>What the shared context is NOT</h3>
+<ul><li><b>Not a replacement for the control plane.</b> The control plane (<code>atrium ctl</code>) is for coordination and task tracking; shared context is for knowledge. A fleet uses both.</li><li><b>Not automatic.</b> An agent does not magically absorb knowledge; the indexer must deliberately feed it.</li><li><b>Not mandatory.</b> A small fleet or a synchronous team that talks often may not need it. Add shared context when the fleet grows or when knowledge is getting lost.</li><li><b>Not a sandbox.</b> Every agent consults the same knowledge base; there is no per-agent filtering. Use agent prompts to guide who contributes.</li></ul>
+<h3>Implementation and versioning</h3>
+<p>The <code>context</code> block is part of the frozen v1 contract, backed by the context-mode MCP server. The <code>provider</code> and <code>share</code> fields are stable. Each fleet automatically gets its own isolated context store under <code>.atrium/ctx/&lt;fleet-name&gt;/</code>, managed by the backend — no manual namespace configuration needed.</p>
 <h2>The grant disclosure</h2>
 <p><code>add_dirs</code> becomes <code>claude --add-dir</code>, that is, read access. A fleet file is often written by an agent and approved by a human <i>by running it</i>. So before <code>fleet up</code> blocks for your Enter, atrium resolves every <code>cwd</code> and <code>add_dirs</code> entry <b>through symlinks</b> and names the ones that are not plain subdirectories of the anchor.</p>
 <p>For each such entry the disclosure names:</p>

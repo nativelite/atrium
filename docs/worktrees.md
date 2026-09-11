@@ -1,9 +1,8 @@
-# Per-agent worktrees (PROPOSED)
+# Per-agent worktrees
 
-> **Status: PROPOSED — not yet implemented.** This is the design spec for
-> coordination finding #5 (shared-checkout gating). It doubles as the future
-> feature doc: when the feature lands, flip this banner and add `worktrees` to
-> `docs/build.py`'s `PAGES`.
+> **Status: shipped.** Opt-in per-agent git worktrees, the structural fix for
+> coordination finding #5 (shared-checkout gating). Configured in
+> `atrium.fleet.json`; dormant unless a fleet asks for it.
 
 ## The problem
 
@@ -112,7 +111,17 @@ a git repo):
 
 - Branch: `atrium/<fleet>/<worktree>`
 - Directory: `../.atrium-worktrees/<fleet>/<worktree>` — a **sibling** of the
-  repo, so the worktrees never show up as untracked files inside it.
+  repo by default, so the worktrees never show up as untracked files inside it.
+  Override the base with the fleet-level `"worktree_base"` key (resolved against
+  the fleet dir; absolute used as-is) — set it to give two concurrent sessions
+  on the same repo **distinct** bases so they don't collide on the same
+  directories and branches.
+
+The worktree/branch name is slugged to a safe single path/ref component
+(anything outside `[A-Za-z0-9._-]` → `-`), so an agent name carrying a slash or
+a control char can't produce an invalid branch or escape the base dir. Two
+distinct names that slug alike would collide — a documented v1 sharp edge; keep
+worktree names simple.
 
 **On teardown — never destroy unmerged work:**
 
@@ -122,6 +131,13 @@ a git repo):
   can inspect or merge it deliberately.
 - `git worktree prune` clears orphaned entries on the next launch (an agent that
   crashed, a directory deleted by hand).
+
+Once you have merged (or discarded) the work in a kept worktree, reclaim it with
+`atrium fleet clean <name>`, run from the directory the fleet launched in. It
+re-applies the same clean+merged test and removes the ones that now pass, still
+refusing to destroy anything dirty or unmerged. It is implemented as a `fleet`
+subcommand, not `ctl cleanup`: the cleanup happens *after* the fleet has exited,
+so there is no running instance for ctl's IPC to reach.
 
 ## Seeding untracked shared state
 
@@ -198,11 +214,16 @@ The **first** implementation cannot run *inside* worktrees (they don't exist yet
 — chicken and egg), but it can still use the fleet's board/bus coordination. Once
 landed, atrium can dogfood its own worktrees for subsequent work.
 
-## Open questions
+## Resolved decisions
 
-- Worktree dir location — sibling `../.atrium-worktrees/` (proposed) vs a
-  configurable base vs a temp/scratch area?
-- Should teardown offer an explicit `atrium ctl` command to remove a kept
-  worktree after a manual merge, or leave it entirely to the operator + `prune`?
-- Is a `worktrees: true` shorthand worth it, or is the explicit per-agent key
-  enough for v1?
+The three open questions from the design phase, as shipped:
+
+- **Worktree dir location** — sibling `../.atrium-worktrees/<fleet>/` by
+  default, **configurable** via `"worktree_base"` so two concurrent sessions on
+  one repo don't collide.
+- **Explicit cleanup** — yes: `atrium fleet clean <name>` reclaims kept
+  worktrees after a manual merge; `git worktree prune` still runs automatically
+  on every launch for orphans.
+- **`worktrees: true` shorthand** — kept; it expresses the common full-fan-out
+  case without repeating the key, and an explicit per-agent `worktree` still
+  overrides it so a squad can group.
