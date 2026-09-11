@@ -201,6 +201,38 @@ pub fn ensure(cwd: &Path, plan: &WorktreePlan) -> Result<bool, String> {
         .map_err(|e| format!("git worktree add for {:?} failed: {e}", plan.name))
 }
 
+/// Build a minimal [`WorktreePlan`] for an ad-hoc (non-fleet) worktree.
+///
+/// Branch: `atrium/adhoc/<slug(name)>`. Directory: under the default worktree
+/// base (a sibling `../.atrium-worktrees` of `cwd`). No agents — the caller
+/// decides who works in it.
+pub fn plan_for(cwd: &Path, name: &str) -> WorktreePlan {
+    let base = cwd
+        .parent()
+        .map(|p| p.join(DEFAULT_BASE_NAME))
+        .unwrap_or_else(|| cwd.join(DEFAULT_BASE_NAME));
+    let component = slug(name);
+    WorktreePlan {
+        name: name.to_string(),
+        branch: format!("atrium/adhoc/{component}"),
+        dir: base.join("adhoc").join(&component),
+        agents: vec![],
+    }
+}
+
+const WORKTREE_AGENT_NORMS: &str = "\
+You are in git worktree {name} on branch {branch}; \
+your current directory already IS the worktree, do not cd, \
+run no git worktree commands, commit on your current branch, \
+and announce results tersely on the bus.";
+
+/// Render the norms text for a worktree agent (substitutes name and branch).
+pub(crate) fn worktree_norms(name: &str, branch: &str) -> String {
+    WORKTREE_AGENT_NORMS
+        .replace("{name}", name)
+        .replace("{branch}", branch)
+}
+
 /// Clear git's records of worktrees whose directories have vanished (a crashed
 /// agent, a hand-deleted dir). Safe to call on every launch.
 pub fn prune(cwd: &Path) -> Result<(), String> {
@@ -824,5 +856,46 @@ mod tests {
         let warns = junction_sibling_deps(&r.repo, &plan);
         assert_eq!(warns.len(), 1, "one warning for the missing source");
         assert!(warns[0].contains("not found"), "got: {warns:?}");
+    }
+
+    // --- plan_for and worktree_norms -------------------------------------------
+
+    #[test]
+    fn plan_for_sets_adhoc_branch_and_dir_with_empty_agents() {
+        let cwd = Path::new("/work/repo");
+        let p = plan_for(cwd, "myfix");
+        assert_eq!(p.name, "myfix");
+        assert_eq!(p.branch, "atrium/adhoc/myfix");
+        assert_eq!(
+            p.dir,
+            Path::new("/work")
+                .join(DEFAULT_BASE_NAME)
+                .join("adhoc")
+                .join("myfix")
+        );
+        assert!(p.agents.is_empty(), "ad-hoc plan carries no agents");
+    }
+
+    #[test]
+    fn plan_for_slugs_hostile_names_in_branch_and_dir() {
+        let cwd = Path::new("/r/repo");
+        let p = plan_for(cwd, "feat/login");
+        assert_eq!(p.branch, "atrium/adhoc/feat-login");
+        assert_eq!(
+            p.dir,
+            Path::new("/r")
+                .join(DEFAULT_BASE_NAME)
+                .join("adhoc")
+                .join("feat-login")
+        );
+    }
+
+    #[test]
+    fn worktree_norms_substitutes_name_and_branch() {
+        let s = worktree_norms("wt", "atrium/adhoc/wt");
+        assert!(s.contains("git worktree wt"), "name substituted");
+        assert!(s.contains("branch atrium/adhoc/wt"), "branch substituted");
+        assert!(!s.contains("{name}"), "no raw placeholder left");
+        assert!(!s.contains("{branch}"), "no raw placeholder left");
     }
 }
