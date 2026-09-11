@@ -101,6 +101,26 @@ pub struct Fleet {
     /// Absent → the bus is soft-gated (a novel topic needs an explicit `--new`).
     /// Names are normalized (lowercased/trimmed) by the bus.
     pub topics: Option<Vec<String>>,
+    /// Fleet-level shorthand for the per-agent [`Agent::worktree`] key: `true`
+    /// means "every agent gets its **own** worktree, named after itself" — the
+    /// common full-fan-out case without repeating the key on each agent. An agent
+    /// that *also* names a `worktree` explicitly keeps that value (so you can fan
+    /// most agents out yet still group two onto one tree). Absent/`false` → no
+    /// shorthand; only agents that name a `worktree` get one.
+    pub worktrees: Option<bool>,
+    /// Where the per-agent worktree directories are created. Absent → the default
+    /// sibling `../.atrium-worktrees/<fleet>/` beside the repo (kept out of the
+    /// tree so the worktrees never show up as untracked files inside it). Set it
+    /// to give two concurrent sessions on the same repo **distinct** bases so they
+    /// don't collide on the same directories/branches. Resolved relative to the
+    /// fleet file's directory; an absolute path is used as-is.
+    pub worktree_base: Option<String>,
+    /// Untracked files/dirs to **link** into each fresh worktree (`git worktree
+    /// add` only checks out tracked files, so a `.env` an agent needs is missing).
+    /// atrium hardlinks files / junctions dirs (no admin on Windows), copying only
+    /// as a fallback. Build caches are never seeded — those belong to a per-agent
+    /// env var. Default empty/opt-in: atrium seeds nothing unless told.
+    pub worktree_seed: Option<Vec<String>>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -142,6 +162,14 @@ pub struct Agent {
     /// composes with the existing checks instead of replacing them: an agent with
     /// `can_spawn` still cannot exceed the trust ceiling or the depth cap.
     pub can_spawn: Option<bool>,
+    /// Opt-in per-agent working-tree isolation, as a **group name**. A distinct
+    /// value gives this agent its own `git worktree` + branch (solo isolation); a
+    /// value **shared** with other agents makes them co-develop one worktree +
+    /// branch (a squad on one concern); **absent** leaves the agent in the main
+    /// tree — exactly today's behavior, fully backward-compatible. Nothing engages
+    /// unless at least one agent sets this (or the fleet sets `worktrees: true`),
+    /// so coding isolation is a layer you switch on, not a change to what atrium is.
+    pub worktree: Option<String>,
     /// An initial **user** prompt appended as the final positional argument, so
     /// the agent starts working the moment the fleet comes up instead of waiting
     /// for the human to type. For claude this is `claude … "<kickoff>"`, which
@@ -288,6 +316,44 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         None => None,
     };
 
+    // Fleet-level worktree knobs. All opt-in; absent leaves behavior unchanged.
+    let worktrees = match get("worktrees") {
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("fleet {name:?}: \"worktrees\" must be true or false"))?,
+        ),
+        None => None,
+    };
+    let worktree_base = match get("worktree_base") {
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| format!("fleet {name:?}: \"worktree_base\" must be a string"))?
+                .to_string(),
+        ),
+        None => None,
+    };
+    let worktree_seed = match get("worktree_seed") {
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| {
+                format!("fleet {name:?}: \"worktree_seed\" must be an array of strings")
+            })?;
+            let mut out = Vec::with_capacity(arr.len());
+            for e in arr {
+                out.push(
+                    e.as_str()
+                        .ok_or_else(|| {
+                            format!(
+                                "fleet {name:?}: every \"worktree_seed\" entry must be a string"
+                            )
+                        })?
+                        .to_string(),
+                );
+            }
+            Some(out)
+        }
+        None => None,
+    };
+
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
     let agent_items = agents_val
@@ -308,6 +374,9 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         identity,
         context,
         topics,
+        worktrees,
+        worktree_base,
+        worktree_seed,
         agents,
     })
 }
@@ -368,6 +437,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
             None => None,
         };
     let kickoff = str_field("kickoff")?;
+    let worktree = str_field("worktree")?;
 
     let add_dirs = match get("add_dirs") {
         Some(v) => {
@@ -401,6 +471,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         model,
         effort,
         can_spawn,
+        worktree,
         kickoff,
     })
 }
@@ -1605,6 +1676,81 @@ mod tests {
         assert_eq!(f.get("a").unwrap().topics, None);
     }
 
+    // --- worktree config -----------------------------------------------------
+
+    #[test]
+    fn an_agent_can_name_its_worktree_group() {
+        let f = parse(
+            r#"{ "fleets": { "a": { "agents": [
+                 { "name": "solo",  "cmd": ["claude"], "worktree": "solo" },
+                 { "name": "lead",  "cmd": ["claude"] },
+                 { "name": "help",  "cmd": ["claude"], "worktree": "squad" },
+                 { "name": "help2", "cmd": ["claude"], "worktree": "squad" }
+               ] } } }"#,
+        )
+        .unwrap();
+        let ag = &f.get("a").unwrap().agents;
+        assert_eq!(ag[0].worktree.as_deref(), Some("solo"));
+        assert_eq!(ag[1].worktree, None, "absent key = main tree (legacy)");
+        assert_eq!(ag[2].worktree.as_deref(), Some("squad"));
+        assert_eq!(
+            ag[3].worktree.as_deref(),
+            Some("squad"),
+            "shared group name"
+        );
+    }
+
+    #[test]
+    fn a_fleet_can_set_the_worktrees_shorthand_base_and_seed() {
+        let f = parse(
+            r#"{ "fleets": { "a": {
+                 "worktrees": true,
+                 "worktree_base": "../wt-session-2",
+                 "worktree_seed": [".env", "config.local.json"],
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap();
+        let fleet = f.get("a").unwrap();
+        assert_eq!(fleet.worktrees, Some(true));
+        assert_eq!(fleet.worktree_base.as_deref(), Some("../wt-session-2"));
+        assert_eq!(
+            fleet.worktree_seed,
+            Some(vec![".env".to_string(), "config.local.json".to_string()])
+        );
+    }
+
+    #[test]
+    fn absent_worktree_config_leaves_the_fleet_on_the_main_tree() {
+        let f =
+            parse(r#"{ "fleets": { "a": { "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#)
+                .unwrap();
+        let fleet = f.get("a").unwrap();
+        assert_eq!(fleet.worktrees, None);
+        assert_eq!(fleet.worktree_base, None);
+        assert_eq!(fleet.worktree_seed, None);
+        assert_eq!(fleet.agents[0].worktree, None);
+    }
+
+    #[test]
+    fn a_non_bool_worktrees_is_a_clear_error() {
+        let err = parse(
+            r#"{ "fleets": { "a": { "worktrees": "yes",
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("worktrees"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_non_array_worktree_seed_is_a_clear_error() {
+        let err = parse(
+            r#"{ "fleets": { "a": { "worktree_seed": ".env",
+                 "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("worktree_seed"), "unhelpful error: {err}");
+    }
+
     #[test]
     fn a_non_bool_allow_ctl_is_a_clear_error() {
         let err = parse(
@@ -1762,6 +1908,9 @@ mod tests {
             allow_ctl: None,
             context: None,
             topics: None,
+            worktrees: None,
+            worktree_base: None,
+            worktree_seed: None,
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -2023,6 +2172,9 @@ mod tests {
             allow_ctl: None,
             context: None,
             topics: None,
+            worktrees: None,
+            worktree_base: None,
+            worktree_seed: None,
             agents,
         };
         let anchor = Anchor {

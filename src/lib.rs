@@ -42,3 +42,4 @@ pub mod trust;
 pub mod uid;
 pub mod vendors;
 pub mod warden;
+pub mod worktree;
