@@ -3513,6 +3513,21 @@ fn pane_base_env(
 /// `--session-id` / effective-command discipline is written once and shared.
 ///
 /// `command` is the *base* user command with any extra agent args already
+/// Combine an optional worktree-norms block with an optional ctl directive into
+/// a single `--append-system-prompt` payload.
+///
+/// Claude is last-wins on `--append-system-prompt`: two separate flags silently
+/// drop the first. This pure helper merges both text blocks so callers can push
+/// exactly one flag. Returns `None` when both inputs are absent (no flag needed).
+fn combine_system_prompt(norms: Option<&str>, ctl: Option<&str>) -> Option<String> {
+    match (norms, ctl) {
+        (Some(n), Some(c)) => Some(format!("{n}\n\n{c}")),
+        (Some(n), None) => Some(n.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    }
+}
+
 /// appended (e.g. the fleet loader's `--add-dir` / `--append-system-prompt` /
 /// `--model` / `--effort`); this function then appends `--session-id` when the
 /// pane is a bindable agent, exactly as before. `cwd` is `Some(dir)` for a fleet
@@ -3599,20 +3614,16 @@ fn spawn_pane_full(
     // skill happening to surface. Appended after any trust flags so it terminates
     // the `--allowedTools` list cleanly rather than being read as one of its values.
     // Combine any worktree-specific norms with the ctl directive into a SINGLE
-    // --append-system-prompt block. Claude is last-wins on this flag, so two
-    // separate pushes would silently drop the first. Both norms-only (no ctl)
-    // and ctl-only (no worktree) cases produce exactly one block each.
-    {
-        let has_ctl = is_claude && CTL_ADDRESS.get().is_some();
-        if has_ctl || (is_claude && extra_norms.is_some()) {
+    // --append-system-prompt block via combine_system_prompt. Claude is last-wins
+    // on this flag — two separate pushes silently drop the first.
+    if is_claude {
+        let ctl = if CTL_ADDRESS.get().is_some() {
+            Some(atrium::ctl::AGENT_CTL_DIRECTIVE)
+        } else {
+            None
+        };
+        if let Some(block) = combine_system_prompt(extra_norms, ctl) {
             base.push("--append-system-prompt".to_string());
-            let block = match (extra_norms, has_ctl) {
-                (Some(n), true) => {
-                    format!("{n}\n\n{}", atrium::ctl::AGENT_CTL_DIRECTIVE)
-                }
-                (Some(n), false) => n.to_string(),
-                (None, _) => atrium::ctl::AGENT_CTL_DIRECTIVE.to_string(),
-            };
             base.push(block);
         }
     }
@@ -3949,7 +3960,43 @@ fn effective_command(command: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{pane_base_env, privilege_for, routed_wake};
+    use super::{combine_system_prompt, pane_base_env, privilege_for, routed_wake};
+
+    // -- combine_system_prompt pure seam ------------------------------------
+
+    #[test]
+    fn combine_both_blocks_into_one_payload() {
+        // The key regression guard: norms + ctl must both survive in a single
+        // block so callers push exactly ONE --append-system-prompt flag.
+        let result = combine_system_prompt(Some("NORMS"), Some("CTL")).unwrap();
+        assert!(result.contains("NORMS"), "norms must be present: {result}");
+        assert!(
+            result.contains("CTL"),
+            "ctl directive must be present: {result}"
+        );
+        // Exactly one block — no embedded flag that would re-introduce last-wins.
+        assert!(
+            !result.contains("--append-system-prompt"),
+            "payload must not contain the flag itself: {result}"
+        );
+    }
+
+    #[test]
+    fn combine_norms_only_returns_norms() {
+        let result = combine_system_prompt(Some("NORMS"), None).unwrap();
+        assert_eq!(result, "NORMS");
+    }
+
+    #[test]
+    fn combine_ctl_only_returns_ctl() {
+        let result = combine_system_prompt(None, Some("CTL")).unwrap();
+        assert_eq!(result, "CTL");
+    }
+
+    #[test]
+    fn combine_neither_returns_none() {
+        assert!(combine_system_prompt(None, None).is_none());
+    }
 
     fn wake_fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs
