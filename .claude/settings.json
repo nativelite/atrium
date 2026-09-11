@@ -10,6 +10,8 @@
       "Bash(cargo check *)",
       "Bash(cargo clippy *)",
       "Bash(cargo fmt *)",
+      "Bash(cargo run *)",
+      "Bash(cargo clean *)",
       "Bash(go test *)",
       "Bash(go build *)",
       "Bash(go vet *)",
