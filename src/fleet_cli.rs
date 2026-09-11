@@ -431,6 +431,34 @@ pub(crate) fn fleet_up(
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
+
+    // Per-agent trust overrides (the mixed-model case). Validate each keyword now so
+    // a typo fails fast, and compute the capped effective posture for the banner.
+    // Each request is capped to the session ceiling exactly like a ctl-spawn
+    // `--mode`: an agent may de-escalate (accept under an automode session, so a
+    // haiku agent gets the acceptEdits allowlist) but never escalate past what the
+    // human approved at launch.
+    let mut trust_overrides: Vec<(String, String)> = Vec::new();
+    for a in &fleet.agents {
+        if let Some(k) = &a.trust {
+            match atrium::ctl::TrustMode::from_policy_keyword(k) {
+                Some(req) => {
+                    let (eff, _note) = crate::effective_mode(Some(req), trust);
+                    if eff != trust {
+                        trust_overrides.push((fsan(&a.name), eff.policy_label().to_string()));
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "atrium fleet: agent \"{}\" declares trust {k:?}, which is not one of \
+                         plan, accept, automode, skip",
+                        fsan(&a.name)
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    }
     // Vet every agent's argv exactly as `ctl spawn` does. A fleet file's `cmd` was
     // spawned VERBATIM, so it could embed `--dangerously-skip-permissions`,
     // `--mcp-config`, `--plugin-dir` - the flags the spawn vetting exists to
@@ -552,6 +580,17 @@ pub(crate) fn fleet_up(
         trust.policy_label(),
         if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
+    // Name any agent that runs at a DIFFERENT posture than the session — part of
+    // what the human approves (a mixed-model fleet often runs its haiku agents at
+    // `accept` under an `automode` session).
+    if !trust_overrides.is_empty() {
+        let shown = trust_overrides
+            .iter()
+            .map(|(n, m)| format!("{n}={m}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("atrium fleet: per-agent trust overrides — {shown}");
+    }
 
     // Who may create teammates is part of what the human approves, so say it.
     let spawners: Vec<String> = plan
@@ -908,6 +947,16 @@ pub(crate) fn spawn_fleet_window(
         // roster is the definition of the run, so the capability belongs in it -
         // and the safe default is the one that surprises nobody.
         let can_spawn = agent.can_spawn.unwrap_or(false);
+        // Per-agent trust: an agent may override the session posture (capped to it),
+        // so a haiku agent can run at `accept` under an `automode` session. No
+        // override → the session mode, exactly as before.
+        let agent_mode = match agent.trust.as_deref() {
+            Some(k) => {
+                crate::effective_mode(atrium::ctl::TrustMode::from_policy_keyword(k), trust_mode())
+                    .0
+            }
+            None => trust_mode(),
+        };
         let (command, mut cwd, role) = fleet_launch(agent, disclosed);
         // If this agent belongs to a worktree, it runs in that worktree's dir —
         // atrium's own managed checkout off HEAD, overriding any fleet-file cwd so
@@ -935,7 +984,7 @@ pub(crate) fn spawn_fleet_window(
             id,
             identity,
             cwd.as_deref(),
-            trust_mode(),
+            agent_mode,
             flash,
             &ctx_vars,
         ) {

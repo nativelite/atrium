@@ -162,6 +162,17 @@ pub struct Agent {
     /// composes with the existing checks instead of replacing them: an agent with
     /// `can_spawn` still cannot exceed the trust ceiling or the depth cap.
     pub can_spawn: Option<bool>,
+    /// Per-agent trust posture (`"plan"` / `"accept"` / `"automode"` / `"skip"`),
+    /// overriding the fleet/session posture for THIS agent only. The reason it
+    /// exists is mixed-model fleets: `automode` is gated per model on Anthropic's
+    /// side (haiku reports "this model does not have automode"), and it also
+    /// carries no command allowlist — so a fleet launched `--trust automode` leaves
+    /// its haiku agents unable to run commands hands-off. Setting `"trust":
+    /// "accept"` on those agents gives them `acceptEdits` + the allowlist instead,
+    /// which every model honors. It is a REQUEST, capped to the session ceiling
+    /// like every other trust: an agent can de-escalate (accept under an automode
+    /// session) but never escalate past what the human approved at launch.
+    pub trust: Option<String>,
     /// Opt-in per-agent working-tree isolation, as a **group name**. A distinct
     /// value gives this agent its own `git worktree` + branch (solo isolation); a
     /// value **shared** with other agents makes them co-develop one worktree +
@@ -438,6 +449,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         };
     let kickoff = str_field("kickoff")?;
     let worktree = str_field("worktree")?;
+    let trust = str_field("trust")?;
 
     let add_dirs = match get("add_dirs") {
         Some(v) => {
@@ -471,6 +483,7 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         model,
         effort,
         can_spawn,
+        trust,
         worktree,
         kickoff,
     })
@@ -1749,6 +1762,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("worktree_seed"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_agent_can_override_its_trust_posture() {
+        // The mixed-model case: automode session, but the haiku agent asks for
+        // accept (which carries an allowlist and is not model-gated).
+        let f = parse(
+            r#"{ "fleets": { "a": { "agents": [
+                 { "name": "sonnet", "cmd": ["claude", "--model", "sonnet"] },
+                 { "name": "haiku",  "cmd": ["claude", "--model", "haiku"], "trust": "accept" }
+               ] } } }"#,
+        )
+        .unwrap();
+        let ag = &f.get("a").unwrap().agents;
+        assert_eq!(
+            ag[0].trust, None,
+            "no override → inherit the session posture"
+        );
+        assert_eq!(ag[1].trust.as_deref(), Some("accept"));
     }
 
     #[test]
