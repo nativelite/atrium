@@ -200,10 +200,11 @@ atrium ctl send scout "explore the auth module and report findings"
 
 What happens:
 
-- atrium looks up (or creates) a git worktree named `<name>`, using the same
-  naming and placement rules as fleet worktrees: branch
-  `atrium/<fleet>/<name>`, directory `../.atrium-worktrees/<fleet>/<name>` (or
-  the session's configured `worktree_base`).
+- atrium looks up (or creates) a git worktree named `<name>` under a fixed
+  **`adhoc`** slot — branch `atrium/adhoc/<name>`, directory
+  `<worktree_base>/adhoc/<name>`. The name is slugged the same way fleet names
+  are (anything outside `[A-Za-z0-9._-]` → `-`), so `feat/login` becomes
+  `atrium/adhoc/feat-login`.
 - The spawned pane's working directory is set to that worktree, so its
   `dev.py check` and `git commit` run isolated from every other tree.
 - The **worktree behavioral norms** — "you are in worktree `<name>` on branch
@@ -212,13 +213,13 @@ What happens:
   exactly as fleet members get them. No fleet file required.
 
 If the worktree `<name>` already exists (an earlier teammate in the session
-created it), the spawn **reuses it** — the same group-share semantics as the
-fleet `"worktree"` config key. Two teammates with `--worktree squad` co-develop
-one tree and one branch.
+created it), the spawn **reuses it**. Two teammates with `--worktree squad`
+co-develop one tree and one branch — the same group-share semantics as the
+fleet `"worktree"` config key.
 
-The worktree can be reclaimed after the session with
-`atrium fleet clean <fleet>`, which applies the same clean-and-merged safety test
-it applies to fleet-created worktrees.
+The worktree can be reclaimed after the session with `atrium fleet clean`, which
+applies the same clean-and-merged safety test it applies to fleet-created
+worktrees.
 
 ## Respawning a pane into a worktree — `ctl respawn`
 
