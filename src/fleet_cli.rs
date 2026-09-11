@@ -52,23 +52,6 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
     }
 }
 
-/// Norms template injected into every worktree member via `--append-system-prompt`.
-/// `{name}` and `{branch}` are substituted at spawn time with the values from the
-/// agent's `WorktreePlan`. Mirrors how `main.rs` appends `AGENT_CTL_DIRECTIVE` for
-/// all panes, but is scoped to worktree members and lives entirely in this file.
-const WORKTREE_AGENT_NORMS: &str = "\
-You are in git worktree {name} on branch {branch}; \
-your current directory already IS the worktree, do not cd, \
-run no git worktree commands, commit on your current branch, \
-and announce results tersely on the bus.";
-
-/// Render [`WORKTREE_AGENT_NORMS`] for a specific worktree.
-fn worktree_norms(name: &str, branch: &str) -> String {
-    WORKTREE_AGENT_NORMS
-        .replace("{name}", name)
-        .replace("{branch}", branch)
-}
-
 /// Is `rest` — the tokens left after atrium's own leading launch flags are
 /// stripped — the top-level `up <name>` fleet alias?
 ///
@@ -992,7 +975,7 @@ pub(crate) fn spawn_fleet_window(
             // they are folded into a SINGLE --append-system-prompt block with the
             // ctl directive (last-wins on the installed claude — two separate flags
             // silently drop the first).
-            pane_norms = Some(worktree_norms(&wt.name, &wt.branch));
+            pane_norms = Some(atrium::worktree::worktree_norms(&wt.name, &wt.branch));
         }
         // Per-agent context vars: derive the shared ctx_dir endpoint and the
         // agent's role name, then let context_env map (provider, share) →
@@ -1044,9 +1027,7 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias, worktree_norms,
-    };
+    use super::{ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias};
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -1169,7 +1150,7 @@ mod tests {
             .find(|w| w.agents.iter().any(|a| a == "alice"))
         {
             cmd.push("--append-system-prompt".to_string());
-            cmd.push(worktree_norms(&w.name, &w.branch));
+            cmd.push(atrium::worktree::worktree_norms(&w.name, &w.branch));
         }
         let idx = cmd
             .iter()
@@ -1198,7 +1179,7 @@ mod tests {
             .find(|w| w.agents.iter().any(|a| a == "bob"))
         {
             cmd.push("--append-system-prompt".to_string());
-            cmd.push(worktree_norms(&w.name, &w.branch));
+            cmd.push(atrium::worktree::worktree_norms(&w.name, &w.branch));
         }
         assert!(
             !cmd.contains(&"--append-system-prompt".to_string()),
