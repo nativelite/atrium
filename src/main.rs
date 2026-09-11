@@ -3242,14 +3242,7 @@ fn worktree_spawn_params(wt_name: Option<&str>) -> (Option<String>, Option<Strin
     let _ = atrium::worktree::ensure(&cwd, &plan);
     let _ = atrium::worktree::junction_sibling_deps(&cwd, &plan);
     let dir = plan.dir.to_string_lossy().into_owned();
-    let norms = format!(
-        "You are in git worktree {name} on branch {branch}; \
-         your current directory already IS the worktree, do not cd, \
-         run no git worktree commands, commit on your current branch, \
-         and announce results tersely on the bus.",
-        name = plan.name,
-        branch = plan.branch,
-    );
+    let norms = atrium::worktree::worktree_norms(&plan.name, &plan.branch);
     (Some(dir), Some(norms))
 }
 
