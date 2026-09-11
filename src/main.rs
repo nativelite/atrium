@@ -2830,7 +2830,11 @@ fn dispatch_ctl(
             // Build the new working directory. When worktree is named, create it
             // (idempotent) and use its dir; otherwise the new process inherits
             // atrium's own cwd, same as a plain spawn.
-            let (new_cwd, norms) = worktree_spawn_params(rr.worktree.as_deref());
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (new_cwd, norms) = match worktree_spawn_params(&cwd, rr.worktree.as_deref()) {
+                Ok(pair) => pair,
+                Err(e) => return ctl::reply_err(&format!("spawn failed: {e}")),
+            };
             let mut flash = None;
             let new_pane = match spawn_pane_full(
                 &cmd,
@@ -3231,19 +3235,28 @@ fn scope_denied(
 /// Resolve an optional ad-hoc worktree name into `(cwd, norms)` for a ctl spawn.
 ///
 /// When `wt_name` is `Some`, creates the worktree (idempotent) and returns its
-/// directory as cwd plus the behavioral norms text. `None` → both `None`, which
-/// leaves the spawned pane in atrium's own cwd with no extra norms.
-fn worktree_spawn_params(wt_name: Option<&str>) -> (Option<String>, Option<String>) {
+/// directory as cwd plus the behavioral norms text. `None` → `Ok((None, None))`,
+/// which leaves the spawned pane in atrium's own cwd with no extra norms.
+/// Returns `Err` (with a human-readable message) when the worktree cannot be
+/// created — the caller must surface this as a ctl error rather than spawning
+/// a child into a directory that does not exist.
+///
+/// `junction_sibling_deps` is best-effort: failures are silently ignored so a
+/// missing junction never prevents the worktree from being usable.
+fn worktree_spawn_params(
+    cwd: &std::path::Path,
+    wt_name: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
     let Some(name) = wt_name else {
-        return (None, None);
+        return Ok((None, None));
     };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let plan = atrium::worktree::plan_for(&cwd, name);
-    let _ = atrium::worktree::ensure(&cwd, &plan);
-    let _ = atrium::worktree::junction_sibling_deps(&cwd, &plan);
+    let plan = atrium::worktree::plan_for(cwd, name);
+    atrium::worktree::ensure(cwd, &plan)
+        .map_err(|e| format!("could not create worktree '{name}': {e}"))?;
+    let _ = atrium::worktree::junction_sibling_deps(cwd, &plan);
     let dir = plan.dir.to_string_lossy().into_owned();
     let norms = atrium::worktree::worktree_norms(&plan.name, &plan.branch);
-    (Some(dir), Some(norms))
+    Ok((Some(dir), Some(norms)))
 }
 
 /// `ctl spawn` (default): a visible worker in a brand-new window.
@@ -3259,7 +3272,11 @@ fn spawn_worker_window(
     note: Option<&str>,
     job: &atrium::reap::SessionJob,
 ) -> String {
-    let (wt_cwd, wt_norms) = worktree_spawn_params(sp.worktree.as_deref());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+        Ok(pair) => pair,
+        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    };
     let mut flash = None;
     match spawn_window(
         &sp.argv,
@@ -3329,7 +3346,11 @@ fn spawn_worker_here(
         (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
         (cols / 2).saturating_sub(2),
     );
-    let (wt_cwd, wt_norms) = worktree_spawn_params(sp.worktree.as_deref());
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+        Ok(pair) => pair,
+        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    };
     let mut flash = None;
     match spawn_pane_full(
         &sp.argv,
@@ -4064,7 +4085,9 @@ fn effective_command(command: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{combine_system_prompt, pane_base_env, privilege_for, routed_wake};
+    use super::{
+        combine_system_prompt, pane_base_env, privilege_for, routed_wake, worktree_spawn_params,
+    };
 
     // -- combine_system_prompt pure seam ------------------------------------
 
@@ -4592,5 +4615,55 @@ mod tests {
         // Esc cancels
         let mut c = String::from("pwsh");
         assert!(matches!(edit_prompt(&mut c, &[0x1b]), PromptEdit::Cancel));
+    }
+
+    // -- worktree_spawn_params error-path -------------------------------------
+
+    /// A non-git directory must produce a clear `Err` rather than silently
+    /// returning a path that was never created (the original bug).
+    #[test]
+    fn worktree_spawn_params_non_git_dir_returns_err() {
+        let tmp = std::env::temp_dir().join("atrium_test_non_git");
+        std::fs::create_dir_all(&tmp).ok();
+        let result = worktree_spawn_params(&tmp, Some("my-wt"));
+        assert!(
+            result.is_err(),
+            "expected Err for non-git dir, got Ok: {result:?}"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("could not create worktree"),
+            "message should identify the failure: {msg}"
+        );
+    }
+
+    /// A real git repo must produce `Ok` with a `Some` dir that actually exists.
+    #[test]
+    fn worktree_spawn_params_git_repo_yields_ok_and_creates_dir() {
+        let tmp = std::env::temp_dir().join("atrium_test_git_repo");
+        // Clean slate so the test is idempotent.
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Initialise a minimal git repo with one commit so `worktree add` has HEAD.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&tmp)
+                .output()
+        };
+        git(&["init"]).unwrap();
+        git(&["commit", "--allow-empty", "-m", "init"]).unwrap();
+        let result = worktree_spawn_params(&tmp, Some("test-wt"));
+        assert!(result.is_ok(), "expected Ok for valid git repo: {result:?}");
+        let (dir, norms) = result.unwrap();
+        let dir = dir.expect("dir must be Some");
+        let norms = norms.expect("norms must be Some");
+        assert!(
+            std::path::Path::new(&dir).exists(),
+            "worktree directory must have been created: {dir}"
+        );
+        assert!(!norms.is_empty(), "norms must not be empty");
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
