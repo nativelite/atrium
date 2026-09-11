@@ -187,6 +187,73 @@ non-coding** never touches worktrees or git — it keeps using the board and bus
 general coordination primitives. "Coding mode" is a layer you switch on, not a
 change to what atrium fundamentally is.
 
+## Ad-hoc worktrees — `ctl spawn --worktree`
+
+A `fleet.json` entry is the right home for a standing team. But a quick ad-hoc
+teammate does not need a fleet definition. Pass `--worktree <name>` directly to a
+live `ctl spawn` and atrium handles the rest:
+
+```
+atrium ctl spawn --role scout --worktree probe -- claude
+atrium ctl send scout "explore the auth module and report findings"
+```
+
+What happens:
+
+- atrium looks up (or creates) a git worktree named `<name>` under a fixed
+  **`adhoc`** slot — branch `atrium/adhoc/<name>`, directory
+  `<worktree_base>/adhoc/<name>`. The name is slugged the same way fleet names
+  are (anything outside `[A-Za-z0-9._-]` → `-`), so `feat/login` becomes
+  `atrium/adhoc/feat-login`.
+- The spawned pane's working directory is set to that worktree, so its
+  `dev.py check` and `git commit` run isolated from every other tree.
+- The **worktree behavioral norms** — "you are in worktree `<name>` on branch
+  `<branch>`, do not cd, do not create new branches, commit on your current
+  branch, announce tersely on the bus" — are injected as a system-prompt append,
+  exactly as fleet members get them. No fleet file required.
+
+If the worktree `<name>` already exists (an earlier teammate in the session
+created it), the spawn **reuses it**. Two teammates with `--worktree squad`
+co-develop one tree and one branch — the same group-share semantics as the
+fleet `"worktree"` config key.
+
+The worktree can be reclaimed after the session with `atrium fleet clean`, which
+applies the same clean-and-merged safety test it applies to fleet-created
+worktrees.
+
+## Respawning a pane into a worktree — `ctl respawn`
+
+Once a pane's child process is running you cannot `chdir` it from outside: the
+process owns its working directory and there is no cross-process chdir primitive
+on any supported platform. The only way to move a live pane into a different
+directory is **respawn-in-place**: kill the child, then relaunch it with the new
+cwd.
+
+```
+atrium ctl respawn scout --worktree probe
+```
+
+What `respawn` does:
+
+1. Sends the pane's current child a graceful stop and waits for it to exit.
+2. Creates the named worktree if it does not yet exist (same naming rules as
+   `spawn --worktree`).
+3. Relaunches the same command — same argv, role, and identity — with its working
+   directory set to the worktree.
+4. Re-injects the worktree behavioral norms into the fresh session.
+
+The pane id and role are preserved. Teammates that target `scout` by role keep
+reaching it after the respawn. Board state is yours to carry forward or reset —
+a new session does not automatically inherit the previous session's conversation
+context.
+
+**When to use each:**
+
+| Goal | Command |
+| --- | --- |
+| New teammate, isolated tree from the start | `ctl spawn --worktree <name> -- <cmd>` |
+| Move an existing pane into a worktree mid-session | `ctl respawn <pane> --worktree <name>` |
+
 ## Implementation plan
 
 Single-owner-per-file, pure seam + regression test per change, as usual.
