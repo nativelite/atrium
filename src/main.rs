@@ -895,6 +895,8 @@ fn run(
                 trust_mode(),
                 &mut flash,
                 None,
+                None,
+                None,
             ),
         },
     };
@@ -1151,6 +1153,8 @@ fn run(
                             trust_mode(),
                             &mut flash,
                             Some(&session_job),
+                            None,
+                            None,
                         ) {
                             Ok(w) => {
                                 windows.push(w);
@@ -1486,6 +1490,8 @@ fn run(
                         trust_mode(),
                         &mut flash,
                         Some(&session_job),
+                        None,
+                        None,
                     ) {
                         Ok(w) => {
                             windows.push(w);
@@ -1517,6 +1523,8 @@ fn run(
                         atrium::ctl::TrustMode::Off,
                         &mut flash,
                         Some(&session_job),
+                        None,
+                        None,
                     ) {
                         Ok(w) => {
                             windows.push(w);
@@ -2803,6 +2811,67 @@ fn dispatch_ctl(
             killed.sort_unstable();
             ctl::reply_killed(&killed)
         }
+        Cmd::Respawn(rr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&rr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            // Capture the info we need before mutating the pane.
+            let (pane_slot_id, cmd, identity_name) = {
+                let Some(p) = pane_by_agent(windows, id) else {
+                    return ctl::reply_err("respawn: target pane not found");
+                };
+                (p.id, vec![p.title.clone()], p.identity.clone())
+            };
+            // Build the new working directory. When worktree is named, create it
+            // (idempotent) and use its dir; otherwise the new process inherits
+            // atrium's own cwd, same as a plain spawn.
+            let (new_cwd, norms) = worktree_spawn_params(rr.worktree.as_deref());
+            let mut flash = None;
+            let new_pane = match spawn_pane_full(
+                &cmd,
+                rows,
+                cols,
+                pane_slot_id,
+                identity_name.as_deref(),
+                new_cwd.as_deref(),
+                trust_mode(),
+                &mut flash,
+                &[],
+                norms.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => return ctl::reply_err(&format!("respawn failed: {e}")),
+            };
+            job.assign(new_pane.pty.pid());
+            // In-place replacement: kill the old child then swap in the new pty,
+            // term, and session fields. Role/parent/depth/can_spawn are preserved.
+            let p = pane_by_agent_mut(windows, id).unwrap();
+            let _ = p.pty.kill();
+            p.pty = new_pane.pty;
+            p.term = new_pane.term;
+            p.filter = new_pane.filter;
+            p.exited = false;
+            p.session_id = new_pane.session_id.clone();
+            p.launch_ms = new_pane.launch_ms;
+            p.cwd = new_pane.cwd;
+            p.agent_id = new_pane.agent_id;
+            p.token = new_pane.token;
+            p.activity = false;
+            p.painted = false;
+            let new_id = p.agent_id;
+            let role = p.role.clone();
+            ctl::reply_spawned(
+                new_id,
+                role.as_deref(),
+                new_pane.session_id.as_deref(),
+                None,
+            )
+        }
         // `audit` is handled in `apply_ctl` (it needs the log); never reaches here.
         Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
         Cmd::Board(op) => {
@@ -3028,6 +3097,14 @@ fn audit_label(req: &atrium::ctl::Request) -> (&'static str, String) {
                 atrium::ctl::BusOp::Topics => "topics".to_string(),
             },
         ),
+        Cmd::Respawn(rr) => (
+            "respawn",
+            format!(
+                "target={} worktree={}",
+                rr.target,
+                rr.worktree.as_deref().unwrap_or("-")
+            ),
+        ),
     }
 }
 
@@ -3151,6 +3228,24 @@ fn scope_denied(
     }
 }
 
+/// Resolve an optional ad-hoc worktree name into `(cwd, norms)` for a ctl spawn.
+///
+/// When `wt_name` is `Some`, creates the worktree (idempotent) and returns its
+/// directory as cwd plus the behavioral norms text. `None` → both `None`, which
+/// leaves the spawned pane in atrium's own cwd with no extra norms.
+fn worktree_spawn_params(wt_name: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(name) = wt_name else {
+        return (None, None);
+    };
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let plan = atrium::worktree::plan_for(&cwd, name);
+    let _ = atrium::worktree::ensure(&cwd, &plan);
+    let _ = atrium::worktree::junction_sibling_deps(&cwd, &plan);
+    let dir = plan.dir.to_string_lossy().into_owned();
+    let norms = atrium::worktree::worktree_norms(&plan.name, &plan.branch);
+    (Some(dir), Some(norms))
+}
+
 /// `ctl spawn` (default): a visible worker in a brand-new window.
 #[allow(clippy::too_many_arguments)]
 fn spawn_worker_window(
@@ -3164,6 +3259,7 @@ fn spawn_worker_window(
     note: Option<&str>,
     job: &atrium::reap::SessionJob,
 ) -> String {
+    let (wt_cwd, wt_norms) = worktree_spawn_params(sp.worktree.as_deref());
     let mut flash = None;
     match spawn_window(
         &sp.argv,
@@ -3174,6 +3270,8 @@ fn spawn_worker_window(
         mode,
         &mut flash,
         Some(job),
+        wt_cwd.as_deref(),
+        wt_norms.as_deref(),
     ) {
         Ok(mut w) => {
             let pane = &mut w.panes[0];
@@ -3231,15 +3329,19 @@ fn spawn_worker_here(
         (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
         (cols / 2).saturating_sub(2),
     );
+    let (wt_cwd, wt_norms) = worktree_spawn_params(sp.worktree.as_deref());
     let mut flash = None;
-    match spawn_pane(
+    match spawn_pane_full(
         &sp.argv,
         pr.max(1),
         pc.max(1),
         new_id,
         sp.identity.as_deref(),
+        wt_cwd.as_deref(),
         mode,
         &mut flash,
+        &[],
+        wt_norms.as_deref(),
     ) {
         Ok(mut pane) => {
             pane.role = sp.role.clone();
@@ -3360,15 +3462,20 @@ fn spawn_window(
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
     job: Option<&atrium::reap::SessionJob>,
+    cwd: Option<&str>,
+    extra_norms: Option<&str>,
 ) -> std::io::Result<Window> {
-    let pane = spawn_pane(
+    let pane = spawn_pane_full(
         command,
         rows.saturating_sub(1).max(1),
         cols,
         0,
         identity,
+        cwd,
         mode,
         flash,
+        &[],
+        extra_norms,
     )?;
     // Enroll a RUNTIME-spawned pane in the session Job synchronously, before it is
     // returned, so a pane spawned mid-loop is torn down with atrium even if atrium
@@ -3457,9 +3564,6 @@ fn spawn_pane(
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
-    // The single-pane / split / grid path: no per-pane working directory (the
-    // child inherits atrium's cwd, today's behavior). The fleet loader is the only
-    // caller that supplies a `cwd`; everyone else routes through here with `None`.
     spawn_pane_full(
         command,
         rows,

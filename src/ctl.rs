@@ -77,6 +77,9 @@ pub enum Cmd {
     Board(BoardOp),
     /// Publish to / pull from the shared pub/sub bus — the team's event stream.
     Bus(BusOp),
+    /// Kill a target pane's child process and relaunch it in a new working
+    /// directory — optionally an ad-hoc worktree created on demand.
+    Respawn(RespawnReq),
 }
 
 /// A `kill` request's payload.
@@ -84,6 +87,16 @@ pub enum Cmd {
 pub struct KillReq {
     /// Pane id (numeric) or role label at the root of the subtree to tear down.
     pub target: String,
+}
+
+/// A `respawn` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RespawnReq {
+    /// Pane id (numeric) or role label to restart in-place.
+    pub target: String,
+    /// Name of an ad-hoc worktree to create (via `worktree::plan_for` +
+    /// `worktree::ensure`) and use as the relaunched pane's cwd.
+    pub worktree: Option<String>,
 }
 
 /// An `audit` request's payload.
@@ -185,6 +198,10 @@ pub struct SpawnReq {
     /// worker, caps it at the session policy — a worker may match or de-escalate
     /// but never elevate ([`TrustMode::rank`]).
     pub mode: Option<TrustMode>,
+    /// Name of an ad-hoc worktree to create and use as the pane's cwd
+    /// (`--worktree <name>`). When set, atrium calls `worktree::plan_for` +
+    /// `worktree::ensure` before spawning and passes `plan.dir` as cwd.
+    pub worktree: Option<String>,
 }
 
 /// Why a spawn was refused. Each maps to a clear reply the caller can act on.
@@ -816,6 +833,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 new_window,
                 identity,
                 mode,
+                worktree: v
+                    .get("worktree")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
             })
         }
         Some("list") => Cmd::List,
@@ -843,6 +864,18 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .ok_or_else(|| "kill needs a target".to_string())?
                 .to_string();
             Cmd::Kill(KillReq { target })
+        }
+        Some("respawn") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "respawn needs a target".to_string())?
+                .to_string();
+            let worktree = v
+                .get("worktree")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Cmd::Respawn(RespawnReq { target, worktree })
         }
         Some("audit") => {
             let tail = v
@@ -1721,10 +1754,19 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             let mut identity: Option<String> = None;
             let mut new_window = true;
             let mut mode: Option<TrustMode> = None;
+            let mut worktree: Option<String> = None;
             let mut argv: Vec<String> = Vec::new();
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
+                    "--worktree" => {
+                        let name = args
+                            .get(i + 1)
+                            .cloned()
+                            .ok_or_else(|| "--worktree needs a name".to_string())?;
+                        worktree = Some(name);
+                        i += 2;
+                    }
                     "--mode" => {
                         let k = args.get(i + 1).ok_or_else(|| {
                             "--mode needs a value (plan, accept, or automode)".to_string()
@@ -1776,6 +1818,9 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
             }
             if let Some(m) = mode {
                 pairs.push(("mode", Value::String(m.policy_label().to_string())));
+            }
+            if let Some(w) = worktree {
+                pairs.push(("worktree", Value::String(w)));
             }
             pairs.push(("window", Value::Bool(new_window)));
             pairs.push((
@@ -2004,10 +2049,25 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
                 }
             }
         }
+        Some("respawn") => {
+            pairs.push(("cmd", s("respawn")));
+            let target = args
+                .get(1)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "respawn needs a target (pane id or role)".to_string())?;
+            pairs.push(("target", Value::String(target.clone())));
+            if let Some(pos) = args.iter().position(|a| a == "--worktree") {
+                let name = args
+                    .get(pos + 1)
+                    .ok_or_else(|| "--worktree needs a name".to_string())?
+                    .clone();
+                pairs.push(("worktree", Value::String(name)));
+            }
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
-                "needs a subcommand: spawn | list | send | status | kill | audit | board | bus"
+                "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | respawn"
                     .to_string(),
             )
         }
