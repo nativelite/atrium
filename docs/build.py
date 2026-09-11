@@ -24,6 +24,7 @@ PAGES = [
     ("control-plane", "control plane"),
     ("trust-and-security", "trust & security"),
     ("worktrees", "worktrees"),
+    ("dev-fleet", "dev fleet"),
     ("reaping", "reaping"),
 ]
 SLUGS = {slug for slug, _ in PAGES}
