@@ -30,7 +30,8 @@ the next fleet with the new binary.
 
 ## The fleet config
 
-A dev-fleet for atrium looks like this:
+A dev-fleet for atrium assigns each worker an explicit worktree group so the
+config is self-documenting about who works where:
 
 ```jsonc
 {
@@ -38,29 +39,30 @@ A dev-fleet for atrium looks like this:
     "atrium-dev": {
       "allow_ctl": true,
       "trust": "automode",
-      "worktrees": true,
-      "worktree_seed": [".env"],
+      "worktree_base": "../.atrium-worktrees",
       "agents": [
-        { "name": "lead",       "cmd": ["claude"],  "can_spawn": true },
-        { "name": "trust",      "cmd": ["claude"] },
-        { "name": "norms",      "cmd": ["claude"] },
-        { "name": "seed",       "cmd": ["claude"] },
-        { "name": "scaffold",   "cmd": ["claude"] },
-        { "name": "docs",       "cmd": ["claude"] },
-        { "name": "reviewer",   "cmd": ["claude"] },
-        { "name": "integrator", "cmd": ["claude"] }
+        { "name": "lead",       "cmd": ["claude"], "can_spawn": true },
+        { "name": "trust",      "cmd": ["claude"], "worktree": "trust" },
+        { "name": "norms",      "cmd": ["claude"], "worktree": "norms" },
+        { "name": "seed",       "cmd": ["claude"], "worktree": "seed" },
+        { "name": "scaffold",   "cmd": ["claude"], "worktree": "scaffold" },
+        { "name": "docs",       "cmd": ["claude"], "worktree": "docs" },
+        { "name": "reviewer",   "cmd": ["claude"], "worktree": "reviewer" },
+        { "name": "integrator", "cmd": ["claude"], "worktree": "integrator" }
       ]
     }
   }
 }
 ```
 
-`"worktrees": true` is the full fan-out shorthand: every agent gets its own
-branch and directory, named after itself. The lead and integrator can stay in
-the main tree by giving them an explicit `"worktree": ""` — or they can have
-their own trees too and commit only to coordinate; that is a team call. The
-key principle is **one concern per worktree** so one agent's WIP can never fail
-another agent's `dev.py check` gate.
+Each `"worktree"` value is a group name. Distinct values give each agent its own
+branch and directory (`atrium/atrium-dev/<name>`). The lead has no `worktree`
+key and stays in the main tree — it coordinates rather than edits. The
+`"worktrees": true` fleet-level shorthand produces the same fan-out with less
+typing; explicit per-agent keys are preferred here because they make squad
+grouping and lead exemption visible at a glance. The key principle either way
+is **one concern per worktree** so one agent's WIP can never fail another
+agent's `dev.py check` gate.
 
 ## Per-agent isolation in a Rust repo
 
@@ -97,30 +99,36 @@ up as untracked files inside the repo itself.
 ## The sibling relative-path-dep pitfall
 
 When a Cargo project references a sibling repo via a relative path — for example
-a dev-dependency declared as `path = "../atrium-skill-kit"` — that path is
-**resolved from the worktree's directory**, not from the main repo root. A
-worktree at `../.atrium-worktrees/atrium-dev/seed/` would look for
-`../atrium-skill-kit` one level up from itself, landing at
-`../.atrium-worktrees/atrium-dev/atrium-skill-kit/`, which does not exist.
-`cargo build` in that worktree fails immediately with a `No such file or
-directory` error.
+atrium's `Cargo.toml` has `path = "../abus"` — that path is **resolved from the
+worktree's directory**, not from the main repo root. A worktree at
+`../.atrium-worktrees/atrium-dev/seed/` looks for `../abus` one level up from
+itself, landing at `../.atrium-worktrees/atrium-dev/abus/`, which does not
+exist. `cargo build` fails immediately:
 
-**The fix: `worktree_seed` with a junction.** Add the sibling to the seed list:
-
-```jsonc
-"worktree_seed": ["../atrium-skill-kit"]
+```
+error: failed to get `nativelite-abus` as a dependency of package `atrium`
+  unable to update ../.atrium-worktrees/atrium-dev/abus
+  failed to read Cargo.toml: No such file or directory (os error 3)
 ```
 
-The seed function resolves the source relative to the main repo root (`cwd`):
-`cwd.join("../atrium-skill-kit")` → the real sibling. The destination resolves
-relative to the worktree directory (`dir`): `dir.join("../atrium-skill-kit")`
-→ the slot beside the worktree where `cargo` expects it. On Windows this link is
-created as an **NTFS junction** (no admin rights needed), on Unix as a
-**symlink**. A hardlink falls back to a copy only when both junction and symlink
-fail. The result: every worktree can `cargo build` immediately, and edits to the
-linked sibling propagate to all trees that share it.
+**The fix: auto junction beside the fleet directory.** When the `seed` worker's
+patch lands, `atrium fleet up` will detect the Cargo path dependencies and
+automatically create a junction (Windows) or symlink (Unix) for each one at the
+fleet-directory level — beside all the worktrees, where every `../dep` relative
+path resolves correctly. No config key is needed: the mechanism is driven by
+reading the `Cargo.toml` in the repo, not by listing deps manually.
 
-Build caches are explicitly **not** seeded — they can be shared via the
+Until that patch is integrated, the same effect can be achieved manually:
+
+```
+# Windows — run once after 'atrium fleet up', before starting work
+cd ../.atrium-worktrees/atrium-dev
+mklink /J abus D:\projects\nativelite\repos\abus
+mklink /J pty-rs D:\projects\nativelite\repos\pty-rs
+# … one per sibling dep
+```
+
+Build caches are **not** junctioned — they can be shared via the
 `CARGO_TARGET_DIR` env var set on agents that want it, or left isolated so each
 tree builds independently. Both are valid and neither is a default.
 
@@ -210,7 +218,7 @@ just uses what is already there.
 ## The development loop end-to-end
 
 ```
-1.  atrium fleet atrium-dev     # launches fleet; creates worktrees off HEAD
+1.  atrium fleet up atrium-dev  # launches fleet; creates worktrees off HEAD
 2.  [each agent] claim your file on the board
 3.  [each agent] write failing test → make it pass → cargo fmt
 4.  [each agent] python dev.py check  (green → commit on your branch)
@@ -226,11 +234,12 @@ every commit is what protects `main`, and every package ships a `dev.py` so the
 check runs in seconds. The check order is:
 
 ```
-cargo fmt --check  →  cargo clippy  →  cargo test
+python tools/dep_guard.py  →  cargo fmt --check  →  cargo test
 ```
 
-Formatting runs first because it is the fastest filter and the most common
-cause of gate contamination in a multi-agent tree. Fix it before running tests.
+The dependency guard is cheapest and runs first; formatting next (fast, fails
+fast on style drift); tests last. There is no clippy step — dev.py does not
+invoke it. Fix formatting before running tests.
 
 ## When the fleet is the product
 
