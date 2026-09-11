@@ -65,6 +65,8 @@ const DEFAULT_ALLOW: &[&str] = &[
     "cargo check",
     "cargo clippy",
     "cargo fmt",
+    "cargo run",
+    "cargo clean",
     "go test",
     "go build",
     "go vet",
@@ -76,7 +78,7 @@ const DEFAULT_ALLOW: &[&str] = &[
     // the local, non-destructive subcommands: inspect (status/log/diff/branch/
     // show), stage/commit, merge, and manage worktrees. Deliberately NOT `git`
     // wholesale — that would sweep in `push` (network), `reset --hard` and `clean`
-    // (destructive), which stay a visible prompt exactly as `cargo run` does.
+    // (destructive), which stay a visible prompt.
     "git status",
     "git log",
     "git diff",
@@ -428,10 +430,43 @@ mod tests {
         assert!(args.iter().any(|a| a == "Bash(pytest *)"), "{args:?}");
         assert!(args.iter().any(|a| a == "Bash(cargo test *)"), "{args:?}");
         assert!(args.iter().any(|a| a == "Bash(just build *)"), "{args:?}");
+        // newly added cargo commands run hands-off in the build/clean/run loop
+        assert!(args.iter().any(|a| a == "Bash(cargo run *)"), "{args:?}");
+        assert!(args.iter().any(|a| a == "Bash(cargo clean *)"), "{args:?}");
         // and it does NOT open all of bash
         assert!(
             !args.iter().any(|a| a == "Bash" || a == "Bash(*)"),
             "{args:?}"
+        );
+    }
+
+    /// The `--allowedTools` CLI flag uses SPACE before `*`: `Bash(P *)`.
+    ///
+    /// Evidence: `claude --help` documents the form `Bash(git *)` with a space
+    /// (confirmed by the atrium-dev reviewer against the installed binary).
+    /// The colon form `Bash(P:*)` appears only in settings.json `permissions.allow`,
+    /// which is a separate surface. Pinned here so a future refactor doesn't
+    /// silently flip to colon and produce matchers that never match.
+    #[test]
+    fn allowedtools_cli_format_is_space_not_colon() {
+        let args = accept_edits_args(&["just build".to_string()]);
+        // Every Bash matcher must use the space form, never the colon form.
+        for arg in &args {
+            if arg.starts_with("Bash(") {
+                assert!(
+                    !arg.contains(':'),
+                    "matcher uses colon form (must be space form `Bash(P *)`): {arg}"
+                );
+                assert!(
+                    arg.ends_with(" *)"),
+                    "matcher does not end with ` *)` (space before wildcard): {arg}"
+                );
+            }
+        }
+        // Spot-check: a known prefix has the exact right shape.
+        assert!(
+            args.iter().any(|a| a == "Bash(cargo test *)"),
+            "expected 'Bash(cargo test *)': {args:?}"
         );
     }
 
