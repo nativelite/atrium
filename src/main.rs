@@ -3460,7 +3460,18 @@ fn spawn_pane(
     // The single-pane / split / grid path: no per-pane working directory (the
     // child inherits atrium's cwd, today's behavior). The fleet loader is the only
     // caller that supplies a `cwd`; everyone else routes through here with `None`.
-    spawn_pane_full(command, rows, cols, id, identity, None, mode, flash, &[])
+    spawn_pane_full(
+        command,
+        rows,
+        cols,
+        id,
+        identity,
+        None,
+        mode,
+        flash,
+        &[],
+        None,
+    )
 }
 
 /// The non-secret environment every pane is born with.
@@ -3517,6 +3528,7 @@ fn spawn_pane_full(
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
     extra_env: &[(String, String)],
+    extra_norms: Option<&str>,
 ) -> std::io::Result<Pane> {
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
@@ -3586,9 +3598,23 @@ fn spawn_pane_full(
     // `--append-system-prompt`), so reliable delegation no longer hinges on a
     // skill happening to surface. Appended after any trust flags so it terminates
     // the `--allowedTools` list cleanly rather than being read as one of its values.
-    if is_claude && CTL_ADDRESS.get().is_some() {
-        base.push("--append-system-prompt".to_string());
-        base.push(atrium::ctl::AGENT_CTL_DIRECTIVE.to_string());
+    // Combine any worktree-specific norms with the ctl directive into a SINGLE
+    // --append-system-prompt block. Claude is last-wins on this flag, so two
+    // separate pushes would silently drop the first. Both norms-only (no ctl)
+    // and ctl-only (no worktree) cases produce exactly one block each.
+    {
+        let has_ctl = is_claude && CTL_ADDRESS.get().is_some();
+        if has_ctl || (is_claude && extra_norms.is_some()) {
+            base.push("--append-system-prompt".to_string());
+            let block = match (extra_norms, has_ctl) {
+                (Some(n), true) => {
+                    format!("{n}\n\n{}", atrium::ctl::AGENT_CTL_DIRECTIVE)
+                }
+                (Some(n), false) => n.to_string(),
+                (None, _) => atrium::ctl::AGENT_CTL_DIRECTIVE.to_string(),
+            };
+            base.push(block);
+        }
     }
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
