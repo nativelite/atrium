@@ -52,6 +52,23 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// Norms template injected into every worktree member via `--append-system-prompt`.
+/// `{name}` and `{branch}` are substituted at spawn time with the values from the
+/// agent's `WorktreePlan`. Mirrors how `main.rs` appends `AGENT_CTL_DIRECTIVE` for
+/// all panes, but is scoped to worktree members and lives entirely in this file.
+const WORKTREE_AGENT_NORMS: &str = "\
+You are in git worktree {name} on branch {branch}; \
+your current directory already IS the worktree, do not cd, \
+run no git worktree commands, commit on your current branch, \
+and announce results tersely on the bus.";
+
+/// Render [`WORKTREE_AGENT_NORMS`] for a specific worktree.
+fn worktree_norms(name: &str, branch: &str) -> String {
+    WORKTREE_AGENT_NORMS
+        .replace("{name}", name)
+        .replace("{branch}", branch)
+}
+
 /// Is `rest` — the tokens left after atrium's own leading launch flags are
 /// stripped — the top-level `up <name>` fleet alias?
 ///
@@ -957,7 +974,7 @@ pub(crate) fn spawn_fleet_window(
             }
             None => trust_mode(),
         };
-        let (command, mut cwd, role) = fleet_launch(agent, disclosed);
+        let (mut command, mut cwd, role) = fleet_launch(agent, disclosed);
         // If this agent belongs to a worktree, it runs in that worktree's dir —
         // atrium's own managed checkout off HEAD, overriding any fleet-file cwd so
         // the pane's gate and index are isolated from its teammates'. When
@@ -967,6 +984,12 @@ pub(crate) fn spawn_fleet_window(
             .find(|w| w.agents.iter().any(|a| a == &agent.name))
         {
             cwd = Some(wt.dir.to_string_lossy().into_owned());
+            // Inject worktree-specific behavioral norms so the agent knows its
+            // identity, won't cd away from its root, and won't run git worktree
+            // commands. Appended after any existing --append-system-prompt flags
+            // from the fleet file (multiple flags are all honoured by claude).
+            command.push("--append-system-prompt".to_string());
+            command.push(worktree_norms(&wt.name, &wt.branch));
         }
         // Per-agent context vars: derive the shared ctx_dir endpoint and the
         // agent's role name, then let context_env map (provider, share) →
@@ -1017,7 +1040,9 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias};
+    use super::{
+        ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias, worktree_norms,
+    };
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -1116,5 +1141,64 @@ mod tests {
     fn no_ctl_never_warns() {
         // Without the control plane there are no teammates to spawn — silence.
         assert!(!ctl_without_spawner(false, 0));
+    }
+
+    // -- worktree norms injection --------------------------------------------
+
+    fn make_wt(name: &str, branch: &str, agents: &[&str]) -> atrium::worktree::WorktreePlan {
+        atrium::worktree::WorktreePlan {
+            name: name.to_string(),
+            branch: branch.to_string(),
+            dir: std::path::PathBuf::from("/tmp/wt"),
+            agents: agents.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn norms_block_appended_for_worktree_member() {
+        let wt = make_wt("norms-wt", "atrium/feat/norms", &["alice"]);
+        let worktrees = [wt];
+        let mut cmd = vec!["claude".to_string()];
+        // Mirror the spawn_fleet_window logic under test.
+        if let Some(w) = worktrees
+            .iter()
+            .find(|w| w.agents.iter().any(|a| a == "alice"))
+        {
+            cmd.push("--append-system-prompt".to_string());
+            cmd.push(worktree_norms(&w.name, &w.branch));
+        }
+        let idx = cmd
+            .iter()
+            .position(|s| s == "--append-system-prompt")
+            .expect("--append-system-prompt must be present for a worktree member");
+        let norms = &cmd[idx + 1];
+        assert!(
+            norms.contains("norms-wt"),
+            "norms must name the worktree: {norms}"
+        );
+        assert!(
+            norms.contains("atrium/feat/norms"),
+            "norms must name the branch: {norms}"
+        );
+    }
+
+    #[test]
+    fn norms_block_absent_for_main_tree_member() {
+        // An agent NOT listed in any WorktreePlan stays on the main tree and
+        // must NOT receive the worktree norms.
+        let wt = make_wt("norms-wt", "atrium/feat/norms", &["alice"]);
+        let worktrees = [wt];
+        let mut cmd = vec!["claude".to_string()];
+        if let Some(w) = worktrees
+            .iter()
+            .find(|w| w.agents.iter().any(|a| a == "bob"))
+        {
+            cmd.push("--append-system-prompt".to_string());
+            cmd.push(worktree_norms(&w.name, &w.branch));
+        }
+        assert!(
+            !cmd.contains(&"--append-system-prompt".to_string()),
+            "--append-system-prompt must be absent for a main-tree member"
+        );
     }
 }
