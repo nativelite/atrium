@@ -5,64 +5,16 @@
       "agents": [
         {
           "name": "claude",
-          "cmd": ["claude"],
+          "cmd": [
+            "claude"
+          ],
           "kickoff": "You are the baseline pane. Say hello, then wait. This pane should light up in the Ctrl+A o overview immediately, with no vendor tag."
         },
         {
           "name": "codex",
-          "cmd": ["codex"]
-        }
-      ]
-    },
-    "atrium-dev": {
-      "grid": "2x4",
-      "allow_ctl": true,
-      "worktree_base": "../.atrium-worktrees",
-      "agents": [
-        {
-          "name": "lead",
-          "cmd": ["claude", "--model", "opus"],
-          "kickoff": "You are the LEAD of the atrium-dev fleet developing atrium itself (repo root D:\\projects\\nativelite\\repos\\atrium). You run in the MAIN tree — NOT a worktree — so PLAN.md and RUN.md at the repo root are visible to you; read both now. Your job is delegation and orchestration, NOT editing code. There are five workers, each already placed in its own isolated git worktree owning exactly ONE file (single-owner-per-file is what keeps merges clean): trust->src/trust.rs, norms->src/fleet_cli.rs, seed->src/worktree.rs, scaffold->new .claude/settings.json + CLAUDE.md, docs->docs/. Subscribe with `atrium ctl bus sub atrium-dev`. Confirm each worker has claimed its file on the board (`atrium ctl board`), watch `atrium ctl bus feed`, and unblock anyone who reports a cross-file collision (if a worker says it must edit a file it does not own, that is the ONE thing to escalate — tell them to STOP and post the need; you re-partition). When all five report committed, tell the integrator the merge order: trust, seed, norms, scaffold, docs (all disjoint, expect clean merges). Do NOT run cargo install or restart atrium — the founder owns the reinstall step (the running exe is locked). Keep bus chatter terse."
-        },
-        {
-          "name": "trust",
-          "cmd": ["claude", "--model", "sonnet"],
-          "worktree": "trust",
-          "kickoff": "You own src/trust.rs in the atrium-dev fleet. atrium has ALREADY placed you in your own git worktree on branch atrium/atrium-dev/trust — your current directory IS the worktree, do NOT cd anywhere and do NOT run any git worktree commands; just work here and commit on your current branch. Claim your file: `atrium ctl board claim src/trust.rs`. You must NOT edit any file other than src/trust.rs; if you think you need to, STOP and post on the bus (`atrium ctl bus pub atrium-dev msg=...`) so the lead re-partitions. Two tasks, both entirely inside trust.rs: (1) Add `cargo clean` (and consider `cargo run`) to the DEFAULT_ALLOW list (around line 38) so those run hands-off like the other cargo commands — keep the deliberate exclusions (no git push/reset/clean). Extend the DEFAULT_ALLOW test to assert the new entries are present. (2) Verify the --allowedTools matcher FORMAT: accept_edits_args (around line 105-118) emits `Bash(P *)` with a SPACE, but Claude Code settings.json documents the colon form `Bash(P:*)`. Determine empirically which form the currently-installed Claude Code actually honors (a space-form matcher that silently still prompts is the smoking gun). If colon is correct, change the formatter at line ~118 to emit `Bash(P:*)` and update every affected test; if space is already honored, add a test that pins the chosen form and post your evidence on the bus. Gate: run `python dev.py check` in your worktree until GREEN — fmt runs FIRST and reflows, so run `cargo fmt` before each gate re-run (the R6 trap). Then `git add -A && git commit`. Announce: `atrium ctl bus pub atrium-dev msg=trust committed`, include which matcher form you concluded is correct."
-        },
-        {
-          "name": "norms",
-          "cmd": ["claude", "--model", "sonnet"],
-          "worktree": "norms",
-          "kickoff": "You own src/fleet_cli.rs in the atrium-dev fleet. atrium has ALREADY placed you in your own git worktree on branch atrium/atrium-dev/norms — your current directory IS the worktree, do NOT cd and do NOT run git worktree commands; work here and commit on your current branch. Claim it: `atrium ctl board claim src/fleet_cli.rs`. Edit ONLY src/fleet_cli.rs (you may READ worktree.rs, fleet.rs, ctl.rs, main.rs for reference but must not modify them — if you believe a change belongs in one of them, STOP and post on the bus so the lead decides). Task (backlog #1, worktree-norms system-prompt injection): when the fleet spawns a member pane that has a WorktreePlan (name + branch are in scope in spawn_fleet_window), append a SECOND `--append-system-prompt` block carrying behavior norms specific to worktree agents — e.g.: 'You are in git worktree <name> on branch <branch>; your current directory already IS the worktree, do not cd, run no git worktree commands, commit on your current branch, and announce results tersely on the bus.' This mirrors how main.rs:3590 appends AGENT_CTL_DIRECTIVE, but is scoped to worktree members and lives entirely in fleet_cli.rs (define the norms text as a private const in this file). This is BEHAVIOR/instructions only — it grants no permissions. Add a unit test asserting the norms block is appended for a member with a worktree and absent for a main-tree member. Gate: `python dev.py check` GREEN (cargo fmt before each re-run — R6 trap). Then `git add -A && git commit`. Announce: `atrium ctl bus pub atrium-dev msg=norms committed`."
-        },
-        {
-          "name": "seed",
-          "cmd": ["claude", "--model", "sonnet"],
-          "worktree": "seed",
-          "kickoff": "You own src/worktree.rs in the atrium-dev fleet. atrium has ALREADY placed you in your own git worktree on branch atrium/atrium-dev/seed — your current directory IS the worktree, do NOT cd and do NOT run git worktree commands; work here and commit on your current branch. Claim it: `atrium ctl board claim src/worktree.rs`. Edit ONLY src/worktree.rs. Task (the atrium-on-atrium build fix): a repo with RELATIVE sibling path dependencies (atrium's Cargo.toml pins abus=../abus, pty=../pty-rs, akey=../akey, rawterm=../rawterm-rs, ansi=../ansi-rs, vterm=../vterm-rs, agsess=../agsess, json=../json-rs) does NOT build inside a worktree, because from `<base>/<fleet>/<name>/` the `../abus` dep resolves to `<base>/<fleet>/abus`, which is missing. Fix it: after `ensure` creates a worktree, parse the repo-root Cargo.toml for `path = \"../<x>\"` style dependencies and, for each, create a junction (Windows: a directory junction; fall back to symlink/copy like the existing `seed` helper does) at `<base>/<fleet>/<x>` pointing to the real sibling crate, so `../<x>` resolves from every worktree in that fleet. Create each junction once per fleet base (idempotent — skip if it already exists and points at the right target). Add tests over a temp git repo with a fake sibling path-dep proving the junction is created and points to the real crate. Keep it pure-seam-friendly: a testable planning helper that lists (link_path -> target) pairs, plus the thin effectful creator. Gate: `python dev.py check` GREEN — NOTE your own worktree needs the manual junctions the founder created per RUN.md to build; that is expected, your feature automates it for future rounds (cargo fmt before each re-run — R6 trap). Then `git add -A && git commit`. Announce: `atrium ctl bus pub atrium-dev msg=seed committed`."
-        },
-        {
-          "name": "scaffold",
-          "cmd": ["claude", "--model", "sonnet"],
-          "worktree": "scaffold",
-          "kickoff": "You own the NEW files .claude/settings.json and CLAUDE.md at the atrium repo root in the atrium-dev fleet. atrium has ALREADY placed you in your own git worktree on branch atrium/atrium-dev/scaffold — your current directory IS the worktree, do NOT cd and do NOT run git worktree commands; work here and commit on your current branch. Claim them: `atrium ctl board claim .claude/settings.json` and `atrium ctl board claim CLAUDE.md`. Create ONLY these two files; do not touch any src/ file. Task (backlog #5, zero-flag hands-off scaffold): (1) .claude/settings.json with a `permissions.allow` array that mirrors atrium's vetted DEFAULT_ALLOW from src/trust.rs — read that list first and match it EXACTLY, including the deliberate exclusions (NO git push, reset, or clean). This file is committed off HEAD so every worktree checked out from it inherits the hands-off allowlist, model-independently. IMPORTANT: use whichever matcher form (space `Bash(cmd *)` vs colon `Bash(cmd:*)`) the `trust` worker concludes is correct — watch the bus for its finding before finalizing, or post a question. (2) CLAUDE.md capturing the behavior norms for agents working in this repo: worktree agents do not cd and commit on their current branch; the gate is `python dev.py check` (fmt runs first); the running exe is locked so changes go live only on reinstall+restart. CLAUDE.md is INSTRUCTIONS only, it grants no permissions. Gate: `python dev.py check` GREEN (these are non-code files but run it anyway to be safe; cargo fmt before re-run if needed). Then `git add -A && git commit`. Announce: `atrium ctl bus pub atrium-dev msg=scaffold committed`."
-        },
-        {
-          "name": "docs",
-          "cmd": ["claude", "--model", "sonnet"],
-          "worktree": "docs",
-          "kickoff": "You own the docs/ directory in the atrium-dev fleet. atrium has ALREADY placed you in your own git worktree on branch atrium/atrium-dev/docs — your current directory IS the worktree, do NOT cd and do NOT run git worktree commands; work here and commit on your current branch. Claim it: `atrium ctl board claim docs/`. Edit ONLY files under docs/. Task: document the atrium-on-atrium dev workflow that this very fleet embodies — extend docs/worktrees.md (or add a focused docs/dev-fleet.md and wire it into docs/build.py PAGES) covering: (a) how per-agent worktrees isolate a fleet developing a multi-crate repo, including the sibling relative-path-dep pitfall and the junction fix the `seed` worker is adding; (b) the worktree behavior norms the `norms` worker injects; (c) the committed .claude/settings.json + CLAUDE.md scaffold; (d) the bootstrap loop: develop-in-worktrees -> `python dev.py check` green -> merge -> `cargo install --path . --force` -> restart (the running exe is locked). Watch the bus for the other workers' concrete decisions and reflect them accurately. If docs/build.py regenerates HTML, run it. Gate: `python dev.py check` GREEN (cargo fmt before re-run if it touches anything — R6 trap). Then `git add -A && git commit`. Announce: `atrium ctl bus pub atrium-dev msg=docs committed`."
-        },
-        {
-          "name": "reviewer",
-          "cmd": ["claude", "--model", "opus"],
-          "kickoff": "You are the ADVERSARIAL REVIEWER for atrium-dev. You run in the MAIN tree (no worktree). Read PLAN.md at the repo root. Do NOT rubber-stamp and do NOT edit code — you critique, workers fix. Subscribe: `atrium ctl bus sub atrium-dev`. As each worker reports committed, inspect its branch (`git log`/`git diff atrium/atrium-dev/<name>`) and verify against REAL behavior, not self-consistency: (trust) cargo clean actually added to DEFAULT_ALLOW with push/reset/clean still excluded, and the matcher space-vs-colon conclusion is backed by evidence not a guess; (norms) the second --append-system-prompt block is scoped to worktree members only and is behavior-only (no permission grant), with a test proving present/absent; (seed) the junction fix genuinely makes `../<sibling>` resolve for all 8 path deps (abus, pty-rs, akey, rawterm-rs, ansi-rs, vterm-rs, agsess, json-rs) and is idempotent; (scaffold) .claude/settings.json matches trust.rs DEFAULT_ALLOW EXACTLY including exclusions and uses the correct matcher form; (docs) claims match what actually shipped. Verify isolation was real: `git worktree list` shows each worker in a separate path under ..\\.atrium-worktrees\\atrium-dev\\, and no worker touched a file it did not own (per-branch diff). Post concrete findings on the bus and BLOCK the integrator's final commit until every issue is fixed."
-        },
-        {
-          "name": "integrator",
-          "cmd": ["claude", "--model", "sonnet"],
-          "kickoff": "You are the INTEGRATOR for atrium-dev. You run in the MAIN tree at the repo root D:\\projects\\nativelite\\repos\\atrium (no worktree of your own). Read PLAN.md. Subscribe: `atrium ctl bus sub atrium-dev`; `atrium ctl bus feed` until all five workers (trust, seed, norms, scaffold, docs) report committed AND the reviewer has posted no unresolved blockers. Then merge their branches onto your current branch in this order (disjoint files, expect clean merges): `git merge atrium/atrium-dev/trust atrium/atrium-dev/seed atrium/atrium-dev/norms atrium/atrium-dev/scaffold atrium/atrium-dev/docs`. If any conflict appears, post it on the bus as a finding and resolve minimally. Run `python dev.py check` on the merged MAIN tree — it builds normally here (no junctions needed in the main tree) and must be GREEN (cargo fmt first if it reflows — R6 trap). Commit the merged result. Do NOT run `git worktree remove` (atrium's teardown reclaims clean+merged worktrees on fleet exit; `atrium fleet clean atrium-dev` reclaims any it kept) and do NOT run `cargo install` or restart atrium — the FOUNDER owns reinstall+restart (the running exe is locked). Announce done on the bus with the dev.py check summary."
+          "cmd": [
+            "codex"
+          ]
         }
       ]
     }
