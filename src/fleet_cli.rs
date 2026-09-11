@@ -410,6 +410,13 @@ pub(crate) fn fleet_up(
         }
     }
 
+    // Per-agent worktrees (#5): plan them now so they can be disclosed in the
+    // banner, but touch no git until after the operator acknowledges. Active only
+    // when the fleet asks for a worktree AND the cwd is a git repo — a non-repo
+    // fleet (research, ops) is warned and left on the main tree, never blocked.
+    let wt_plans = atrium::worktree::plan_worktrees(&fleet, name, &cwd);
+    let wt_active = !wt_plans.is_empty() && atrium::worktree::is_git_repo(&cwd);
+
     // The disclosure, then the posture, then the verdict, then the Enter.
     //
     // Order is load-bearing and was measured: a six-agent roster's banner is
@@ -463,6 +470,37 @@ pub(crate) fn fleet_up(
              — if this fleet coordinates by spawning, set \"can_spawn\": true on its lead"
         );
     }
+    // Per-agent worktrees: say which agents leave the main tree, where, and on
+    // what branch — isolation the operator is approving as much as the dirs above.
+    if !wt_plans.is_empty() {
+        if wt_active {
+            eprintln!(
+                "atrium fleet: per-agent worktrees — {} off HEAD; auto-removed on exit only if \
+                 clean + merged, else kept:",
+                wt_plans.len()
+            );
+            for p in &wt_plans {
+                let who = p
+                    .agents
+                    .iter()
+                    .map(|a| fsan(a))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "atrium fleet:   {} → {} (branch {}) [{who}]",
+                    fsan(&p.name),
+                    atrium::fleet::show_path(&p.dir),
+                    fsan(&p.branch)
+                );
+            }
+        } else {
+            eprintln!(
+                "atrium fleet: warning: this fleet asks for per-agent worktrees, but {} is not a \
+                 git repo — every agent shares the main tree",
+                cwd.display()
+            );
+        }
+    }
     // The last line before the block, so it cannot scroll: it NAMES the
     // destinations rather than counting them. A surviving summary line that
     // omits the payload is the one thing an operator is guaranteed to read and
@@ -487,6 +525,42 @@ pub(crate) fn fleet_up(
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
+
+    // Now that the operator has approved, materialize the worktrees off HEAD —
+    // BEFORE raw mode (so any git warning is readable on the normal screen) and
+    // BEFORE any pane spawns (so a failure here leaves nothing half-open). Prune
+    // first to clear records orphaned by a prior crashed run. The plan + base ref
+    // are kept for teardown after the run loop exits.
+    let mut wt_teardown: Option<(Vec<atrium::worktree::WorktreePlan>, String)> = None;
+    if wt_active {
+        let _ = atrium::worktree::prune(&cwd);
+        let base = match atrium::worktree::base_ref(&cwd) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("atrium fleet: cannot read the repo's HEAD for worktrees: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let seeds = fleet.worktree_seed.as_deref().unwrap_or(&[]);
+        for p in &wt_plans {
+            match atrium::worktree::ensure(&cwd, p) {
+                Ok(_) => {
+                    for w in atrium::worktree::seed(&cwd, &p.dir, seeds) {
+                        eprintln!("atrium fleet: worktree \"{}\": {w}", fsan(&p.name));
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "atrium fleet: could not create worktree \"{}\": {e}",
+                        fsan(&p.name)
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        wt_teardown = Some((wt_plans.clone(), base));
+    }
+
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.
     set_trust_mode(trust);
@@ -510,7 +584,21 @@ pub(crate) fn fleet_up(
     } else {
         None
     };
-    let window = match spawn_fleet_window(&fleet, &plan, grid, rows, cols, name, &cwd, &mut flash) {
+    // When worktrees are active, hand the plans to the spawn so each member
+    // pane's cwd is its worktree dir; an empty slice (inactive, or not a repo)
+    // means every pane keeps its fleet-file cwd — today's behavior, unchanged.
+    let wt_for_spawn: &[atrium::worktree::WorktreePlan] = if wt_active { &wt_plans } else { &[] };
+    let window = match spawn_fleet_window(
+        &fleet,
+        &plan,
+        grid,
+        rows,
+        cols,
+        name,
+        &cwd,
+        wt_for_spawn,
+        &mut flash,
+    ) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("atrium fleet: cannot start fleet \"{}\": {e}", fsan(name));
@@ -523,7 +611,7 @@ pub(crate) fn fleet_up(
     let scratch = vec![default_shell()];
     // ctl is opt-in for a fleet too (`atrium fleet up <name> --allow-ctl`), so the
     // roster can coordinate over the board/bus; without the flag it runs as before.
-    run(
+    let exit = run(
         &mut term,
         &scratch,
         fleet.identity.as_deref(),
@@ -536,7 +624,46 @@ pub(crate) fn fleet_up(
         // A fleet may declare a canonical topic vocabulary; when it does, the bus
         // runs strict. Absent ⇒ soft-gate.
         fleet.topics.clone(),
-    )
+    );
+
+    // Teardown, after the run loop has restored the normal screen. Each worktree
+    // is removed ONLY if clean and fully merged; anything with uncommitted or
+    // unmerged work is kept and its path + branch reported, so nothing is ever
+    // destroyed. A final prune clears records for the ones that were removed.
+    if let Some((plans, base)) = &wt_teardown {
+        report_worktree_teardown(&cwd, plans, base);
+        let _ = atrium::worktree::prune(&cwd);
+    }
+    exit
+}
+
+/// Tear down a fleet's worktrees, printing a line for each that is kept (with a
+/// reason) so the operator knows exactly what is left to merge or remove.
+fn report_worktree_teardown(
+    cwd: &std::path::Path,
+    plans: &[atrium::worktree::WorktreePlan],
+    base: &str,
+) {
+    use atrium::worktree::Teardown;
+    for p in plans {
+        match atrium::worktree::remove_if_safe(cwd, p, base) {
+            Ok(Teardown::Removed) | Ok(Teardown::Missing) => {}
+            Ok(Teardown::KeptDirty) => eprintln!(
+                "atrium fleet: kept worktree \"{}\" at {} (branch {}) — it has uncommitted changes",
+                fsan(&p.name),
+                atrium::fleet::show_path(&p.dir),
+                fsan(&p.branch)
+            ),
+            Ok(Teardown::KeptUnmerged) => eprintln!(
+                "atrium fleet: kept worktree \"{}\" at {} (branch {}) — it has unmerged commits; \
+                 merge or remove it deliberately",
+                fsan(&p.name),
+                atrium::fleet::show_path(&p.dir),
+                fsan(&p.branch)
+            ),
+            Err(e) => eprintln!("atrium fleet: worktree \"{}\" teardown: {e}", fsan(&p.name)),
+        }
+    }
 }
 
 /// The argv and working directory one fleet agent is actually spawned with.
@@ -646,6 +773,7 @@ pub(crate) fn spawn_fleet_window(
     cols: u16,
     fleet_name: &str,
     cwd: &std::path::Path,
+    worktrees: &[atrium::worktree::WorktreePlan],
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
     // Stable, writable directory shared by every pane in this fleet instance.
@@ -668,7 +796,17 @@ pub(crate) fn spawn_fleet_window(
         // roster is the definition of the run, so the capability belongs in it -
         // and the safe default is the one that surprises nobody.
         let can_spawn = agent.can_spawn.unwrap_or(false);
-        let (command, cwd, role) = fleet_launch(agent, disclosed);
+        let (command, mut cwd, role) = fleet_launch(agent, disclosed);
+        // If this agent belongs to a worktree, it runs in that worktree's dir —
+        // atrium's own managed checkout off HEAD, overriding any fleet-file cwd so
+        // the pane's gate and index are isolated from its teammates'. When
+        // `worktrees` is empty (the common case) this never fires.
+        if let Some(wt) = worktrees
+            .iter()
+            .find(|w| w.agents.iter().any(|a| a == &agent.name))
+        {
+            cwd = Some(wt.dir.to_string_lossy().into_owned());
+        }
         // Per-agent context vars: derive the shared ctx_dir endpoint and the
         // agent's role name, then let context_env map (provider, share) →
         // CONTEXT_MODE_DIR / CONTEXT_MODE_SESSION_SUFFIX. Provider::None / absent context block → empty vec.
