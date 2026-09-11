@@ -70,6 +70,22 @@ const DEFAULT_ALLOW: &[&str] = &[
     "go vet",
     "node",
     "npm test",
+    // git — the coordination-and-commit loop a worktree fleet runs on. Without
+    // these, a per-agent worktree fleet under `accept` prompts on every commit and
+    // on the integrator's merge, which is the whole point of the fleet. Scoped to
+    // the local, non-destructive subcommands: inspect (status/log/diff/branch/
+    // show), stage/commit, merge, and manage worktrees. Deliberately NOT `git`
+    // wholesale — that would sweep in `push` (network), `reset --hard` and `clean`
+    // (destructive), which stay a visible prompt exactly as `cargo run` does.
+    "git status",
+    "git log",
+    "git diff",
+    "git branch",
+    "git show",
+    "git add",
+    "git commit",
+    "git merge",
+    "git worktree",
 ];
 
 /// Read [`ENV_TRUST_ALLOW`] into extra allow prefixes (trimmed, empties dropped).
@@ -417,6 +433,29 @@ mod tests {
             !args.iter().any(|a| a == "Bash" || a == "Bash(*)"),
             "{args:?}"
         );
+    }
+
+    #[test]
+    fn the_worktree_git_loop_is_hands_off_but_destructive_git_still_prompts() {
+        let args = accept_edits_args(&[]);
+        // The commit + merge + worktree loop a per-agent worktree fleet runs on is
+        // auto-allowed, so `accept` no longer prompts on every commit.
+        for m in [
+            "Bash(git add *)",
+            "Bash(git commit *)",
+            "Bash(git merge *)",
+            "Bash(git worktree *)",
+            "Bash(git status *)",
+        ] {
+            assert!(args.iter().any(|a| a == m), "missing {m}: {args:?}");
+        }
+        // But network / destructive git is NOT swept in — it stays a visible prompt.
+        for m in ["Bash(git push *)", "Bash(git reset *)", "Bash(git clean *)"] {
+            assert!(
+                !args.iter().any(|a| a == m),
+                "should not allow {m}: {args:?}"
+            );
+        }
     }
 
     #[test]
