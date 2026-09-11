@@ -974,22 +974,22 @@ pub(crate) fn spawn_fleet_window(
             }
             None => trust_mode(),
         };
-        let (mut command, mut cwd, role) = fleet_launch(agent, disclosed);
+        let (command, mut cwd, role) = fleet_launch(agent, disclosed);
         // If this agent belongs to a worktree, it runs in that worktree's dir —
         // atrium's own managed checkout off HEAD, overriding any fleet-file cwd so
         // the pane's gate and index are isolated from its teammates'. When
         // `worktrees` is empty (the common case) this never fires.
+        let mut pane_norms: Option<String> = None;
         if let Some(wt) = worktrees
             .iter()
             .find(|w| w.agents.iter().any(|a| a == &agent.name))
         {
             cwd = Some(wt.dir.to_string_lossy().into_owned());
-            // Inject worktree-specific behavioral norms so the agent knows its
-            // identity, won't cd away from its root, and won't run git worktree
-            // commands. Appended after any existing --append-system-prompt flags
-            // from the fleet file (multiple flags are all honoured by claude).
-            command.push("--append-system-prompt".to_string());
-            command.push(worktree_norms(&wt.name, &wt.branch));
+            // Worktree-specific behavioral norms are passed to spawn_pane_full so
+            // they are folded into a SINGLE --append-system-prompt block with the
+            // ctl directive (last-wins on the installed claude — two separate flags
+            // silently drop the first).
+            pane_norms = Some(worktree_norms(&wt.name, &wt.branch));
         }
         // Per-agent context vars: derive the shared ctx_dir endpoint and the
         // agent's role name, then let context_env map (provider, share) →
@@ -1010,6 +1010,7 @@ pub(crate) fn spawn_fleet_window(
             agent_mode,
             flash,
             &ctx_vars,
+            pane_norms.as_deref(),
         ) {
             Ok(mut pane) => {
                 // Tag the pane with the agent's fleet name as its role, so the
