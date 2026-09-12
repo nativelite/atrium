@@ -1191,6 +1191,9 @@ fn run(
     // The spinner frame last painted by the passthrough startup splash, so it
     // redraws only when the frame advances (not every tick).
     let mut last_splash_frame: usize = usize::MAX;
+    // The spin_frame value used by the last tiled composite. When any pane is
+    // still loading, a new spin_frame means new spinner content → must re-composite.
+    let mut last_tiled_spin: usize = usize::MAX;
     let mut last_bar = String::new();
 
     // Agent session state (§5): one read-only `agsess::World` over the Claude
@@ -2119,6 +2122,14 @@ fn run(
             let _ = out.flush();
         }
 
+        // Collect per-pane dirty bits for the active window in one pass after
+        // all draining is done. fold (not any) is required so every term's
+        // flag is reset even when an earlier pane was already dirty.
+        let tiled_dirty = windows[active]
+            .panes
+            .iter_mut()
+            .fold(false, |d, p| d | p.term.take_dirty());
+
         // 3. background windows: drain (discarded — emulator/ConPTY keep the
         //    screen) and flag activity so the bar shows it.
         for (i, w) in windows.iter_mut().enumerate() {
@@ -2428,29 +2439,43 @@ fn run(
             }
         } else if windows[active].tiled() {
             let (cur_rows, cur_cols) = (rows as usize, cols as usize);
-            // Reuse the scratch buffer's allocation when the size is unchanged;
-            // reallocate only on a first frame or after a terminal resize.
-            match tiled_buf.as_mut() {
-                Some(b) if b.rows() == cur_rows && b.cols() == cur_cols => b.clear(),
-                _ => tiled_buf = Some(ansi::Screen::new(cur_rows, cur_cols)),
+            let any_loading = windows[active].panes.iter().any(|p| !p.painted);
+            // Skip the composite when nothing has changed. The four conditions
+            // that force a repaint even with no new pane output:
+            //   force_repaint — a ctl event, window switch, or resize set it;
+            //   prev_master.is_none() — first frame, must render_full;
+            //   tiled_dirty — at least one pane received bytes this tick;
+            //   spinner advance — a booting pane's animation frame changed.
+            let needs_composite = force_repaint
+                || prev_master.is_none()
+                || tiled_dirty
+                || (any_loading && spin_frame != last_tiled_spin);
+            if needs_composite {
+                // Reuse the scratch buffer's allocation when the size is unchanged;
+                // reallocate only on a first frame or after a terminal resize.
+                match tiled_buf.as_mut() {
+                    Some(b) if b.rows() == cur_rows && b.cols() == cur_cols => b.clear(),
+                    _ => tiled_buf = Some(ansi::Screen::new(cur_rows, cur_cols)),
+                }
+                render_tiled(
+                    tiled_buf.as_mut().unwrap(),
+                    &windows[active],
+                    rows,
+                    cols,
+                    &world,
+                    spin_frame,
+                );
+                match &prev_master {
+                    Some(prev) => frame.extend_from_slice(&prev.diff(tiled_buf.as_ref().unwrap())),
+                    None => frame.extend_from_slice(&tiled_buf.as_ref().unwrap().render_full()),
+                };
+                // Rotate buffers: tiled_buf (just written) becomes prev_master for
+                // the next diff, and the old prev_master's allocation becomes the
+                // next scratch. After a full-repaint reset (prev_master == None),
+                // tiled_buf becomes None on this swap and is reallocated next tick.
+                std::mem::swap(&mut prev_master, &mut tiled_buf);
+                last_tiled_spin = spin_frame;
             }
-            render_tiled(
-                tiled_buf.as_mut().unwrap(),
-                &windows[active],
-                rows,
-                cols,
-                &world,
-                spin_frame,
-            );
-            match &prev_master {
-                Some(prev) => frame.extend_from_slice(&prev.diff(tiled_buf.as_ref().unwrap())),
-                None => frame.extend_from_slice(&tiled_buf.as_ref().unwrap().render_full()),
-            };
-            // Rotate buffers: tiled_buf (just written) becomes prev_master for
-            // the next diff, and the old prev_master's allocation becomes the
-            // next scratch. After a full-repaint reset (prev_master == None),
-            // tiled_buf becomes None on this swap and is reallocated next tick.
-            std::mem::swap(&mut prev_master, &mut tiled_buf);
         } else {
             // Passthrough (single pane or zoomed). While the focused pane has not
             // painted yet, animate the startup splash so the ~seconds of agent

@@ -1003,6 +1003,55 @@ mod tests {
         );
     }
 
+    /// Skipping a composite when nothing changed must not desync prev_master.
+    ///
+    /// Frame 1: compose from initial panes → prev_master.
+    /// Frame 2: same panes, nothing changed → diff is empty (skip emits no bytes).
+    /// Frame 3: one pane changes → diff against prev_master (unchanged by the skip)
+    ///           must equal the diff of the same two screens computed fresh.
+    #[test]
+    fn skip_does_not_desync_the_diff() {
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 12,
+        };
+        // Frame 1: pane filled with 'A'.
+        let a_screen = filled(3, 10, 'A');
+        let panes_a = vec![view(&a_screen, rect, 1, "sh", PaneState::Idle)];
+        let frame1 = compose(5, 12, &panes_a, 0);
+
+        // Frame 2: same panes → diff must be empty (skip would emit nothing).
+        let frame2 = compose(5, 12, &panes_a, 0);
+        assert_eq!(
+            frame1.diff(&frame2),
+            vec![],
+            "identical frames produce no bytes — skip is safe"
+        );
+
+        // Frame 3: pane changes to 'B'. Diff against frame1 (prev_master was
+        // not updated during the skip of frame2, so it still equals frame1).
+        let b_screen = filled(3, 10, 'B');
+        let panes_b = vec![view(&b_screen, rect, 1, "sh", PaneState::Idle)];
+        let frame3 = compose(5, 12, &panes_b, 0);
+        let delta_after_skip = frame1.diff(&frame3);
+
+        // The delta must be non-empty (a real change occurred).
+        assert!(
+            !delta_after_skip.is_empty(),
+            "changed frame must produce a non-empty diff"
+        );
+
+        // And it must be byte-identical to the diff computed without any skip
+        // (i.e. frame1 directly diffed to frame3), proving prev_master is intact.
+        let delta_fresh = frame1.diff(&frame3);
+        assert_eq!(
+            delta_after_skip, delta_fresh,
+            "skipping frame2 did not alter prev_master: diff is stable"
+        );
+    }
+
     /// The cursor must never park outside its own pane (review #10).
     ///
     /// With `inner_rows == 0` the translated row landed at `rect.row + 1` — below
