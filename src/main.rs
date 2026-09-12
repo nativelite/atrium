@@ -57,6 +57,8 @@ static CAP_NOTICE: OnceLock<String> = OnceLock::new();
 /// How often the warden re-reads what it snapshotted. Slow on purpose: a
 /// tripwire that costs the event loop is a tripwire that gets removed.
 const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
+/// How often the run loop checks whether the session snapshot needs refreshing.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Bind the per-process ctl endpoint and publish its address to [`CTL_ADDRESS`]
 /// so every pane spawned afterward is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
@@ -499,6 +501,11 @@ pub(crate) struct Pane {
     /// only forwarded to a pane that wants mouse — so hovering a claude tile
     /// scrolls it, while a bare shell never receives stray mouse bytes.
     pub(crate) mouse_wanted: bool,
+    /// The command vector this pane was spawned with — the user command before
+    /// atrium appends trust flags or `--session-id`. Used by `atrium recover`.
+    pub(crate) argv: Vec<String>,
+    /// The git worktree this pane runs in, if any.
+    pub(crate) worktree: Option<String>,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -586,6 +593,12 @@ fn main() -> ExitCode {
             }
         }
         return ExitCode::SUCCESS;
+    }
+    // `atrium recover` rehydrates the most recent session snapshot — same dispatch
+    // level as `fleet` and `ctl`, before flag parsing, so `recover` is never
+    // mistaken for a hosted command.
+    if args.first().map(String::as_str) == Some("recover") {
+        return recover_cmd(&args[1..]);
     }
     // `atrium fleet …` is its own command family (a saved roster of agents), not a
     // hosted program — dispatch it before any of atrium's flag parsing so `fleet`
@@ -784,6 +797,191 @@ fn confirm_skip_permissions() -> bool {
         Ok(n) if n > 0 => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
         _ => false, // EOF / non-interactive → do not enter the dangerous mode
     }
+}
+
+/// Write a session snapshot iff the window state has changed since the last write.
+/// Pure capture + equality check — no I/O when nothing changed.
+fn snapshot_if_changed(
+    windows: &[Window],
+    path: &std::path::Path,
+    last: &mut Option<atrium::session::Snapshot>,
+) {
+    let w = match windows.first() {
+        Some(w) => w,
+        None => return,
+    };
+    let snap = atrium::session::capture(
+        w.tree.ids(),
+        w.tree.focus(),
+        w.panes
+            .iter()
+            .map(|p| atrium::session::PaneCapture {
+                id: p.id,
+                role: p.role.clone(),
+                argv: p.argv.clone(),
+                cwd: p.cwd.clone(),
+                identity: p.identity.clone(),
+                session_id: p.session_id.clone(),
+                worktree: p.worktree.clone(),
+            })
+            .collect(),
+    );
+    if last.as_ref() == Some(&snap) {
+        return;
+    }
+    let _ = atrium::session::save(path, &snap);
+    *last = Some(snap);
+}
+
+/// `atrium recover` — load the most recent session snapshot and relaunch every
+/// pane with its session resumed. A missing snapshot prints a clear message
+/// and exits cleanly rather than panicking.
+fn recover_cmd(args: &[String]) -> ExitCode {
+    let (allow_ctl, max_depth, trust, rest) = match atrium::ctl::parse_flags(args) {
+        Ok(quad) => quad,
+        Err(msg) => {
+            eprintln!("atrium recover: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !rest.is_empty() {
+        eprintln!("atrium recover: unexpected argument {:?}", rest[0]);
+        return ExitCode::FAILURE;
+    }
+    let snap_dir = atrium::reap::registry_dir();
+    let snap = match find_latest_snapshot(&snap_dir) {
+        Some(path) => match atrium::session::load(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("atrium recover: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            eprintln!(
+                "atrium recover: no snapshot found in {} — nothing to recover",
+                snap_dir.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+    };
+    if snap.panes.is_empty() {
+        eprintln!("atrium recover: snapshot has no panes — nothing to recover");
+        return ExitCode::SUCCESS;
+    }
+    let trust = cap_trust_to_ancestor(trust);
+    if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
+        eprintln!("atrium recover: aborted.");
+        return ExitCode::SUCCESS;
+    }
+    set_trust_mode(trust);
+    let mut flash: Option<(String, Instant)> = None;
+    let ctl_listener = if allow_ctl {
+        bind_ctl(&mut flash)
+    } else {
+        None
+    };
+    let mut term = match rawterm::Terminal::raw() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("atrium recover: stdin/stdout must be a terminal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (rows, cols) = term.size().unwrap_or((24, 80));
+    let pane_rows = rows.saturating_sub(1).max(1);
+    let cell_rows = (pane_rows as usize / snap.panes.len().max(1)).max(1) as u16;
+    let mut panes: Vec<Pane> = Vec::with_capacity(snap.panes.len());
+    for record in &snap.panes {
+        let argv = resume_argv(record);
+        match spawn_pane_full(
+            &argv,
+            cell_rows,
+            cols,
+            record.id,
+            record.identity.as_deref(),
+            record.cwd.as_deref(),
+            trust_mode(),
+            &mut flash,
+            &[],
+            None,
+        ) {
+            Ok(mut pane) => {
+                pane.role = record.role.clone();
+                pane.worktree = record.worktree.clone();
+                panes.push(pane);
+            }
+            Err(e) => {
+                eprintln!("atrium recover: cannot start {:?}: {e}", argv[0]);
+                for p in panes.iter_mut() {
+                    let _ = p.pty.kill();
+                }
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let max_id = snap.layout.ids.iter().copied().max().unwrap_or(0);
+    let mut tree = Tree::grid_from_ids(&snap.layout.ids);
+    tree.focus_pane(snap.layout.focus);
+    let window = Window {
+        panes,
+        tree,
+        zoomed: false,
+        next_id: max_id + 1,
+    };
+    run(
+        &mut term,
+        &[default_shell()],
+        None,
+        None,
+        Some(window),
+        allow_ctl,
+        max_depth,
+        trust,
+        ctl_listener,
+        None,
+    )
+}
+
+/// Build the recovery argv for one pane. For claude panes with a stored
+/// session id, strips `--continue` and appends `--resume <id>` so the agent
+/// resumes its conversation. Non-claude panes are relaunched verbatim.
+fn resume_argv(record: &atrium::session::PaneRecord) -> Vec<String> {
+    let mut argv = record.argv.clone();
+    if argv.is_empty() {
+        return argv;
+    }
+    if !atrium::bind::is_claude_stem(&atrium::bind::command_stem(&argv[0])) {
+        return argv;
+    }
+    if let Some(id) = &record.session_id {
+        argv.retain(|a| a != "--continue");
+        argv.push("--resume".to_string());
+        argv.push(id.clone());
+    }
+    argv
+}
+
+/// Scan `dir` for `atrium-session-*.json` files and return the most recently
+/// modified one, or `None` if the directory is unreadable or empty.
+fn find_latest_snapshot(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("atrium-session-") || !name.ends_with(".json") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if best.as_ref().map_or(true, |(t, _)| modified > *t) {
+                    best = Some((modified, entry.path()));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
 }
 
 // The run loop threads several independent, well-named launch parameters; a
@@ -1012,6 +1210,10 @@ fn run(
     // The crash registry: the pane process groups a watchdog should kill if this
     // process dies without running any teardown at all.
     let registry_path = atrium::reap::registry_path(std::process::id());
+    let snapshot_path =
+        atrium::reap::registry_dir().join(format!("atrium-session-{}.json", std::process::id()));
+    let mut last_snapshot: Option<atrium::session::Snapshot> = None;
+    let mut last_snapshot_check = Instant::now();
     // The warden: tripwires, not gates. atrium cannot stop an agent that can run
     // commands from launching an unconstrained one (it could run claude directly
     // with no atrium at all), so what it CAN do is notice - its own binary being
@@ -1072,6 +1274,12 @@ fn run(
                     atrium::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
                 warden.registry_rewritten();
                 registered = cur;
+                snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
+                last_snapshot_check = Instant::now();
+            }
+            if last_snapshot_check.elapsed() >= SNAPSHOT_INTERVAL {
+                last_snapshot_check = Instant::now();
+                snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
             }
             if last_warden_check.elapsed() >= WARDEN_INTERVAL {
                 last_warden_check = Instant::now();
@@ -3917,6 +4125,8 @@ fn spawn_pane_full(
         can_spawn: true,
         painted: false,
         mouse_wanted: false,
+        argv: command.to_vec(),
+        worktree: None,
     })
 }
 
