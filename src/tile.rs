@@ -12,12 +12,14 @@
 //! simply abut: `┐┌` at a top seam, `││` down a shared column. That is
 //! intended — every pane owns and draws its own four-sided border.
 //!
-//! Fidelity note: tiling is the *emulated* path. East Asian double-width and
-//! emoji are composited correctly (the emulator marks each cell's width and the
-//! blit honors it); a pane that still needs pixel-exact rendering (a TUI
-//! mid-redraw, sixel) takes the escape hatch — `Ctrl+A z` zoom drops it back to
-//! raw passthrough. See the 0.2 design doc, §1 and the vterm README's fidelity
-//! boundaries.
+//! Fidelity note: tiling is the *emulated* path. Double-width CJK and
+//! single-codepoint emoji are composited correctly (the emulator marks each
+//! cell's width and the blit honors it). Multi-codepoint grapheme clusters
+//! (ZWJ/flag/modifier emoji, combining marks) still render as their components
+//! — joiners and variation selectors are width-0 and dropped, each base takes
+//! its own cell — and may want the `Ctrl+A z` zoom escape hatch, as do sixel
+//! and a TUI mid-redraw. See the 0.2 design doc, §1 and the vterm README's
+//! fidelity boundaries.
 
 use crate::layout::Rect;
 use ansi::{Cell, Color, Screen, Style};
