@@ -228,7 +228,7 @@ fn draw_loading(master: &mut Screen, p: &PaneView, rows: usize, cols: usize, fra
     for (i, ch) in label.chars().enumerate() {
         let c = start_c + i;
         if c < inner_col + inner_cols && mid_r < rows && c < cols {
-            master.set(mid_r, c, Cell { ch, style });
+            master.set(mid_r, c, Cell::new(ch, style));
         }
     }
 }
@@ -268,7 +268,7 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
 
     let put = |m: &mut Screen, r: usize, c: usize, ch: char| {
         if r < rows && c < cols {
-            m.set(r, c, Cell { ch, style });
+            m.set(r, c, Cell::new(ch, style));
         }
     };
 
@@ -332,14 +332,7 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
                     break;
                 }
                 if r0 < rows && start + col < cols {
-                    master.set(
-                        r0,
-                        start + col,
-                        Cell {
-                            ch,
-                            style: tag_style,
-                        },
-                    );
+                    master.set(r0, start + col, Cell::new(ch, tag_style));
                 }
                 col += 1;
             }
@@ -384,14 +377,7 @@ mod tests {
         let mut s = Screen::new(rows, cols);
         for r in 0..rows {
             for c in 0..cols {
-                s.set(
-                    r,
-                    c,
-                    Cell {
-                        ch,
-                        style: Style::default(),
-                    },
-                );
+                s.set(r, c, Cell::new(ch, Style::default()));
             }
         }
         s
