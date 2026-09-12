@@ -220,6 +220,20 @@ pub(crate) fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut im
     let _ = out.flush();
 }
 
+/// Pure predicate: has any pane content (or spinner animation) changed this tick?
+///
+/// - `tiled_dirty`  — at least one active-window pane's `Term::take_dirty()` fired.
+/// - `any_loading`  — at least one pane has not painted yet (spinner is visible).
+/// - `spin_advanced` — the animation clock ticked since the last composite
+///   (`spin_frame != last_tiled_spin`).
+///
+/// The spinner arm (`any_loading && spin_advanced`) is intentionally separate from
+/// the PTY-bytes arm (`tiled_dirty`): a loading pane whose child is silent still
+/// needs a composite every time the spinner frame changes.
+pub(crate) fn any_pane_dirty(tiled_dirty: bool, any_loading: bool, spin_advanced: bool) -> bool {
+    tiled_dirty || (any_loading && spin_advanced)
+}
+
 /// Pure predicate: should the tiled compositor re-run this tick?
 ///
 /// - `any_pane_dirty` — at least one active-window pane received bytes OR a
@@ -241,6 +255,50 @@ pub(crate) fn needs_composite(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Table: (tiled_dirty, any_loading, spin_advanced, expected).
+    // RED-when-broken: dropping the spinner term makes loading+spin_advanced -> false.
+    #[test]
+    fn any_pane_dirty_gate_table() {
+        let cases: &[(bool, bool, bool, bool, &str)] = &[
+            // spinner arm: only fires when BOTH loading AND spin advanced
+            (
+                false,
+                true,
+                true,
+                true,
+                "loading+spin_advanced must be dirty",
+            ),
+            (
+                false,
+                true,
+                false,
+                false,
+                "loading+not_advanced must be clean",
+            ),
+            (
+                false,
+                false,
+                true,
+                false,
+                "not_loading+advanced must be clean",
+            ),
+            // PTY-bytes arm: independent of spinner
+            (true, false, false, true, "tiled_dirty alone must be dirty"),
+            // combined
+            (true, true, true, true, "all-true must be dirty"),
+            (
+                true,
+                true,
+                false,
+                true,
+                "tiled_dirty+loading+not_advanced dirty",
+            ),
+        ];
+        for &(dirty, loading, spin, want, label) in cases {
+            assert_eq!(any_pane_dirty(dirty, loading, spin), want, "{label}");
+        }
+    }
 
     // Table: each row is (any_pane_dirty, view_changed, force_repaint, expected).
     // RED-when-broken: inverting any term in needs_composite flips at least one case.
