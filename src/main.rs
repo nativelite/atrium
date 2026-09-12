@@ -1227,6 +1227,11 @@ fn run(
     // The previous composited master, kept per-frame so tiled mode diffs. Reset
     // to None (full repaint) on mode/layout/window changes.
     let mut prev_master: Option<ansi::Screen> = None;
+    // A persistent scratch buffer written into each tiled frame. After every
+    // render it swaps with `prev_master` so neither allocation is freed: one
+    // holds the current frame (for diffing next tick) and the other is cleared
+    // and overwritten. At most one fresh allocation per full-repaint reset.
+    let mut tiled_buf: Option<ansi::Screen> = None;
     // The last view identity (window / zoom / focused pane / overlay / size). A
     // passthrough (single or zoomed) pane only gets the heavy repaint nudge
     // (clear + resize) on a *real* transition — never on a routine `force_repaint`
@@ -2423,12 +2428,30 @@ fn run(
                 );
             }
         } else if windows[active].tiled() {
-            let master = render_tiled(&windows[active], rows, cols, &world, spin_frame);
+            let (cur_rows, cur_cols) = (rows as usize, cols as usize);
+            // Reuse the scratch buffer's allocation when the size is unchanged;
+            // reallocate only on a first frame or after a terminal resize.
+            match tiled_buf.as_mut() {
+                Some(b) if b.rows() == cur_rows && b.cols() == cur_cols => b.clear(),
+                _ => tiled_buf = Some(ansi::Screen::new(cur_rows, cur_cols)),
+            }
+            render_tiled(
+                tiled_buf.as_mut().unwrap(),
+                &windows[active],
+                rows,
+                cols,
+                &world,
+                spin_frame,
+            );
             match &prev_master {
-                Some(prev) => frame.extend_from_slice(&prev.diff(&master)),
-                None => frame.extend_from_slice(&master.render_full()),
+                Some(prev) => frame.extend_from_slice(&prev.diff(tiled_buf.as_ref().unwrap())),
+                None => frame.extend_from_slice(&tiled_buf.as_ref().unwrap().render_full()),
             };
-            prev_master = Some(master);
+            // Rotate buffers: tiled_buf (just written) becomes prev_master for
+            // the next diff, and the old prev_master's allocation becomes the
+            // next scratch. After a full-repaint reset (prev_master == None),
+            // tiled_buf becomes None on this swap and is reallocated next tick.
+            std::mem::swap(&mut prev_master, &mut tiled_buf);
         } else {
             // Passthrough (single pane or zoomed). While the focused pane has not
             // painted yet, animate the startup splash so the ~seconds of agent

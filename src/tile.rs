@@ -145,28 +145,28 @@ impl PaneView<'_> {
     }
 }
 
-/// Compose `panes` into a fresh master [`Screen`] of `rows x cols`. Each pane is
-/// drawn as a full box border (its index + title in the top edge) with its
-/// screen blitted into the inner area, inset one cell on every side. Border and
-/// title are tinted by the pane's [`PaneState`]. `bar_row` (0-based) is left
-/// blank — the caller paints the existing status bar there after diffing,
-/// exactly as in passthrough mode.
-///
-/// Returns the master screen with its `cursor` set to the focused pane's
-/// cursor, translated into the focused pane's *inner* (bordered) coordinates.
-pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Screen {
-    let mut master = Screen::new(rows, cols);
-
+/// Write `panes` into `master` (already sized to `rows × cols` and pre-cleared
+/// by the caller). Each pane is drawn as a full box border (its index + title
+/// in the top edge) with its screen blitted into the inner area, inset one cell
+/// on every side. Border and title are tinted by the pane's [`PaneState`].
+/// `master.cursor` is set to the focused pane's cursor in master-screen coords.
+pub fn compose_into(
+    master: &mut Screen,
+    rows: usize,
+    cols: usize,
+    panes: &[PaneView],
+    frame: usize,
+) {
     for p in panes {
         // A pane that has not painted anything yet (freshly spawned agent still
         // booting) shows an animated "starting…" spinner instead of a dead blank
         // rect — so an initializing pane reads as *loading*, not *broken*.
         if screen_is_blank(p.screen) {
-            draw_loading(&mut master, p, rows, cols, frame);
+            draw_loading(master, p, rows, cols, frame);
         } else {
-            blit_inner(&mut master, p, rows, cols);
+            blit_inner(master, p, rows, cols);
         }
-        draw_border(&mut master, p, rows, cols);
+        draw_border(master, p, rows, cols);
     }
 
     // Park the cursor at the focused pane's cursor, translated into the inner
@@ -187,7 +187,20 @@ pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Sc
         let c = c.clamp(f.rect.col, f.rect.col + f.rect.cols.saturating_sub(1));
         master.cursor = (r.min(rows.saturating_sub(1)), c.min(cols.saturating_sub(1)));
     }
+}
 
+/// Compose `panes` into a fresh master [`Screen`] of `rows x cols`. Each pane is
+/// drawn as a full box border (its index + title in the top edge) with its
+/// screen blitted into the inner area, inset one cell on every side. Border and
+/// title are tinted by the pane's [`PaneState`]. `bar_row` (0-based) is left
+/// blank — the caller paints the existing status bar there after diffing,
+/// exactly as in passthrough mode.
+///
+/// Returns the master screen with its `cursor` set to the focused pane's
+/// cursor, translated into the focused pane's *inner* (bordered) coordinates.
+pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Screen {
+    let mut master = Screen::new(rows, cols);
+    compose_into(&mut master, rows, cols, panes, frame);
     master
 }
 

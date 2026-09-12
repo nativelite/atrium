@@ -1,7 +1,7 @@
 use crate::*;
 use atrium::input::Dir;
 use atrium::layout::{self, Rect};
-use atrium::tile::{compose, AgentMark, PaneState, PaneView};
+use atrium::tile::{compose_into, AgentMark, PaneState, PaneView};
 use std::io::Write;
 use std::time::Instant;
 
@@ -24,15 +24,17 @@ pub(crate) fn to_move(d: Dir) -> layout::Move {
     }
 }
 
-/// Compose the active window's panes into a master screen (boxed borders +
-/// titles + liveness color + content); the caller diffs it to the terminal.
+/// Compose the active window's panes into `out` (pre-cleared, already sized to
+/// the terminal). Borders + titles + liveness color + content; the caller diffs
+/// `out` against the previous frame and writes only the changed bytes.
 pub(crate) fn render_tiled(
+    out: &mut ansi::Screen,
     w: &Window,
     rows: u16,
     cols: u16,
     world: &atrium::vendors::VendorWorlds,
     frame: usize,
-) -> ansi::Screen {
+) {
     let outer = tiled_outer(rows, cols);
     let rects = w.tree.rects(outer);
     let focus = w.tree.focus();
@@ -78,7 +80,7 @@ pub(crate) fn render_tiled(
         .collect();
     // Compose over the full terminal (rows), leaving the bar row untouched; the
     // bar is painted separately after the diff, exactly as in passthrough.
-    compose(rows as usize, cols as usize, &views, frame)
+    compose_into(out, rows as usize, cols as usize, &views, frame)
 }
 
 /// Split the focused pane, spawning a new pane sized to what its half will be.
