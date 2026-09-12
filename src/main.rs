@@ -2440,17 +2440,9 @@ fn run(
         } else if windows[active].tiled() {
             let (cur_rows, cur_cols) = (rows as usize, cols as usize);
             let any_loading = windows[active].panes.iter().any(|p| !p.painted);
-            // Skip the composite when nothing has changed. The four conditions
-            // that force a repaint even with no new pane output:
-            //   force_repaint — a ctl event, window switch, or resize set it;
-            //   prev_master.is_none() — first frame, must render_full;
-            //   tiled_dirty — at least one pane received bytes this tick;
-            //   spinner advance — a booting pane's animation frame changed.
-            let needs_composite = force_repaint
-                || prev_master.is_none()
-                || tiled_dirty
-                || (any_loading && spin_frame != last_tiled_spin);
-            if needs_composite {
+            let any_pane_dirty = tiled_dirty || (any_loading && spin_frame != last_tiled_spin);
+            let view_changed = prev_master.is_none();
+            if needs_composite(any_pane_dirty, view_changed, force_repaint) {
                 // Reuse the scratch buffer's allocation when the size is unchanged;
                 // reallocate only on a first frame or after a terminal resize.
                 match tiled_buf.as_mut() {

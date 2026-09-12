@@ -219,3 +219,55 @@ pub(crate) fn repaint_focused(w: &mut Window, rows: u16, cols: u16, out: &mut im
     }
     let _ = out.flush();
 }
+
+/// Pure predicate: should the tiled compositor re-run this tick?
+///
+/// - `any_pane_dirty` — at least one active-window pane received bytes OR a
+///   loading pane's spinner frame advanced (content or animation changed).
+/// - `view_changed`   — `prev_master` is `None` (first frame, or after a
+///   resize/mode change that cleared it).
+/// - `force_repaint`  — a ctl event, window switch, or explicit repaint request.
+///
+/// All three conditions are independent: any one suffices. The function is pure
+/// so it can be unit-tested without the run loop.
+pub(crate) fn needs_composite(
+    any_pane_dirty: bool,
+    view_changed: bool,
+    force_repaint: bool,
+) -> bool {
+    any_pane_dirty || view_changed || force_repaint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Table: each row is (any_pane_dirty, view_changed, force_repaint, expected).
+    // RED-when-broken: inverting any term in needs_composite flips at least one case.
+    #[test]
+    fn needs_composite_gate_table() {
+        let cases: &[(bool, bool, bool, bool, &str)] = &[
+            // all-clean — the ONLY case where we skip
+            (false, false, false, false, "all-clean must skip"),
+            // single dirty flag — each alone forces a composite
+            (true, false, false, true, "dirty pane must composite"),
+            (false, true, false, true, "view_changed must composite"),
+            (false, false, true, true, "force_repaint must composite"),
+            // animating/dirty pane is the same bit as dirty
+            (
+                true,
+                false,
+                false,
+                true,
+                "animating dirty pane must composite",
+            ),
+            // combinations still composite
+            (true, true, true, true, "all-true must composite"),
+            (true, true, false, true, "dirty+view_changed must composite"),
+            (false, true, true, true, "view_changed+force must composite"),
+        ];
+        for &(dirty, view, force, want, label) in cases {
+            assert_eq!(needs_composite(dirty, view, force), want, "{label}");
+        }
+    }
+}
