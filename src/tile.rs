@@ -94,6 +94,10 @@ pub struct PaneView<'a> {
     /// a colored `·<name>` tag after the `index:title` in the top border. The
     /// color is a redundant channel; the text is always drawn (a11y).
     pub identity: Option<&'a str>,
+    /// True once the pane's emulator has produced at least one non-default cell.
+    /// Cached from `Pane::painted` so `compose_into` avoids scanning the screen
+    /// on every frame; a pane that has ever painted stays `true` forever.
+    pub painted: bool,
 }
 
 impl PaneView<'_> {
@@ -158,10 +162,7 @@ pub fn compose_into(
     frame: usize,
 ) {
     for p in panes {
-        // A pane that has not painted anything yet (freshly spawned agent still
-        // booting) shows an animated "starting…" spinner instead of a dead blank
-        // rect — so an initializing pane reads as *loading*, not *broken*.
-        if screen_is_blank(p.screen) {
+        if !p.painted {
             draw_loading(master, p, rows, cols, frame);
         } else {
             blit_inner(master, p, rows, cols);
@@ -206,22 +207,6 @@ pub fn compose(rows: usize, cols: usize, panes: &[PaneView], frame: usize) -> Sc
 
 /// Braille spinner frames for the per-pane loading state (advances ~8/sec).
 const SPINNER: [char; 8] = ['⣾', '⣽', '⣻', '⢿', '⡿', '⣟', '⣯', '⣷'];
-
-/// True if the pane's emulator has produced no visible content yet — its screen
-/// is entirely default cells. Short-circuits on the first non-blank cell, so a
-/// pane that has painted (the common case) is cheap; the full scan only runs
-/// while a pane is still blank (its brief loading phase).
-fn screen_is_blank(s: &Screen) -> bool {
-    let blank = Cell::default();
-    for r in 0..s.rows() {
-        for c in 0..s.cols() {
-            if s.cell(r, c) != blank {
-                return false;
-            }
-        }
-    }
-    true
-}
 
 /// Draw an animated "⣾ starting <title>…" centered in the pane's inner area,
 /// tinted with the pane's state style. `frame` advances the spinner. Clipped to
@@ -366,6 +351,18 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
 mod tests {
     use super::*;
 
+    fn screen_is_blank(s: &Screen) -> bool {
+        let blank = Cell::default();
+        for r in 0..s.rows() {
+            for c in 0..s.cols() {
+                if s.cell(r, c) != blank {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn filled(rows: usize, cols: usize, ch: char) -> Screen {
         let mut s = Screen::new(rows, cols);
         for r in 0..rows {
@@ -398,6 +395,7 @@ mod tests {
             state,
             agent: None,
             identity: None,
+            painted: !screen_is_blank(screen),
         }
     }
 
@@ -418,6 +416,7 @@ mod tests {
             state,
             agent: Some(AgentMark { status }),
             identity: None,
+            painted: !screen_is_blank(screen),
         }
     }
 
@@ -438,6 +437,7 @@ mod tests {
             state,
             agent: None,
             identity: Some(identity),
+            painted: !screen_is_blank(screen),
         }
     }
 

@@ -2105,7 +2105,6 @@ fn run(
                             }
                         } else if pane.id != focus {
                             pane.activity = true;
-                            pane.painted = true; // background/tiled: any output = painted
                         }
                     }
                     Ok(Some(_)) => {

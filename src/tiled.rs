@@ -74,6 +74,7 @@ pub(crate) fn render_tiled(
                     state,
                     agent,
                     identity: p.identity.as_deref(),
+                    painted: p.painted,
                 }
             })
         })
