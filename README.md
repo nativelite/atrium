@@ -322,4 +322,30 @@ CI right now; the local `dev.py check` is the pre-push gate.
 
 ## License
 
-MIT. nativelite ships its packages permissively; see [LICENSE](LICENSE).
+The **atrium** application is licensed under the [Functional Source License,
+Version 1.1, Apache 2.0 Future License](LICENSE) (`FSL-1.1-Apache-2.0`), a
+source-available license. You can read, modify, self-host, and use atrium in
+production for essentially any purpose (internal use, research, education,
+professional services) *except* selling it, or a substantially similar product,
+as your own. Two years after each release, that version automatically converts
+to Apache-2.0. Versions published through 0.30.3 remain under MIT.
+
+The underlying `nativelite-*` library crates (abus, pty, akey, rawterm, ansi,
+vterm, uwidth, agsess, json) remain **MIT**, permissively reusable on their own.
+
+### Why FSL?
+
+atrium started out MIT, and those versions stay MIT. I moved the application to a
+source-available license after seeing a large company take independent
+developers' work and ship it commercially ([what happened to the Artemis devs,
+via minitap](https://www.minitap.ai/blog/i-expected-better-from-google)). I don't
+want that to happen here. FSL keeps atrium open and inspectable. The goal was
+never to close it off, only to stop it from becoming free R&D for someone to
+repackage and resell. atrium exists to help developers and to be the best
+orchestration layer I can build. I know a license can't stop everyone, and some
+will do it anyway. This is the line I can draw, and I would rather have tried.
+
+Contributions for atrium are still more than welcome. Reach out to me and I will
+see what I can do.
+
+Jeffrie Steven Budde
