@@ -1,22 +1,22 @@
 [package]
 name = "atrium"
-version = "0.30.3"
+version = "0.31.0"
 edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/nativelite/atrium"
 keywords = ["terminal", "multiplexer", "agents", "claude", "nativelite"]
 categories = ["command-line-utilities"]
 
 # nativelite app rule: zero THIRD-PARTY dependencies; org crates only.
 [dependencies]
-abus = { package = "nativelite-abus", version = "0.1", path = "../abus" }
+abus = { package = "nativelite-abus", version = "0.2", path = "../abus" }
 pty = { package = "nativelite-pty", version = "0.3", path = "../pty-rs" }
 akey = { package = "nativelite-akey", version = "0.2", path = "../akey" }
 rawterm = { package = "nativelite-rawterm", version = "0.2", path = "../rawterm-rs" }
-ansi = { package = "nativelite-ansi", version = "0.1", path = "../ansi-rs" }
-vterm = { package = "nativelite-vterm", version = "0.3", path = "../vterm-rs" }
+ansi = { package = "nativelite-ansi", version = "0.2", path = "../ansi-rs" }
+vterm = { package = "nativelite-vterm", version = "0.4", path = "../vterm-rs" }
 agsess = { package = "nativelite-agsess", version = "0.1", path = "../agsess" }
 json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
 
