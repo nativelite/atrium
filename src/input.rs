@@ -357,18 +357,13 @@ fn push_move(
     actions.push(Action::MoveFocus(dir));
 }
 
-/// Encode a left-button press as an SGR mouse sequence for forwarding to a
-/// child PTY. Button code 0 = left button, `M` = press event.
-pub fn encode_sgr_left_click(col: usize, row: usize) -> String {
-    format!("\x1b[<0;{col};{row}M")
-}
-
-/// Encode a left-button **release** as an SGR mouse sequence. Button code 0,
-/// `m` = release event. A complete synthesised click requires both the press
-/// (`encode_sgr_left_click`) and this release; omitting the release means
-/// release-triggered handlers (hyperlinks, buttons) never fire.
-pub fn encode_sgr_left_release(col: usize, row: usize) -> String {
-    format!("\x1b[<0;{col};{row}m")
+/// Encode a complete synthesised left click as a single SGR mouse string:
+/// press (`M`) immediately followed by release (`m`), both at the same
+/// 1-based `(col, row)`. Writing this one string to the child PTY is
+/// equivalent to the terminal reporting a full click; release-triggered
+/// handlers (hyperlinks, buttons) fire because they receive the `m` event.
+pub fn encode_sgr_click(col: usize, row: usize) -> String {
+    format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m")
 }
 
 /// Map an arrow CSI final byte to a direction.
@@ -480,32 +475,18 @@ mod scroll_tests {
     }
 
     #[test]
-    fn encode_sgr_left_click_formats_correctly() {
-        use super::encode_sgr_left_click;
-        assert_eq!(encode_sgr_left_click(5, 3), "\x1b[<0;5;3M");
-        assert_eq!(encode_sgr_left_click(1, 1), "\x1b[<0;1;1M");
-        assert_eq!(encode_sgr_left_click(80, 24), "\x1b[<0;80;24M");
-    }
-
-    #[test]
-    fn encode_sgr_left_release_formats_correctly() {
-        use super::encode_sgr_left_release;
-        // Release uses lowercase `m`; press uses uppercase `M`.
-        assert_eq!(encode_sgr_left_release(5, 3), "\x1b[<0;5;3m");
-        assert_eq!(encode_sgr_left_release(1, 1), "\x1b[<0;1;1m");
-    }
-
-    #[test]
-    fn press_and_release_differ_only_in_terminator() {
-        use super::{encode_sgr_left_click, encode_sgr_left_release};
-        let press = encode_sgr_left_click(5, 3);
-        let release = encode_sgr_left_release(5, 3);
-        // A synthesised click sends press then release; the two sequences must
-        // differ — only the final byte (`M` vs `m`) distinguishes them.
-        assert_ne!(press, release, "press and release must differ");
-        assert_eq!(&press[..press.len() - 1], &release[..release.len() - 1]);
-        assert!(press.ends_with('M'));
-        assert!(release.ends_with('m'));
+    fn encode_sgr_click_contains_press_and_release() {
+        use super::encode_sgr_click;
+        // The combined string must contain both the press (`M`) and release
+        // (`m`) sequences at the specified coords — red-when-broken: removing
+        // either half from encode_sgr_click fails this assertion.
+        assert_eq!(
+            encode_sgr_click(5, 3),
+            "\x1b[<0;5;3M\x1b[<0;5;3m",
+            "must be press then release"
+        );
+        assert_eq!(encode_sgr_click(1, 1), "\x1b[<0;1;1M\x1b[<0;1;1m");
+        assert_eq!(encode_sgr_click(80, 24), "\x1b[<0;80;24M\x1b[<0;80;24m");
     }
 
     #[test]
