@@ -1354,15 +1354,17 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         .ok()
         .and_then(|p| p.parse::<usize>().ok());
 
-    // `--json` prints the raw reply (for scripting); otherwise a `board` view
-    // renders as a colored table with clickable links.
+    // `--json` prints the raw reply (for scripting); `--no-color` forces plain
+    // text even on a TTY. Otherwise board/bus views render with SGR colors.
     let raw_json = args.iter().any(|a| a == "--json");
+    let no_color = args.iter().any(|a| a == "--no-color");
     let filtered: Vec<String> = args
         .iter()
-        .filter(|a| a.as_str() != "--json")
+        .filter(|a| a.as_str() != "--json" && a.as_str() != "--no-color")
         .cloned()
         .collect();
     let args = &filtered[..];
+    let color = !no_color && should_color();
 
     let request = match build_request(args, caller) {
         Ok(r) => r,
@@ -1384,11 +1386,11 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             // A `board` result renders as a table (unless --json); everything else
             // prints its JSON reply verbatim.
             match (args.first().map(String::as_str), raw_json) {
-                (Some("board"), false) => match render_board(&reply) {
+                (Some("board"), false) => match render_board(&reply, color) {
                     Some(view) => println!("{view}"),
                     None => println!("{reply}"),
                 },
-                (Some("bus"), false) => match render_bus(&reply) {
+                (Some("bus"), false) => match render_bus(&reply, color) {
                     Some(view) => println!("{view}"),
                     None => println!("{reply}"),
                 },
@@ -1417,11 +1419,18 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// True when stdout is a terminal and `NO_COLOR` is not set — the standard
+/// condition for emitting SGR color codes. Also gates OSC-8 hyperlinks.
+fn should_color() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() && std::env::var("NO_COLOR").is_err()
+}
+
 /// Render a `board` reply as a human view: one line per entry, the `status`
-/// field colored, `http(s)` values as OSC-8 clickable links, and the writer dim
-/// in parens. `None` if the reply isn't a board result (caller falls back to the
-/// raw JSON). Escapes are cosmetic — piping `--json` gives the machine form.
-fn render_board(reply: &str) -> Option<String> {
+/// field colored (when `color` is true), `http(s)` values as OSC-8 clickable
+/// links, and the writer dim in parens. `None` if the reply isn't a board
+/// result (caller falls back to the raw JSON).
+fn render_board(reply: &str, color: bool) -> Option<String> {
     let v = json::parse(reply).ok()?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -1435,7 +1444,7 @@ fn render_board(reply: &str) -> Option<String> {
             .iter()
             .map(|e| {
                 let key = e.get("key").and_then(Value::as_str).unwrap_or("?");
-                render_entry_line(key, e)
+                render_entry_line(key, e, color)
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1458,15 +1467,22 @@ fn render_board(reply: &str) -> Option<String> {
         let key = v.get("key").and_then(Value::as_str).unwrap_or("?");
         if granted {
             let line = match v.get("entry") {
-                Some(entry) if entry != &Value::Null => render_entry_line(key, entry),
+                Some(entry) if entry != &Value::Null => render_entry_line(key, entry, color),
                 _ => format!("  {key}"),
             };
-            return Some(format!("{line}\n  \x1b[38;5;10mclaimed {key}\x1b[0m"));
+            let suffix = if color {
+                format!("\n  \x1b[38;5;10mclaimed {key}\x1b[0m")
+            } else {
+                format!("\n  claimed {key}")
+            };
+            return Some(format!("{line}{suffix}"));
         }
         let holder = v.get("holder").and_then(Value::as_str).unwrap_or("someone");
-        return Some(format!(
-            "  \x1b[38;5;11m{key} is held by {holder}\x1b[0m — pick another task"
-        ));
+        return Some(if color {
+            format!("  \x1b[38;5;11m{key} is held by {holder}\x1b[0m — pick another task")
+        } else {
+            format!("  {key} is held by {holder} — pick another task")
+        });
     }
     // release → a one-line confirmation.
     if let Some(released) = v.get("released").and_then(Value::as_bool) {
@@ -1484,7 +1500,7 @@ fn render_board(reply: &str) -> Option<String> {
     if let Some(key) = v.get("key").and_then(Value::as_str) {
         return Some(match v.get("entry") {
             Some(Value::Null) | None => format!("  {key}: (not on the board)"),
-            Some(entry) => render_entry_line(key, entry),
+            Some(entry) => render_entry_line(key, entry, color),
         });
     }
     None
@@ -1494,7 +1510,7 @@ fn render_board(reply: &str) -> Option<String> {
 /// (seq, an urgency glyph, the topic, its fields, and who sent it); `sub`/`unsub`
 /// shows the resulting subscription set; `resolve` a one-line confirmation. `None`
 /// if the reply isn't a bus result (caller falls back to raw JSON).
-fn render_bus(reply: &str) -> Option<String> {
+fn render_bus(reply: &str, color: bool) -> Option<String> {
     let v = json::parse(reply).ok()?;
     if v.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;
@@ -1507,12 +1523,14 @@ fn render_bus(reply: &str) -> Option<String> {
         let cursor = v.get("cursor").and_then(Value::as_i64).unwrap_or(0);
         let mut body = arr
             .iter()
-            .map(render_event_line)
+            .map(|e| render_event_line(e, color))
             .collect::<Vec<_>>()
             .join("\n");
-        body.push_str(&format!(
-            "\n\x1b[2m  — cursor {cursor} (next: bus feed --since {cursor})\x1b[0m"
-        ));
+        body.push_str(&if color {
+            format!("\n\x1b[2m  — cursor {cursor} (next: bus feed --since {cursor})\x1b[0m")
+        } else {
+            format!("\n  — cursor {cursor} (next: bus feed --since {cursor})")
+        });
         return Some(body);
     }
     // topics → the active-topic roster with subscriber counts.
@@ -1525,7 +1543,11 @@ fn render_bus(reply: &str) -> Option<String> {
             .map(|t| {
                 let topic = t.get("topic").and_then(Value::as_str).unwrap_or("?");
                 let subs = t.get("subs").and_then(Value::as_i64).unwrap_or(0);
-                format!("  \x1b[1m{topic}\x1b[0m  subs={subs}")
+                if color {
+                    format!("  \x1b[1m{topic}\x1b[0m  subs={subs}")
+                } else {
+                    format!("  {topic}  subs={subs}")
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1537,7 +1559,7 @@ fn render_bus(reply: &str) -> Option<String> {
     // ([`ctl_cmd`]) — mixing it into stdout would corrupt every existing `bus pub`
     // consumer. The additive `subscribers` field in the reply is ignored here.
     if let Some(event) = v.get("event") {
-        return Some(render_event_line(event));
+        return Some(render_event_line(event, color));
     }
     // sub/unsub → the resulting subscription set.
     if let Some(subs) = v.get("subscribed").and_then(Value::as_array) {
@@ -1568,16 +1590,34 @@ fn render_bus(reply: &str) -> Option<String> {
 
 /// Format one bus event: `[#7] ! deploy  msg=ship it?  (from dev_1)`. A
 /// `decision_needed` event gets an amber `!` and bold topic so escalations stand
-/// out from FYI chatter (a dim `·`).
-fn render_event_line(event: &Value) -> String {
+/// out from FYI chatter (a dim `·`). SGR codes are emitted only when `color` is true.
+fn render_event_line(event: &Value, color: bool) -> String {
     let seq = event.get("seq").and_then(Value::as_i64).unwrap_or(0);
     let topic = event.get("topic").and_then(Value::as_str).unwrap_or("?");
     let kind = event.get("kind").and_then(Value::as_str).unwrap_or("fyi");
     let decision = kind == "decision_needed";
-    let (glyph, topic_sgr) = if decision {
-        ("\x1b[38;5;11m!\x1b[0m", "\x1b[1;38;5;11m") // amber bang, bold amber topic
+    let (seq_prefix, seq_suffix, glyph, topic_prefix, topic_suffix) = if color {
+        if decision {
+            (
+                "\x1b[2m",
+                "\x1b[0m",
+                "\x1b[38;5;11m!\x1b[0m",
+                "\x1b[1;38;5;11m",
+                "\x1b[0m",
+            )
+        } else {
+            (
+                "\x1b[2m",
+                "\x1b[0m",
+                "\x1b[2m·\x1b[0m",
+                "\x1b[1m",
+                "\x1b[0m",
+            )
+        }
+    } else if decision {
+        ("", "", "!", "", "")
     } else {
-        ("\x1b[2m·\x1b[0m", "\x1b[1m") // dim dot, bold topic
+        ("", "", "·", "", "")
     };
     let empty: &[(String, Value)] = &[];
     let fields = event
@@ -1589,7 +1629,11 @@ fn render_event_line(event: &Value) -> String {
         .map(|(k, v)| {
             let vs = v.as_str().unwrap_or("");
             if is_url(vs) {
-                format!("{k}={}", hyperlink(vs, vs))
+                if color {
+                    format!("{k}={}", hyperlink(vs, vs))
+                } else {
+                    format!("{k}={vs}")
+                }
             } else {
                 format!("{k}={vs}")
             }
@@ -1599,15 +1643,21 @@ fn render_event_line(event: &Value) -> String {
     let from = event
         .get("from")
         .and_then(Value::as_str)
-        .map(|f| format!("  \x1b[2m(from {f})\x1b[0m"))
+        .map(|f| {
+            if color {
+                format!("  \x1b[2m(from {f})\x1b[0m")
+            } else {
+                format!("  (from {f})")
+            }
+        })
         .unwrap_or_default();
-    format!("\x1b[2m[#{seq}]\x1b[0m {glyph} {topic_sgr}{topic}\x1b[0m  {field_str}{from}")
+    format!("{seq_prefix}[#{seq}]{seq_suffix} {glyph} {topic_prefix}{topic}{topic_suffix}  {field_str}{from}")
 }
 
 /// Format one board entry: `● key   status=DONE  owner=Max  url=<link>  (by dev_1)`.
 /// `entry` is `{by, ms, fields:{…}}`; the `key` is passed in (list entries carry it
-/// inline, get/set entries don't).
-fn render_entry_line(key: &str, entry: &Value) -> String {
+/// inline, get/set entries don't). SGR codes are emitted only when `color` is true.
+fn render_entry_line(key: &str, entry: &Value, color: bool) -> String {
     let empty: &[(String, Value)] = &[];
     let fields = entry
         .get("fields")
@@ -1618,7 +1668,8 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
         .find(|(k, _)| k == "status")
         .and_then(|(_, v)| v.as_str());
     let glyph = match status {
-        Some(st) => format!("{}\u{25CF}\x1b[0m ", status_sgr(st)),
+        Some(st) if color => format!("{}\u{25CF}\x1b[0m ", status_sgr(st)),
+        Some(_) => "\u{25CF} ".to_string(),
         None => "  ".to_string(),
     };
     let field_str = fields
@@ -1626,9 +1677,17 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
         .map(|(k, v)| {
             let vs = v.as_str().unwrap_or("");
             let rendered = if k == "status" {
-                format!("{}{vs}\x1b[0m", status_sgr(vs))
+                if color {
+                    format!("{}{vs}\x1b[0m", status_sgr(vs))
+                } else {
+                    vs.to_string()
+                }
             } else if is_url(vs) {
-                hyperlink(vs, vs)
+                if color {
+                    hyperlink(vs, vs)
+                } else {
+                    vs.to_string()
+                }
             } else {
                 vs.to_string()
             };
@@ -1636,19 +1695,35 @@ fn render_entry_line(key: &str, entry: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("  ");
-    // A live claim shows a magenta `⊙holder` tag so a glance at the board tells
+    // A live claim shows a `⊙holder` tag so a glance at the board tells
     // you who is actively working each task (empty when unclaimed).
     let held = entry
         .get("claimed_by")
         .and_then(Value::as_str)
-        .map(|h| format!("  \x1b[38;5;13m\u{2299}{h}\x1b[0m"))
+        .map(|h| {
+            if color {
+                format!("  \x1b[38;5;13m\u{2299}{h}\x1b[0m")
+            } else {
+                format!("  \u{2299}{h}")
+            }
+        })
         .unwrap_or_default();
     let by = entry
         .get("by")
         .and_then(Value::as_str)
-        .map(|b| format!("  \x1b[2m(by {b})\x1b[0m"))
+        .map(|b| {
+            if color {
+                format!("  \x1b[2m(by {b})\x1b[0m")
+            } else {
+                format!("  (by {b})")
+            }
+        })
         .unwrap_or_default();
-    format!("{glyph}\x1b[1m{key:<12}\x1b[0m {field_str}{held}{by}")
+    if color {
+        format!("{glyph}\x1b[1m{key:<12}\x1b[0m {field_str}{held}{by}")
+    } else {
+        format!("{glyph}{key:<12} {field_str}{held}{by}")
+    }
 }
 
 /// A status string → an SGR color: green done/shipped, red blocked/failed, cyan
@@ -2101,7 +2176,7 @@ mod tests {
     #[test]
     fn render_bus_topics_lists_topic_and_count() {
         let json = reply_bus_topics(vec![("deploy".to_string(), 3)]);
-        let view = render_bus(&json).expect("topics reply must render");
+        let view = render_bus(&json, true).expect("topics reply must render");
         assert!(view.contains("deploy"), "names the topic: {view:?}");
         assert!(view.contains("subs=3"), "shows the count: {view:?}");
     }
@@ -2109,7 +2184,10 @@ mod tests {
     #[test]
     fn render_bus_topics_empty_is_explicit() {
         let json = reply_bus_topics(vec![]);
-        assert_eq!(render_bus(&json).as_deref(), Some("  (no active topics)"));
+        assert_eq!(
+            render_bus(&json, true).as_deref(),
+            Some("  (no active topics)")
+        );
     }
 
     /// `atrium ctl bus topics` round-trips argv → request → parsed `BusOp::Topics`.
@@ -2154,7 +2232,7 @@ mod tests {
             Some("warning: published to 'ghost' with 0 subscribers")
         );
         // And it is NOT smuggled into the stdout render.
-        let view = render_bus(reply).expect("pub reply must render");
+        let view = render_bus(reply, true).expect("pub reply must render");
         assert!(
             !view.contains("warning:"),
             "warning must not be on stdout: {view:?}"
@@ -2177,7 +2255,7 @@ mod tests {
     fn zero_sub_warning_backward_compatible_without_field() {
         let reply = r#"{"ok":true,"event":{"seq":7,"topic":"deploy","kind":"fyi","from":"dev_1","fields":{"m":"hi"}}}"#;
         assert_eq!(zero_sub_warning(reply), None, "legacy reply must not warn");
-        let view = render_bus(reply).expect("legacy pub reply must still render");
+        let view = render_bus(reply, true).expect("legacy pub reply must still render");
         assert!(
             view.contains("deploy"),
             "legacy reply still shows the event: {view:?}"
@@ -2952,7 +3030,7 @@ mod tests {
                 lease_ms: 1100,
             },
         );
-        let view = render_board(&reply).expect("claim reply renders");
+        let view = render_board(&reply, true).expect("claim reply renders");
         assert!(view.contains("held by scout"), "view was: {view}");
         // A granted claim shows the confirmation.
         let e = crate::board::Entry {
@@ -2961,15 +3039,15 @@ mod tests {
             ..Default::default()
         };
         let granted = reply_board_claim("cli", &crate::board::Claim::Granted(e));
-        let gview = render_board(&granted).expect("granted renders");
+        let gview = render_board(&granted, true).expect("granted renders");
         assert!(gview.contains("claimed cli"), "view was: {gview}");
     }
 
     #[test]
     fn board_view_renders_status_color_and_clickable_url() {
-        // A list reply renders each entry with a colored status and an OSC-8 link.
         let reply = r#"{"ok":true,"board":[{"key":"auth","by":"dev_1","ms":1,"fields":{"status":"DONE","owner":"Max","url":"https://x.io"}}]}"#;
-        let view = render_board(reply).unwrap();
+        // Colored output (TTY path).
+        let view = render_board(reply, true).unwrap();
         assert!(view.contains("auth"), "key present");
         assert!(view.contains("owner=Max"));
         assert!(view.contains("\x1b[38;5;10m"), "DONE is green");
@@ -2979,20 +3057,27 @@ mod tests {
             "url is clickable"
         );
         assert!(view.contains("(by dev_1)"));
+        // Plain output (piped/redirected path) — no escape sequences at all.
+        let plain = render_board(reply, false).unwrap();
+        assert!(plain.contains("auth"), "key present in plain");
+        assert!(plain.contains("status=DONE"), "status visible in plain");
+        assert!(plain.contains("owner=Max"), "other fields in plain");
+        assert!(plain.contains("(by dev_1)"), "author in plain");
+        assert!(!plain.contains('\x1b'), "no escape codes in plain output");
     }
 
     #[test]
     fn board_view_handles_empty_and_missing() {
         assert_eq!(
-            render_board(r#"{"ok":true,"board":[]}"#).unwrap(),
+            render_board(r#"{"ok":true,"board":[]}"#, true).unwrap(),
             "  (board is empty)"
         );
-        assert!(render_board(r#"{"ok":true,"key":"x","entry":null}"#)
+        assert!(render_board(r#"{"ok":true,"key":"x","entry":null}"#, true)
             .unwrap()
             .contains("not on the board"));
         // A non-board (or failed) reply → None, so the caller prints raw JSON.
-        assert!(render_board(r#"{"ok":true,"pane":3}"#).is_none());
-        assert!(render_board(r#"{"ok":false,"err":"nope"}"#).is_none());
+        assert!(render_board(r#"{"ok":true,"pane":3}"#, true).is_none());
+        assert!(render_board(r#"{"ok":false,"err":"nope"}"#, true).is_none());
     }
 
     #[test]
