@@ -237,18 +237,48 @@ fn draw_loading(master: &mut Screen, p: &PaneView, rows: usize, cols: usize, fra
 /// every side, truncating anything past the inner bounds (the pane should be
 /// sized to the inner area, but a resize race could leave it momentarily larger
 /// — clip rather than overwrite the border or neighbors).
+///
+/// Double-width aware: the pane's cells already carry their display `width`
+/// (the emulator computed it — a wide glyph is a `width==2` lead followed by a
+/// `width==0` continuation), so a straight copy preserves alignment. The one
+/// case a straight copy gets wrong is a wide glyph whose continuation would
+/// fall on the border: rather than let half a glyph spill past the inset, its
+/// lead is replaced by a space. Each row is blitted with a single
+/// [`Screen::copy_cells`] rather than a `set` per cell.
 fn blit_inner(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
     let inner_row = p.rect.row + 1;
     let inner_col = p.rect.col + 1;
     let inner_rows = p.rect.rows.saturating_sub(2).min(p.screen.rows());
     let inner_cols = p.rect.cols.saturating_sub(2).min(p.screen.cols());
+    if inner_rows == 0 || inner_cols == 0 {
+        return;
+    }
+    // Build each row once (applying the wide-glyph edge clip), then copy the
+    // whole run into the master with a single bounds check.
+    let mut run: Vec<Cell> = Vec::with_capacity(inner_cols);
     for r in 0..inner_rows {
+        let mr = inner_row + r;
+        if mr >= rows {
+            break;
+        }
+        run.clear();
         for c in 0..inner_cols {
-            let (mr, mc) = (inner_row + r, inner_col + c);
-            if mr < rows && mc < cols {
-                master.set(mr, mc, p.screen.cell(r, c));
+            let cell = p.screen.cell(r, c);
+            if cell.width == 2 && c + 1 == inner_cols {
+                // Wide lead in the last inner column: its continuation would be
+                // the border. Clip the glyph to a space so nothing overflows.
+                run.push(Cell::new(' ', cell.style));
+            } else if cell.width == 0 && c == 0 {
+                // Orphaned continuation (its lead is off the left edge): show a
+                // space, not an empty never-emitted cell.
+                run.push(Cell::new(' ', cell.style));
+            } else {
+                run.push(cell);
             }
         }
+        // copy_cells clips the run at the master's right edge, matching the old
+        // per-cell `mc < cols` guard.
+        master.copy_cells(mr, inner_col, &run);
     }
 }
 
@@ -1146,5 +1176,77 @@ mod tests {
             (cx_zoom, cy_zoom),
             "tiled border-inset must differ from zoomed direct-passthrough coords"
         );
+    }
+
+    // ── double-width compositing (atrium-dev-r8 item 4) ──────────────────────
+    // Driven through the real emulator (vterm computes width) → compose(), not a
+    // hand-built grid: this exercises the actual width model end to end.
+
+    #[test]
+    fn wide_glyphs_compose_without_drift_and_borders_stay_put() {
+        // A pane showing 世界 in a 3x8 box (inner 1x6). vterm lays each ideograph
+        // out as a width-2 lead + width-0 continuation; the blit preserves that,
+        // so 界 lands at inner column 2 (not 1) — no leftward drift — and the
+        // right border stays at the box edge.
+        let mut t = vterm::Term::new(1, 6);
+        t.feed("世界".as_bytes());
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 8,
+        };
+        let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Idle)];
+        let m = compose(3, 8, &panes, 0);
+        // Inner origin is (1,1).
+        assert_eq!(m.cell(1, 1).ch, '世');
+        assert_eq!(m.cell(1, 1).width, 2, "lead is width 2");
+        assert_eq!(m.cell(1, 2).width, 0, "right half is a continuation");
+        assert_eq!(m.cell(1, 3).ch, '界', "second glyph did not drift left");
+        assert_eq!(m.cell(1, 4).width, 0);
+        // Right border intact at the box edge (col 7), not shoved by content.
+        assert_eq!(m.cell(1, 7).ch, '│');
+    }
+
+    #[test]
+    fn wide_glyph_at_inner_right_edge_clips_to_space() {
+        // Resize-race shape: the pane screen (10 cols) is wider than the pane's
+        // inner area (3 cols). A wide lead sits in the last inner column; its
+        // continuation would land on the border. It must clip to a space so half
+        // a glyph never overflows the box.
+        let mut t = vterm::Term::new(1, 10);
+        t.feed("AB世".as_bytes()); // 世 lead at col 2, continuation at col 3
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 5, // inner_cols = 3
+        };
+        let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Idle)];
+        let m = compose(3, 5, &panes, 0);
+        assert_eq!(m.cell(1, 1).ch, 'A');
+        assert_eq!(m.cell(1, 2).ch, 'B');
+        assert_eq!(m.cell(1, 3).ch, ' ', "wide glyph clipped to a space");
+        assert_eq!(m.cell(1, 3).width, 1);
+        assert_eq!(m.cell(1, 4).ch, '│', "border not overrun by half a glyph");
+    }
+
+    #[test]
+    fn focused_cursor_lands_past_wide_cells() {
+        // After printing a wide glyph the emulator cursor is at column 2; the
+        // focused-pane translation (1:1 blit) must land the master cursor two
+        // columns into the inner area, i.e. just past the glyph.
+        let mut t = vterm::Term::new(1, 6);
+        t.feed("世".as_bytes());
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 8,
+        };
+        let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Focused)];
+        let m = compose(3, 8, &panes, 0);
+        // Inner origin (1,1) + cursor col 2 → master col 3.
+        assert_eq!(m.cursor, (1, 3));
     }
 }
