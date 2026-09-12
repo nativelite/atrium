@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Session save-state and recovery — atrium docs</title>
+<meta name="description" content="atrium documentation: Session save-state and recovery. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html">dev fleet</a><a href="reaping.html">reaping</a><a href="session-recovery.html" class="active">session recovery</a></div>
+<h1>Session save-state and recovery</h1>
+<p>atrium periodically writes a snapshot of the running session to disk. If the host crashes or atrium exits uncleanly, <code>atrium recover</code> reads that snapshot and reopens the session: same window-and-pane layout, same working directories, same identities, same agent commands — and, for agents that support <code>--resume</code>, the same transcript.</p>
+<h2>What is captured</h2>
+<p>Each snapshot is a point-in-time image of the live session. It records:</p>
+<ul><li><b>Window layout</b> — the split tree describing how panes are arranged and which pane is focused. atrium's layout <code>Tree</code> stores pane boundaries as a recursive left/right split so the exact tile geometry can be reconstructed.</li></ul>
+<ul><li>Per pane:</li><li><b>argv</b> — the command the pane is running (the hosted command and its arguments, exactly as passed to atrium at launch or via <code>ctl spawn</code>).</li><li><b>cwd</b> — the working directory the agent was started in.</li><li><b>identity</b> — the credential identity name passed via <code>--identity</code>, if any.</li><li><b>session\_id</b> — the UUID atrium injected via <code>--session-id</code> when the pane was spawned as a Claude agent. <code>None</code> for shells and agents atrium did not bind. See <a href="agent-status.html">agent status</a> for how session ids are used.</li><li><b>role</b> — the ctl role label the pane was spawned under (e.g. <code>dev_1</code>), if any. Used by the ctl spawn tree to route messages; restored so <code>ctl send</code> works again after recovery.</li><li><b>worktree</b> — the git worktree directory the pane is working in, if the session was started with per-agent worktrees. See <a href="worktrees.html">worktrees</a>.</li></ul>
+<p>These are the live fields tracked on each <code>Pane</code> throughout the session (<code>src/main.rs</code>); the snapshot serialises them to disk.</p>
+<h2>Where the snapshot lives</h2>
+<p>The snapshot path is determined by the snap implementation. The snap worker will publish the concrete location on the <code>atrium-dev-r4</code> bus when the feature lands; this section will be updated to name it. Until then, treat the location as implementation-defined — do not hard-code it in scripts.</p>
+<h2>How agents resume</h2>
+<p>Recovery distinguishes between agents that can reconnect to a prior transcript and those that cannot.</p>
+<h3>Claude (supports <code>--resume</code>)</h3>
+<p>For a Claude pane, atrium captured the <code>session_id</code> UUID it originally injected via <code>--session-id</code>. On recovery, instead of minting a fresh UUID, atrium launches the pane with <code>--resume &lt;session_id&gt;</code>, which reopens the previous transcript exactly where it left off.</p>
+<p>atrium's binder (<code>src/bind.rs</code>) already recognises <code>--resume</code> / <code>-r</code> as a user-owned session argument and suppresses its own <code>--session-id</code> injection in that case; the same suppression applies to the recovery-generated <code>--resume</code>.</p>
+<h3>Agents without resume support</h3>
+<p>For shells and any agent that does not understand <code>--resume</code>, atrium launches the pane fresh: the same argv in the same cwd, with the same identity resolved. The working directory and role are restored so the pane slots back into the ctl spawn tree correctly. The prior transcript is not recoverable — those panes come back at a clean prompt.</p>
+<h2>Recovery flow after a host crash</h2>
+<ol><li><b>atrium exits</b> — uncleanly (crash, power loss, kill) or cleanly (graceful quit writes a final snapshot).</li><li><b>Hosted agents are terminated (Windows) or orphaned (Unix).</b> On Windows, atrium assigns every pane process to a Job Object with <code>JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE</code> (<code>src/reap.rs</code>). When atrium's handle closes — however it dies, including an uncatchable <code>TerminateProcess</code> — the kernel terminates every process in the job. There is nothing to reattach to; <code>atrium recover</code> reconstructs the session from the snapshot. On Unix, agents may continue running under <code>init</code> until they exit naturally. The orphan reaper can reclaim stale processes; see <a href="reaping.html">reaping</a>.</li><li><b>Operator runs <code>atrium recover</code></b> — no arguments required. atrium locates the most recent snapshot for the current session, reads it, and re-opens the session window.</li><li><b>Layout is rebuilt</b> — the split tree is reconstructed and all panes are re-spawned. For Claude panes, <code>--resume &lt;session_id&gt;</code> reconnects each agent to its prior transcript. For other panes, the same command is re-launched in the recorded cwd.</li><li><b>ctl topology is restored</b> — roles are re-stamped so <code>ctl spawn</code>, <code>ctl send</code>, and <code>ctl status</code> see the same logical layout they did before the crash.</li></ol>
+<p><code>atrium recover</code> is safe to run even if the previous session exited cleanly: it opens a new session from the last snapshot rather than raising an error.</p>
+<h2>Relationship to <code>--session-id</code></h2>
+<p>atrium injects <code>--session-id &lt;uuid&gt;</code> at spawn for every Claude agent pane it starts, binding the pane to a freshly-minted session id (<a href="agent-status.html">agent status</a>). The snapshot preserves that id so recovery can pass it back as <code>--resume &lt;session_id&gt;</code> instead of creating a second, disconnected session.</p>
+<p>A pane that already carries <code>--session-id</code>, <code>--resume</code>, <code>-r</code>, <code>--continue</code>, or <code>-c</code> in its argv is treated as user-owned; atrium does not inject a second id at original spawn or at recovery.</p>
+<p>See also the <a href="https://github.com/nativelite/atrium#readme">atrium README</a>.</p>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

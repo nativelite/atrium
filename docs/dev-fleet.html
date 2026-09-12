@@ -20,7 +20,7 @@
 </div></header>
 
 <main class="wrap doc">
-<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html" class="active">dev fleet</a><a href="reaping.html">reaping</a></div>
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html" class="active">dev fleet</a><a href="reaping.html">reaping</a><a href="session-recovery.html">session recovery</a></div>
 <h1>Developing atrium with atrium: the dev-fleet pattern</h1>
 <p>&gt; <b>This page documents what this very fleet embodies.</b> The atrium-dev fleet &gt; runs atrium to develop atrium — each worker in its own per-agent worktree, &gt; coordinating over the board and bus, gating every push with <code>python dev.py &gt; check</code>. The pattern is repeatable for any multi-concern Rust (or other &gt; compiled) repo.</p>
 <h2>The bootstrap moment</h2>
