@@ -22,8 +22,9 @@
 //! that the emulator can't render pixel-exact (wide glyphs, sixel, mouse).
 
 use atrium::bar::{bar_paint, PaneInfo};
-use atrium::input::{Action, Dir, PrefixScanner};
+use atrium::input::{encode_sgr_left_click, Action, Dir, PrefixScanner};
 use atrium::layout::{self, Tree};
+use atrium::tile::screen_to_pane_local;
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -1896,25 +1897,32 @@ fn run(
                     force_repaint = true;
                 }
                 Action::MouseClick { col, row } => {
-                    // Focus the pane under the cursor. Only meaningful in a tiled
-                    // window (a single/zoomed pane already has focus).
                     let w = &mut windows[active];
                     if w.tiled() {
                         let outer = tiled_outer(rows, cols);
                         let mx = col.saturating_sub(1) as usize;
                         let my = row.saturating_sub(1) as usize;
-                        for (id, rect) in w.tree.rects(outer) {
-                            let inside = my >= rect.row
-                                && my < rect.row + rect.rows
-                                && mx >= rect.col
-                                && mx < rect.col + rect.cols;
-                            if inside {
-                                if w.tree.focus_pane(id) {
-                                    prev_master = None;
-                                    force_repaint = true;
+                        let hit = w.tree.rects(outer).into_iter().find(|(_, r)| {
+                            my >= r.row && my < r.row + r.rows && mx >= r.col && mx < r.col + r.cols
+                        });
+                        if let Some((id, rect)) = hit {
+                            if let Some(p) = w.pane_mut(id) {
+                                if p.mouse_wanted {
+                                    if let Some((cx, cy)) = screen_to_pane_local(mx, my, &rect) {
+                                        let seq = encode_sgr_left_click(cx, cy);
+                                        let _ = p.pty.write(seq.as_bytes());
+                                    }
                                 }
-                                break;
                             }
+                            if w.tree.focus_pane(id) {
+                                prev_master = None;
+                                force_repaint = true;
+                            }
+                        }
+                    } else if let Some(p) = windows[active].focused_mut() {
+                        if p.mouse_wanted {
+                            let seq = encode_sgr_left_click(col as usize, row as usize);
+                            let _ = p.pty.write(seq.as_bytes());
                         }
                     }
                 }

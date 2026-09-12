@@ -347,6 +347,23 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
     }
 }
 
+/// Map a master-screen 0-based `(col, row)` into the pane's 1-based inner
+/// `(col, row)` coordinates, inset one cell for the box border and clamped to
+/// the content area. Returns `None` if the point is entirely outside the rect.
+///
+/// Used to translate a click or scroll position on the master screen into the
+/// pane-local coords forwarded to the child PTY as an SGR mouse event.
+pub fn screen_to_pane_local(mx: usize, my: usize, rect: &Rect) -> Option<(usize, usize)> {
+    if my < rect.row || my >= rect.row + rect.rows || mx < rect.col || mx >= rect.col + rect.cols {
+        return None;
+    }
+    let inner_cols = rect.cols.saturating_sub(2).max(1);
+    let inner_rows = rect.rows.saturating_sub(2).max(1);
+    let cx = mx.saturating_sub(rect.col + 1).min(inner_cols - 1) + 1;
+    let cy = my.saturating_sub(rect.row + 1).min(inner_rows - 1) + 1;
+    Some((cx, cy))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1091,6 +1108,57 @@ mod tests {
         assert_eq!(
             m.cursor.0, 0,
             "cursor escaped a one-row pane into the sibling below"
+        );
+    }
+
+    // --- screen_to_pane_local ---
+
+    #[test]
+    fn screen_to_pane_local_inside_rect() {
+        // Rect at row=2, col=5, rows=8, cols=10. Border eats one cell each side.
+        // Inner content in master coords (0-based): rows [3..9], cols [6..14].
+        let rect = Rect {
+            row: 2,
+            col: 5,
+            rows: 8,
+            cols: 10,
+        };
+        // mx=8, my=4: cx=(8−6).min(7)+1=3, cy=(4−3).min(5)+1=2
+        assert_eq!(screen_to_pane_local(8, 4, &rect), Some((3, 2)));
+        // top-left inner corner
+        assert_eq!(screen_to_pane_local(6, 3, &rect), Some((1, 1)));
+    }
+
+    #[test]
+    fn screen_to_pane_local_outside_rect() {
+        let rect = Rect {
+            row: 2,
+            col: 5,
+            rows: 8,
+            cols: 10,
+        };
+        assert_eq!(screen_to_pane_local(3, 1, &rect), None); // above and left
+        assert_eq!(screen_to_pane_local(20, 2, &rect), None); // to the right
+        assert_eq!(screen_to_pane_local(5, 15, &rect), None); // below
+    }
+
+    #[test]
+    fn tiled_border_inset_differs_from_zoomed_direct_coords() {
+        // Guard: applying the tiled border-inset formula in zoom mode gives wrong coords.
+        // Tiled: master (6,3) on rect(row=2,col=5) → pane-local (1,1) after border inset.
+        let rect = Rect {
+            row: 2,
+            col: 5,
+            rows: 8,
+            cols: 10,
+        };
+        let (cx_tiled, cy_tiled) = screen_to_pane_local(6, 3, &rect).unwrap();
+        // Zoom: 1-based SGR (col=7, row=4) is forwarded unchanged — no offset applied.
+        let (cx_zoom, cy_zoom) = (7usize, 4usize);
+        assert_ne!(
+            (cx_tiled, cy_tiled),
+            (cx_zoom, cy_zoom),
+            "tiled border-inset must differ from zoomed direct-passthrough coords"
         );
     }
 }

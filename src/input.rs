@@ -47,9 +47,9 @@ pub enum Action {
     MoveFocus(Dir),
     /// Toggle the focused pane to/from full-screen passthrough — `Ctrl+A z`.
     Zoom,
-    /// Toggle mouse mode — `Ctrl+A m`. When on, clicks focus panes (and the
-    /// host captures the mouse); when off, the terminal's native drag-to-select
-    /// / copy is restored.
+    /// Toggle mouse mode — `Ctrl+A m`. When on, clicks focus panes and are
+    /// forwarded to any pane whose child has enabled mouse tracking; when off,
+    /// the terminal's native drag-to-select / copy is restored.
     ToggleMouse,
     /// Toggle the full-screen **board** dashboard — `Ctrl+A b`. An overlay of the
     /// shared board (source-of-truth state); keystrokes don't reach the panes
@@ -357,6 +357,12 @@ fn push_move(
     actions.push(Action::MoveFocus(dir));
 }
 
+/// Encode a left-button press as an SGR mouse sequence for forwarding to a
+/// child PTY. Button code 0 = left button, `M` = press event.
+pub fn encode_sgr_left_click(col: usize, row: usize) -> String {
+    format!("\x1b[<0;{col};{row}M")
+}
+
 /// Map an arrow CSI final byte to a direction.
 fn arrow_dir(b: u8) -> Option<Dir> {
     match b {
@@ -463,5 +469,41 @@ mod scroll_tests {
     fn prefix_o_toggles_the_overview() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b'o']), vec![Action::ToggleOverview]);
+    }
+
+    #[test]
+    fn encode_sgr_left_click_formats_correctly() {
+        use super::encode_sgr_left_click;
+        assert_eq!(encode_sgr_left_click(5, 3), "\x1b[<0;5;3M");
+        assert_eq!(encode_sgr_left_click(1, 1), "\x1b[<0;1;1M");
+        assert_eq!(encode_sgr_left_click(80, 24), "\x1b[<0;80;24M");
+    }
+
+    #[test]
+    fn prefix_m_toggles_mouse() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'm']), vec![Action::ToggleMouse]);
+    }
+
+    #[test]
+    fn mouse_toggle_changes_scanner_interception() {
+        // Mouse off (default): SGR sequence is forwarded verbatim.
+        let mut s = PrefixScanner::new();
+        let out = s.feed(b"\x1b[<0;5;3M");
+        assert!(
+            matches!(out.as_slice(), [Action::Forward(_)]),
+            "mouse off: forward"
+        );
+        // Enable — now intercepted as a click.
+        s.set_mouse(true);
+        let out = s.feed(b"\x1b[<0;5;3M");
+        assert_eq!(out, vec![Action::MouseClick { col: 5, row: 3 }]);
+        // Disable again — back to forwarding.
+        s.set_mouse(false);
+        let out = s.feed(b"\x1b[<0;5;3M");
+        assert!(
+            matches!(out.as_slice(), [Action::Forward(_)]),
+            "mouse off again: forward"
+        );
     }
 }
