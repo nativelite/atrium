@@ -244,10 +244,40 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude.json"))
 }
 
+/// Lexically collapse `.` and `..` components without disk IO. Defense-in-depth
+/// counterpart to the same function in `worktree.rs` — kept self-contained here
+/// so `trust.rs` has no cross-file contract with the worktree planner. See the
+/// primary fix and its full comment there.
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => out.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let at_root = matches!(
+                    out.components().last(),
+                    Some(Component::RootDir) | Some(Component::Prefix(_)) | None
+                );
+                if !at_root {
+                    out.pop();
+                }
+            }
+            Component::Normal(_) => out.push(c),
+        }
+    }
+    out
+}
+
 /// Convert a directory to claude's project-map key: an absolute path with
 /// forward slashes and no trailing slash (e.g. `D:/projects/x`). claude (a Node
 /// app) keys projects by `process.cwd()` in exactly this shape on every
 /// platform, so the child's inherited cwd maps to the same key we write.
+///
+/// The path is lexically normalized before conversion so a `..`-laden path
+/// (produced when a worktree base like `../../.atrium-worktrees` is joined onto
+/// the repo cwd) maps to the same key as claude's OS-resolved `process.cwd()`.
 fn project_key(dir: &Path) -> String {
     let abs = if dir.is_absolute() {
         dir.to_path_buf()
@@ -256,6 +286,7 @@ fn project_key(dir: &Path) -> String {
             .map(|c| c.join(dir))
             .unwrap_or_else(|_| dir.to_path_buf())
     };
+    let abs = normalize_path(&abs);
     let mut s = abs.to_string_lossy().replace('\\', "/");
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
@@ -551,6 +582,47 @@ mod tests {
         {
             assert_eq!(project_key(Path::new("/home/u/proj")), "/home/u/proj");
             assert_eq!(project_key(Path::new("/home/u/proj/")), "/home/u/proj");
+        }
+    }
+
+    /// A `..`-laden path and its collapsed form must produce the same key —
+    /// this is the core invariant that prevents the folder-trust dialog from
+    /// reappearing for worktree panes.
+    #[test]
+    fn project_key_normalizes_dotdot_before_converting() {
+        #[cfg(unix)]
+        {
+            // The worktree case: base built by joining a `../..`-relative path.
+            assert_eq!(
+                project_key(Path::new(
+                    "/home/dev/repo/../../.atrium-worktrees/fleet/fix"
+                )),
+                project_key(Path::new("/home/.atrium-worktrees/fleet/fix")),
+            );
+            assert_eq!(
+                project_key(Path::new(
+                    "/home/dev/repo/../../.atrium-worktrees/fleet/fix"
+                )),
+                "/home/.atrium-worktrees/fleet/fix",
+            );
+            // A path with no `..` is unchanged.
+            assert_eq!(
+                project_key(Path::new("/home/dev/.atrium-worktrees/fleet/fix")),
+                "/home/dev/.atrium-worktrees/fleet/fix",
+            );
+            // `..` that would escape above root is clamped.
+            assert_eq!(project_key(Path::new("/../..")), "/");
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                project_key(Path::new("D:\\projects\\repo\\..\\..\\wt\\fleet\\fix")),
+                project_key(Path::new("D:\\wt\\fleet\\fix")),
+            );
+            assert_eq!(
+                project_key(Path::new("D:\\projects\\repo\\..\\..\\wt\\fleet\\fix")),
+                "D:/wt/fleet/fix",
+            );
         }
     }
 
