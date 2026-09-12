@@ -86,6 +86,10 @@ The file is read **read-only**. atrium never writes it.
 | `allow_ctl` | optional | Bring [the control plane](control-plane.md) up, as `--allow-ctl` does. |
 | `trust` | optional | The trust posture the whole fleet runs at. |
 | `context` | optional | Shared knowledge and memory backend for the fleet (see [Shared context](#shared-context)). |
+| `topics` | optional | The fleet's canonical bus-topic vocabulary (an array of strings): the topics its agents coordinate on. See [the control plane](control-plane.md). |
+| `worktrees` | optional | `true` gives **every** agent its own git worktree and branch (a full fan-out), so parallel workers never clobber one shared tree. See [worktrees](worktrees.md). |
+| `worktree_base` | optional | Where those worktrees are created; defaults to a sibling of the repo so they never show up as untracked files inside it. See [worktrees](worktrees.md). |
+| `worktree_seed` | optional | Untracked paths (an array of strings) linked from the main tree into each fresh worktree — config or build inputs git does not track. Best-effort (junction/symlink, copy fallback); never fails a launch. See [worktrees](worktrees.md). |
 
 **`identity`** is resolved via `akey` and injected per pane exactly as `--identity` does. The pane shows the `·<name>` tag (the **name** only, never a secret), and a resolve failure is flashed and the pane runs without it, never silently unauthenticated. See [credential identity](identity.md).
 
@@ -108,6 +112,9 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 | `model` | `--model` | The model to run. |
 | `effort` | `--effort` | The reasoning effort. |
 | `can_spawn` | `ctl spawn` capability | May this agent create teammates? **Defaults to `false`.** |
+| `trust` | `--trust` for this pane | Overrides the fleet-level `trust` for this one agent, capped at the fleet/session ceiling (a per-agent posture can de-escalate, never elevate). See [trust and security](trust-and-security.md). |
+| `worktree` | worktree group | The worktree group this agent joins. Agents sharing a name co-develop one worktree and branch; distinct names are isolated. See [worktrees](worktrees.md). |
+| `kickoff` | first prompt | An opening message submitted to the agent once it is up (distinct from `prompt`, which is appended to its system prompt) — the initiative that starts it working. |
 
 **`can_spawn`** is a capability the roster grants, not something implied by having ctl access. A depth cap bounds how far a fan-out goes, but never says who may start one, so the right to create teammates is declared here.
 

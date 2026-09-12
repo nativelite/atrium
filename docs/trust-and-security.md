@@ -80,11 +80,17 @@ pane, which shows as a waiting-on-you `?` in the chrome.
 
 The built-in allowlist covers:
 
-- `python` / `pytest`
-- `cargo test` / `build` / `check` / `clippy` / `fmt`
+- `atrium ctl` — the coordination layer itself, so a fleet's own `bus` / `board` /
+  `ctl` calls never prompt (deliberately `atrium ctl`, **not** `atrium`: starting a
+  fresh session from inside a pane is not hands-off)
+- `python` / `python3` / `pytest`
+- `cargo test` / `build` / `check` / `clippy` / `fmt` / `run` / `clean`
 - `go test` / `build` / `vet`
-- `node`
-- `npm test`
+- `node` / `npm test`
+- the local, non-destructive `git` loop: `status` / `log` / `diff` / `branch` /
+  `show` / `add` / `commit` / `merge` / `worktree` — the commit-and-merge loop a
+  worktree fleet runs on, deliberately **not** `git push` (network), `reset --hard`,
+  or `clean` (destructive), which still prompt
 
 Read-only shell like `ls` / `cat` / `git status` is already auto-accepted by
 acceptEdits.
@@ -95,10 +101,10 @@ comma-separated prefix `P` becomes a `Bash(P *)` matcher, for example
 
 ## The folder-trust write
 
-Both the `accept` and `skip` modes also **pre-accept claude's separate
-folder-trust dialog** for each pane's working directory: the "Do you trust the
-files in this folder?" gate, stored per-directory in `~/.claude.json`, which
-neither permission flag covers.
+Every `--trust` mode (`plan`, `accept`, `automode`, `skip`) also **pre-accepts
+claude's separate folder-trust dialog** for each pane's working directory: the
+"Do you trust the files in this folder?" gate, stored per-directory in
+`~/.claude.json`, which the permission flags do not cover.
 
 atrium writes only that trust bit, only for the pane's own directory, atomically.
 A config it can't parse is left untouched and the pane still launches. That write

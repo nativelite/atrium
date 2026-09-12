@@ -40,7 +40,7 @@ The identity applies to the initial agent pane and is inherited by every split a
 Only the *name* of an identity is ever rendered.
 
 - A `·<name>` tag rides in the pane's top border (for example `2:claude ·work`) and appears next to the window's entry in the bar.
-- The tag renders as **colored text**: the identity color is used as the name's foreground, matching the pane border, in both the border and the reverse-video bar. It is never a filled color chip.
+- The tag renders as **colored text**: the identity color is used as the name's foreground, matching the pane border, in both the border and the status bar (drawn as foreground over the bar's dark background). It is never a filled color chip.
 - The text is always drawn. Color is a redundant accessibility channel, never the only signal, so the identity is legible without relying on color.
 
 ## The hard guarantee: names, never secrets

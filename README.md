@@ -114,6 +114,8 @@ Then drive it with the **`Ctrl+A`** prefix (press `Ctrl+A`, release, then a key)
 | `h` `j` `k` `l` / arrows | move focus between tiles |
 | `z` | zoom the focused pane to full-screen and back |
 | `b` | the board + bus dashboard |
+| `o` | the overview: a mission-control panel of the agent tree, colored by status |
+| `a` | the activity log: a scrollable, time-ordered merge of bus, board, and agent actions |
 | `m` | toggle mouse capture (off by default, so text selection works) |
 | `x` / `q` | kill the focused pane / quit atrium |
 | `Ctrl+A` | send a literal `Ctrl+A` through to the pane |
@@ -124,7 +126,7 @@ A pane whose process exits closes itself; when the last one exits, atrium exits.
 > meant for the agent is never eaten: `--identity <name>` / `-I` (a credential
 > identity), `-n <N>` (N agent panes, N a positive multiple of 2), `--grid <R>x<C>`
 > (explicit grid), `--allow-ctl` (the [control plane](#coordinating-agents-the-control-plane)),
-> `--trust <policy>` (hands-off posture).
+> `--max-depth <N>` (spawn-recursion cap, default 6), `--trust <policy>` (hands-off posture).
 
 Before agents can **coordinate or delegate** across panes (any `--allow-ctl`
 session or `atrium fleet up`), install the coordination skills once: see
@@ -206,10 +208,11 @@ atrium fleet ls               # list the fleets in the file
 
 A fleet is defined in **`atrium.fleet.json`** (checked into the repo, or a
 user-global fallback). Each agent gets a `name`, a `cmd`, and optional `cwd`,
-`add_dirs`, `prompt`, `model`, `effort`, `identity`, and `can_spawn`. A fleet
-can also declare a **shared knowledge backend** (e.g. context-mode) so a
-designated indexer agent keeps the team's knowledge fresh and every other agent
-can search it. Before it launches, atrium **discloses every directory the roster
+`add_dirs`, `prompt`, `kickoff`, `model`, `effort`, `identity`, `trust`,
+`worktree`, and `can_spawn`. A fleet can also declare its own git **worktrees**
+(so parallel workers never share one tree) and a **shared knowledge backend**
+(e.g. context-mode) so a designated indexer agent keeps the team's knowledge
+fresh and every other agent can search it. Before it launches, atrium **discloses every directory the roster
 grants** (resolved through symlinks) and waits for your Enter. Errors spawn
 nothing, never a partial fleet. Full spec and the JSON schema:
 [docs/fleets.md](docs/fleets.md).
@@ -279,8 +282,9 @@ control plane exists.
 | Command | Purpose |
 | --- | --- |
 | `atrium [flags] [cmd...]` | start a session hosting `cmd` (default: your shell) |
-| `atrium fleet up <name>` / `ls` | bring up a saved roster / list rosters |
+| `atrium fleet up <name>` / `ls` / `clean <name>` | bring up a saved roster / list rosters / reclaim a fleet's clean, merged worktrees |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
+| `atrium recover` | rehydrate the most recent session snapshot ([session recovery](docs/session-recovery.md)) |
 | `atrium reap` / `--reap-orphans` | clean up orphaned pane groups ([reaping](docs/reaping.md)) |
 | `atrium --stdin-probe` | print the hex of what your terminal sends (diagnostics) |
 | `atrium --version` | print the version |

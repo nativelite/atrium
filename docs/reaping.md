@@ -38,8 +38,9 @@ skip.
    this guards against killing more than atrium owns.
 3. Its owner is provably gone, not merely unreachable. `kill(pid, 0)` succeeds
    on a zombie, so liveness uses `pid_running`; the start time defeats pid
-   reuse; and the identity check is `proc_pidpath` plus `(dev, ino)`, never
-   `argv[0]`, which is forgeable on macOS.
+   reuse; and the identity check is the executable's real path plus `(dev, ino)`
+   (via `proc_pidpath` on macOS, `/proc/<pid>/exe` on Linux), never `argv[0]`,
+   which is forgeable.
 
 ## Why `ppid == 1` is the wrong test
 
