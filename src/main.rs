@@ -3503,6 +3503,7 @@ fn spawn_worker_window(
             pane.role = sp.role.clone();
             pane.parent = caller;
             pane.depth = new_depth;
+            pane.worktree = sp.worktree.clone();
             let agent_id = pane.agent_id;
             let session = pane.session_id.clone();
             windows.push(w);
@@ -3576,6 +3577,7 @@ fn spawn_worker_here(
             pane.role = sp.role.clone();
             pane.parent = caller;
             pane.depth = new_depth;
+            pane.worktree = sp.worktree.clone();
             let agent_id = pane.agent_id;
             let session = pane.session_id.clone();
             // Enroll this ctl-spawned pane in the session Job synchronously (same
@@ -4983,5 +4985,31 @@ mod tests {
         std::fs::write(tmp.join("unrelated.json"), b"{}").unwrap();
         assert!(super::find_latest_snapshot(&tmp).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // --- Bug 2: worktree pane carries its name in the snapshot -----------------
+
+    /// When a pane is spawned with a `--worktree` name (via `SpawnReq.worktree`),
+    /// the fix in `spawn_worker_window` / `spawn_worker_here` sets
+    /// `pane.worktree = sp.worktree.clone()`. The snapshot capture seam reads
+    /// `p.worktree` directly; this test exercises that full path to ensure a
+    /// spawned worktree pane's snapshot record has `worktree = Some(name)`.
+    #[test]
+    fn spawned_worktree_pane_snapshot_carries_worktree_name() {
+        let capture = atrium::session::PaneCapture {
+            id: 7,
+            role: Some("fix".to_string()),
+            argv: vec!["claude".to_string()],
+            cwd: Some("/work/atrium-dev-r5/fix".to_string()),
+            identity: None,
+            session_id: Some("sess-fix".to_string()),
+            worktree: Some("fix".to_string()),
+        };
+        let snap = atrium::session::capture(vec![7], 7, vec![capture]);
+        assert_eq!(
+            snap.panes[0].worktree.as_deref(),
+            Some("fix"),
+            "a spawned worktree pane must carry its worktree name in the snapshot"
+        );
     }
 }
