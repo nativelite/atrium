@@ -799,6 +799,31 @@ fn confirm_skip_permissions() -> bool {
     }
 }
 
+/// Build a [`atrium::session::PaneCapture`] from the individual pane metadata
+/// fields that `snapshot_if_changed` reads from a live [`Pane`]. Extracted
+/// from the inline closure so the field mapping is directly unit-testable
+/// without a real PTY — if `worktree` (or any other field) is accidentally
+/// dropped, the test at `capture_pane_fields_propagates_worktree` fails.
+fn capture_pane_fields(
+    id: usize,
+    role: Option<String>,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    identity: Option<String>,
+    session_id: Option<String>,
+    worktree: Option<String>,
+) -> atrium::session::PaneCapture {
+    atrium::session::PaneCapture {
+        id,
+        role,
+        argv,
+        cwd,
+        identity,
+        session_id,
+        worktree,
+    }
+}
+
 /// Write a session snapshot iff the window state has changed since the last write.
 /// Pure capture + equality check — no I/O when nothing changed.
 fn snapshot_if_changed(
@@ -815,14 +840,16 @@ fn snapshot_if_changed(
         w.tree.focus(),
         w.panes
             .iter()
-            .map(|p| atrium::session::PaneCapture {
-                id: p.id,
-                role: p.role.clone(),
-                argv: p.argv.clone(),
-                cwd: p.cwd.clone(),
-                identity: p.identity.clone(),
-                session_id: p.session_id.clone(),
-                worktree: p.worktree.clone(),
+            .map(|p| {
+                capture_pane_fields(
+                    p.id,
+                    p.role.clone(),
+                    p.argv.clone(),
+                    p.cwd.clone(),
+                    p.identity.clone(),
+                    p.session_id.clone(),
+                    p.worktree.clone(), // set by spawn_worker_* via sp.worktree
+                )
             })
             .collect(),
     );
@@ -4987,29 +5014,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    // --- Bug 2: worktree pane carries its name in the snapshot -----------------
+    // --- Bug 2: worktree field flows through the real snapshot mapping path ---
 
-    /// When a pane is spawned with a `--worktree` name (via `SpawnReq.worktree`),
-    /// the fix in `spawn_worker_window` / `spawn_worker_here` sets
-    /// `pane.worktree = sp.worktree.clone()`. The snapshot capture seam reads
-    /// `p.worktree` directly; this test exercises that full path to ensure a
-    /// spawned worktree pane's snapshot record has `worktree = Some(name)`.
+    /// Guards the `p.worktree -> PaneCapture.worktree` mapping inside
+    /// `snapshot_if_changed` (main.rs:818-827, now via `capture_pane_fields`).
+    ///
+    /// The original bug: `spawn_worker_window`/`spawn_worker_here` never set
+    /// `pane.worktree`, so every live snapshot saw `None` even for worktree
+    /// panes. The fix adds `pane.worktree = sp.worktree.clone()` in both spawn
+    /// paths. This test fails if `worktree` is dropped or hardcoded to `None`
+    /// in `capture_pane_fields` — the function `snapshot_if_changed` calls with
+    /// `p.worktree.clone()` as the final argument.
     #[test]
-    fn spawned_worktree_pane_snapshot_carries_worktree_name() {
-        let capture = atrium::session::PaneCapture {
-            id: 7,
-            role: Some("fix".to_string()),
-            argv: vec!["claude".to_string()],
-            cwd: Some("/work/atrium-dev-r5/fix".to_string()),
-            identity: None,
-            session_id: Some("sess-fix".to_string()),
-            worktree: Some("fix".to_string()),
-        };
-        let snap = atrium::session::capture(vec![7], 7, vec![capture]);
+    fn capture_pane_fields_propagates_worktree() {
+        let cap = super::capture_pane_fields(
+            7,
+            Some("fix".to_string()),
+            vec!["claude".to_string()],
+            Some("/work".to_string()),
+            None,
+            Some("sess-fix".to_string()),
+            Some("fix".to_string()),
+        );
         assert_eq!(
-            snap.panes[0].worktree.as_deref(),
+            cap.worktree.as_deref(),
             Some("fix"),
-            "a spawned worktree pane must carry its worktree name in the snapshot"
+            "worktree must flow through capture_pane_fields unchanged"
+        );
+        // None must propagate too — a non-worktree pane must not invent a name.
+        let cap_none =
+            super::capture_pane_fields(8, None, vec!["bash".to_string()], None, None, None, None);
+        assert!(
+            cap_none.worktree.is_none(),
+            "non-worktree pane must have None"
         );
     }
 }
