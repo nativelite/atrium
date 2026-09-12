@@ -26,6 +26,7 @@ PAGES = [
     ("worktrees", "worktrees"),
     ("dev-fleet", "dev fleet"),
     ("reaping", "reaping"),
+    ("session-recovery", "session recovery"),
 ]
 SLUGS = {slug for slug, _ in PAGES}
 
