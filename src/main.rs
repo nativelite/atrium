@@ -4333,6 +4333,20 @@ fn split_cmdline(line: &str) -> Vec<String> {
     out
 }
 
+/// Strip embedded newlines from a shell-arg before it is forwarded through a
+/// `cmd /C` shim.  `cmd.exe` builds the command line by concatenating all argv
+/// tokens and then parses that string line-by-line, so a bare `\n` acts as a
+/// line delimiter and silently drops every token that follows it — that is how
+/// `--permission-mode auto` and `--session-id` vanished from fleet panes that
+/// received a multi-line kickoff prompt in r8.
+///
+/// `CreateProcessW` and POSIX `exec` pass argv literally, so they must NOT use
+/// this sanitization (a multi-line prompt is valid and meaningful there).
+fn sanitize_shim_arg(s: &str) -> String {
+    // Collapse CRLF first so it counts as one space, then lone CR and LF.
+    s.replace("\r\n", " ").replace('\r', " ").replace('\n', " ")
+}
+
 /// On Windows, resolve the command the way the shell would (PATH x PATHEXT) and
 /// host `.cmd`/`.bat` shims under `cmd /C` — npm-installed CLIs (Claude Code
 /// included) are such shims, and `CreateProcessW` cannot launch them directly.
@@ -4352,7 +4366,7 @@ fn effective_command(command: &[String]) -> Vec<String> {
         Some(path) if resolve::needs_shell(&path) => {
             let mut v = vec!["cmd".to_string(), "/C".to_string()];
             v.push(path.to_string_lossy().into_owned());
-            v.extend(command[1..].iter().cloned());
+            v.extend(command[1..].iter().map(|a| sanitize_shim_arg(a)));
             v
         }
         Some(path) => {
@@ -4372,8 +4386,52 @@ fn effective_command(command: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_system_prompt, pane_base_env, privilege_for, routed_wake, worktree_spawn_params,
+        combine_system_prompt, pane_base_env, privilege_for, routed_wake, sanitize_shim_arg,
+        worktree_spawn_params,
     };
+
+    // -- sanitize_shim_arg pure seam -------------------------------------------
+
+    #[test]
+    fn sanitize_shim_arg_collapses_all_newline_forms() {
+        // CRLF counts as one space, lone CR and LF each become one space.
+        assert_eq!(sanitize_shim_arg("a\nb\r\nc"), "a b c");
+    }
+
+    #[test]
+    fn sanitize_shim_arg_leaves_single_line_unchanged() {
+        assert_eq!(sanitize_shim_arg("hello"), "hello");
+    }
+
+    #[test]
+    fn sanitize_shim_arg_leaves_angle_brackets_and_backticks_untouched() {
+        let s = "<name> `echo hi`";
+        assert_eq!(sanitize_shim_arg(s), s);
+    }
+
+    /// Regression guard for the r8 fleet launch bug: a multi-line kickoff
+    /// prompt caused `cmd.exe` to truncate the command at the first newline,
+    /// dropping `--permission-mode auto` and `--session-id` so the pane ran in
+    /// the wrong mode under a self-generated session id.
+    #[test]
+    fn sanitize_shim_arg_regression_trailing_flags_survive_newline_in_prompt() {
+        let args: Vec<String> = vec![
+            "--model".into(),
+            "opus".into(),
+            "first line\nsecond line".into(), // multi-line prompt
+            "--permission-mode".into(),
+            "auto".into(),
+            "--session-id".into(),
+            "X".into(),
+        ];
+        let sanitized: Vec<String> = args.iter().map(|a| sanitize_shim_arg(a)).collect();
+        assert_eq!(sanitized.len(), 7, "no args dropped");
+        assert_eq!(sanitized[2], "first line second line", "prompt collapsed");
+        assert_eq!(sanitized[3], "--permission-mode");
+        assert_eq!(sanitized[4], "auto");
+        assert_eq!(sanitized[5], "--session-id");
+        assert_eq!(sanitized[6], "X");
+    }
 
     // -- combine_system_prompt pure seam ------------------------------------
 
