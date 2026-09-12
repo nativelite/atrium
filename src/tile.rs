@@ -169,7 +169,7 @@ pub fn compose_into(
         if !p.painted {
             draw_loading(master, p, rows, cols, frame);
         } else {
-            blit_inner(master, p, rows, cols);
+            blit_inner(master, p, rows);
         }
         draw_border(master, p, rows, cols);
     }
@@ -249,7 +249,7 @@ fn draw_loading(master: &mut Screen, p: &PaneView, rows: usize, cols: usize, fra
 /// fall on the border: rather than let half a glyph spill past the inset, its
 /// lead is replaced by a space. Each row is blitted with a single
 /// [`Screen::copy_cells`] rather than a `set` per cell.
-fn blit_inner(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
+fn blit_inner(master: &mut Screen, p: &PaneView, rows: usize) {
     let inner_row = p.rect.row + 1;
     let inner_col = p.rect.col + 1;
     let inner_rows = p.rect.rows.saturating_sub(2).min(p.screen.rows());
