@@ -12,10 +12,12 @@
 //! simply abut: `┐┌` at a top seam, `││` down a shared column. That is
 //! intended — every pane owns and draws its own four-sided border.
 //!
-//! Fidelity note: tiling is the *emulated* path. A pane that needs pixel-exact
-//! rendering (a TUI mid-redraw, wide/CJK glyphs, sixel) takes the escape hatch
-//! — `Ctrl+A z` zoom drops it back to raw passthrough. See the 0.2 design doc,
-//! §1 and the vterm README's fidelity boundaries.
+//! Fidelity note: tiling is the *emulated* path. East Asian double-width and
+//! emoji are composited correctly (the emulator marks each cell's width and the
+//! blit honors it); a pane that still needs pixel-exact rendering (a TUI
+//! mid-redraw, sixel) takes the escape hatch — `Ctrl+A z` zoom drops it back to
+//! raw passthrough. See the 0.2 design doc, §1 and the vterm README's fidelity
+//! boundaries.
 
 use crate::layout::Rect;
 use ansi::{Cell, Color, Screen, Style};
@@ -1248,5 +1250,159 @@ mod tests {
         let m = compose(3, 8, &panes, 0);
         // Inner origin (1,1) + cursor col 2 → master col 3.
         assert_eq!(m.cursor, (1, 3));
+    }
+
+    // ── item 5: heavy end-to-end integration across the tiled path ───────────
+    // All driven through the real emulator (vterm computes width) → compose(),
+    // never a hand-built grid (r5 lesson).
+
+    /// A pane's inner row rendered to the *visible* text from the composed
+    /// master: width-0 continuation cells carry no glyph of their own (the wide
+    /// lead spans both columns), so they are skipped.
+    fn inner_visible_text(m: &Screen, rect: &Rect, inner_r: usize) -> String {
+        let inner_col = rect.col + 1;
+        let inner_cols = rect.cols.saturating_sub(2);
+        (0..inner_cols)
+            .filter_map(|c| {
+                let cell = m.cell(rect.row + 1 + inner_r, inner_col + c);
+                (cell.width != 0).then_some(cell.ch)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mixed_ascii_and_wide_row_lays_out_by_column() {
+        // "a世b界c" must render one-for-one by column: the ideographs take two
+        // cells each and the ASCII between them stays put. Columns:
+        // a=0, 世=1(lead)+2(cont), b=3, 界=4(lead)+5(cont), c=6.
+        let mut t = vterm::Term::new(1, 9);
+        t.feed("a世b界c".as_bytes());
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 11, // inner_cols = 9
+        };
+        let panes = vec![view(t.screen(), rect, 1, "m", PaneState::Idle)];
+        let m = compose(3, 11, &panes, 0);
+        assert_eq!(m.cell(1, 1).ch, 'a');
+        assert_eq!(m.cell(1, 2).ch, '世');
+        assert_eq!(m.cell(1, 2).width, 2);
+        assert_eq!(m.cell(1, 3).width, 0);
+        assert_eq!(m.cell(1, 4).ch, 'b');
+        assert_eq!(m.cell(1, 5).ch, '界');
+        assert_eq!(m.cell(1, 6).width, 0);
+        assert_eq!(
+            m.cell(1, 7).ch,
+            'c',
+            "trailing ASCII not shifted by wide glyphs"
+        );
+        // Right border intact at the box edge.
+        assert_eq!(m.cell(1, 10).ch, '│');
+    }
+
+    #[test]
+    fn emoji_pane_composes_two_columns_with_border_intact() {
+        let mut t = vterm::Term::new(1, 6);
+        t.feed("🚀x".as_bytes());
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 8,
+        };
+        let panes = vec![view(t.screen(), rect, 1, "e", PaneState::Idle)];
+        let m = compose(3, 8, &panes, 0);
+        assert_eq!(m.cell(1, 1).ch, '🚀');
+        assert_eq!(m.cell(1, 1).width, 2);
+        assert_eq!(m.cell(1, 2).width, 0);
+        assert_eq!(m.cell(1, 3).ch, 'x', "ASCII after emoji is not shifted");
+        assert_eq!(m.cell(1, 7).ch, '│');
+    }
+
+    #[test]
+    fn wide_content_does_not_bleed_into_the_right_neighbor() {
+        // Two side-by-side 5x8 panes. The left is packed with CJK; its right
+        // border and the right pane's left border must both survive — a wide
+        // glyph never spills across the pane boundary.
+        let mut left = vterm::Term::new(3, 6);
+        left.feed("世界世".as_bytes());
+        let right = filled(3, 6, 'R');
+        let a = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 8,
+        };
+        let b = Rect {
+            row: 0,
+            col: 8,
+            rows: 5,
+            cols: 8,
+        };
+        let panes = vec![
+            view(left.screen(), a, 1, "L", PaneState::Idle),
+            view(&right, b, 2, "R", PaneState::Idle),
+        ];
+        let m = compose(5, 16, &panes, 0);
+        // Left pane inner row 0 shows the three ideographs, then its border.
+        assert_eq!(inner_visible_text(&m, &a, 0), "世界世");
+        assert_eq!(m.cell(1, 7).ch, '│', "left pane right border intact");
+        assert_eq!(m.cell(1, 8).ch, '│', "right pane left border intact");
+        assert_eq!(m.cell(1, 9).ch, 'R', "right pane content undisturbed");
+    }
+
+    #[test]
+    fn ascii_scene_introduces_no_wide_cells_byte_identity_guard() {
+        // Composing an all-ASCII scene must yield only single-width cells — no
+        // width-2/0 anywhere — so pre-r8 ASCII rendering is byte-for-byte
+        // unchanged (the width model is inert for narrow content).
+        let left = filled(3, 6, 'X');
+        let right = filled(3, 6, 'Y');
+        let a = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 8,
+        };
+        let b = Rect {
+            row: 0,
+            col: 8,
+            rows: 5,
+            cols: 8,
+        };
+        let panes = vec![
+            view(&left, a, 1, "ay", PaneState::Idle),
+            view(&right, b, 2, "by", PaneState::Focused),
+        ];
+        let m = compose(5, 16, &panes, 0);
+        for r in 0..m.rows() {
+            for c in 0..m.cols() {
+                assert_eq!(
+                    m.cell(r, c).width,
+                    1,
+                    "ASCII scene produced a non-width-1 cell at ({r},{c})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focused_cursor_lands_past_two_wide_cells() {
+        // After "世界" the emulator cursor is at column 4; the focused-pane
+        // translation must land the master cursor four columns into the inner
+        // area (past both ideographs).
+        let mut t = vterm::Term::new(1, 8);
+        t.feed("世界".as_bytes());
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 3,
+            cols: 10,
+        };
+        let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Focused)];
+        let m = compose(3, 10, &panes, 0);
+        // Inner origin (1,1) + cursor col 4 → master col 5.
+        assert_eq!(m.cursor, (1, 5));
     }
 }
