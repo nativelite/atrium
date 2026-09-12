@@ -66,9 +66,14 @@ at a clean prompt.
 
 1. **atrium exits** — uncleanly (crash, power loss, kill) or cleanly (graceful
    quit writes a final snapshot).
-2. **Hosted agents are orphaned** — they may keep running under `init` (or the
-   system reaper) until they exit naturally. The orphan reaper can reclaim them;
-   see [reaping](reaping.md).
+2. **Hosted agents are terminated (Windows) or orphaned (Unix).**
+   On Windows, atrium assigns every pane process to a Job Object with
+   `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`src/reap.rs`). When atrium's handle
+   closes — however it dies, including an uncatchable `TerminateProcess` — the
+   kernel terminates every process in the job. There is nothing to reattach to;
+   `atrium recover` reconstructs the session from the snapshot.
+   On Unix, agents may continue running under `init` until they exit naturally.
+   The orphan reaper can reclaim stale processes; see [reaping](reaping.md).
 3. **Operator runs `atrium recover`** — no arguments required. atrium locates
    the most recent snapshot for the current session, reads it, and re-opens the
    session window.
