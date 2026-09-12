@@ -22,7 +22,7 @@
 //! that the emulator can't render pixel-exact (wide glyphs, sixel, mouse).
 
 use atrium::bar::{bar_paint, PaneInfo};
-use atrium::input::{encode_sgr_left_click, Action, Dir, PrefixScanner};
+use atrium::input::{encode_sgr_left_click, encode_sgr_left_release, Action, Dir, PrefixScanner};
 use atrium::layout::{self, Tree};
 use atrium::tile::screen_to_pane_local;
 use std::io::Write;
@@ -1909,8 +1909,10 @@ fn run(
                             if let Some(p) = w.pane_mut(id) {
                                 if p.mouse_wanted {
                                     if let Some((cx, cy)) = screen_to_pane_local(mx, my, &rect) {
-                                        let seq = encode_sgr_left_click(cx, cy);
-                                        let _ = p.pty.write(seq.as_bytes());
+                                        let _ =
+                                            p.pty.write(encode_sgr_left_click(cx, cy).as_bytes());
+                                        let _ =
+                                            p.pty.write(encode_sgr_left_release(cx, cy).as_bytes());
                                     }
                                 }
                             }
@@ -1921,8 +1923,9 @@ fn run(
                         }
                     } else if let Some(p) = windows[active].focused_mut() {
                         if p.mouse_wanted {
-                            let seq = encode_sgr_left_click(col as usize, row as usize);
-                            let _ = p.pty.write(seq.as_bytes());
+                            let (c, r) = (col as usize, row as usize);
+                            let _ = p.pty.write(encode_sgr_left_click(c, r).as_bytes());
+                            let _ = p.pty.write(encode_sgr_left_release(c, r).as_bytes());
                         }
                     }
                 }
