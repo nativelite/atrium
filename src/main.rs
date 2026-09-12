@@ -4876,4 +4876,112 @@ mod tests {
         // Cleanup.
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    // --- resume_argv --------------------------------------------------------
+
+    fn pane_record(argv: Vec<String>, session_id: Option<String>) -> atrium::session::PaneRecord {
+        atrium::session::PaneRecord {
+            id: 0,
+            role: None,
+            argv,
+            cwd: None,
+            identity: None,
+            session_id,
+            worktree: None,
+        }
+    }
+
+    #[test]
+    fn resume_argv_claude_session_id_appends_resume_no_session_id_flag() {
+        let r = pane_record(vec!["claude".into()], Some("abc-123".into()));
+        let got = super::resume_argv(&r);
+        assert_eq!(got, vec!["claude", "--resume", "abc-123"]);
+        assert!(!got.iter().any(|a| a == "--session-id"));
+    }
+
+    #[test]
+    fn resume_argv_claude_continue_stripped_and_replaced_with_resume() {
+        let r = pane_record(
+            vec!["claude".into(), "--continue".into()],
+            Some("abc-123".into()),
+        );
+        let got = super::resume_argv(&r);
+        assert!(!got.contains(&"--continue".to_string()));
+        assert!(got.contains(&"--resume".to_string()));
+        assert!(got.contains(&"abc-123".to_string()));
+    }
+
+    #[test]
+    fn resume_argv_non_claude_verbatim() {
+        let r = pane_record(vec!["bash".into(), "-l".into()], Some("any-id".into()));
+        let got = super::resume_argv(&r);
+        assert_eq!(got, vec!["bash", "-l"]);
+    }
+
+    #[test]
+    fn resume_argv_claude_no_session_id_unchanged() {
+        let r = pane_record(vec!["claude".into(), "--continue".into()], None);
+        let got = super::resume_argv(&r);
+        // no session_id → argv returned verbatim, --continue preserved
+        assert_eq!(got, vec!["claude", "--continue"]);
+    }
+
+    #[test]
+    fn resume_argv_empty_argv_no_panic() {
+        let r = pane_record(vec![], Some("any-id".into()));
+        let got = super::resume_argv(&r);
+        assert!(got.is_empty());
+    }
+
+    // --- find_latest_snapshot -----------------------------------------------
+
+    #[test]
+    fn find_latest_picks_newest_json_and_ignores_others() {
+        let tmp =
+            std::env::temp_dir().join(format!("atrium_snap_latest_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Non-matching files must be ignored.
+        std::fs::write(tmp.join("atrium-session-1.pids"), b"pids").unwrap();
+        std::fs::write(tmp.join("other.json"), b"{}").unwrap();
+        // Two matching files — write B after A so B has mtime >= A.
+        let a = tmp.join("atrium-session-100.json");
+        let b = tmp.join("atrium-session-200.json");
+        std::fs::write(&a, b"{}").unwrap();
+        std::fs::write(&b, b"{}").unwrap();
+        let result = super::find_latest_snapshot(&tmp);
+        assert!(result.is_some(), "must find a snapshot");
+        let got = result.unwrap();
+        assert!(
+            got == a || got == b,
+            "must return one of the two json files"
+        );
+        // The returned file's mtime must be >= the other's.
+        let got_mt = std::fs::metadata(&got).unwrap().modified().unwrap();
+        let other = if got == a { &b } else { &a };
+        let other_mt = std::fs::metadata(other).unwrap().modified().unwrap();
+        assert!(
+            got_mt >= other_mt,
+            "returned file must be newest: got {got_mt:?} vs {other_mt:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn find_latest_unreadable_dir_returns_none() {
+        let missing = std::path::PathBuf::from("/no/such/directory/atrium_test_xyz");
+        assert!(super::find_latest_snapshot(&missing).is_none());
+    }
+
+    #[test]
+    fn find_latest_dir_with_no_matching_files_returns_none() {
+        let tmp =
+            std::env::temp_dir().join(format!("atrium_snap_none_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("atrium-session-1.pids"), b"pids").unwrap();
+        std::fs::write(tmp.join("unrelated.json"), b"{}").unwrap();
+        assert!(super::find_latest_snapshot(&tmp).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
