@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host's native selection with mouse mode off.
 
 ### Fixed
+- **The bar names a window by the agent you're looking at.** A window's bar entry
+  (`N:claude:<role>`) always took the window's *first* pane, so zooming or
+  focusing any other fleet agent still read as the first one (`1:claude:lead`
+  while you were in `engine`). It now follows the focused pane.
 - **A `ctl send` / bus wake no longer lands on top of what the human is typing.**
   Delivery waited only for the target to reach its prompt, so if you were
   mid-sentence in that pane the queued text was appended to your draft and the

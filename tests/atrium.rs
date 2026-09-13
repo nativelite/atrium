@@ -981,6 +981,16 @@ fn fleet_up_opens_a_two_agent_window() {
         "fleet pane 2 silent after focus move: {:?}",
         String::from_utf8_lossy(&out)
     );
+    // The bar names the window by its FOCUSED agent, not its first one — so a
+    // zoomed or focused fleet pane reads as who it is.
+    let stem: &str = if cfg!(windows) { "cmd" } else { "sh" };
+    let bar = format!("1:{stem}:two");
+    let out = read_until(&mut p, bar.as_bytes(), Duration::from_secs(10));
+    assert!(
+        contains(&out, bar.as_bytes()),
+        "bar did not follow focus to pane 2: {:?}",
+        String::from_utf8_lossy(&out)
+    );
 
     p.write(b"\x01q").unwrap();
     assert_eq!(wait_exit(&mut p, 15), 0);

@@ -532,6 +532,12 @@ impl Window {
         self.panes.iter_mut().find(|p| p.id == id)
     }
 
+    /// The pane that stands for this window in the bar: the focused one (so a
+    /// zoomed or focused fleet agent reads as itself), else the first.
+    pub(crate) fn bar_pane(&self) -> Option<&Pane> {
+        self.pane(self.tree.focus()).or_else(|| self.panes.first())
+    }
+
     pub(crate) fn focused_mut(&mut self) -> Option<&mut Pane> {
         let f = self.tree.focus();
         self.pane_mut(f)
@@ -2570,7 +2576,7 @@ fn run(
             .iter()
             .enumerate()
             .map(|(i, w)| PaneInfo {
-                title: w.panes.first().map(|p| p.title.clone()).unwrap_or_default(),
+                title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
                 active: i == active,
                 activity: w.panes.iter().any(|p| p.activity),
                 exited: w.panes.iter().all(|p| p.exited),
@@ -2582,13 +2588,13 @@ fn run(
                         Some(agsess::Status::WaitingApproval)
                     )
                 }),
-                // The window's identity tag: the first pane's identity name (all
+                // The window's identity tag: the bar pane's identity name (all
                 // panes in a window inherit the same identity in v1). Name only.
-                identity: w.panes.first().and_then(|p| p.identity.clone()),
-                // The window's persona/role (fleet agent name or ctl --role), so
-                // the entry reads `N:claude:persona` and a decision's `from` maps
-                // to a window number.
-                role: w.panes.first().and_then(|p| p.role.clone()),
+                identity: w.bar_pane().and_then(|p| p.identity.clone()),
+                // The window's persona/role (fleet agent name or ctl --role) —
+                // of the FOCUSED pane, so the entry reads `N:claude:persona` for
+                // the agent you are looking at, zoomed or tiled.
+                role: w.bar_pane().and_then(|p| p.role.clone()),
             })
             .collect();
         if flash
