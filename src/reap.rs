@@ -146,6 +146,14 @@ mod sys {
 
     /// Liveness via `OpenProcess`; a handle that cannot be opened for query
     /// means the process is gone.
+    ///
+    /// **Invariant: never kill by pid on Windows.** Windows recycles pids
+    /// aggressively and this answers for whoever holds `pid` *now* — an unrelated
+    /// process that inherited the number reads as alive. That is harmless only
+    /// because nothing on Windows acts destructively on a pid: the Job Object
+    /// ([`SessionJob`](super::SessionJob)) is the sole reaper, and the orphan
+    /// sweep's start-token binding is inert here. Anything that ever kills by pid
+    /// must bind to a handle or start token taken at spawn first (r10 audit B14).
     pub fn pid_alive(pid: u32) -> bool {
         const SYNCHRONIZE: u32 = 0x0010_0000;
         const WAIT_TIMEOUT: u32 = 258;

@@ -2422,7 +2422,11 @@ fn run(
                     // resize can be missed by an app mid-boot or mid-reconnect —
                     // claude keeps drawing at the stale size, ending up in a corner
                     // of the larger terminal. The extra resize guarantees a fresh
-                    // SIGWINCH/redraw. (The `force_repaint` path below only nudges
+                    // SIGWINCH/redraw ONLY because the two sizes differ, which holds
+                    // because this branch is gated on `r >= 3` (so `ar >= 2` and
+                    // `ar - 1 != ar`): ConPTY emits no event for a same-size resize,
+                    // so lowering that floor silently voids the guarantee.
+                    // (The `force_repaint` path below only nudges
                     // once the pane has painted, so it misses exactly the boot
                     // window the founder hit; this covers it.)
                     if !windows[active].tiled() {
