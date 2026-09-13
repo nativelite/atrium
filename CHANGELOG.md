@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are single-sourced (`reap::PS_PATH`, `reap::pid_columns`).
 
 ### Fixed
+- **Best-effort failures are no longer invisible.** A session snapshot that
+  cannot be saved (so `atrium recover` would have nothing), an orphan watchdog
+  that fails to start (unix), a warden decision the bus refuses, and a pane pty
+  resize that fails are now shown in the status bar, once per failure streak. A
+  failed snapshot is retried instead of being marked written; the watchdog is
+  retried every few seconds instead of every tick; and on a failed resize the
+  pane's emulator no longer changes size without its pty. (r10 audit B8.)
 - **A failed crash-registry write is no longer reported as done.** The registry
   is the record a crash sweep kills from so pane process trees don't leak. The
   live rewrite dropped its `Result` and told the warden it had happened anyway,

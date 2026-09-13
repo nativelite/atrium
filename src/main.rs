@@ -830,16 +830,46 @@ fn capture_pane_fields(
     }
 }
 
+/// Surface a best-effort operation's failure in the bar **once per failure
+/// streak**: the first `Err` flashes `<what> failed: <error>`, later ones stay
+/// quiet until an `Ok` resets the streak. Returns the success value, if any. The
+/// pattern the r10 audit (B8) asked every swallowed best-effort `Result` to follow.
+fn surface_once<T>(
+    failing: &mut bool,
+    result: std::io::Result<T>,
+    what: &str,
+    flash: &mut Option<(String, Instant)>,
+) -> Option<T> {
+    match result {
+        Ok(v) => {
+            *failing = false;
+            Some(v)
+        }
+        Err(e) => {
+            if !*failing {
+                *failing = true;
+                *flash = Some((format!("{what} failed: {e}"), Instant::now()));
+            }
+            None
+        }
+    }
+}
+
 /// Write a session snapshot iff the window state has changed since the last write.
 /// Pure capture + equality check — no I/O when nothing changed.
+///
+/// `last` advances only when the write lands, so a failed save is retried on the
+/// next check instead of being forgotten; the error is returned for the caller to
+/// surface (r10 audit B8 — it used to be dropped, and `atrium recover` silently
+/// had nothing to restore).
 fn snapshot_if_changed(
     windows: &[Window],
     path: &std::path::Path,
     last: &mut Option<atrium::session::Snapshot>,
-) {
+) -> std::io::Result<()> {
     let w = match windows.first() {
         Some(w) => w,
-        None => return,
+        None => return Ok(()),
     };
     let snap = atrium::session::capture(
         w.tree.ids(),
@@ -860,10 +890,11 @@ fn snapshot_if_changed(
             .collect(),
     );
     if last.as_ref() == Some(&snap) {
-        return;
+        return Ok(());
     }
-    let _ = atrium::session::save(path, &snap);
+    atrium::session::save(path, &snap)?;
     *last = Some(snap);
+    Ok(())
 }
 
 /// `atrium recover` — load the most recent session snapshot and relaunch every
@@ -1275,6 +1306,8 @@ fn run(
     let mut registry_dirty = false;
     let mut registry_failing = false;
     let mut registry_retry_at: Option<Instant> = None;
+    // A failing session snapshot is surfaced once per failure streak.
+    let mut snapshot_failing = false;
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
     // tree outlives atrium however it dies (TerminateProcess included); a no-op on
     // unix (the process-group teardown + watchdog below already cover the tree).
@@ -1287,6 +1320,10 @@ fn run(
     // and would block on its pipe forever, R5).
     #[cfg(unix)]
     let mut watchdog: Option<std::process::Child> = None;
+    #[cfg(unix)]
+    let mut watchdog_failing = false;
+    #[cfg(unix)]
+    let mut watchdog_retry_at: Option<Instant> = None;
     let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
         (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
 
@@ -1325,7 +1362,8 @@ fn run(
                 registered = cur;
                 registry_dirty = true;
                 registry_retry_at = None;
-                snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
+                let saved = snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
+                surface_once(&mut snapshot_failing, saved, "session snapshot", &mut flash);
                 last_snapshot_check = Instant::now();
             }
             // Persist it. A failed write is neither dropped nor recorded as done
@@ -1352,6 +1390,7 @@ fn run(
                         if !registry_failing {
                             registry_failing = true;
                             ctl_audit.record(None, alert.kind, &alert.detail, false, "");
+                            // The bar carries it whether or not the bus accepts it.
                             let _ = bus.publish(
                                 "warden",
                                 atrium::bus::Kind::DecisionNeeded,
@@ -1368,7 +1407,8 @@ fn run(
             }
             if last_snapshot_check.elapsed() >= SNAPSHOT_INTERVAL {
                 last_snapshot_check = Instant::now();
-                snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
+                let saved = snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
+                surface_once(&mut snapshot_failing, saved, "session snapshot", &mut flash);
             }
             if last_warden_check.elapsed() >= WARDEN_INTERVAL {
                 last_warden_check = Instant::now();
@@ -1391,13 +1431,21 @@ fn run(
                     ctl_audit.record(None, alert.kind, &alert.detail, false, "");
                     // A decision, not an FYI: these are exactly the events that
                     // should stop the operator rather than scroll past them.
-                    let _ = bus.publish(
+                    // If the bus refuses it (rate/size cap), the audit record above
+                    // is a log, not an alert: put the decision in the bar instead
+                    // of losing the operator-facing signal (r10 audit B8).
+                    if let Err(e) = bus.publish(
                         "warden",
                         atrium::bus::Kind::DecisionNeeded,
                         None,
                         &[("msg".to_string(), alert.detail.clone())],
                         agsess::sessions::now_ms(),
-                    );
+                    ) {
+                        flash = Some((
+                            format!("warden: {} (bus refused: {e})", alert.detail),
+                            Instant::now(),
+                        ));
+                    }
                     force_repaint = true;
                 }
                 // There is no enforcement branch here any more, and that is a
@@ -1418,8 +1466,21 @@ fn run(
             // pipe forever. The Job Object attaches just above (`session_job`),
             // in this same pane-set-changed block.
             #[cfg(unix)]
-            if watchdog.is_none() && !registered.is_empty() {
-                watchdog = atrium::reap::spawn_watchdog(&registry_path).ok();
+            if watchdog.is_none()
+                && !registered.is_empty()
+                && watchdog_retry_at.map_or(true, |t| Instant::now() >= t)
+            {
+                // A failed spawn is retried on the warden cadence (not every tick)
+                // and surfaced once, so a safety net that never comes up is visible
+                // (r10 audit B8).
+                let spawned = atrium::reap::spawn_watchdog(&registry_path);
+                watchdog_retry_at = spawned.is_err().then(|| Instant::now() + WARDEN_INTERVAL);
+                watchdog = surface_once(
+                    &mut watchdog_failing,
+                    spawned,
+                    "orphan watchdog (pane trees may outlive a crash)",
+                    &mut flash,
+                );
             }
         }
         // 1. keystrokes -> scanner -> focused pane / commands
@@ -2368,9 +2429,19 @@ fn run(
                         let ar = rows.saturating_sub(1).max(1);
                         let focus = windows[active].tree.focus();
                         if let Some(p) = windows[active].pane_mut(focus) {
+                            // The first resize is only the redraw nudge and may fail
+                            // harmlessly. The emulator follows the SECOND, so the pty
+                            // and emulator are never left at different sizes; a
+                            // failure is surfaced instead of desyncing silently
+                            // (r10 audit B8).
                             let _ = p.pty.resize(ar.saturating_sub(1).max(1), cols);
-                            let _ = p.pty.resize(ar, cols);
-                            p.term.resize(ar as usize, cols as usize);
+                            match p.pty.resize(ar, cols) {
+                                Ok(()) => p.term.resize(ar as usize, cols as usize),
+                                Err(e) => {
+                                    flash =
+                                        Some((format!("pane resize failed: {e}"), Instant::now()))
+                                }
+                            }
                         }
                     }
                     // Force a full recompose at the new size: tiled repaints via
@@ -4423,8 +4494,41 @@ fn effective_command(command: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         assemble_command, combine_system_prompt, pane_base_env, privilege_for, routed_wake,
-        sanitize_shim_arg, worktree_spawn_params,
+        sanitize_shim_arg, surface_once, worktree_spawn_params,
     };
+
+    // -- surface_once (r10 B8) -------------------------------------------------
+
+    #[test]
+    fn a_failure_streak_flashes_once_and_success_resets_it() {
+        let fail = || -> std::io::Result<u8> { Err(std::io::Error::other("disk full")) };
+        let (mut failing, mut flash) = (false, None);
+
+        assert_eq!(
+            surface_once(&mut failing, fail(), "snapshot", &mut flash),
+            None
+        );
+        let first = flash.take().expect("the first failure is surfaced");
+        assert_eq!(first.0, "snapshot failed: disk full");
+
+        // Still failing: quiet, so a persistent error doesn't strobe the bar.
+        assert_eq!(
+            surface_once(&mut failing, fail(), "snapshot", &mut flash),
+            None
+        );
+        assert!(flash.is_none(), "a repeat failure re-flashed");
+
+        // Recovery returns the value and re-arms the next streak.
+        assert_eq!(
+            surface_once(&mut failing, Ok(7), "snapshot", &mut flash),
+            Some(7)
+        );
+        surface_once(&mut failing, fail(), "snapshot", &mut flash);
+        assert!(
+            flash.is_some(),
+            "a new streak after recovery must surface again"
+        );
+    }
 
     // -- assemble_command pure seam ------------------------------------------
 
