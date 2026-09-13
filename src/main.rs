@@ -5050,6 +5050,37 @@ mod tests {
         );
     }
 
+    /// r10 B10: the unit thresholds are exactly where an off-by-one hides.
+    #[test]
+    fn ago_switches_units_exactly_at_the_thresholds() {
+        let s = |secs: u64| ago(1_000_000_000 + secs * 1000, 1_000_000_000);
+        assert_eq!(s(0), "0s");
+        assert_eq!(s(59), "59s");
+        assert_eq!(s(60), "1m");
+        assert_eq!(s(3599), "59m");
+        assert_eq!(s(3600), "1h");
+        assert_eq!(s(86_399), "23h");
+        assert_eq!(s(86_400), "1d");
+        // A timestamp from the future (clock skew) saturates, never underflows.
+        assert_eq!(ago(1_000, 5_000), "0s");
+    }
+
+    /// r10 B10: wrap_to's edges — empty input, an exact fit, a word longer than
+    /// the width (kept whole, not broken), and overflow marking.
+    #[test]
+    fn wrap_to_edge_cases() {
+        assert!(wrap_to("", 10, 3).is_empty());
+        assert!(wrap_to("   ", 10, 3).is_empty());
+        // "aa bb" is exactly 5 columns: it fits on one line.
+        assert_eq!(wrap_to("aa bb cc", 5, 3), vec!["aa bb", "cc"]);
+        // An over-width single word is emitted whole on its own line.
+        assert_eq!(wrap_to("abcdefghij", 4, 3), vec!["abcdefghij"]);
+        // Exactly max_lines of content: no ellipsis.
+        assert_eq!(wrap_to("aa bb", 2, 2), vec!["aa", "bb"]);
+        // More than fits: the last kept line is cut to width-1 plus the marker.
+        assert_eq!(wrap_to("aa bb cc dd", 2, 2), vec!["aa", "b…"]);
+    }
+
     #[test]
     fn ago_formats_coarsely() {
         assert_eq!(ago(10_000, 5_000), "5s");

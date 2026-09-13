@@ -2627,6 +2627,33 @@ mod tests {
         }
     }
 
+    /// r10 B10: a field value may itself contain `=` (query strings, base64), and
+    /// an empty value must survive as empty. Pins `split_once` semantics.
+    #[test]
+    fn field_values_keep_embedded_equals_and_empty_values() {
+        let line = build_request(
+            &v(&[
+                "bus",
+                "pub",
+                "deploy",
+                "url=https://x/pr/9?a=b&c=d",
+                "blob=YQ==",
+                "note=",
+            ]),
+            Some(0),
+        )
+        .unwrap();
+        match parse_request(&line).unwrap().cmd {
+            Cmd::Bus(BusOp::Pub { fields, .. }) => {
+                let get = |k: &str| fields.iter().find(|(f, _)| f == k).map(|(_, v)| v.as_str());
+                assert_eq!(get("url"), Some("https://x/pr/9?a=b&c=d"));
+                assert_eq!(get("blob"), Some("YQ=="));
+                assert_eq!(get("note"), Some(""));
+            }
+            other => panic!("expected bus pub, got {other:?}"),
+        }
+    }
+
     #[test]
     fn build_bus_pub_roundtrips_through_parse() {
         let line = build_request(

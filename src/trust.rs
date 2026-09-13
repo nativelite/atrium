@@ -361,6 +361,40 @@ mod tests {
             .and_then(Value::as_bool)
     }
 
+    /// r10 B10: a config whose `projects` (or project entry) is not an object is
+    /// coerced into one rather than panicking or silently leaving the dir untrusted.
+    #[test]
+    fn non_object_projects_and_entries_are_coerced() {
+        let mut root = json::parse(r#"{"projects": 42}"#).unwrap();
+        assert!(set_trusted_in(&mut root, "D:/x"));
+        assert_eq!(trusted(&root, "D:/x"), Some(true));
+        assert!(json::parse(&root.to_string()).is_ok(), "still valid JSON");
+
+        let mut root = json::parse(r#"{"projects": {"D:/x": 42, "D:/keep": {"a": 1}}}"#).unwrap();
+        assert!(set_trusted_in(&mut root, "D:/x"));
+        assert_eq!(trusted(&root, "D:/x"), Some(true));
+        assert!(
+            root.get("projects").unwrap().get("D:/keep").is_some(),
+            "sibling projects are untouched"
+        );
+        // A non-object root is refused, not rewritten.
+        let mut root = json::parse("[1,2]").unwrap();
+        assert!(!set_trusted_in(&mut root, "D:/x"));
+    }
+
+    #[test]
+    fn accept_edits_args_drop_blank_extra_prefixes() {
+        let with = accept_edits_args(&["".into(), "  ".into(), " make ".into()]);
+        let without = accept_edits_args(&[]);
+        assert_eq!(
+            with.len(),
+            without.len() + 1,
+            "only the real prefix is added"
+        );
+        assert_eq!(with.last().unwrap(), "Bash(make *)", "and it is trimmed");
+        assert!(!with.iter().any(|a| a == "Bash( *)" || a == "Bash(   *)"));
+    }
+
     #[test]
     fn sets_trust_on_a_fresh_config() {
         let mut root = json::parse("{}").unwrap();

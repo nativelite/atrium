@@ -918,6 +918,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// r10 B10: the tolerant registry parse is a safety contract (a mis-parse
+    /// aims a later killpg at an unrelated group), so pin it against garbage.
+    #[test]
+    fn read_registry_keeps_only_valid_pids_and_read_policy_needs_its_line() {
+        let dir = std::env::temp_dir().join(format!("atrium-regparse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("atrium-session-9.pids");
+        std::fs::write(
+            &path,
+            "policy=plan\n\nnot-a-pid\n123\n  456  \n-7\n99999999999\n12 34\n",
+        )
+        .unwrap();
+        assert_eq!(read_registry(&path), vec![123, 456]);
+        assert_eq!(read_policy(&path).as_deref(), Some("plan"));
+
+        std::fs::write(&path, "123\n456\n").unwrap();
+        assert_eq!(read_policy(&path), None, "no policy= line means no policy");
+        assert_eq!(read_registry(&dir.join("absent.pids")), Vec::<u32>::new());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pid_columns_parse_leading_pids_and_skip_malformed_lines() {
         let mut it = "  42  7  7 rest of line".split_whitespace();

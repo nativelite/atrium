@@ -804,6 +804,30 @@ mod tests {
     }
 
     #[test]
+    fn ensure_reattaches_a_kept_branch_whose_dir_was_removed() {
+        // r10 B10: the recovery arm — the branch ref survives but its directory
+        // was deleted (a crash, a manual rm). ensure must re-attach, not fail.
+        let r = Repo::new("reattach");
+        let plan = r.plan("fix");
+        assert_eq!(ensure(&r.repo, &plan), Ok(true));
+        std::fs::remove_dir_all(&plan.dir).unwrap();
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&r.repo)
+            .args(["worktree", "prune"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(!plan.dir.exists());
+        assert_eq!(
+            ensure(&r.repo, &plan),
+            Ok(true),
+            "re-attached to the kept branch"
+        );
+        assert!(plan.dir.join("README.md").exists(), "checkout is back");
+    }
+
+    #[test]
     fn ensure_creates_the_worktree_then_is_idempotent() {
         let r = Repo::new("ensure");
         let plan = r.plan("flake");
@@ -884,6 +908,26 @@ mod tests {
     }
 
     // --- sibling path-dep auto-junction ----------------------------------------
+
+    #[test]
+    fn sibling_path_deps_forms_and_word_boundary() {
+        // r10 B10: standalone and inline forms, both quote styles, and the
+        // `xpath` word-boundary rejection.
+        let dir = std::env::temp_dir().join(format!("atrium-pdf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cargo = dir.join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "[dependencies.alpha]\npath = \"../alpha\"\n\
+             [dependencies]\nbeta = { version = \"1\", path = '../beta' }\n\
+             gamma = {path=\"../gamma\"}\n\
+             [package.metadata]\nxpath = \"../nope\"\n",
+        )
+        .unwrap();
+        let deps = sibling_path_deps(&cargo);
+        assert_eq!(deps, vec!["alpha", "beta", "gamma"], "{deps:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn sibling_path_deps_finds_only_direct_parent_relative_paths() {
