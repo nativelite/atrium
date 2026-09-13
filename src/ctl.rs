@@ -566,7 +566,8 @@ pub enum TrustMode {
 }
 
 impl TrustMode {
-    /// Autonomous-power rank, low→high: `Off` < `Plan` < `Edits` < `Skip`. The
+    /// Autonomous-power rank, low→high: `Off` < `Plan` < `Edits` < `Auto` < `Skip`.
+    /// The only integer projection of a mode — never store it as one. The
     /// **session policy** (the launch `--trust <policy>`) is the ceiling: a
     /// non-operator worker may request a mode of equal or lower rank (match or
     /// de-escalate) but never a higher one (no self-elevation). The operator (the

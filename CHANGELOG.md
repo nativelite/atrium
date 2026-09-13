@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   visible screen is selectable (no scrollback); single-pane and zoomed views keep
   the host's native selection with mouse mode off.
 
+### Changed
+- **The launch trust mode is stored as the `TrustMode` enum, not a `u8` code.**
+  The global used a hand-written codec whose numbering disagreed with
+  `TrustMode::rank()` (so one integer mistaken for the other would silently raise
+  or lower an agent's permission posture) and decoded any unknown code to `Off`.
+  It now holds the enum itself; `rank()` is the only integer projection left.
+  No behavior change. (r10 audit B3.)
+
 ### Fixed
 - **A failed crash-registry write is no longer reported as done.** The registry
   is the record a crash sweep kills from so pane process trees don't leak. The

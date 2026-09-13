@@ -27,8 +27,8 @@ use atrium::layout::{self, Tree};
 use atrium::tile::screen_to_pane_local;
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod fleet_cli;
@@ -82,34 +82,27 @@ fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<atrium::ipc::Listen
     }
 }
 
-/// Set once at startup from the `--trust` / `--skip-permissions` flags: how much
-/// atrium relaxes the permission posture of every agent pane it spawns. Encoded as
-/// `0=Off`, `1=Edits` (`--trust`: acceptEdits + safe allowlist), `2=Skip`
-/// (`--skip-permissions`: full bypass). Read by the spawn path
-/// (`spawn_pane_full`) via [`trust_mode`].
-static AGENT_TRUST: AtomicU8 = AtomicU8::new(0);
+/// Set at startup from the `--trust` / `--skip-permissions` flags (or a fleet's
+/// declared posture): how much atrium relaxes the permission posture of every
+/// agent pane it spawns. Read by the spawn path (`spawn_pane_full`) via
+/// [`trust_mode`].
+///
+/// Stores the enum itself. It used to be an `AtomicU8` with a hand-written codec
+/// whose numbering (`Edits=1, Skip=2, Plan=3, Auto=4`) disagreed with
+/// [`TrustMode::rank`](atrium::ctl::TrustMode::rank) — one integer confused for the
+/// other was a silent privilege up/down-grade, and an unknown code decoded to
+/// `Off` (r10 audit B3). With no integer form there is nothing to confuse.
+static AGENT_TRUST: Mutex<atrium::ctl::TrustMode> = Mutex::new(atrium::ctl::TrustMode::Off);
 
-/// Decode [`AGENT_TRUST`] into the typed mode.
+/// The launch trust mode. A poisoned lock still holds a whole `TrustMode` (it is
+/// `Copy` and only ever replaced), so recovering its value is sound.
 fn trust_mode() -> atrium::ctl::TrustMode {
-    match AGENT_TRUST.load(Ordering::Relaxed) {
-        1 => atrium::ctl::TrustMode::Edits,
-        2 => atrium::ctl::TrustMode::Skip,
-        3 => atrium::ctl::TrustMode::Plan,
-        4 => atrium::ctl::TrustMode::Auto,
-        _ => atrium::ctl::TrustMode::Off,
-    }
+    *AGENT_TRUST.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Publish the launch trust mode to the spawn path.
 fn set_trust_mode(m: atrium::ctl::TrustMode) {
-    let code = match m {
-        atrium::ctl::TrustMode::Off => 0,
-        atrium::ctl::TrustMode::Edits => 1,
-        atrium::ctl::TrustMode::Skip => 2,
-        atrium::ctl::TrustMode::Plan => 3,
-        atrium::ctl::TrustMode::Auto => 4,
-    };
-    AGENT_TRUST.store(code, Ordering::Relaxed);
+    *AGENT_TRUST.lock().unwrap_or_else(|e| e.into_inner()) = m;
 }
 
 fn next_agent_id() -> usize {
