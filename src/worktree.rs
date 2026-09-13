@@ -80,37 +80,6 @@ pub fn slug(name: &str) -> String {
     }
 }
 
-/// Lexically collapse `.` and `..` components in a path without touching the
-/// filesystem (`std::fs::canonicalize` is not used — on Windows it prepends
-/// `\\?\`, does disk IO, and breaks the pure-plan seam).
-///
-/// `Prefix` and `RootDir` components pass through unchanged. `CurDir` (`.`) is
-/// dropped. `Normal` is pushed. `ParentDir` (`..`) pops the last component
-/// unless that would escape above the root/prefix, in which case it is silently
-/// clamped. A relative path (no root) is returned as-is; nothing to collapse
-/// without an anchor.
-fn normalize_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(_) | Component::RootDir => out.push(c),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let at_root = matches!(
-                    out.components().last(),
-                    Some(Component::RootDir) | Some(Component::Prefix(_)) | None
-                );
-                if !at_root {
-                    out.pop();
-                }
-            }
-            Component::Normal(_) => out.push(c),
-        }
-    }
-    out
-}
-
 /// Resolve the base directory the worktrees live under.
 ///
 /// `Some(base)` in the fleet is resolved relative to the repo dir (absolute used
@@ -128,7 +97,7 @@ pub fn base_dir(fleet: &Fleet, cwd: &Path) -> PathBuf {
             .map(|p| p.join(DEFAULT_BASE_NAME))
             .unwrap_or_else(|| cwd.join(DEFAULT_BASE_NAME)),
     };
-    normalize_path(&raw)
+    crate::resolve::normalize_path(&raw)
 }
 
 /// The worktrees a fleet needs, fully resolved but with **no side effects**.
@@ -250,7 +219,7 @@ pub fn plan_for(cwd: &Path, name: &str) -> WorktreePlan {
     WorktreePlan {
         name: name.to_string(),
         branch: format!("atrium/adhoc/{component}"),
-        dir: normalize_path(&base.join("adhoc").join(&component)),
+        dir: crate::resolve::normalize_path(&base.join("adhoc").join(&component)),
         agents: vec![],
     }
 }
@@ -674,37 +643,6 @@ mod tests {
         assert_eq!(
             plans[0].dir,
             Path::new("/home/dev/.atrium-worktrees/atrium-dev-r7/fix")
-        );
-    }
-
-    // --- normalize_path unit tests ---
-
-    #[test]
-    fn normalize_path_collapses_dotdot() {
-        assert_eq!(
-            normalize_path(Path::new("/home/dev/repo/../wt")),
-            Path::new("/home/dev/wt")
-        );
-        assert_eq!(normalize_path(Path::new("/a/b/../../c")), Path::new("/c"));
-    }
-
-    #[test]
-    fn normalize_path_drops_curdirs() {
-        assert_eq!(normalize_path(Path::new("/a/./b/./c")), Path::new("/a/b/c"));
-    }
-
-    #[test]
-    fn normalize_path_clamps_dotdot_at_root() {
-        // `..` above the root is silently clamped — no panic, no escape.
-        assert_eq!(normalize_path(Path::new("/../..")), Path::new("/"));
-        assert_eq!(normalize_path(Path::new("/a/../..")), Path::new("/"));
-    }
-
-    #[test]
-    fn normalize_path_leaves_clean_absolute_path_unchanged() {
-        assert_eq!(
-            normalize_path(Path::new("/home/dev/repo")),
-            Path::new("/home/dev/repo")
         );
     }
 

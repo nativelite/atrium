@@ -244,32 +244,6 @@ fn config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude.json"))
 }
 
-/// Lexically collapse `.` and `..` components without disk IO. Defense-in-depth
-/// counterpart to the same function in `worktree.rs` — kept self-contained here
-/// so `trust.rs` has no cross-file contract with the worktree planner. See the
-/// primary fix and its full comment there.
-fn normalize_path(path: &std::path::Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in path.components() {
-        match c {
-            Component::Prefix(_) | Component::RootDir => out.push(c),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let at_root = matches!(
-                    out.components().last(),
-                    Some(Component::RootDir) | Some(Component::Prefix(_)) | None
-                );
-                if !at_root {
-                    out.pop();
-                }
-            }
-            Component::Normal(_) => out.push(c),
-        }
-    }
-    out
-}
-
 /// Convert a directory to claude's project-map key: an absolute path with
 /// forward slashes and no trailing slash (e.g. `D:/projects/x`). claude (a Node
 /// app) keys projects by `process.cwd()` in exactly this shape on every
@@ -286,7 +260,7 @@ fn project_key(dir: &Path) -> String {
             .map(|c| c.join(dir))
             .unwrap_or_else(|_| dir.to_path_buf())
     };
-    let abs = normalize_path(&abs);
+    let abs = crate::resolve::normalize_path(&abs);
     let mut s = abs.to_string_lossy().replace('\\', "/");
     while s.len() > 1 && s.ends_with('/') {
         s.pop();
