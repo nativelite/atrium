@@ -35,6 +35,7 @@ pub mod orphan;
 pub mod reap;
 pub mod resolve;
 pub mod resources;
+pub mod select;
 pub mod session;
 pub mod signals;
 pub mod spawn;

@@ -1149,9 +1149,14 @@ fn run(
     // works out of the box (dragging highlights, as in any shell) — the common
     // case. `Ctrl+A m` toggles capture ON when you want the atrium mouse: click to
     // focus the pane under the cursor, wheel to scroll the hovered tile. (With
-    // capture on, native selection falls back to Shift-drag.) The scanner and the
+    // capture on, a drag selects within one tile via atrium::select; the host's
+    // native selection falls back to Shift-drag.) The scanner and the
     // terminal are kept in sync by the toggle.
     let mut mouse_on = false;
+    // A drag-selection in progress inside one tile (mouse on, tiled window), with
+    // the window it was started in: press starts it, drags extend it, release
+    // copies it (atrium::select).
+    let mut selection: Option<(usize, atrium::select::Selection)> = None;
     // Whether atrium has forced the OUTER terminal's mouse reporting off because the
     // focused pane does not want the mouse (a shell/WSL). A mouse app (claude)
     // enables motion tracking via passthrough, which leaks to the terminal; once
@@ -1888,7 +1893,7 @@ fn run(
                         scanner.set_mouse(mouse_on);
                         flash = Some((
                             if mouse_on {
-                                "mouse: ON — click focuses, wheel scrolls the hovered tile (Shift-drag selects)"
+                                "mouse: ON — click focuses, drag selects within a tile (copies), wheel scrolls"
                                     .to_string()
                             } else {
                                 "mouse: OFF — native drag to select / copy".to_string()
@@ -1911,6 +1916,8 @@ fn run(
                             my >= r.row && my < r.row + r.rows && mx >= r.col && mx < r.col + r.cols
                         });
                         if let Some((id, rect)) = hit {
+                            selection =
+                                Some((active, atrium::select::Selection::start(id, mx, my, &rect)));
                             if let Some(p) = w.pane_mut(id) {
                                 if p.mouse_wanted {
                                     if let Some((cx, cy)) = screen_to_pane_local(mx, my, &rect) {
@@ -1929,6 +1936,43 @@ fn run(
                                 .pty
                                 .write(encode_sgr_click(col as usize, row as usize).as_bytes());
                         }
+                    }
+                }
+                Action::MouseDrag { col, row } => {
+                    // Extend a tile selection; the head is clamped into the tile
+                    // it started in, however far the pointer strays.
+                    if let Some((win, sel)) = selection.as_mut() {
+                        let w = &windows[active];
+                        if *win == active && w.tiled() {
+                            let rect = w
+                                .tree
+                                .rects(tiled_outer(rows, cols))
+                                .into_iter()
+                                .find(|(id, _)| *id == sel.pane_id);
+                            if let Some((_, rect)) = rect {
+                                let prev = sel.head;
+                                let mx = col.saturating_sub(1) as usize;
+                                let my = row.saturating_sub(1) as usize;
+                                sel.drag(mx, my, &rect);
+                                if sel.head != prev {
+                                    force_repaint = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                Action::MouseRelease { .. } => {
+                    // End a tile selection: copy its text unless it was a click.
+                    if let Some((win, sel)) = selection.take() {
+                        if win == active && !sel.is_empty() {
+                            if let Some(p) = windows[active].pane(sel.pane_id) {
+                                let text = atrium::select::text(&sel, p.term.screen());
+                                let n = text.chars().count();
+                                atrium::select::copy(&text, &mut out);
+                                flash = Some((format!("copied {n} chars"), Instant::now()));
+                            }
+                        }
+                        force_repaint = true;
                     }
                 }
                 Action::MouseScroll { up, col, row } => {
@@ -2470,6 +2514,17 @@ fn run(
                     &world,
                     spin_frame,
                 );
+                if let Some((win, sel)) = &selection {
+                    let w = &windows[active];
+                    let rect = w
+                        .tree
+                        .rects(tiled_outer(rows, cols))
+                        .into_iter()
+                        .find(|(id, _)| *id == sel.pane_id);
+                    if let (true, false, Some((_, rect))) = (*win == active, sel.is_empty(), rect) {
+                        atrium::select::highlight(sel, tiled_buf.as_mut().unwrap(), &rect);
+                    }
+                }
                 match &prev_master {
                     Some(prev) => frame.extend_from_slice(&prev.diff(tiled_buf.as_ref().unwrap())),
                     None => frame.extend_from_slice(&tiled_buf.as_ref().unwrap().render_full()),

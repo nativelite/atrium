@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fleet agent name, or a `ctl spawn --role` — as ` 3:engine `, falling back to
   the command for panes without one. The role is sanitized before it is drawn: a
   ctl role arrives raw and an ESC in it would otherwise reach the real terminal.
+- **Select and copy text inside one tile.** In a tiled window the host
+  terminal's native selection runs across every neighbouring tile and the
+  borders, and with mouse mode on (`Ctrl+A m`) atrium dropped drags, so text in
+  an agent's tile could not be selected cleanly either way. With mouse mode on, a
+  left drag now selects within the tile it started in — highlighted in reverse
+  video and clamped to that tile's content however far the pointer strays — and
+  the release copies it: OSC 52 to the host terminal, and on Windows also the
+  system clipboard directly (no dependency on the terminal's OSC 52 support or
+  ConPTY passthrough). Rows are joined with newlines, trailing padding trimmed,
+  double-width glyphs copied once. A plain click still just focuses. Only the
+  visible screen is selectable (no scrollback); single-pane and zoomed views keep
+  the host's native selection with mouse mode off.
 
 ### Fixed
 - **A `ctl send` / bus wake no longer lands on top of what the human is typing.**

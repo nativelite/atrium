@@ -116,7 +116,7 @@ Then drive it with the **`Ctrl+A`** prefix (press `Ctrl+A`, release, then a key)
 | `b` | the board + bus dashboard |
 | `o` | the overview: a mission-control panel of the agent tree, colored by status |
 | `a` | the activity log: a scrollable, time-ordered merge of bus, board, and agent actions |
-| `m` | toggle mouse capture (off by default, so text selection works) |
+| `m` | toggle mouse capture (off by default: native selection). On: click focuses a tile, drag selects text within that tile and copies it on release (OSC 52, plus the system clipboard on Windows), wheel scrolls |
 | `x` / `q` | kill the focused pane / quit atrium |
 | `Ctrl+A` | send a literal `Ctrl+A` through to the pane |
 

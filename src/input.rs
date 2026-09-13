@@ -48,8 +48,9 @@ pub enum Action {
     /// Toggle the focused pane to/from full-screen passthrough — `Ctrl+A z`.
     Zoom,
     /// Toggle mouse mode — `Ctrl+A m`. When on, clicks focus panes and are
-    /// forwarded to any pane whose child has enabled mouse tracking; when off,
-    /// the terminal's native drag-to-select / copy is restored.
+    /// forwarded to any pane whose child has enabled mouse tracking, and a drag
+    /// selects text within one tile (copied on release); when off, the
+    /// terminal's native drag-to-select / copy is restored.
     ToggleMouse,
     /// Toggle the full-screen **board** dashboard — `Ctrl+A b`. An overlay of the
     /// shared board (source-of-truth state); keystrokes don't reach the panes
@@ -79,6 +80,18 @@ pub enum Action {
     /// pane under the cursor so you can scroll whichever tile you're hovering.
     MouseScroll {
         up: bool,
+        col: u16,
+        row: u16,
+    },
+    /// Pointer motion with the left button held, at 1-based (`col`, `row`) —
+    /// only emitted while mouse mode is on. Extends a tile selection.
+    MouseDrag {
+        col: u16,
+        row: u16,
+    },
+    /// Left-button release at 1-based (`col`, `row`) — only emitted while mouse
+    /// mode is on. Ends a tile selection (and copies it).
+    MouseRelease {
         col: u16,
         row: u16,
     },
@@ -275,18 +288,23 @@ impl PrefixScanner {
                     continue;
                 }
                 State::MouseParams => {
-                    // Accumulate `Cb;Cx;Cy` until the terminator: `M` = press,
-                    // `m` = release. We act on a left-button press only.
+                    // Accumulate `Cb;Cx;Cy` until the terminator: `M` = press or
+                    // motion, `m` = release. We act on left press / drag /
+                    // release (click, tile selection) and the wheel.
                     if b == b'M' || b == b'm' {
-                        if b == b'M' {
-                            if let Some((cb, col, row)) = parse_sgr_mouse(&self.mouse_buf) {
-                                if is_left_press(cb) {
-                                    flush(&mut run, &mut actions);
-                                    actions.push(Action::MouseClick { col, row });
-                                } else if let Some(up) = wheel_dir(cb) {
-                                    flush(&mut run, &mut actions);
-                                    actions.push(Action::MouseScroll { up, col, row });
-                                }
+                        if let Some((cb, col, row)) = parse_sgr_mouse(&self.mouse_buf) {
+                            let action = if b == b'm' {
+                                is_left_press(cb).then_some(Action::MouseRelease { col, row })
+                            } else if is_left_press(cb) {
+                                Some(Action::MouseClick { col, row })
+                            } else if is_left_drag(cb) {
+                                Some(Action::MouseDrag { col, row })
+                            } else {
+                                wheel_dir(cb).map(|up| Action::MouseScroll { up, col, row })
+                            };
+                            if let Some(a) = action {
+                                flush(&mut run, &mut actions);
+                                actions.push(a);
                             }
                         }
                         self.mouse_buf.clear();
@@ -332,6 +350,12 @@ fn parse_sgr_mouse(buf: &[u8]) -> Option<(u32, u16, u16)> {
 /// event (bit 6, `0x40`) — i.e. a real left click, not a drag or scroll.
 fn is_left_press(cb: u32) -> bool {
     cb & 0b0110_0011 == 0
+}
+
+/// True when an SGR button code is pointer **motion** (bit 5) with the **left**
+/// button held (button bits `00`), not a wheel event — a left drag.
+fn is_left_drag(cb: u32) -> bool {
+    cb & 0b0100_0011 == 0 && cb & 0x20 != 0
 }
 
 /// If `cb` is a **wheel** event (bit 6, `0x40`, set) and not pointer motion

@@ -141,8 +141,12 @@ fn mouse_on_left_press_becomes_a_click() {
 fn mouse_on_release_and_wheel_and_drag_are_not_clicks() {
     let mut s = PrefixScanner::new();
     s.set_mouse(true);
-    assert_eq!(s.feed(b"\x1b[<0;12;7m"), vec![]); // release
-                                                  // Wheel-up is not a click — it scrolls the hovered tile (the scroll feature).
+    // A left release ends a tile selection; it is not a click.
+    assert_eq!(
+        s.feed(b"\x1b[<0;12;7m"),
+        vec![Action::MouseRelease { col: 12, row: 7 }]
+    );
+    // Wheel-up is not a click — it scrolls the hovered tile (the scroll feature).
     assert_eq!(
         s.feed(b"\x1b[<64;1;1M"),
         vec![Action::MouseScroll {
@@ -151,7 +155,14 @@ fn mouse_on_release_and_wheel_and_drag_are_not_clicks() {
             row: 1
         }]
     );
-    assert_eq!(s.feed(b"\x1b[<32;1;1M"), vec![]); // motion/drag
+    // A left drag extends a tile selection; it is not a click.
+    assert_eq!(
+        s.feed(b"\x1b[<32;1;1M"),
+        vec![Action::MouseDrag { col: 1, row: 1 }]
+    );
+    // Other buttons' drags and releases are still ignored.
+    assert_eq!(s.feed(b"\x1b[<34;1;1M"), vec![]); // right-button drag
+    assert_eq!(s.feed(b"\x1b[<2;1;1m"), vec![]); // right-button release
 }
 
 #[test]
