@@ -941,15 +941,11 @@ fn fleet_up_opens_a_two_agent_window() {
     )
     .unwrap();
 
-    let stem: &[u8] = if cfg!(windows) { b"cmd" } else { b"sh" };
-    // Two pane labels appear in the tiled frame: `1:<stem>` and `2:<stem>` (the
-    // leading blank is not matched — see the note in the mass-spawn test above).
-    let mut label2 = b"2:".to_vec();
-    label2.extend_from_slice(stem);
-    let out = read_until(&mut p, &label2, Duration::from_secs(20));
-    for i in 1..=2u8 {
-        let mut label = vec![b'0' + i, b':'];
-        label.extend_from_slice(stem);
+    // Two pane labels appear in the tiled frame, named for the fleet agents —
+    // `1:one` and `2:two`, not the shared command stem (the leading blank is not
+    // matched — see the note in the mass-spawn test above).
+    let out = read_until(&mut p, b"2:two", Duration::from_secs(20));
+    for (i, label) in [(1, &b"1:one"[..]), (2, &b"2:two"[..])] {
         assert!(
             contains(&out, &label),
             "fleet pane {i} label missing: {:?}",
