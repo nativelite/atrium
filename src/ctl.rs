@@ -107,6 +107,116 @@ pub enum Cmd {
     Respawn(RespawnReq),
 }
 
+impl Cmd {
+    /// Is this a read-only command — served to any caller, authenticated or not?
+    /// Everything else mutates the fleet or its shared state (spawn, send, kill,
+    /// board writes/claims, bus publish/subscribe/resolve) and requires an
+    /// authenticated, token-matched caller.
+    ///
+    /// An exhaustive `match`, deliberately: it used to be a `matches!` in `main.rs`,
+    /// which a new variant silently fell out of (as "not read-only" — fail-secure,
+    /// but mis-gated). Now adding a command is a compile error here until its
+    /// posture is decided, next to the variant (r10 audit B5).
+    pub fn is_read_only(&self) -> bool {
+        match self {
+            Cmd::List | Cmd::Status(_) | Cmd::Audit(_) => true,
+            Cmd::Spawn(_) | Cmd::Send(_) | Cmd::Kill(_) | Cmd::Respawn(_) => false,
+            Cmd::Board(op) => match op {
+                BoardOp::Get { .. } | BoardOp::List => true,
+                BoardOp::Set { .. }
+                | BoardOp::Del { .. }
+                | BoardOp::Claim { .. }
+                | BoardOp::Release { .. } => false,
+            },
+            Cmd::Bus(op) => match op {
+                BusOp::Feed { .. } | BusOp::Topics => true,
+                BusOp::Pub { .. }
+                | BusOp::Sub { .. }
+                | BusOp::Unsub { .. }
+                | BusOp::Resolve { .. } => false,
+            },
+        }
+    }
+
+    /// The audit `(action, detail)` for a request: a stable verb plus a compact,
+    /// **secret-free** description (identity *names* only; `send` logs the text
+    /// *length*, never the body).
+    pub fn audit_label(&self) -> (&'static str, String) {
+        match self {
+            Cmd::List => ("list", String::new()),
+            Cmd::Status(sr) => (
+                "status",
+                match &sr.target {
+                    Some(t) => format!("target={t}"),
+                    None => "scope=subtree".to_string(),
+                },
+            ),
+            Cmd::Send(sr) => (
+                "send",
+                format!("target={} len={}", sr.target, sr.text.chars().count()),
+            ),
+            Cmd::Spawn(sp) => {
+                let stem = sp
+                    .argv
+                    .first()
+                    .map(|a| crate::bind::command_stem(a))
+                    .unwrap_or_default();
+                (
+                    "spawn",
+                    format!(
+                        "role={} argv={} identity={}",
+                        sp.role.as_deref().unwrap_or("-"),
+                        stem,
+                        sp.identity.as_deref().unwrap_or("-")
+                    ),
+                )
+            }
+            Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
+            Cmd::Audit(_) => ("audit", String::new()),
+            Cmd::Board(op) => (
+                "board",
+                match op {
+                    BoardOp::Set { key, fields } => {
+                        format!("set {key} fields={}", fields.len())
+                    }
+                    BoardOp::Get { key } => format!("get {key}"),
+                    BoardOp::List => "list".to_string(),
+                    BoardOp::Del { key } => format!("del {key}"),
+                    BoardOp::Claim { key, .. } => format!("claim {key}"),
+                    BoardOp::Release { key } => format!("release {key}"),
+                },
+            ),
+            Cmd::Bus(op) => (
+                "bus",
+                match op {
+                    BusOp::Pub {
+                        topic,
+                        kind,
+                        fields,
+                        create,
+                    } => {
+                        let new = if *create { " --new" } else { "" };
+                        format!("pub {topic}{new} {} fields={}", kind.as_str(), fields.len())
+                    }
+                    BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
+                    BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
+                    BusOp::Feed { since } => format!("feed since={since}"),
+                    BusOp::Resolve { seq } => format!("resolve {seq}"),
+                    BusOp::Topics => "topics".to_string(),
+                },
+            ),
+            Cmd::Respawn(rr) => (
+                "respawn",
+                format!(
+                    "target={} worktree={}",
+                    rr.target,
+                    rr.worktree.as_deref().unwrap_or("-")
+                ),
+            ),
+        }
+    }
+}
+
 /// A `kill` request's payload.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KillReq {
@@ -2752,6 +2862,40 @@ mod tests {
         assert!(!in_subtree(a(4), a(1), &parents)); // a cousin is not
         assert!(in_subtree(a(4), a(0), &parents)); // everything is under the root
         assert!(!in_subtree(a(1), a(2), &parents)); // a parent is not under its child
+    }
+
+    #[test]
+    fn ctl_read_ops_are_open_mutations_require_auth() {
+        // Reads are servable to an unauthenticated caller…
+        assert!(Cmd::List.is_read_only());
+        assert!(Cmd::Board(BoardOp::List).is_read_only());
+        assert!(Cmd::Board(BoardOp::Get { key: "auth".into() }).is_read_only());
+        assert!(Cmd::Bus(BusOp::Feed { since: 0 }).is_read_only());
+        // …while anything that mutates the fleet or shared state is gated.
+        assert!(!Cmd::Kill(KillReq { target: "w".into() }).is_read_only());
+        assert!(!Cmd::Board(BoardOp::Set {
+            key: "t".into(),
+            fields: vec![],
+        })
+        .is_read_only());
+        assert!(!Cmd::Board(BoardOp::Claim {
+            key: "t".into(),
+            ttl_ms: None,
+        })
+        .is_read_only());
+        assert!(!Cmd::Bus(BusOp::Resolve { seq: 1 }).is_read_only());
+    }
+
+    #[test]
+    fn audit_labels_are_secret_free() {
+        // `send` records the text length, never the body.
+        let (action, detail) = Cmd::Send(SendReq {
+            target: "dev".into(),
+            text: "the secret plan".into(),
+        })
+        .audit_label();
+        assert_eq!(action, "send");
+        assert_eq!(detail, "target=dev len=15");
     }
 
     #[test]

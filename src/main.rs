@@ -2836,24 +2836,6 @@ fn decision_for_agent(e: &atrium::bus::Event, windows: &[Window]) -> bool {
     })
 }
 
-/// Read-only control commands — served to any caller, authenticated or not.
-/// Everything else mutates the fleet or its shared state (spawn, send, kill,
-/// board writes/claims, bus publish/subscribe/resolve) and requires an
-/// authenticated, token-matched caller.
-fn ctl_is_read_only(cmd: &atrium::ctl::Cmd) -> bool {
-    use atrium::ctl::{BoardOp, BusOp, Cmd};
-    matches!(
-        cmd,
-        Cmd::List
-            | Cmd::Status(_)
-            | Cmd::Audit(_)
-            | Cmd::Board(BoardOp::Get { .. })
-            | Cmd::Board(BoardOp::List)
-            | Cmd::Bus(BusOp::Feed { .. })
-            | Cmd::Bus(BusOp::Topics)
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_ctl(
     line: &str,
@@ -2917,11 +2899,11 @@ fn apply_ctl(
     let authenticated = authed.is_some();
     // Reads (list/status/audit/board get/list/bus feed) are open; anything that
     // mutates the fleet or its shared state requires an authenticated caller.
-    if !authenticated && !ctl_is_read_only(&req.cmd) {
+    if !authenticated && !req.cmd.is_read_only() {
         let reply = ctl::reply_err(
             "unauthenticated: control request carries no valid pane token (ATRIUM_TOKEN)",
         );
-        let (action, detail) = audit_label(&req);
+        let (action, detail) = req.cmd.audit_label();
         audit.record(None, action, &detail, false, "unauthenticated");
         return reply;
     }
@@ -2941,7 +2923,7 @@ fn apply_ctl(
         return audit_reply(audit, windows, caller, privileged, ar.tail);
     }
 
-    let (action, detail) = audit_label(&req);
+    let (action, detail) = req.cmd.audit_label();
     let reply = dispatch_ctl(
         req,
         caller,
@@ -3427,85 +3409,6 @@ fn truncate(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(n).collect::<String>() + "…"
-    }
-}
-
-/// The audit `(action, detail)` for a request: a stable verb plus a compact,
-/// **secret-free** description (identity *names* only; `send` logs the text
-/// *length*, never the body).
-fn audit_label(req: &atrium::ctl::Request) -> (&'static str, String) {
-    use atrium::ctl::Cmd;
-    match &req.cmd {
-        Cmd::List => ("list", String::new()),
-        Cmd::Status(sr) => (
-            "status",
-            match &sr.target {
-                Some(t) => format!("target={t}"),
-                None => "scope=subtree".to_string(),
-            },
-        ),
-        Cmd::Send(sr) => (
-            "send",
-            format!("target={} len={}", sr.target, sr.text.chars().count()),
-        ),
-        Cmd::Spawn(sp) => {
-            let stem = sp
-                .argv
-                .first()
-                .map(|a| atrium::bind::command_stem(a))
-                .unwrap_or_default();
-            (
-                "spawn",
-                format!(
-                    "role={} argv={} identity={}",
-                    sp.role.as_deref().unwrap_or("-"),
-                    stem,
-                    sp.identity.as_deref().unwrap_or("-")
-                ),
-            )
-        }
-        Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
-        Cmd::Audit(_) => ("audit", String::new()),
-        Cmd::Board(op) => (
-            "board",
-            match op {
-                atrium::ctl::BoardOp::Set { key, fields } => {
-                    format!("set {key} fields={}", fields.len())
-                }
-                atrium::ctl::BoardOp::Get { key } => format!("get {key}"),
-                atrium::ctl::BoardOp::List => "list".to_string(),
-                atrium::ctl::BoardOp::Del { key } => format!("del {key}"),
-                atrium::ctl::BoardOp::Claim { key, .. } => format!("claim {key}"),
-                atrium::ctl::BoardOp::Release { key } => format!("release {key}"),
-            },
-        ),
-        Cmd::Bus(op) => (
-            "bus",
-            match op {
-                atrium::ctl::BusOp::Pub {
-                    topic,
-                    kind,
-                    fields,
-                    create,
-                } => {
-                    let new = if *create { " --new" } else { "" };
-                    format!("pub {topic}{new} {} fields={}", kind.as_str(), fields.len())
-                }
-                atrium::ctl::BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
-                atrium::ctl::BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
-                atrium::ctl::BusOp::Feed { since } => format!("feed since={since}"),
-                atrium::ctl::BusOp::Resolve { seq } => format!("resolve {seq}"),
-                atrium::ctl::BusOp::Topics => "topics".to_string(),
-            },
-        ),
-        Cmd::Respawn(rr) => (
-            "respawn",
-            format!(
-                "target={} worktree={}",
-                rr.target,
-                rr.worktree.as_deref().unwrap_or("-")
-            ),
-        ),
     }
 }
 
@@ -5034,29 +4937,6 @@ mod tests {
             flat.contains("#1") && flat.contains("grace"),
             "seq + source shown: {flat}"
         );
-    }
-
-    #[test]
-    fn ctl_read_ops_are_open_mutations_require_auth() {
-        use atrium::ctl::{BoardOp, Cmd, KillReq};
-        // Reads are servable to an unauthenticated caller…
-        assert!(ctl_is_read_only(&Cmd::List));
-        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::List)));
-        assert!(ctl_is_read_only(&Cmd::Board(BoardOp::Get {
-            key: "auth".into()
-        })));
-        // …while anything that mutates the fleet or shared state is gated.
-        assert!(!ctl_is_read_only(&Cmd::Kill(KillReq {
-            target: "w".into()
-        })));
-        assert!(!ctl_is_read_only(&Cmd::Board(BoardOp::Set {
-            key: "t".into(),
-            fields: vec![],
-        })));
-        assert!(!ctl_is_read_only(&Cmd::Board(BoardOp::Claim {
-            key: "t".into(),
-            ttl_ms: None,
-        })));
     }
 
     #[test]
