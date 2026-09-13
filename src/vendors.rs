@@ -267,6 +267,20 @@ impl VendorWorlds {
             .map(|s| s.status)
     }
 
+    /// Does the pane's bound session end on an unresolved `tool_use` — a running
+    /// tool, or a question / approval dialog open on screen? `false` when
+    /// unbound. See [`agsess::AgentSession::awaiting_tool`].
+    pub fn awaiting_tool_for(&self, session_id: Option<&str>) -> bool {
+        let Some(id) = session_id else {
+            return false;
+        };
+        self.worlds
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.awaiting_tool())
+    }
+
     /// Every session across every vendor world, for overview counts and for
     /// [`adopt_session_for`] to scan. Flattened; no ordering guarantee beyond
     /// each world's own most-recent-first sort.

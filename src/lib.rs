@@ -20,6 +20,7 @@ pub mod bar;
 pub mod bind;
 pub mod context;
 pub mod ctl;
+pub mod deliver;
 // The coordination layer (board + bus) now lives in the `abus` org crate;
 // re-exported here so `atrium::board` / `atrium::bus` (and `crate::bus` inside the
 // crate) keep resolving unchanged.

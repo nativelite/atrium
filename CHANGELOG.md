@@ -30,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that needs parallelism, is a different bug and says so. Ctrl-C now kills the
   tree as well.
 
+### Fixed
+- **A `ctl send` / bus wake no longer lands on top of what the human is typing.**
+  Delivery waited only for the target to reach its prompt, so if you were
+  mid-sentence in that pane the queued text was appended to your draft and the
+  Enter submitted both. atrium now tracks unsent input per pane from the keys it
+  forwards (typing marks it dirty; Enter or Ctrl+C clears it; Esc, focus and mouse
+  reports don't count) and holds deliveries while a draft is open. A draft left
+  untouched for 5 minutes is treated as abandoned so a stray key can't wedge a
+  pane's queue.
+- **A delivery can no longer answer an open question or approve a plan.** agsess
+  decays any session quiet for a minute to `Idle`, including one sitting on a
+  question, permission or plan-approval dialog — and atrium delivered into `Idle`,
+  so its Enter picked the highlighted option. Seen live: two plan-mode agents
+  "approved" their own plans. Delivery now also waits while the transcript ends on
+  an unresolved `tool_use` (agsess `AgentSession::awaiting_tool`), however old.
+
 ## [0.30.0] - 2026-09-06
 
 ### Added

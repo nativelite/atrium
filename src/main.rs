@@ -439,6 +439,10 @@ pub(crate) struct Pane {
     /// splitting the overloaded "idle" into busy vs. genuinely-stale. Monotonic so
     /// an NTP step can't make idle jump or go negative. Initialized at spawn.
     pub(crate) last_activity: std::time::Instant,
+    /// Unsent human input in this pane's prompt, inferred from forwarded keys. A
+    /// queued `ctl send` waits while it holds, so a delivery is never spliced
+    /// onto — and submitted with — what the human is typing.
+    pub(crate) draft: atrium::deliver::Draft,
     pub(crate) exited: bool,
     /// The session id atrium injected via `--session-id` when this pane is an
     /// agent it launched (§3.3). `None` for shells and agents atrium did not
@@ -1702,6 +1706,7 @@ fn run(
             match action {
                 Action::Forward(b) => {
                     if let Some(p) = windows[active].focused_mut() {
+                        p.draft.observe(&b, Instant::now());
                         let _ = p.pty.write(&b);
                     }
                 }
@@ -3699,17 +3704,19 @@ fn flush_sends(
     pending.retain_mut(|ps| {
         match ps.text_written_at {
             None => {
-                // Decide readiness from the target's live status.
+                // Decide readiness from the target's live status, an open
+                // dialog, and any unsent human draft (see atrium::deliver).
                 let ready = match pane_by_agent(windows, ps.target) {
                     None => return false, // target gone — drop the send
                     Some(p) => {
-                        match world.status_for(p.session_id.as_deref()) {
-                            Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) => {
-                                true
-                            }
-                            Some(_) => false, // Working / WaitingApproval — keep waiting
-                            None => now.duration_since(ps.queued_at) >= SEND_UNBOUND_FALLBACK,
-                        }
+                        let sid = p.session_id.as_deref();
+                        atrium::deliver::ready(
+                            world.status_for(sid),
+                            world.awaiting_tool_for(sid),
+                            p.draft.holds(now),
+                            now.duration_since(ps.queued_at),
+                            SEND_UNBOUND_FALLBACK,
+                        )
                     }
                 };
                 if ready {
@@ -4182,6 +4189,7 @@ fn spawn_pane_full(
         // A fresh pane is "active" (idle 0) until proven idle; stamped forward on
         // every output byte in the run loop.
         last_activity: std::time::Instant::now(),
+        draft: atrium::deliver::Draft::default(),
         exited: false,
         session_id,
         launch_ms: agsess::sessions::now_ms(),
