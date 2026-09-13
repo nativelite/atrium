@@ -294,6 +294,30 @@ impl Warden {
         self.registry_digest = digest_file(&self.registry);
     }
 
+    /// Account for one attempt by atrium to rewrite the registry.
+    ///
+    /// Only a write that landed moves the tamper baseline. A failed one returns an
+    /// alert instead: the registry is the crash-recovery record a later sweep kills
+    /// from, so a silently stale file means orphans that leak with no signal
+    /// (r10 audit B2 — the old call site dropped the `Result` and recorded the
+    /// rewrite as done regardless).
+    pub fn record_registry_write(&mut self, result: &std::io::Result<()>) -> Option<Alert> {
+        match result {
+            Ok(()) => {
+                self.registry_rewritten();
+                None
+            }
+            Err(e) => Some(Alert {
+                kind: "warden-registry-write-failed",
+                detail: format!(
+                    "could not update the crash registry {}: {e}. Pane process trees from \
+                     this session may not be reaped if atrium dies; retrying",
+                    self.registry.display()
+                ),
+            }),
+        }
+    }
+
     /// Look for atrium sessions we cannot account for.
     ///
     /// The candidate set is deliberately small: only pids that own a session
@@ -856,6 +880,47 @@ mod tests {
                 .all(|a| a.kind != "warden-registry-changed"),
             "the same change was reported twice"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// r10 B2: a registry write that FAILED must neither move the tamper baseline
+    /// (the file on disk did not change) nor pass silently — it is an alert.
+    /// Revert `record_registry_write` to "always call registry_rewritten, return
+    /// None" and both halves fail.
+    #[test]
+    fn a_failed_registry_write_alerts_and_keeps_the_baseline() {
+        let dir = std::env::temp_dir().join(format!("atrium-warden-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = dir.join("registry");
+        std::fs::write(&reg, "1\n").unwrap();
+        let mut w = Warden::new(reg.clone());
+
+        let failed: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "disk says no",
+        ));
+        let alert = w
+            .record_registry_write(&failed)
+            .expect("a failed write alerts");
+        assert_eq!(alert.kind, "warden-registry-write-failed");
+        assert!(alert.detail.contains("disk says no"), "{alert:?}");
+
+        // The baseline did not move: a later change on disk is still caught.
+        std::fs::write(&reg, "1\n2\n").unwrap();
+        assert!(
+            w.check(&[])
+                .iter()
+                .any(|a| a.kind == "warden-registry-changed"),
+            "a failed write must not be recorded as atrium's own rewrite"
+        );
+
+        // A write that landed moves the baseline and is silent.
+        std::fs::write(&reg, "1\n2\n3\n").unwrap();
+        assert!(w.record_registry_write(&Ok(())).is_none());
+        assert!(w
+            .check(&[])
+            .iter()
+            .all(|a| a.kind != "warden-registry-changed"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -50,6 +50,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host's native selection with mouse mode off.
 
 ### Fixed
+- **A failed crash-registry write is no longer reported as done.** The registry
+  is the record a crash sweep kills from so pane process trees don't leak. The
+  live rewrite dropped its `Result` and told the warden it had happened anyway,
+  and teardown's `settle_registry` returned "survivors are on disk" even when the
+  write failed — so the record could go silently stale and orphans leak after a
+  crash with no signal. A failed write now keeps the warden's tamper baseline,
+  is surfaced once per failure streak (audit log, `decision_needed` on the bus,
+  status bar), and is retried every few seconds until it lands; teardown prints
+  the unrecorded survivors instead of implying the watchdog has them.
+  `reap::settle_registry` now returns `io::Result<bool>`. (r10 audit B2.)
 - **Prompts, branch names and fleet args containing `&`, `|`, `%` or quotes no
   longer break Windows agent launches.** A `.cmd` shim (Claude Code's
   `claude.cmd`) ran as `cmd /C <shim> args…` with args quoted by argv rules, which

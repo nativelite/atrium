@@ -1274,6 +1274,12 @@ fn run(
     let mut last_warden_check = Instant::now();
     let mut cap_notice_raised = false;
     let mut registered: Vec<u32> = Vec::new();
+    // Registry persistence state: `registry_dirty` = `registered` not yet on disk;
+    // `registry_failing` = the last attempt failed (surfaced once per streak);
+    // `registry_retry_at` = earliest next attempt after a failure.
+    let mut registry_dirty = false;
+    let mut registry_failing = false;
+    let mut registry_retry_at: Option<Instant> = None;
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
     // tree outlives atrium however it dies (TerminateProcess included); a no-op on
     // unix (the process-group teardown + watchdog below already cover the tree).
@@ -1321,12 +1327,49 @@ fn run(
                 for pid in cur.iter().filter(|p| !registered.contains(p)) {
                     session_job.assign(*pid);
                 }
-                let _ =
-                    atrium::reap::write_registry(&registry_path, &cur, trust_mode().policy_label());
-                warden.registry_rewritten();
                 registered = cur;
+                registry_dirty = true;
+                registry_retry_at = None;
                 snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
                 last_snapshot_check = Instant::now();
+            }
+            // Persist it. A failed write is neither dropped nor recorded as done
+            // (r10 audit B2): the warden keeps its baseline, the failure is
+            // surfaced once per streak (audit + bus + bar), and it is retried on
+            // the warden cadence until it lands.
+            if registry_dirty && registry_retry_at.map_or(true, |t| Instant::now() >= t) {
+                let written = atrium::reap::write_registry(
+                    &registry_path,
+                    &registered,
+                    trust_mode().policy_label(),
+                );
+                match warden.record_registry_write(&written) {
+                    None => {
+                        if registry_failing {
+                            flash = Some(("crash registry updated".to_string(), Instant::now()));
+                            force_repaint = true;
+                        }
+                        registry_dirty = false;
+                        registry_failing = false;
+                        registry_retry_at = None;
+                    }
+                    Some(alert) => {
+                        if !registry_failing {
+                            registry_failing = true;
+                            ctl_audit.record(None, alert.kind, &alert.detail, false, "");
+                            let _ = bus.publish(
+                                "warden",
+                                atrium::bus::Kind::DecisionNeeded,
+                                None,
+                                &[("msg".to_string(), alert.detail.clone())],
+                                agsess::sessions::now_ms(),
+                            );
+                            flash = Some((alert.detail, Instant::now()));
+                            force_repaint = true;
+                        }
+                        registry_retry_at = Some(Instant::now() + WARDEN_INTERVAL);
+                    }
+                }
             }
             if last_snapshot_check.elapsed() >= SNAPSHOT_INTERVAL {
                 last_snapshot_check = Instant::now();
@@ -2732,12 +2775,21 @@ fn run(
     // the watchdog then TERMs and KILLs precisely what is left, and a later
     // `atrium reap` finds the same short list rather than a stale full one. Panes
     // that did die are dropped from it, because a dead pane's pgid can be reused.
-    if atrium::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
-        eprintln!(
+    match atrium::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
+        Ok(false) => {}
+        Ok(true) => eprintln!(
             "atrium: warning: {} pane process group(s) survived teardown: {:?}",
             survivors.len(),
             survivors
-        );
+        ),
+        // The record could not be settled: say so, with the groups a manual
+        // cleanup would need, instead of implying the watchdog has them.
+        Err(e) => eprintln!(
+            "atrium: warning: could not update the crash registry {}: {e}; surviving pane \
+             process group(s), if any, are not recorded for the watchdog: {:?}",
+            registry_path.display(),
+            survivors
+        ),
     }
     // Panes that are genuinely gone leave no stamp behind. A survivor keeps
     // its stamp — that is the marker the sweep needs to collect it later.

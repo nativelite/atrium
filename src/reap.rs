@@ -509,14 +509,22 @@ pub fn write_registry(path: &Path, pgids: &[u32], policy: &str) -> io::Result<()
 /// a pane that did exit frees its pgid for reuse, so a stale full list is a
 /// list of process groups that may later belong to somebody else.
 ///
-/// Returns whether anything was left on disk for a later sweep to act on.
-pub fn settle_registry(path: &Path, survivors: &[u32], policy: &str) -> bool {
+/// Returns whether anything was left on disk for a later sweep to act on, or the
+/// error that stopped the record from being settled.
+pub fn settle_registry(path: &Path, survivors: &[u32], policy: &str) -> io::Result<bool> {
     if survivors.is_empty() {
-        let _ = std::fs::remove_file(path);
-        false
+        // Already gone is the clean outcome; any other failure leaves a stale
+        // record naming groups that may be reused, which the caller must hear.
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     } else {
-        let _ = write_registry(path, survivors, policy);
-        true
+        // A dropped write here used to still return `true`: the caller was told
+        // the survivors were on disk when they may not be (r10 audit B2).
+        write_registry(path, survivors, policy)?;
+        Ok(true)
     }
 }
 
@@ -844,14 +852,14 @@ mod tests {
 
         // Clean teardown: nothing survived, so nothing is left behind.
         write_registry(&path, &[101, 102], "plan").unwrap();
-        assert!(!settle_registry(&path, &[], "plan"));
+        assert!(!settle_registry(&path, &[], "plan").unwrap());
         assert!(!path.exists(), "a clean teardown leaves no registry");
 
         // Survivors: the record stays, trimmed to exactly what is still alive.
         // 102 exited, and a dead pane's pgid can be reused - keeping it would
         // aim a later sweep at whatever inherits the number.
         write_registry(&path, &[101, 102], "plan").unwrap();
-        assert!(settle_registry(&path, &[101], "plan"));
+        assert!(settle_registry(&path, &[101], "plan").unwrap());
         assert!(path.exists(), "the watchdog's only record must survive");
         assert_eq!(
             read_registry(&path),
@@ -859,6 +867,31 @@ mod tests {
             "and must name exactly the groups that survived"
         );
         assert_eq!(read_policy(&path).as_deref(), Some("plan"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// r10 B2: settling must not claim a record is on disk when writing it
+    /// failed, nor call a clean teardown clean when the stale file could not be
+    /// removed. Revert to `let _ = write_registry(..); true` and the first
+    /// assertion fails.
+    #[test]
+    fn settle_reports_the_failures_it_used_to_swallow() {
+        let dir = std::env::temp_dir().join(format!("atrium-settle-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Survivors, but the registry's directory does not exist: the write fails.
+        let unwritable = dir.join("missing-dir").join("atrium-session-1.pids");
+        assert!(settle_registry(&unwritable, &[101], "plan").is_err());
+
+        // Clean teardown where the path cannot be removed (it is a directory).
+        let not_a_file = dir.join("atrium-session-2.pids");
+        std::fs::create_dir_all(&not_a_file).unwrap();
+        assert!(settle_registry(&not_a_file, &[], "plan").is_err());
+
+        // Clean teardown with nothing on disk is simply clean.
+        let absent = dir.join("atrium-session-3.pids");
+        assert!(!settle_registry(&absent, &[], "plan").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
