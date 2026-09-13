@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or lower an agent's permission posture) and decoded any unknown code to `Off`.
   It now holds the enum itself; `rank()` is the only integer projection left.
   No behavior change. (r10 audit B3.)
+- **Agent ids are a type, not a bare `usize`.** A pane carries two integer ids
+  from different counters — its split-tree id and its ctl agent id, which the
+  subtree authorization guard compares — and both were `usize`, so passing one
+  for the other compiled cleanly and misrouted a `send`/`status`/`kill` scope
+  check. The agent id is now `ctl::AgentId` through the spawn tree, target
+  resolution, `in_subtree`, the audit log and the reply builders (a plain number
+  on the wire), pinned by a `compile_fail` doctest. The token-authenticated caller
+  is also no longer written back into the request's self-reported `caller` hint;
+  it is passed separately as an `AgentId`. No behavior change. (r10 audit B4.)
 
 ### Fixed
 - **A failed crash-registry write is no longer reported as done.** The registry

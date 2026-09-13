@@ -41,6 +41,31 @@ pub const ENV_TOKEN: &str = "ATRIUM_TOKEN";
 /// runaway self-spawning agent. Overridable/removable via `--max-depth`.
 pub const DEFAULT_MAX_DEPTH: usize = 6;
 
+/// A pane's **agent id**: the process-global key of the ctl spawn tree — the
+/// value `send`/`status`/`kill` targets resolve to and the subtree-scoping
+/// authorization guard ([`in_subtree`]) compares.
+///
+/// A newtype, not a bare `usize`, because a pane also has a per-window split-tree
+/// id that IS a bare `usize`, minted from a different counter. Both used to be
+/// `usize`, so passing one where the other belonged compiled cleanly and misrouted
+/// an authorization check (r10 audit B4); now it is a type error. Serialized as
+/// its plain number on the wire.
+///
+/// ```compile_fail
+/// use atrium::ctl::{in_subtree, AgentId};
+/// // A split-tree pane id (a bare usize) is not an agent id: this must not compile.
+/// let split_tree_id: usize = 1;
+/// in_subtree(split_tree_id, AgentId(0), &[]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentId(pub usize);
+
+impl std::fmt::Display for AgentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// A parsed control request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Request {
@@ -415,15 +440,15 @@ pub fn sanitize_spawn_argv(argv: &[String]) -> (Vec<String>, Vec<String>) {
 /// target is unknown or a role is ambiguous (matches more than one pane). Pure.
 pub fn resolve_target(
     target: &str,
-    candidates: &[(usize, Option<String>)],
-) -> Result<usize, String> {
-    if let Ok(id) = target.parse::<usize>() {
+    candidates: &[(AgentId, Option<String>)],
+) -> Result<AgentId, String> {
+    if let Ok(id) = target.parse::<usize>().map(AgentId) {
         if candidates.iter().any(|(cid, _)| *cid == id) {
             return Ok(id);
         }
         return Err(format!("no pane with id {id}"));
     }
-    let hits: Vec<usize> = candidates
+    let hits: Vec<AgentId> = candidates
         .iter()
         .filter(|(_, role)| role.as_deref() == Some(target))
         .map(|(cid, _)| *cid)
@@ -435,7 +460,7 @@ pub fn resolve_target(
             "role {target:?} is ambiguous ({} panes: {}); use a pane id",
             many.len(),
             many.iter()
-                .map(usize::to_string)
+                .map(AgentId::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         )),
@@ -446,11 +471,11 @@ pub fn resolve_target(
 /// descendant of it)? `parents` maps each `agent_id` to its parent. This is the
 /// **subtree-scoping guard** (Decision 3): a non-privileged caller may only
 /// `send`/`status` panes in its own subtree. Pure; cycle-guarded.
-pub fn in_subtree(target: usize, root: usize, parents: &[(usize, Option<usize>)]) -> bool {
+pub fn in_subtree(target: AgentId, root: AgentId, parents: &[(AgentId, Option<AgentId>)]) -> bool {
     if target == root {
         return true;
     }
-    let parent_of = |id: usize| parents.iter().find(|(i, _)| *i == id).and_then(|(_, p)| *p);
+    let parent_of = |id: AgentId| parents.iter().find(|(i, _)| *i == id).and_then(|(_, p)| *p);
     let mut cur = target;
     // The tree is shallow (depth-capped) but guard against a malformed cycle.
     for _ in 0..4096 {
@@ -1228,14 +1253,14 @@ pub fn zero_sub_warning(reply: &str) -> Option<String> {
 /// `note` carries a non-fatal advisory (e.g. permission flags atrium stripped from
 /// the spawn argv) so the caller sees it instead of it happening silently.
 pub fn reply_spawned(
-    pane: usize,
+    pane: AgentId,
     role: Option<&str>,
     session: Option<&str>,
     note: Option<&str>,
 ) -> String {
     obj(vec![
         ("ok", Value::Bool(true)),
-        ("pane", i(pane)),
+        ("pane", i(pane.0)),
         ("role", role.map(s).unwrap_or(Value::Null)),
         ("session", session.map(s).unwrap_or(Value::Null)),
         ("note", note.map(s).unwrap_or(Value::Null)),
@@ -1246,10 +1271,10 @@ pub fn reply_spawned(
 /// `{"ok":true,"target":<id>,"queued":<bool>}` — a `send` was accepted. `queued`
 /// is true when the target was busy (delivery waits for it to go idle), false
 /// when it will go out immediately. Delivery itself is asynchronous.
-pub fn reply_sent(target: usize, queued: bool) -> String {
+pub fn reply_sent(target: AgentId, queued: bool) -> String {
     obj(vec![
         ("ok", Value::Bool(true)),
-        ("target", i(target)),
+        ("target", i(target.0)),
         ("queued", Value::Bool(queued)),
     ])
     .to_string()
@@ -1258,8 +1283,8 @@ pub fn reply_sent(target: usize, queued: bool) -> String {
 /// `{"ok":true,"killed":[<id>,…]}` — the set of panes torn down by a `kill`
 /// (the target plus every descendant), sorted. Empty only if the target
 /// vanished between resolve and teardown.
-pub fn reply_killed(killed: &[usize]) -> String {
-    let arr = killed.iter().map(|id| i(*id)).collect();
+pub fn reply_killed(killed: &[AgentId]) -> String {
+    let arr = killed.iter().map(|id| i(id.0)).collect();
     obj(vec![
         ("ok", Value::Bool(true)),
         ("killed", Value::Array(arr)),
@@ -1294,10 +1319,10 @@ pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> Str
 /// status. `idle_ms` is the same **additive** u64-millisecond field as on
 /// [`reply_list`] nodes (`0` when active); the baseline `{pane,status}` keys are
 /// unchanged.
-pub fn reply_status_one(pane: usize, status: Option<&str>, idle_ms: u64) -> String {
+pub fn reply_status_one(pane: AgentId, status: Option<&str>, idle_ms: u64) -> String {
     obj(vec![
         ("ok", Value::Bool(true)),
-        ("pane", i(pane)),
+        ("pane", i(pane.0)),
         ("status", status.map(s).unwrap_or(Value::Null)),
         ("idle_ms", Value::Number(Number::Int(idle_ms as i64))),
     ])
@@ -1308,8 +1333,8 @@ pub fn reply_status_one(pane: usize, status: Option<&str>, idle_ms: u64) -> Stri
 /// (monotonic ms) since the pane last produced output — `0` for an active pane —
 /// computed by the run loop via [`crate::ipc::idle_ms`].
 pub struct TreeNode<'a> {
-    pub id: usize,
-    pub parent: Option<usize>,
+    pub id: AgentId,
+    pub parent: Option<AgentId>,
     pub role: Option<&'a str>,
     pub title: &'a str,
     pub depth: usize,
@@ -1326,8 +1351,8 @@ pub fn reply_list(nodes: &[TreeNode]) -> String {
         .iter()
         .map(|n| {
             obj(vec![
-                ("id", i(n.id)),
-                ("parent", n.parent.map(i).unwrap_or(Value::Null)),
+                ("id", i(n.id.0)),
+                ("parent", n.parent.map(|p| i(p.0)).unwrap_or(Value::Null)),
                 ("role", n.role.map(s).unwrap_or(Value::Null)),
                 ("title", s(n.title)),
                 ("depth", i(n.depth)),
@@ -2213,7 +2238,7 @@ mod tests {
 
     #[test]
     fn reply_status_one_carries_idle_ms_additively() {
-        let json = reply_status_one(2, Some("working"), 7_000);
+        let json = reply_status_one(AgentId(2), Some("working"), 7_000);
         let v = json::parse(&json).unwrap();
         assert_eq!(v.get("pane").and_then(Value::as_i64), Some(2));
         assert_eq!(v.get("status").and_then(Value::as_str), Some("working"));
@@ -2687,12 +2712,12 @@ mod tests {
     #[test]
     fn resolve_target_by_id_and_role() {
         let panes = [
-            (0usize, Some("ceo".to_string())),
-            (1, Some("dev_1".to_string())),
-            (2, None),
+            (AgentId(0), Some("ceo".to_string())),
+            (AgentId(1), Some("dev_1".to_string())),
+            (AgentId(2), None),
         ];
-        assert_eq!(resolve_target("1", &panes), Ok(1));
-        assert_eq!(resolve_target("dev_1", &panes), Ok(1));
+        assert_eq!(resolve_target("1", &panes), Ok(AgentId(1)));
+        assert_eq!(resolve_target("dev_1", &panes), Ok(AgentId(1)));
         assert!(resolve_target("9", &panes).unwrap_err().contains("no pane"));
         assert!(resolve_target("ghost", &panes)
             .unwrap_err()
@@ -2702,8 +2727,8 @@ mod tests {
     #[test]
     fn resolve_target_flags_ambiguous_roles() {
         let panes = [
-            (1usize, Some("dev".to_string())),
-            (2, Some("dev".to_string())),
+            (AgentId(1), Some("dev".to_string())),
+            (AgentId(2), Some("dev".to_string())),
         ];
         assert!(resolve_target("dev", &panes)
             .unwrap_err()
@@ -2713,19 +2738,20 @@ mod tests {
     #[test]
     fn in_subtree_walks_the_parent_chain() {
         // 0 (root) → 1 (lead) → 2, 3 (ICs); 4 is a sibling lead's IC.
+        let a = AgentId;
         let parents = [
-            (0usize, None),
-            (1, Some(0)),
-            (2, Some(1)),
-            (3, Some(1)),
-            (4, Some(5)),
-            (5, Some(0)),
+            (a(0), None),
+            (a(1), Some(a(0))),
+            (a(2), Some(a(1))),
+            (a(3), Some(a(1))),
+            (a(4), Some(a(5))),
+            (a(5), Some(a(0))),
         ];
-        assert!(in_subtree(2, 1, &parents)); // IC is in its lead's subtree
-        assert!(in_subtree(1, 1, &parents)); // a pane is in its own subtree
-        assert!(!in_subtree(4, 1, &parents)); // a cousin is not
-        assert!(in_subtree(4, 0, &parents)); // everything is under the root
-        assert!(!in_subtree(1, 2, &parents)); // a parent is not under its child
+        assert!(in_subtree(a(2), a(1), &parents)); // IC is in its lead's subtree
+        assert!(in_subtree(a(1), a(1), &parents)); // a pane is in its own subtree
+        assert!(!in_subtree(a(4), a(1), &parents)); // a cousin is not
+        assert!(in_subtree(a(4), a(0), &parents)); // everything is under the root
+        assert!(!in_subtree(a(1), a(2), &parents)); // a parent is not under its child
     }
 
     #[test]
@@ -3220,7 +3246,7 @@ mod tests {
 
     #[test]
     fn reply_killed_lists_the_torn_down_panes() {
-        let r = reply_killed(&[1, 2, 3]);
+        let r = reply_killed(&[AgentId(1), AgentId(2), AgentId(3)]);
         let v = json::parse(&r).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(
@@ -3231,7 +3257,7 @@ mod tests {
 
     #[test]
     fn reply_builders_are_valid_json() {
-        let spawned = reply_spawned(3, Some("dev_1"), Some("abc-123"), None);
+        let spawned = reply_spawned(AgentId(3), Some("dev_1"), Some("abc-123"), None);
         let v = json::parse(&spawned).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(v.get("pane").and_then(Value::as_i64), Some(3));
@@ -3239,7 +3265,7 @@ mod tests {
 
         // With a note, it rides along as a string field.
         let noted = reply_spawned(
-            3,
+            AgentId(3),
             None,
             None,
             Some("stripped --dangerously-skip-permissions"),
@@ -3251,7 +3277,7 @@ mod tests {
         );
 
         let nodes = [TreeNode {
-            id: 0,
+            id: AgentId(0),
             parent: None,
             role: Some("ceo"),
             title: "claude",

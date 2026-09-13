@@ -21,7 +21,7 @@ pub struct Entry {
     pub seq: u64,
     /// The caller pane's agent id, or `None` for the operator (no attributed
     /// pane).
-    pub caller: Option<usize>,
+    pub caller: Option<crate::ctl::AgentId>,
     /// The verb: `spawn` | `send` | `status` | `list` | `kill` | `bad-request`.
     pub action: String,
     /// A compact, secret-free description (target, role, argv stem, identity
@@ -45,7 +45,7 @@ impl Entry {
             (
                 "caller".to_string(),
                 self.caller
-                    .map(|c| Value::Number(Number::Int(c as i64)))
+                    .map(|c| Value::Number(Number::Int(c.0 as i64)))
                     .unwrap_or(Value::Null),
             ),
             ("action".to_string(), Value::String(self.action.clone())),
@@ -101,7 +101,7 @@ impl Audit {
     /// Record one request + outcome. Returns the assigned sequence number.
     pub fn record(
         &mut self,
-        caller: Option<usize>,
+        caller: Option<crate::ctl::AgentId>,
         action: &str,
         detail: &str,
         ok: bool,
@@ -178,7 +178,7 @@ impl Audit {
 mod tests {
     use super::*;
 
-    fn rec(a: &mut Audit, caller: Option<usize>, action: &str) -> u64 {
+    fn rec(a: &mut Audit, caller: Option<crate::ctl::AgentId>, action: &str) -> u64 {
         a.record(caller, action, "detail", true, "")
     }
 
@@ -186,8 +186,8 @@ mod tests {
     fn record_assigns_monotonic_seqs() {
         let mut a = Audit::in_memory();
         assert_eq!(rec(&mut a, None, "list"), 1);
-        assert_eq!(rec(&mut a, Some(1), "spawn"), 2);
-        assert_eq!(rec(&mut a, Some(1), "send"), 3);
+        assert_eq!(rec(&mut a, Some(crate::ctl::AgentId(1)), "spawn"), 2);
+        assert_eq!(rec(&mut a, Some(crate::ctl::AgentId(1)), "send"), 3);
         assert_eq!(a.entries().count(), 3);
     }
 
@@ -206,16 +206,17 @@ mod tests {
         let mut a = Audit::new(64, None);
         // callers: operator(None), 1, 2, 1, 2
         a.record(None, "list", "", true, "");
-        a.record(Some(1), "spawn", "", true, "");
-        a.record(Some(2), "spawn", "", true, "");
-        a.record(Some(1), "send", "", true, "");
-        a.record(Some(2), "kill", "", true, "");
+        let id = crate::ctl::AgentId;
+        a.record(Some(id(1)), "spawn", "", true, "");
+        a.record(Some(id(2)), "spawn", "", true, "");
+        a.record(Some(id(1)), "send", "", true, "");
+        a.record(Some(id(2)), "kill", "", true, "");
         // Keep only caller 1's entries, last 1 of them.
-        let v = a.view(Some(1), |e| e.caller == Some(1));
+        let v = a.view(Some(1), |e| e.caller == Some(id(1)));
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].get("action").and_then(Value::as_str), Some("send"));
         // No tail: all of caller 1's entries.
-        assert_eq!(a.view(None, |e| e.caller == Some(1)).len(), 2);
+        assert_eq!(a.view(None, |e| e.caller == Some(id(1))).len(), 2);
         // Operator predicate keeps everything.
         assert_eq!(a.view(None, |_| true).len(), 5);
     }
@@ -224,7 +225,7 @@ mod tests {
     fn entry_json_has_expected_shape() {
         let e = Entry {
             seq: 7,
-            caller: Some(3),
+            caller: Some(crate::ctl::AgentId(3)),
             action: "kill".to_string(),
             detail: "target=2".to_string(),
             ok: true,
@@ -262,14 +263,14 @@ mod tests {
         let mut a = Audit::new(4, None);
         assert_eq!(a.oldest_seq(), None, "an empty log has no oldest entry");
         for i in 0..4 {
-            a.record(Some(i), "list", "", true, "");
+            a.record(Some(crate::ctl::AgentId(i)), "list", "", true, "");
         }
         assert_eq!(a.oldest_seq(), Some(1), "nothing evicted yet");
         assert_eq!(a.latest_seq(), 4);
 
         // Two more push the first two out.
-        a.record(Some(9), "list", "", true, "");
-        a.record(Some(9), "list", "", true, "");
+        a.record(Some(crate::ctl::AgentId(9)), "list", "", true, "");
+        a.record(Some(crate::ctl::AgentId(9)), "list", "", true, "");
         assert_eq!(
             a.oldest_seq(),
             Some(3),

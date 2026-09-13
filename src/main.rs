@@ -29,6 +29,8 @@ use std::io::Write;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+use atrium::ctl::AgentId;
 use std::time::{Duration, Instant};
 
 mod fleet_cli;
@@ -105,8 +107,8 @@ fn set_trust_mode(m: atrium::ctl::TrustMode) {
     *AGENT_TRUST.lock().unwrap_or_else(|e| e.into_inner()) = m;
 }
 
-fn next_agent_id() -> usize {
-    NEXT_AGENT.fetch_add(1, Ordering::Relaxed)
+fn next_agent_id() -> AgentId {
+    AgentId(NEXT_AGENT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// DEC synchronized-output (private mode 2026). atrium wraps each composited frame
@@ -194,7 +196,7 @@ fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
 /// mirrors the C0 spike, which split the text and `\r` with a delay.
 struct PendingSend {
     /// Target pane's global agent id (already resolved + scope-checked).
-    target: usize,
+    target: AgentId,
     text: String,
     /// When the send was accepted — a fallback so a target that never yields a
     /// derivable status (a shell, a not-yet-bound agent) still gets it.
@@ -227,13 +229,13 @@ const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
 const ALT_SCREEN_RESERVE_ROWS: u16 = 8;
 
 /// Find a hosted pane by its global agent id (immutable / mutable).
-fn pane_by_agent(windows: &[Window], id: usize) -> Option<&Pane> {
+fn pane_by_agent(windows: &[Window], id: AgentId) -> Option<&Pane> {
     windows
         .iter()
         .flat_map(|w| w.panes.iter())
         .find(|p| p.agent_id == id)
 }
-fn pane_by_agent_mut(windows: &mut [Window], id: usize) -> Option<&mut Pane> {
+fn pane_by_agent_mut(windows: &mut [Window], id: AgentId) -> Option<&mut Pane> {
     windows
         .iter_mut()
         .flat_map(|w| w.panes.iter_mut())
@@ -242,7 +244,7 @@ fn pane_by_agent_mut(windows: &mut [Window], id: usize) -> Option<&mut Pane> {
 
 /// `(agent_id, role)` for every live pane — the candidate set for target
 /// resolution.
-fn ctl_candidates(windows: &[Window]) -> Vec<(usize, Option<String>)> {
+fn ctl_candidates(windows: &[Window]) -> Vec<(AgentId, Option<String>)> {
     windows
         .iter()
         .flat_map(|w| w.panes.iter())
@@ -252,7 +254,7 @@ fn ctl_candidates(windows: &[Window]) -> Vec<(usize, Option<String>)> {
 
 /// `(agent_id, parent)` for every live pane — the spawn-tree edges the subtree
 /// guard walks.
-fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
+fn ctl_parents(windows: &[Window]) -> Vec<(AgentId, Option<AgentId>)> {
     windows
         .iter()
         .flat_map(|w| w.panes.iter())
@@ -264,7 +266,7 @@ fn ctl_parents(windows: &[Window]) -> Vec<(usize, Option<usize>)> {
 /// when it has no attributed pane, or when its pane is a *root* (one atrium opened,
 /// `parent == None`, depth 0) — i.e. where the operator sits. A spawned worker
 /// (depth > 0) is scoped to its own subtree.
-fn caller_privileged(windows: &[Window], caller: Option<usize>) -> bool {
+fn caller_privileged(windows: &[Window], caller: Option<AgentId>) -> bool {
     // Look the caller up, then decide in a pure function so the DECISION can be
     // tested without constructing panes (each of which needs a live pty). This
     // gate had no tests at all: when its two `None` arms were flipped from
@@ -398,7 +400,7 @@ fn effective_mode(
 /// - `None` — no such live pane (a stale or forged token), or no caller at all
 /// - `Some(None)` — a live pane with no parent: a root pane the human opened
 /// - `Some(Some(_))` — a live pane spawned by another: a worker
-fn privilege_for(caller: Option<usize>, pane_parent: Option<Option<usize>>) -> bool {
+fn privilege_for(caller: Option<AgentId>, pane_parent: Option<Option<AgentId>>) -> bool {
     match caller {
         // No authenticated caller is NOT the operator. This arm used to return
         // `true`, which inverted the gate: holding no credential granted strictly
@@ -460,7 +462,7 @@ pub(crate) struct Pane {
     /// Process-global agent id (see [`NEXT_AGENT`]): the ctl spawn-tree key,
     /// stable across windows. Injected into the pane as `ATRIUM_PANE` so an agent
     /// inside can attribute its own `ctl spawn` calls.
-    pub(crate) agent_id: usize,
+    pub(crate) agent_id: AgentId,
     /// The pane's **capability token** — an unguessable secret injected into its
     /// env as `ATRIUM_TOKEN` and matched by the ctl server to authenticate requests
     /// from this pane (identity comes from the token, not the self-reported
@@ -474,7 +476,7 @@ pub(crate) struct Pane {
     pub(crate) role: Option<String>,
     /// The agent id of the pane whose `ctl spawn` created this one. `None` for a
     /// root pane the human opened.
-    pub(crate) parent: Option<usize>,
+    pub(crate) parent: Option<AgentId>,
     /// Depth in the spawn tree: 0 for a root/human pane, parent.depth + 1 for a
     /// ctl-spawned worker. The `--max-depth` recursion guard is checked against
     /// this.
@@ -2870,7 +2872,7 @@ fn apply_ctl(
 ) -> String {
     use atrium::ctl::{self, Cmd};
 
-    let mut req = match ctl::parse_request(line) {
+    let req = match ctl::parse_request(line) {
         Ok(r) => r,
         Err(e) => {
             let reply = ctl::reply_err(&e);
@@ -2913,7 +2915,6 @@ fn apply_ctl(
                 .map(|p| p.agent_id)
         });
     let authenticated = authed.is_some();
-    req.caller = authed;
     // Reads (list/status/audit/board get/list/bus feed) are open; anything that
     // mutates the fleet or its shared state requires an authenticated caller.
     if !authenticated && !ctl_is_read_only(&req.cmd) {
@@ -2924,7 +2925,9 @@ fn apply_ctl(
         audit.record(None, action, &detail, false, "unauthenticated");
         return reply;
     }
-    let caller = req.caller;
+    // The AUTHENTICATED caller, typed apart from the request's self-reported
+    // `caller: Option<usize>` hint so the two can never be confused (r10 B4).
+    let caller: Option<AgentId> = authed;
     let privileged = caller_privileged(windows, caller);
 
     // `audit` reads the log, and IS recorded. It used to be exempt on the
@@ -2941,6 +2944,7 @@ fn apply_ctl(
     let (action, detail) = audit_label(&req);
     let reply = dispatch_ctl(
         req,
+        caller,
         windows,
         rows,
         cols,
@@ -3005,6 +3009,7 @@ fn routed_wake(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_ctl(
     req: atrium::ctl::Request,
+    caller: Option<AgentId>,
     windows: &mut Vec<Window>,
     rows: u16,
     cols: u16,
@@ -3019,7 +3024,6 @@ fn dispatch_ctl(
     job: &atrium::reap::SessionJob,
 ) -> String {
     use atrium::ctl::{self, Cmd};
-    let caller = req.caller;
 
     match req.cmd {
         Cmd::List => reply_tree(windows, world, None),
@@ -3191,7 +3195,7 @@ fn dispatch_ctl(
             // then collapses the split trees, drops the panes, and removes any
             // window left empty — the same proven path an interactive `x` uses.
             let parents = ctl_parents(windows);
-            let mut killed: Vec<usize> = Vec::new();
+            let mut killed: Vec<AgentId> = Vec::new();
             for w in windows.iter_mut() {
                 for p in w.panes.iter_mut() {
                     if atrium::ctl::in_subtree(p.agent_id, id, &parents) {
@@ -3284,7 +3288,7 @@ fn dispatch_ctl(
                         // 1-based to match the status bar's `1:`, `2:` numbering
                         // (agent_id is 0-based internally). Roles are the stable
                         // identity; this is the human-friendly fallback label.
-                        .unwrap_or_else(|| format!("pane {}", p.agent_id + 1))
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id.0 + 1))
                 })
                 .or_else(|| Some("operator".to_string()));
             match op {
@@ -3332,7 +3336,7 @@ fn dispatch_ctl(
                         // 1-based to match the status bar's `1:`, `2:` numbering
                         // (agent_id is 0-based internally). Roles are the stable
                         // identity; this is the human-friendly fallback label.
-                        .unwrap_or_else(|| format!("pane {}", p.agent_id + 1))
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id.0 + 1))
                 })
                 .unwrap_or_else(|| "operator".to_string());
             let now = agsess::sessions::now_ms();
@@ -3545,7 +3549,7 @@ fn audit_outcome(reply: &str) -> (bool, String) {
 fn audit_reply(
     audit: &atrium::audit::Audit,
     windows: &[Window],
-    caller: Option<usize>,
+    caller: Option<AgentId>,
     privileged: bool,
     tail: Option<usize>,
 ) -> String {
@@ -3574,7 +3578,7 @@ fn audit_reply(
 fn reply_tree(
     windows: &[Window],
     world: &atrium::vendors::VendorWorlds,
-    root: Option<usize>,
+    root: Option<AgentId>,
 ) -> String {
     let parents = ctl_parents(windows);
     let mut panes: Vec<&Pane> = windows
@@ -3608,9 +3612,9 @@ fn reply_tree(
 /// JSON refusal. The operator (privileged) may act on anything.
 fn scope_denied(
     windows: &[Window],
-    caller: Option<usize>,
+    caller: Option<AgentId>,
     privileged: bool,
-    target: usize,
+    target: AgentId,
 ) -> Option<String> {
     if privileged {
         return None;
@@ -3657,7 +3661,7 @@ fn worktree_spawn_params(
 fn spawn_worker_window(
     windows: &mut Vec<Window>,
     sp: &atrium::ctl::SpawnReq,
-    caller: Option<usize>,
+    caller: Option<AgentId>,
     new_depth: usize,
     rows: u16,
     cols: u16,
@@ -3710,7 +3714,7 @@ fn spawn_worker_window(
 fn spawn_worker_here(
     windows: &mut [Window],
     sp: &atrium::ctl::SpawnReq,
-    caller: Option<usize>,
+    caller: Option<AgentId>,
     new_depth: usize,
     rows: u16,
     cols: u16,
@@ -4783,7 +4787,7 @@ mod tests {
     /// A token that matches no live pane is stale or forged — not the operator.
     #[test]
     fn a_token_resolving_to_no_live_pane_is_not_the_operator() {
-        assert!(!privilege_for(Some(7), None));
+        assert!(!privilege_for(Some(AgentId(7)), None));
     }
 
     /// **The session policy is a ceiling for everyone** (review #1, remainder).
@@ -4822,8 +4826,8 @@ mod tests {
     /// separate, still-open question — see review finding #1's remainder.)
     #[test]
     fn a_root_pane_is_the_operator_and_a_worker_is_not() {
-        assert!(privilege_for(Some(1), Some(None)));
-        assert!(!privilege_for(Some(2), Some(Some(1))));
+        assert!(privilege_for(Some(AgentId(1)), Some(None)));
+        assert!(!privilege_for(Some(AgentId(2)), Some(Some(AgentId(1)))));
     }
 
     use super::*;
