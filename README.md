@@ -147,7 +147,8 @@ A single (or zoomed) pane renders in **passthrough**: its raw terminal output
 goes straight to your real terminal, so a TUI like Claude Code looks pixel-exact.
 The moment a window holds two or more panes it renders **tiled**: each pane drives
 its own `vterm` emulator and they're composited into one screen, each with a
-one-cell border showing `index:title`. Zoom is the escape hatch back to perfect
+one-cell border showing `index:name` — the agent's name for a fleet or `ctl spawn
+--role` pane, otherwise the command. Zoom is the escape hatch back to perfect
 fidelity.
 
 ### Agent-aware status

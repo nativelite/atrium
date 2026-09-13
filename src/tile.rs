@@ -98,6 +98,11 @@ pub struct PaneView<'a> {
     /// a colored `·<name>` tag after the `index:title` in the top border. The
     /// color is a redundant channel; the text is always drawn (a11y).
     pub identity: Option<&'a str>,
+    /// The pane's agent name (`Pane.role`) — a fleet agent's name or a
+    /// `ctl spawn --role`. Labels the top border in place of `title`, since every
+    /// agent in a fleet usually runs the same command. `None` or empty falls back
+    /// to `title`. Sanitized when drawn: a ctl role arrives raw.
+    pub role: Option<&'a str>,
     /// True once the pane's emulator has produced at least one non-default cell.
     /// Cached from `Pane::painted` so `compose_into` avoids scanning the screen
     /// on every frame; a pane that has ever painted stays `true` forever.
@@ -345,7 +350,12 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
     // never the secret, and the text is always drawn so the signal survives
     // without color (a11y).
     if cn >= 5 {
-        let label = format!(" {}:{} {}", p.index, p.title, p.title_badge());
+        // An agent name tells fleet tiles apart; the command stem rarely does.
+        let name = match p.role {
+            Some(role) if !role.is_empty() => crate::fleet::sanitize(role),
+            _ => p.title.to_string(),
+        };
+        let label = format!(" {}:{} {}", p.index, name, p.title_badge());
         // Available label columns: everything between the two corners.
         let avail = cn.saturating_sub(2);
         let start = c0 + 1;
@@ -432,6 +442,7 @@ mod tests {
             state,
             agent: None,
             identity: None,
+            role: None,
             painted: !screen_is_blank(screen),
         }
     }
@@ -453,6 +464,7 @@ mod tests {
             state,
             agent: Some(AgentMark { status }),
             identity: None,
+            role: None,
             painted: !screen_is_blank(screen),
         }
     }
@@ -474,6 +486,7 @@ mod tests {
             state,
             agent: None,
             identity: Some(identity),
+            role: None,
             painted: !screen_is_blank(screen),
         }
     }
@@ -503,6 +516,49 @@ mod tests {
         // Title in the top edge, one cell in from the corner: " 2:claude ".
         let top: String = (1..11).map(|c| m.cell(0, c).ch).collect();
         assert!(top.starts_with(" 2:claude "), "top edge was {top:?}");
+    }
+
+    /// A 5x20 pane titled `claude` at index 3 carrying `role`; returns its top edge.
+    fn top_edge_with_role(role: &str) -> String {
+        let inner = filled(3, 18, 'X');
+        let mut v = view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            3,
+            "claude",
+            PaneState::Idle,
+        );
+        v.role = Some(role);
+        let m = compose(5, 20, &[v], 0);
+        (1..19).map(|c| m.cell(0, c).ch).collect()
+    }
+
+    #[test]
+    fn a_fleet_agent_name_labels_its_tile_instead_of_the_command() {
+        // Every pane in a fleet runs `claude`; the name is what tells them apart.
+        let top = top_edge_with_role("engine");
+        assert!(top.starts_with(" 3:engine "), "top edge was {top:?}");
+        assert!(!top.contains("claude"), "top edge was {top:?}");
+    }
+
+    #[test]
+    fn an_escape_in_a_role_is_defanged_in_the_border() {
+        // `ctl spawn --role` is taken raw from JSON: an ESC must never reach the
+        // real terminal through the border.
+        let top = top_edge_with_role("ev\x1bil");
+        assert!(!top.contains('\x1b'), "top edge was {top:?}");
+        assert!(top.starts_with(" 3:ev\\u{1b}il"), "top edge was {top:?}");
+    }
+
+    #[test]
+    fn an_empty_role_falls_back_to_the_title() {
+        let top = top_edge_with_role("");
+        assert!(top.starts_with(" 3:claude "), "top edge was {top:?}");
     }
 
     #[test]

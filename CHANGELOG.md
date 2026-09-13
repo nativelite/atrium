@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that needs parallelism, is a different bug and says so. Ctrl-C now kills the
   tree as well.
 
+- **Fleet tiles are labelled with the agent's name.** Every tile's top border
+  showed `index:command`, and since a fleet's agents all run `claude`, a 2x4
+  grid read ` 1:claude ` eight times. The border now shows the pane's role — the
+  fleet agent name, or a `ctl spawn --role` — as ` 3:engine `, falling back to
+  the command for panes without one. The role is sanitized before it is drawn: a
+  ctl role arrives raw and an ESC in it would otherwise reach the real terminal.
+
 ### Fixed
 - **A `ctl send` / bus wake no longer lands on top of what the human is typing.**
   Delivery waited only for the target to reach its prompt, so if you were

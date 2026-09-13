@@ -130,8 +130,8 @@ pub struct Fleet {
 /// schema can grow without breaking older files.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Agent {
-    /// The agent's label (currently informational — the pane title still comes
-    /// from the command stem, as for every other pane).
+    /// The agent's label. Becomes the pane's `role`, which names its tile in the
+    /// tiled border (the command stem stays the pane `title`).
     pub name: String,
     /// The command and its args, e.g. `["claude"]` or `["claude", "--continue"]`.
     pub cmd: Vec<String>,
