@@ -90,33 +90,18 @@ pub fn parse(args: &[String]) -> Result<(Option<Grid>, Vec<String>), String> {
     let mut grid: Option<Grid> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "-n" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| "-n needs a value (a positive multiple of 2)".to_string())?;
-                grid = Some(parse_count(val)?);
-                i += 2;
-            }
-            "--grid" => {
-                let val = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--grid needs a value like 2x3".to_string())?;
-                grid = Some(parse_grid(val)?);
-                i += 2;
-            }
-            s if s.starts_with("-n=") => {
-                grid = Some(parse_count(&s["-n=".len()..])?);
-                i += 1;
-            }
-            s if s.starts_with("--grid=") => {
-                grid = Some(parse_grid(&s["--grid=".len()..])?);
-                i += 1;
-            }
+        let Some(flag) = crate::argv::valued_flag(args, i, &["-n", "--grid"]) else {
             // First non-flag token: the hosted command starts here. Stop parsing
             // atrium options so the child owns the rest verbatim.
-            _ => return Ok((grid, args[i..].to_vec())),
-        }
+            return Ok((grid, args[i..].to_vec()));
+        };
+        grid = Some(match (flag.name, flag.value) {
+            ("-n", Some(val)) => parse_count(val)?,
+            ("-n", None) => return Err("-n needs a value (a positive multiple of 2)".to_string()),
+            (_, Some(val)) => parse_grid(val)?,
+            (_, None) => return Err("--grid needs a value like 2x3".to_string()),
+        });
+        i += flag.consumed;
     }
     Ok((grid, Vec::new()))
 }

@@ -63,38 +63,20 @@ pub fn parse(args: &[String]) -> (Option<String>, Vec<String>) {
     let mut identity: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--identity" | "-I" => {
-                if i + 1 < args.len() {
-                    identity = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    // Value missing: consume the bare flag, no identity set.
-                    i += 1;
-                }
-            }
-            // The glued forms `--identity=<name>` / `-I=<name>`. An empty value
-            // (`--identity=`) is treated as no identity — same as a bare flag —
-            // so a meaningless empty name never reaches `akey::resolve`.
-            s if s.starts_with("--identity=") => {
-                let val = &s["--identity=".len()..];
-                if !val.is_empty() {
+        match crate::argv::valued_flag(args, i, &["--identity", "-I"]) {
+            Some(flag) => {
+                // A missing value (trailing bare flag) or an empty glued one
+                // (`--identity=`) is no identity: the flag is consumed so it
+                // cannot leak into the command, and a meaningless empty name never
+                // reaches `akey::resolve`.
+                if let Some(val) = flag.value.filter(|v| !v.is_empty()) {
                     identity = Some(val.to_string());
                 }
-                i += 1;
-            }
-            s if s.starts_with("-I=") => {
-                let val = &s["-I=".len()..];
-                if !val.is_empty() {
-                    identity = Some(val.to_string());
-                }
-                i += 1;
+                i += flag.consumed;
             }
             // First non-flag token: the hosted command starts here. Stop
             // parsing atrium options so the child owns the rest verbatim.
-            _ => {
-                return (identity, args[i..].to_vec());
-            }
+            None => return (identity, args[i..].to_vec()),
         }
     }
     (identity, Vec::new())

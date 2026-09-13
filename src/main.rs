@@ -4599,7 +4599,8 @@ mod tests {
         );
 
         // With ctl on, the marker is still there, still first, and the three ctl
-        // variables are unchanged.
+        // variables are unchanged. Spelled as literals on purpose: this pins the
+        // WIRE names a child reads, so renaming a const without the child is caught.
         let full = pane_base_env(Some(&key), Some(("/tmp/sock", "3", "deadbeef")));
         let names: Vec<&str> = full.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(

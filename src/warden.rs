@@ -601,7 +601,7 @@ impl ProcTable {
         // fail. Both failed OPEN: an empty table means "no atrium ancestor", which
         // means no ceiling. The ceiling must not be reachable only through a tool
         // the constrained party can replace.
-        let o = std::process::Command::new("/bin/ps")
+        let o = std::process::Command::new(crate::reap::PS_PATH)
             .args(["-eo", "pid=,ppid="])
             .output()
             .ok()?;
@@ -610,11 +610,7 @@ impl ProcTable {
         }
         let mut parent = HashMap::new();
         for line in String::from_utf8_lossy(&o.stdout).lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pid), Some(ppid)) = (it.next(), it.next()) else {
-                continue;
-            };
-            let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+            let Some([pid, ppid]) = crate::reap::pid_columns(&mut line.split_whitespace()) else {
                 continue;
             };
             parent.insert(pid, ppid);

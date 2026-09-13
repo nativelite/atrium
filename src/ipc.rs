@@ -4002,8 +4002,8 @@ mod exploit_replays {
 
         let mut child = Command::new(atrium_bin())
             .args(["ctl", "audit", "--json"])
-            .env("ATRIUM_CTL", &addr)
-            .env("ATRIUM_PANE", "1")
+            .env(crate::ctl::ENV_ADDRESS, &addr)
+            .env(crate::ctl::ENV_PANE, "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -4080,8 +4080,8 @@ mod exploit_replays {
             for _ in 0..6 {
                 let out = Command::new(&bin)
                     .args(["ctl", "list", "--json"])
-                    .env("ATRIUM_CTL", &l_addr)
-                    .env("ATRIUM_PANE", "1")
+                    .env(crate::ctl::ENV_ADDRESS, &l_addr)
+                    .env(crate::ctl::ENV_PANE, "1")
                     .output()
                     .expect("run atrium ctl");
                 if out.status.success()

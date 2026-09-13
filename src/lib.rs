@@ -15,6 +15,7 @@
 //! nudge, not a rebuilt frame. atrium hosts programs; it never inspects,
 //! modifies, or credentials them.
 
+pub mod argv;
 pub mod audit;
 pub mod bar;
 pub mod bind;

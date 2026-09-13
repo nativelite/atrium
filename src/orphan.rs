@@ -718,7 +718,7 @@ fn parse_proc_stat(text: &str) -> Option<(u32, u32, u64)> {
 /// its own group leader.
 #[cfg(all(unix, target_os = "macos"))]
 fn env_candidates() -> Vec<Proc> {
-    let Ok(o) = std::process::Command::new("/bin/ps")
+    let Ok(o) = std::process::Command::new(crate::reap::PS_PATH)
         .args(["-eww", "-E", "-o", "pid=,ppid=,pgid=,command="])
         .output()
     else {
@@ -736,12 +736,7 @@ fn parse_ps_e(text: &str) -> Vec<Proc> {
     let mut out = Vec::new();
     for line in text.lines() {
         let mut it = line.split_whitespace();
-        let (Some(pid), Some(ppid), Some(pgid)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let (Ok(pid), Ok(ppid), Ok(pgid)) =
-            (pid.parse::<u32>(), ppid.parse::<u32>(), pgid.parse::<u32>())
-        else {
+        let Some([pid, ppid, pgid]) = crate::reap::pid_columns(&mut it) else {
             continue;
         };
         let Some(key) = marker_in(it) else { continue };
@@ -1157,7 +1152,7 @@ mod tests {
     fn layout_of_proc_bsdinfo_is_right() {
         let me = std::process::id();
         let (ppid, pgid, start) = proc_ids(me).expect("proc_pidinfo answers for ourselves");
-        let out = std::process::Command::new("/bin/ps")
+        let out = std::process::Command::new(crate::reap::PS_PATH)
             .args(["-o", "ppid=,pgid=", "-p", &me.to_string()])
             .output()
             .expect("ps");

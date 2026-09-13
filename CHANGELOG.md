@@ -65,6 +65,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on the wire), pinned by a `compile_fail` doctest. The token-authenticated caller
   is also no longer written back into the request's self-reported `caller` hint;
   it is passed separately as an `AgentId`. No behavior change. (r10 audit B4.)
+- **Drift traps removed (r10 audit B5–B7), no behavior change.** `normalize_path`
+  (folder-trust keys and worktree containment) had two byte-for-byte copies; now
+  one, in `resolve`. A command's read-only posture and audit label moved onto
+  `impl Cmd`, and the read-only gate is an exhaustive match, so a new command
+  cannot silently fall out of it. The `--identity` and `-n`/`--grid` parsers
+  share one separated/glued flag tokenizer (`argv::valued_flag`). The `/bin/ps`
+  path and pid-column parsing used by the crash sweep, orphan scan and warden
+  are single-sourced (`reap::PS_PATH`, `reap::pid_columns`).
 
 ### Fixed
 - **A failed crash-registry write is no longer reported as done.** The registry

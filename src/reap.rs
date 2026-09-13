@@ -104,7 +104,7 @@ mod sys {
         // shimmed `ps` that always prints `Z` makes every live session look gone,
         // which is what the crash sweep uses to decide a registry's pane groups
         // may be killed.
-        match std::process::Command::new("/bin/ps")
+        match std::process::Command::new(super::PS_PATH)
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
         {
@@ -537,6 +537,29 @@ pub fn read_policy(path: &Path) -> Option<String> {
     })
 }
 
+/// The `ps` atrium runs, by absolute path. Never `ps` through `$PATH`: an agent in
+/// a pane owns its `$PATH`, and every reader of the process table (the crash
+/// sweep's liveness check, the orphan scan, the warden's ancestry walk) makes a
+/// safety decision from what `ps` prints. One constant so no reader drifts back
+/// to a `$PATH` lookup (r10 audit B7).
+#[allow(dead_code)] // read only by unix/macOS code paths
+pub(crate) const PS_PATH: &str = "/bin/ps";
+
+/// Parse the first `N` whitespace columns from `it` as pids, or `None` if a
+/// column is missing or not a `u32` (a header, a truncated line). The shared
+/// table-builder step of every `ps -o pid=,…` reader; the iterator is left
+/// positioned after the pids for callers that read further columns.
+#[allow(dead_code)] // read only by unix/macOS code paths (tested everywhere)
+pub(crate) fn pid_columns<'a, const N: usize>(
+    it: &mut impl Iterator<Item = &'a str>,
+) -> Option<[u32; N]> {
+    let mut out = [0u32; N];
+    for slot in out.iter_mut() {
+        *slot = it.next()?.parse().ok()?;
+    }
+    Some(out)
+}
+
 /// Read a registry, ignoring anything unparseable — a half-written file must not
 /// stop the rest of a tree being killed.
 pub fn read_registry(path: &Path) -> Vec<u32> {
@@ -893,6 +916,16 @@ mod tests {
         let absent = dir.join("atrium-session-3.pids");
         assert!(!settle_registry(&absent, &[], "plan").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_columns_parse_leading_pids_and_skip_malformed_lines() {
+        let mut it = "  42  7  7 rest of line".split_whitespace();
+        assert_eq!(pid_columns::<3>(&mut it), Some([42, 7, 7]));
+        assert_eq!(it.next(), Some("rest"), "iterator left after the pids");
+        assert_eq!(pid_columns::<2>(&mut "PID PPID".split_whitespace()), None);
+        assert_eq!(pid_columns::<2>(&mut "12".split_whitespace()), None);
+        assert_eq!(pid_columns::<2>(&mut "12 -3".split_whitespace()), None);
     }
 
     /// The definitive Windows check (acceptance test #1): assign a long-running
