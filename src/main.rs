@@ -4412,9 +4412,11 @@ fn effective_command(command: &[String]) -> Vec<String> {
     assemble_command(command, resolve::resolve(&command[0], &dirs, &exts))
 }
 
+/// Off Windows there is no PATH/PATHEXT resolution or batch shim: the command is
+/// spawned as given (the same unresolved branch of [`assemble_command`]).
 #[cfg(not(windows))]
 fn effective_command(command: &[String]) -> Vec<String> {
-    command.to_vec()
+    assemble_command(command, None)
 }
 
 #[cfg(test)]

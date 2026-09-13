@@ -350,6 +350,7 @@ fn link_one(src: &Path, dst: &Path) -> Result<(), String> {
 /// The raw `cmd` arguments that make junction `dst` → `src`:
 /// `/e:ON /d /c "mklink /J <dst> <src>"`, each path cmd-encoded. Pure, so the
 /// encoding is tested on every platform.
+#[cfg_attr(not(windows), allow(dead_code))] // only `link_dir`'s Windows arm spawns it
 fn mklink_junction_line(src: &Path, dst: &Path) -> Result<String, String> {
     let enc = |p: &Path| {
         pty::cmdline::quote_batch_arg(&p.to_string_lossy()).map_err(|e| format!("mklink: {e}"))
