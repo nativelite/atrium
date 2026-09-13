@@ -4501,7 +4501,9 @@ mod tests {
 
     #[test]
     fn a_failure_streak_flashes_once_and_success_resets_it() {
-        let fail = || -> std::io::Result<u8> { Err(std::io::Error::other("disk full")) };
+        let fail = || -> std::io::Result<u8> {
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "disk full"))
+        };
         let (mut failing, mut flash) = (false, None);
 
         assert_eq!(
