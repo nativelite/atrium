@@ -720,12 +720,12 @@ pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
 /// always in the agent's context for a ctl session, so it doesn't rely on a skill
 /// happening to surface. The agent applies it against whatever the human types —
 /// delegate on "coordinate a team", stay solo otherwise.
-// IMPORTANT: this string is passed to claude via `--append-system-prompt` on the
-// command line, which on Windows goes through a `cmd /C claude.cmd ...` shim.
-// It must contain NO shell-special characters — no quotes, backticks, angle
-// brackets, parens, &, |, %, ^ — or the shim's quoting breaks and the agent pane
-// dies on launch. Keep it plain prose (letters, spaces, commas, periods, colons,
-// hyphens) so it survives the round-trip intact.
+// This string reaches claude via `--append-system-prompt` on the command line,
+// which on Windows runs through the `claude.cmd` batch shim under cmd.exe. `pty`
+// now encodes batch arguments cmd-safely (`pty::cmdline`), so metacharacters no
+// longer kill the launch — but keep it plain prose anyway (letters, spaces,
+// commas, periods, colons, hyphens): it is defense in depth against any host or
+// older `pty` that quotes by argv rules alone, and the guard test pins it.
 pub const AGENT_CTL_DIRECTIVE: &str = "You are running inside atrium, a terminal \
 multiplexer with a live control plane whose endpoint is in the ATRIUM_CTL \
 environment variable. When a task calls for delegating to teammates or \
@@ -3000,10 +3000,9 @@ mod tests {
 
     #[test]
     fn agent_directive_has_no_shim_breaking_chars() {
-        // The directive is injected via `--append-system-prompt` through a Windows
-        // `cmd /C` shim; a shell-metacharacter would break the quoting and kill the
-        // agent pane on launch. Guard the load-bearing set so a future edit (like
-        // the claim/lease lines) can't silently reintroduce one.
+        // Defense in depth (see AGENT_CTL_DIRECTIVE): the directive rides the
+        // Windows batch shim. `pty` encodes it safely today; keeping the text free
+        // of cmd metacharacters means an argv-only quoter can't break it either.
         for c in ['"', '`', '&', '|', '<', '>', '^', '%'] {
             assert!(
                 !AGENT_CTL_DIRECTIVE.contains(c),

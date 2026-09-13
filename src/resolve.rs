@@ -33,10 +33,9 @@ pub fn resolve(cmd: &str, dirs: &[PathBuf], exts: &[String]) -> Option<PathBuf> 
     None
 }
 
-/// Batch scripts cannot be a process image; they need `cmd /C`.
+/// Batch scripts cannot be a process image; `pty` runs them under `cmd.exe`
+/// (with cmd-safe argument encoding). Delegates to [`pty::cmdline::is_batch`] so
+/// atrium and the spawn agree on what a batch file is.
 pub fn needs_shell(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
-        .unwrap_or(false)
+    path.to_str().is_some_and(pty::cmdline::is_batch)
 }

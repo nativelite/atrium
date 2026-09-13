@@ -4416,9 +4416,35 @@ fn sanitize_shim_arg(s: &str) -> String {
     s.replace("\r\n", " ").replace('\r', " ").replace('\n', " ")
 }
 
-/// On Windows, resolve the command the way the shell would (PATH x PATHEXT) and
-/// host `.cmd`/`.bat` shims under `cmd /C` — npm-installed CLIs (Claude Code
-/// included) are such shims, and `CreateProcessW` cannot launch them directly.
+/// The argv atrium spawns for `command` given where it `resolved` on PATH.
+///
+/// A resolved `.cmd`/`.bat` shim (npm-installed CLIs, Claude Code included) is
+/// spawned directly: `pty` runs batch targets under `cmd.exe /c` with cmd-safe
+/// argument encoding (`pty::cmdline`), so `&`, `|`, `%` and quotes in a prompt,
+/// branch name or fleet arg arrive intact. Newlines are the one thing cmd.exe
+/// cannot carry, so shim args still collapse them ([`sanitize_shim_arg`]).
+/// Other resolved programs get their full path; an unresolved command is left
+/// for the spawn to report.
+fn assemble_command(command: &[String], resolved: Option<std::path::PathBuf>) -> Vec<String> {
+    match resolved {
+        Some(path) => {
+            let shim = atrium::resolve::needs_shell(&path);
+            let mut v = vec![path.to_string_lossy().into_owned()];
+            v.extend(command[1..].iter().map(|a| {
+                if shim {
+                    sanitize_shim_arg(a)
+                } else {
+                    a.clone()
+                }
+            }));
+            v
+        }
+        None => command.to_vec(),
+    }
+}
+
+/// On Windows, resolve the command the way the shell would (PATH x PATHEXT);
+/// see [`assemble_command`] for what is spawned.
 #[cfg(windows)]
 fn effective_command(command: &[String]) -> Vec<String> {
     use atrium::resolve;
@@ -4431,20 +4457,7 @@ fn effective_command(command: &[String]) -> Vec<String> {
         .filter(|e| !e.is_empty())
         .map(str::to_string)
         .collect();
-    match resolve::resolve(&command[0], &dirs, &exts) {
-        Some(path) if resolve::needs_shell(&path) => {
-            let mut v = vec!["cmd".to_string(), "/C".to_string()];
-            v.push(path.to_string_lossy().into_owned());
-            v.extend(command[1..].iter().map(|a| sanitize_shim_arg(a)));
-            v
-        }
-        Some(path) => {
-            let mut v = vec![path.to_string_lossy().into_owned()];
-            v.extend(command[1..].iter().cloned());
-            v
-        }
-        None => command.to_vec(),
-    }
+    assemble_command(command, resolve::resolve(&command[0], &dirs, &exts))
 }
 
 #[cfg(not(windows))]
@@ -4455,9 +4468,46 @@ fn effective_command(command: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        combine_system_prompt, pane_base_env, privilege_for, routed_wake, sanitize_shim_arg,
-        worktree_spawn_params,
+        assemble_command, combine_system_prompt, pane_base_env, privilege_for, routed_wake,
+        sanitize_shim_arg, worktree_spawn_params,
     };
+
+    // -- assemble_command pure seam ------------------------------------------
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_resolved_shim_is_spawned_directly_not_wrapped_in_cmd() {
+        // pty owns the cmd.exe line for batch targets; wrapping here would put
+        // the args back under plain argv quoting (the r10 B1 bug).
+        let cmd = argv(&["claude", "-p", "a & b\nnext", "--permission-mode", "auto"]);
+        let got = assemble_command(&cmd, Some(r"C:\npm\claude.cmd".into()));
+        assert_eq!(
+            got,
+            argv(&[
+                r"C:\npm\claude.cmd",
+                "-p",
+                "a & b next",
+                "--permission-mode",
+                "auto"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_resolved_exe_keeps_its_args_verbatim() {
+        let cmd = argv(&["node", "multi\nline", "x&y"]);
+        let got = assemble_command(&cmd, Some(r"C:\node\node.exe".into()));
+        assert_eq!(got, argv(&[r"C:\node\node.exe", "multi\nline", "x&y"]));
+    }
+
+    #[test]
+    fn an_unresolved_command_is_left_for_the_spawn_to_report() {
+        let cmd = argv(&["nope", "a"]);
+        assert_eq!(assemble_command(&cmd, None), cmd);
+    }
 
     // -- sanitize_shim_arg pure seam -------------------------------------------
 

@@ -50,6 +50,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host's native selection with mouse mode off.
 
 ### Fixed
+- **Prompts, branch names and fleet args containing `&`, `|`, `%` or quotes no
+  longer break Windows agent launches.** A `.cmd` shim (Claude Code's
+  `claude.cmd`) ran as `cmd /C <shim> args…` with args quoted by argv rules, which
+  cmd.exe does not use: a bare `&`/`|`/`^` split the line — every later flag
+  (`--permission-mode`, `--session-id`) silently dropped, the r8 failure shape —
+  and `%NAME%` expanded. atrium now spawns the shim directly and `pty` (≥ the
+  `pty::cmdline` release) builds the cmd.exe line with the batch-safe encoding
+  Rust std adopted after CVE-2024-24576. The second hand-built `cmd /c` line —
+  `mklink /J` for sibling-crate junctions — uses the same encoding, so a path with
+  `&` or `%` makes a junction instead of silently falling back to a copy. The
+  shim-safety guard now covers the worktree norms as well as the ctl directive.
+  (r10 audit B1.)
 - **The bar names a window by the agent you're looking at.** A window's bar entry
   (`N:claude:<role>`) always took the window's *first* pane, so zooming or
   focusing any other fleet agent still read as the first one (`1:claude:lead`

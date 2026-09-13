@@ -378,16 +378,33 @@ fn link_one(src: &Path, dst: &Path) -> Result<(), String> {
     }
 }
 
+/// The raw `cmd` arguments that make junction `dst` → `src`:
+/// `/e:ON /d /c "mklink /J <dst> <src>"`, each path cmd-encoded. Pure, so the
+/// encoding is tested on every platform.
+fn mklink_junction_line(src: &Path, dst: &Path) -> Result<String, String> {
+    let enc = |p: &Path| {
+        pty::cmdline::quote_batch_arg(&p.to_string_lossy()).map_err(|e| format!("mklink: {e}"))
+    };
+    Ok(format!(
+        "/e:ON /d /c \"mklink /J {} {}\"",
+        enc(dst)?,
+        enc(src)?
+    ))
+}
+
 /// Create a no-privilege directory link: a junction on Windows, a symlink on Unix.
 fn link_dir(src: &Path, dst: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         // `mklink /J` makes a junction, which needs no admin rights (unlike a dir
-        // symlink). It is a cmd builtin, so it must run through `cmd /C`.
+        // symlink). It is a cmd builtin, so it must run through `cmd /c` — and
+        // cmd.exe parses that line itself, so the paths are encoded with the
+        // cmd-safe rules (`pty::cmdline`) and passed raw: argv quoting would let
+        // a `&`/`^` split the line or a `%NAME%` expand, failing the junction
+        // into the silent copy fallback.
+        use std::os::windows::process::CommandExt;
         let status = Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(dst)
-            .arg(src)
+            .raw_arg(mklink_junction_line(src, dst)?)
             .status()
             .map_err(|e| format!("mklink: {e}"))?;
         if status.success() {
@@ -726,6 +743,51 @@ mod tests {
         assert_eq!(plans[0].dir, Path::new("/r/.atrium-worktrees/crew/feat-x"));
     }
 
+    // --- mklink junction line (r10 B1: the second cmd /c builder) -------------
+
+    #[test]
+    fn mklink_line_cmd_encodes_both_paths() {
+        let line = mklink_junction_line(Path::new(r"C:\a&b\src"), Path::new(r"C:\100%\dst"));
+        assert_eq!(
+            line.unwrap(),
+            r#"/e:ON /d /c "mklink /J "C:\100%%cd:~,%\dst" "C:\a&b\src"""#
+        );
+    }
+
+    /// End to end on real cmd.exe: a junction between directories whose names
+    /// carry `&`, `^`, `%VAR%` and parens is created at exactly that path and
+    /// resolves to the source (not the copy fallback, not an expanded name).
+    #[cfg(windows)]
+    #[test]
+    fn link_dir_junctions_paths_with_cmd_metacharacters() {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "atrium-mklink-{}-{n} a&b^c %PATH% (x)",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src&dir");
+        let dst = root.join("dst %USERPROFILE%");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("marker.txt"), "through the junction").unwrap();
+
+        link_dir(&src, &dst).expect("junction created");
+        // Exists at the literal (unexpanded) path and reads the source's file…
+        assert_eq!(
+            std::fs::read_to_string(dst.join("marker.txt")).unwrap(),
+            "through the junction"
+        );
+        // …and is a link, not the copy fallback: a file added to the source
+        // after linking is visible through it.
+        std::fs::write(src.join("late.txt"), "x").unwrap();
+        assert!(
+            dst.join("late.txt").exists(),
+            "dst is a copy, not a junction"
+        );
+        let _ = std::fs::remove_dir(&dst); // removes the junction, not the target
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // --- effectful ops, against a real throwaway git repo --------------------
 
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -984,5 +1046,18 @@ mod tests {
         assert!(s.contains("branch atrium/adhoc/wt"), "branch substituted");
         assert!(!s.contains("{name}"), "no raw placeholder left");
         assert!(!s.contains("{branch}"), "no raw placeholder left");
+    }
+
+    #[test]
+    fn worktree_norms_template_has_no_cmd_metacharacters() {
+        // Same defense-in-depth guard as AGENT_CTL_DIRECTIVE: the norms ride the
+        // same `--append-system-prompt` payload through the Windows batch shim
+        // (r10 B1 found only the directive was guarded).
+        for c in ['"', '`', '&', '|', '<', '>', '^', '%'] {
+            assert!(
+                !WORKTREE_AGENT_NORMS.contains(c),
+                "worktree norms contain cmd metacharacter {c:?}"
+            );
+        }
     }
 }
