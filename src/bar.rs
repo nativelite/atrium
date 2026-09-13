@@ -7,17 +7,49 @@
 use crate::identity;
 use ansi::{Color, Style};
 
+/// What a window's bar entry flags, beyond whether it is the active window.
+///
+/// One value, so the illegal combinations the old three bools allowed
+/// (`exited && waiting`, `exited && activity`) cannot be built, and the
+/// precedence between them lives in [`Attention::from_facts`] rather than being
+/// re-derived by every reader (r10 audit B9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Attention {
+    /// Every pane's child has exited — a dead window (`!`).
+    Exited,
+    /// A bound agent is waiting on the human (`WaitingApproval`). Rung 3 of the
+    /// attention ladder (§4.2): drives the `?` marker and the fleet
+    /// `| N waiting` note. Status only — never any transcript text.
+    Waiting,
+    /// Output arrived while the window was in the background (`+`).
+    Activity,
+    /// Nothing to flag (`-`).
+    Idle,
+}
+
+impl Attention {
+    /// Fold a window's independent facts into its one flag. Precedence (§4.2): a
+    /// dead child, then an agent waiting on you, then background activity.
+    pub fn from_facts(exited: bool, waiting: bool, activity: bool) -> Attention {
+        if exited {
+            Attention::Exited
+        } else if waiting {
+            Attention::Waiting
+        } else if activity {
+            Attention::Activity
+        } else {
+            Attention::Idle
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PaneInfo {
     pub title: String,
+    /// This is the window you are looking at (`*` unless something outranks it).
     pub active: bool,
-    /// Output arrived while the pane was in the background.
-    pub activity: bool,
-    pub exited: bool,
-    /// A bound agent in this window is waiting on the human (`WaitingApproval`).
-    /// Rung 3 of the attention ladder (§4.2): drives the `?` marker and the
-    /// fleet `| N waiting` note. Status only — never any transcript text.
-    pub waiting: bool,
+    /// What the entry flags; see [`Attention`].
+    pub attention: Attention,
     /// The credential identity **name** the window's agent runs under, if any —
     /// the name the user typed (`work`, `wif:prod`), never the secret. Shown as
     /// a `·<name>` tag next to the window entry (name-only, a11y text always
@@ -74,16 +106,12 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
         // between `!` and `*` so an unfocused window whose agent is blocked
         // outranks mere activity but never masks an exit. The entry's *color*
         // tracks the same state, so the bar reads at a glance.
-        let (mark, state) = if p.exited {
-            ("!", State::Exited)
-        } else if p.waiting {
-            ("?", State::Waiting)
-        } else if p.active {
-            ("*", State::Active)
-        } else if p.activity {
-            ("+", State::Activity)
-        } else {
-            ("-", State::Idle)
+        let (mark, state) = match (p.attention, p.active) {
+            (Attention::Exited, _) => ("!", State::Exited),
+            (Attention::Waiting, _) => ("?", State::Waiting),
+            (_, true) => ("*", State::Active),
+            (Attention::Activity, false) => ("+", State::Activity),
+            (Attention::Idle, false) => ("-", State::Idle),
         };
         // Append the persona/role as `:role` when it adds information (a fleet
         // agent or ctl `--role`), so the entry reads `1:claude:lead`. Skip it when
@@ -116,7 +144,7 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
     // so a blocked agent in a backgrounded window surfaces even off-screen.
     let waiting = panes
         .iter()
-        .filter(|p| p.waiting && !p.active && !p.exited)
+        .filter(|p| p.attention == Attention::Waiting && !p.active)
         .count();
     if waiting > 0 {
         segs.push(seg(format!("| {waiting} waiting "), Role::Note(true)));
@@ -258,12 +286,19 @@ mod tests {
         PaneInfo {
             title: title.into(),
             active,
-            activity,
-            exited: false,
-            waiting: false,
+            attention: Attention::from_facts(false, false, activity),
             identity: None,
             role: None,
         }
+    }
+
+    #[test]
+    fn attention_precedence_is_exit_then_waiting_then_activity() {
+        use Attention::*;
+        assert_eq!(Attention::from_facts(true, true, true), Exited);
+        assert_eq!(Attention::from_facts(false, true, true), Waiting);
+        assert_eq!(Attention::from_facts(false, false, true), Activity);
+        assert_eq!(Attention::from_facts(false, false, false), Idle);
     }
 
     #[test]

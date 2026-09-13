@@ -2687,16 +2687,18 @@ fn run(
             .map(|(i, w)| PaneInfo {
                 title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
                 active: i == active,
-                activity: w.panes.iter().any(|p| p.activity),
-                exited: w.panes.iter().all(|p| p.exited),
                 // A window is "waiting" when a bound agent pane in it is blocked
                 // on the human (§4.2 rung 3). Status only.
-                waiting: w.panes.iter().any(|p| {
-                    matches!(
-                        world.status_for(p.session_id.as_deref()),
-                        Some(agsess::Status::WaitingApproval)
-                    )
-                }),
+                attention: atrium::bar::Attention::from_facts(
+                    w.panes.iter().all(|p| p.exited),
+                    w.panes.iter().any(|p| {
+                        matches!(
+                            world.status_for(p.session_id.as_deref()),
+                            Some(agsess::Status::WaitingApproval)
+                        )
+                    }),
+                    w.panes.iter().any(|p| p.activity),
+                ),
                 // The window's identity tag: the bar pane's identity name (all
                 // panes in a window inherit the same identity in v1). Name only.
                 identity: w.bar_pane().and_then(|p| p.identity.clone()),

@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share one separated/glued flag tokenizer (`argv::valued_flag`). The `/bin/ps`
   path and pid-column parsing used by the crash sweep, orphan scan and warden
   are single-sourced (`reap::PS_PATH`, `reap::pid_columns`).
+- **`bar::PaneInfo` carries `attention: Attention` instead of three bools**
+  (`activity`, `exited`, `waiting`), so contradictory combinations can't be
+  built and the exit-over-waiting-over-activity precedence lives in
+  `Attention::from_facts`. Bar output is unchanged. (r10 audit B9; a breaking
+  change for anyone constructing `PaneInfo` directly.)
 
 ### Fixed
 - **Best-effort failures are no longer invisible.** A session snapshot that

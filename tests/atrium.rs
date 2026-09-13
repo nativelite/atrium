@@ -2,7 +2,7 @@
 //! thing — atrium itself spawned inside a `pty`, driven with keystrokes,
 //! its passthrough output read back. Deadline-bounded throughout.
 
-use atrium::bar::{bar_paint, bar_text, PaneInfo};
+use atrium::bar::{bar_paint, bar_text, Attention, PaneInfo};
 use atrium::input::{Action, Dir, PrefixScanner};
 use std::time::{Duration, Instant};
 
@@ -187,9 +187,7 @@ fn info(title: &str, active: bool, activity: bool, exited: bool) -> PaneInfo {
     PaneInfo {
         title: title.into(),
         active,
-        activity,
-        exited,
-        waiting: false,
+        attention: Attention::from_facts(exited, false, activity),
         identity: None,
         role: None,
     }
@@ -200,9 +198,7 @@ fn waiting_info(title: &str, active: bool) -> PaneInfo {
     PaneInfo {
         title: title.into(),
         active,
-        activity: false,
-        exited: false,
-        waiting: true,
+        attention: Attention::Waiting,
         identity: None,
         role: None,
     }
@@ -259,8 +255,9 @@ fn bar_waiting_agent_shows_question_marker() {
 #[test]
 fn bar_exit_outranks_waiting_marker() {
     // Priority: `!` (exited) beats `?` (waiting) beats `*`/`+`/`-`.
+    // A waiting agent in a window whose children have all exited: exit wins.
     let mut p = waiting_info("claude", false);
-    p.exited = true;
+    p.attention = Attention::from_facts(true, true, false);
     let text = bar_text(&[p], 120, "");
     assert!(text.contains("1:claude!"), "exit should win: {text}");
     // An exited window is a dead child, not a live waiter: it neither shows `?`
