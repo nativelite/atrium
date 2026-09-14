@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host's native selection with mouse mode off.
 
 ### Changed
+- **Requires `nativelite-ansi` 0.3 and `nativelite-vterm` 0.5** (both unreleased
+  at the time of writing — they must be published before atrium is). Cell width
+  is the `ansi::CellWidth` enum instead of a `0`/`1`/`2` `u8`, and a screen's
+  cursor is a named `ansi::Cursor { row, col }` read through `cursor()` instead
+  of a public tuple, so a transposed row/column no longer type-checks. vterm keeps
+  one cursor (the active buffer's) instead of mirroring its own after every token,
+  which also fixes one stale cursor: an app entering the alt screen and opening a
+  synchronized update in one sequence (`?1049;2026h`) had atrium park the terminal
+  cursor at the pane origin until the update closed. Otherwise vterm's final
+  screens are checksum-identical to the old code, and feed throughput is within
+  noise.
 - **The launch trust mode is stored as the `TrustMode` enum, not a `u8` code.**
   The global used a hand-written codec whose numbering disagreed with
   `TrustMode::rank()` (so one integer mistaken for the other would silently raise

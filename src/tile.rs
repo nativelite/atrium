@@ -22,7 +22,7 @@
 //! fidelity boundaries.
 
 use crate::layout::Rect;
-use ansi::{Cell, Color, Screen, Style};
+use ansi::{Cell, CellWidth, Color, Cursor, Screen, Style};
 
 // The box-drawing characters that frame each pane.
 const TOP_LEFT: char = '┌';
@@ -162,7 +162,7 @@ impl PaneView<'_> {
 /// by the caller). Each pane is drawn as a full box border (its index + title
 /// in the top edge) with its screen blitted into the inner area, inset one cell
 /// on every side. Border and title are tinted by the pane's [`PaneState`].
-/// `master.cursor` is set to the focused pane's cursor in master-screen coords.
+/// The master's cursor is set to the focused pane's cursor in master-screen coords.
 pub fn compose_into(
     master: &mut Screen,
     rows: usize,
@@ -182,7 +182,7 @@ pub fn compose_into(
     // Park the cursor at the focused pane's cursor, translated into the inner
     // area (offset by the one-cell border) and clamped inside that inner box.
     if let Some(f) = panes.iter().find(|p| p.focused()) {
-        let (cr, cc) = f.screen.cursor;
+        let Cursor { row: cr, col: cc } = f.screen.cursor();
         // Inner area origin and size (border eats one cell on each side).
         let inner_rows = f.rect.rows.saturating_sub(2);
         let inner_cols = f.rect.cols.saturating_sub(2);
@@ -195,7 +195,10 @@ pub fn compose_into(
         // underneath: you typed in one pane and the caret blinked in another.
         let r = r.clamp(f.rect.row, f.rect.row + f.rect.rows.saturating_sub(1));
         let c = c.clamp(f.rect.col, f.rect.col + f.rect.cols.saturating_sub(1));
-        master.cursor = (r.min(rows.saturating_sub(1)), c.min(cols.saturating_sub(1)));
+        master.set_cursor(Cursor::new(
+            r.min(rows.saturating_sub(1)),
+            c.min(cols.saturating_sub(1)),
+        ));
     }
 }
 
@@ -248,8 +251,8 @@ fn draw_loading(master: &mut Screen, p: &PaneView, rows: usize, cols: usize, fra
 /// — clip rather than overwrite the border or neighbors).
 ///
 /// Double-width aware: the pane's cells already carry their display `width`
-/// (the emulator computed it — a wide glyph is a `width==2` lead followed by a
-/// `width==0` continuation), so a straight copy preserves alignment. The one
+/// (the emulator computed it — a wide glyph is a `CellWidth::Wide` lead followed
+/// by a `CellWidth::Continuation`), so a straight copy preserves alignment. The one
 /// case a straight copy gets wrong is a wide glyph whose continuation would
 /// fall on the border: rather than let half a glyph spill past the inset, its
 /// lead is replaced by a space. Each row is blitted with a single
@@ -273,11 +276,11 @@ fn blit_inner(master: &mut Screen, p: &PaneView, rows: usize) {
         run.clear();
         for c in 0..inner_cols {
             let cell = p.screen.cell(r, c);
-            if cell.width == 2 && c + 1 == inner_cols {
+            if cell.width == CellWidth::Wide && c + 1 == inner_cols {
                 // Wide lead in the last inner column: its continuation would be
                 // the border. Clip the glyph to a space so nothing overflows.
                 run.push(Cell::new(' ', cell.style));
-            } else if cell.width == 0 && c == 0 {
+            } else if cell.width == CellWidth::Continuation && c == 0 {
                 // Orphaned continuation (its lead is off the left edge): show a
                 // space, not an empty never-emitted cell.
                 run.push(Cell::new(' ', cell.style));
@@ -661,7 +664,7 @@ mod tests {
     #[test]
     fn cursor_parks_at_the_focused_pane_inner_coords() {
         let mut inner = filled(4, 4, ' ');
-        inner.cursor = (1, 2);
+        inner.set_cursor(Cursor::new(1, 2));
         let other = filled(4, 4, ' ');
         let panes = vec![
             view(
@@ -691,7 +694,7 @@ mod tests {
         ];
         let m = compose(6, 12, &panes, 0);
         // Focused rect origin (0,6), inner origin (1,7), cursor (1,2) -> (2,9).
-        assert_eq!(m.cursor, (2, 9));
+        assert_eq!(m.cursor(), Cursor::new(2, 9));
     }
 
     #[test]
@@ -1182,7 +1185,8 @@ mod tests {
         ];
         let m = compose(4, 20, &panes, 0);
         assert_eq!(
-            m.cursor.0, 0,
+            m.cursor().row,
+            0,
             "cursor escaped a one-row pane into the sibling below"
         );
     }
@@ -1260,10 +1264,14 @@ mod tests {
         let m = compose(3, 8, &panes, 0);
         // Inner origin is (1,1).
         assert_eq!(m.cell(1, 1).ch, '世');
-        assert_eq!(m.cell(1, 1).width, 2, "lead is width 2");
-        assert_eq!(m.cell(1, 2).width, 0, "right half is a continuation");
+        assert_eq!(m.cell(1, 1).width, CellWidth::Wide, "lead is width 2");
+        assert_eq!(
+            m.cell(1, 2).width,
+            CellWidth::Continuation,
+            "right half is a continuation"
+        );
         assert_eq!(m.cell(1, 3).ch, '界', "second glyph did not drift left");
-        assert_eq!(m.cell(1, 4).width, 0);
+        assert_eq!(m.cell(1, 4).width, CellWidth::Continuation);
         // Right border intact at the box edge (col 7), not shoved by content.
         assert_eq!(m.cell(1, 7).ch, '│');
     }
@@ -1287,7 +1295,7 @@ mod tests {
         assert_eq!(m.cell(1, 1).ch, 'A');
         assert_eq!(m.cell(1, 2).ch, 'B');
         assert_eq!(m.cell(1, 3).ch, ' ', "wide glyph clipped to a space");
-        assert_eq!(m.cell(1, 3).width, 1);
+        assert_eq!(m.cell(1, 3).width, CellWidth::Single);
         assert_eq!(m.cell(1, 4).ch, '│', "border not overrun by half a glyph");
     }
 
@@ -1307,7 +1315,7 @@ mod tests {
         let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Focused)];
         let m = compose(3, 8, &panes, 0);
         // Inner origin (1,1) + cursor col 2 → master col 3.
-        assert_eq!(m.cursor, (1, 3));
+        assert_eq!(m.cursor(), Cursor::new(1, 3));
     }
 
     // ── item 5: heavy end-to-end integration across the tiled path ───────────
@@ -1323,7 +1331,7 @@ mod tests {
         (0..inner_cols)
             .filter_map(|c| {
                 let cell = m.cell(rect.row + 1 + inner_r, inner_col + c);
-                (cell.width != 0).then_some(cell.ch)
+                (cell.width != CellWidth::Continuation).then_some(cell.ch)
             })
             .collect()
     }
@@ -1345,11 +1353,11 @@ mod tests {
         let m = compose(3, 11, &panes, 0);
         assert_eq!(m.cell(1, 1).ch, 'a');
         assert_eq!(m.cell(1, 2).ch, '世');
-        assert_eq!(m.cell(1, 2).width, 2);
-        assert_eq!(m.cell(1, 3).width, 0);
+        assert_eq!(m.cell(1, 2).width, CellWidth::Wide);
+        assert_eq!(m.cell(1, 3).width, CellWidth::Continuation);
         assert_eq!(m.cell(1, 4).ch, 'b');
         assert_eq!(m.cell(1, 5).ch, '界');
-        assert_eq!(m.cell(1, 6).width, 0);
+        assert_eq!(m.cell(1, 6).width, CellWidth::Continuation);
         assert_eq!(
             m.cell(1, 7).ch,
             'c',
@@ -1372,8 +1380,8 @@ mod tests {
         let panes = vec![view(t.screen(), rect, 1, "e", PaneState::Idle)];
         let m = compose(3, 8, &panes, 0);
         assert_eq!(m.cell(1, 1).ch, '🚀');
-        assert_eq!(m.cell(1, 1).width, 2);
-        assert_eq!(m.cell(1, 2).width, 0);
+        assert_eq!(m.cell(1, 1).width, CellWidth::Wide);
+        assert_eq!(m.cell(1, 2).width, CellWidth::Continuation);
         assert_eq!(m.cell(1, 3).ch, 'x', "ASCII after emoji is not shifted");
         assert_eq!(m.cell(1, 7).ch, '│');
     }
@@ -1438,7 +1446,7 @@ mod tests {
             for c in 0..m.cols() {
                 assert_eq!(
                     m.cell(r, c).width,
-                    1,
+                    CellWidth::Single,
                     "ASCII scene produced a non-width-1 cell at ({r},{c})"
                 );
             }
@@ -1461,6 +1469,6 @@ mod tests {
         let panes = vec![view(t.screen(), rect, 1, "w", PaneState::Focused)];
         let m = compose(3, 10, &panes, 0);
         // Inner origin (1,1) + cursor col 4 → master col 5.
-        assert_eq!(m.cursor, (1, 5));
+        assert_eq!(m.cursor(), Cursor::new(1, 5));
     }
 }

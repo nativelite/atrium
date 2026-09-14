@@ -14,7 +14,7 @@
 //! side effect, isolated in [`copy`].
 
 use crate::layout::Rect;
-use ansi::Screen;
+use ansi::{CellWidth, Screen};
 
 /// A selection in progress: the tile it belongs to and its two ends in that
 /// tile's content coordinates. `anchor` is where the press landed; `head`
@@ -85,7 +85,7 @@ pub fn text(sel: &Selection, screen: &Screen) -> String {
         let mut line = String::new();
         for c in from..=to.min(cols.saturating_sub(1)) {
             let cell = screen.cell(r, c);
-            if cell.width != 0 {
+            if cell.width != CellWidth::Continuation {
                 line.push(cell.ch);
             }
         }

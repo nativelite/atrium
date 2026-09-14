@@ -299,13 +299,13 @@ impl Renderer {
         // coordinates in either mode.
         if bar_appended && !views.board && !views.overview && !views.log && prompt.is_none() {
             let cur = if windows[active].tiled() {
-                self.prev_master.as_ref().map(|m| m.cursor)
+                self.prev_master.as_ref().map(|m| m.cursor())
             } else {
                 let fp = windows[active].tree.focus();
-                windows[active].pane(fp).map(|p| p.term.screen().cursor)
+                windows[active].pane(fp).map(|p| p.term.screen().cursor())
             };
-            if let Some((cr, cc)) = cur {
-                frame.extend_from_slice(format!("\x1b[{};{}H", cr + 1, cc + 1).as_bytes());
+            if let Some(ansi::Cursor { row, col }) = cur {
+                frame.extend_from_slice(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
             }
         }
         // Emit the tick's composite+bar as ONE synchronized frame, so the outer
