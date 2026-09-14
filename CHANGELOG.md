@@ -7,29 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **`atrium --version` (and `-V`).** There was none: an unrecognized flag falls
-  through to "the command to host", so `atrium --version` reached the terminal
-  check and died with `stdin/stdout must be a terminal` — the first thing anyone
-  types into a bug report, answering with an unrelated error. It now prints
-  `atrium <version>` on stdout and exits 0, before the terminal is taken, and works
-  after an `--identity` (which is stripped first).
-- **A hung test can no longer wedge the machine that ran it.** `cargo test` has
-  no per-test timeout and this project has no CI to kill a stuck job, so a test
-  that deadlocked produced no failing line and no end — the last one was found
-  only because someone noticed the terminal had not moved. `./dev.py test` now
-  runs each invocation under a wall-clock budget (`ATRIUM_TEST_TIMEOUT`, default
-  300 s; the suite takes ~15 s), kills the whole **process tree** on expiry —
-  cargo alone would leave the panes, ptys and `ctl` clients a hung test spawned
-  parked forever — and exits `124`, the code `timeout(1)` uses, so a hang is
-  distinguishable from a failure. It then re-runs the suite serially to name the
-  culprit: in parallel mode libtest prints a test's name only when it *finishes*,
-  but under `--test-threads=1` it prints the name first, so the last
-  unterminated line is the test that never came back (`!! THE HANG IS: …`). If
-  the serial re-run passes, that is reported too — an intermittent hang, or one
-  that needs parallelism, is a different bug and says so. Ctrl-C now kills the
-  tree as well.
+## [0.32.0] - 2026-09-14
 
+### Added
 - **Fleet tiles are labelled with the agent's name.** Every tile's top border
   showed `index:command`, and since a fleet's agents all run `claude`, a 2x4
   grid read ` 1:claude ` eight times. The border now shows the pane's role — the
@@ -50,8 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the host's native selection with mouse mode off.
 
 ### Changed
-- **Requires `nativelite-ansi` 0.3 and `nativelite-vterm` 0.5** (both unreleased
-  at the time of writing — they must be published before atrium is). Cell width
+- **Requires `nativelite-ansi` 0.3, `nativelite-vterm` 0.5, `nativelite-pty` 0.4
+  and `nativelite-agsess` 0.2** (pty for `pty::cmdline`, agsess for
+  `AgentSession::awaiting_tool`; all released alongside this version). Cell width
   is the `ansi::CellWidth` enum instead of a `0`/`1`/`2` `u8`, and a screen's
   cursor is a named `ansi::Cursor { row, col }` read through `cursor()` instead
   of a public tuple, so a transposed row/column no longer type-checks. vterm keeps
@@ -151,6 +132,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so its Enter picked the highlighted option. Seen live: two plan-mode agents
   "approved" their own plans. Delivery now also waits while the transcript ends on
   an unresolved `tool_use` (agsess `AgentSession::awaiting_tool`), however old.
+
+## [0.31.0] - 2026-09-12
+
+### Added
+- **`atrium --version` (and `-V`).** There was none: an unrecognized flag falls
+  through to "the command to host", so `atrium --version` reached the terminal
+  check and died with `stdin/stdout must be a terminal` — the first thing anyone
+  types into a bug report, answering with an unrelated error. It now prints
+  `atrium <version>` on stdout and exits 0, before the terminal is taken, and works
+  after an `--identity` (which is stripped first).
+- **A hung test can no longer wedge the machine that ran it.** `cargo test` has
+  no per-test timeout and this project has no CI to kill a stuck job, so a test
+  that deadlocked produced no failing line and no end — the last one was found
+  only because someone noticed the terminal had not moved. `./dev.py test` now
+  runs each invocation under a wall-clock budget (`ATRIUM_TEST_TIMEOUT`, default
+  300 s; the suite takes ~15 s), kills the whole **process tree** on expiry —
+  cargo alone would leave the panes, ptys and `ctl` clients a hung test spawned
+  parked forever — and exits `124`, the code `timeout(1)` uses, so a hang is
+  distinguishable from a failure. It then re-runs the suite serially to name the
+  culprit: in parallel mode libtest prints a test's name only when it *finishes*,
+  but under `--test-threads=1` it prints the name first, so the last
+  unterminated line is the test that never came back (`!! THE HANG IS: …`). If
+  the serial re-run passes, that is reported too — an intermittent hang, or one
+  that needs parallelism, is a different bug and says so. Ctrl-C now kills the
+  tree as well.
 
 ## [0.30.0] - 2026-09-06
 
@@ -1136,7 +1142,9 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/nativelite/atrium/compare/v0.31.0...v0.32.0
+[0.31.0]: https://github.com/nativelite/atrium/compare/v0.30.3...v0.31.0
 [0.3.0]: https://github.com/nativelite/atrium/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/nativelite/atrium/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/nativelite/atrium/compare/v0.1.0...v0.2.0
