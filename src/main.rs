@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 mod ctl_server;
 mod fleet_cli;
 mod loop_phases;
+mod mouse;
 mod overlay_keys;
 mod overview;
 mod pane_spawn;
@@ -44,6 +45,7 @@ mod tiled;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
 pub(crate) use loop_phases::*;
+pub(crate) use mouse::*;
 pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
@@ -1348,31 +1350,19 @@ fn run(
                 PromptEdit::Submit => {
                     let argv = split_cmdline(prompt.take().unwrap_or_default().trim());
                     if !argv.is_empty() {
-                        match spawn_window(
+                        match open_window(
+                            &mut windows,
+                            &mut active,
                             &argv,
-                            rows,
-                            cols,
-                            windows.len(),
                             identity,
                             trust_mode(),
+                            rows,
+                            cols,
+                            &mut out,
                             &mut flash,
-                            Some(&session_job),
-                            None,
-                            None,
+                            &session_job,
                         ) {
-                            Ok(w) => {
-                                windows.push(w);
-                                let last = windows.len() - 1;
-                                switch_window(
-                                    &mut windows,
-                                    &mut active,
-                                    last,
-                                    rows,
-                                    cols,
-                                    &mut out,
-                                );
-                                prev_master = None;
-                            }
+                            Ok(()) => prev_master = None,
                             Err(e) => {
                                 flash = Some((
                                     format!("cannot start {:?}: {e}", argv[0]),
@@ -1445,66 +1435,54 @@ fn run(
                     }
                 }
                 Action::NewPane => {
-                    match spawn_window(
+                    match open_window(
+                        &mut windows,
+                        &mut active,
                         command,
-                        rows,
-                        cols,
-                        windows.len(),
                         identity,
                         trust_mode(),
+                        rows,
+                        cols,
+                        &mut out,
                         &mut flash,
-                        Some(&session_job),
-                        None,
-                        None,
+                        &session_job,
                     ) {
-                        Ok(w) => {
-                            windows.push(w);
-                            let last = windows.len() - 1;
-                            switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
-                            prev_master = None;
-                            force_repaint = true;
-                        }
+                        Ok(()) => prev_master = None,
                         Err(e) => {
                             flash = Some((
                                 format!("cannot start {:?}: {e}", command[0]),
                                 Instant::now(),
                             ));
-                            force_repaint = true;
                         }
                     }
+                    force_repaint = true;
                 }
                 Action::NewShellPane => {
                     // A plain shell in a new window — no identity, no trust posture
                     // (it's not an agent), but it still gets the ctl env injected,
                     // so you can run `atrium ctl board list` here and see it rendered.
                     let shell = vec![default_shell()];
-                    match spawn_window(
+                    match open_window(
+                        &mut windows,
+                        &mut active,
                         &shell,
-                        rows,
-                        cols,
-                        windows.len(),
                         None,
                         atrium::ctl::TrustMode::Off,
+                        rows,
+                        cols,
+                        &mut out,
                         &mut flash,
-                        Some(&session_job),
-                        None,
-                        None,
+                        &session_job,
                     ) {
-                        Ok(w) => {
-                            windows.push(w);
-                            let last = windows.len() - 1;
-                            switch_window(&mut windows, &mut active, last, rows, cols, &mut out);
-                            prev_master = None;
-                            force_repaint = true;
-                        }
+                        Ok(()) => prev_master = None,
                         Err(e) => {
                             flash = Some((
                                 format!("cannot start shell {:?}: {e}", shell[0]),
                                 Instant::now(),
                             ));
-                            force_repaint = true;
                         }
                     }
+                    force_repaint = true;
                 }
                 Action::ToggleBoard => {
                     views.board = !views.board;
@@ -1616,113 +1594,25 @@ fn run(
                     }
                     force_repaint = true;
                 }
-                Action::MouseClick { col, row } => {
-                    let w = &mut windows[active];
-                    if w.tiled() {
-                        let outer = tiled_outer(rows, cols);
-                        let mx = col.saturating_sub(1) as usize;
-                        let my = row.saturating_sub(1) as usize;
-                        let hit = w.tree.rects(outer).into_iter().find(|(_, r)| {
-                            my >= r.row && my < r.row + r.rows && mx >= r.col && mx < r.col + r.cols
-                        });
-                        if let Some((id, rect)) = hit {
-                            selection =
-                                Some((active, atrium::select::Selection::start(id, mx, my, &rect)));
-                            if let Some(p) = w.pane_mut(id) {
-                                if p.mouse_wanted {
-                                    if let Some((cx, cy)) = screen_to_pane_local(mx, my, &rect) {
-                                        let _ = p.pty.write(encode_sgr_click(cx, cy).as_bytes());
-                                    }
-                                }
-                            }
-                            if w.tree.focus_pane(id) {
-                                prev_master = None;
-                                force_repaint = true;
-                            }
-                        }
-                    } else if let Some(p) = windows[active].focused_mut() {
-                        if p.mouse_wanted {
-                            let _ = p
-                                .pty
-                                .write(encode_sgr_click(col as usize, row as usize).as_bytes());
-                        }
+                Action::MouseClick { .. }
+                | Action::MouseDrag { .. }
+                | Action::MouseRelease { .. }
+                | Action::MouseScroll { .. } => {
+                    let outcome = handle_mouse(
+                        &action,
+                        &mut windows,
+                        active,
+                        &mut selection,
+                        rows,
+                        cols,
+                        &mut out,
+                        &mut flash,
+                    );
+                    if outcome.reset_frame {
+                        prev_master = None;
                     }
-                }
-                Action::MouseDrag { col, row } => {
-                    // Extend a tile selection; the head is clamped into the tile
-                    // it started in, however far the pointer strays.
-                    if let Some((win, sel)) = selection.as_mut() {
-                        let w = &windows[active];
-                        if *win == active && w.tiled() {
-                            let rect = w
-                                .tree
-                                .rects(tiled_outer(rows, cols))
-                                .into_iter()
-                                .find(|(id, _)| *id == sel.pane_id);
-                            if let Some((_, rect)) = rect {
-                                let prev = sel.head;
-                                let mx = col.saturating_sub(1) as usize;
-                                let my = row.saturating_sub(1) as usize;
-                                sel.drag(mx, my, &rect);
-                                if sel.head != prev {
-                                    force_repaint = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                Action::MouseRelease { .. } => {
-                    // End a tile selection: copy its text unless it was a click.
-                    if let Some((win, sel)) = selection.take() {
-                        if win == active && !sel.is_empty() {
-                            if let Some(p) = windows[active].pane(sel.pane_id) {
-                                let text = atrium::select::text(&sel, p.term.screen());
-                                let n = text.chars().count();
-                                atrium::select::copy(&text, &mut out);
-                                flash = Some((format!("copied {n} chars"), Instant::now()));
-                            }
-                        }
+                    if outcome.repaint {
                         force_repaint = true;
-                    }
-                }
-                Action::MouseScroll { up, col, row } => {
-                    // Route a wheel notch to the tile under the cursor (not
-                    // necessarily the focused one) so you scroll whatever you're
-                    // hovering. Forward a translated SGR wheel event to that pane's
-                    // app — only if it wants the mouse, so a bare shell never gets
-                    // stray bytes. `64` = wheel up, `65` = wheel down.
-                    let w = &mut windows[active];
-                    let notch = if up { 64 } else { 65 };
-                    if w.tiled() {
-                        let outer = tiled_outer(rows, cols);
-                        let mx = col.saturating_sub(1) as usize;
-                        let my = row.saturating_sub(1) as usize;
-                        let hit = w.tree.rects(outer).into_iter().find(|(_, r)| {
-                            my >= r.row && my < r.row + r.rows && mx >= r.col && mx < r.col + r.cols
-                        });
-                        if let Some((id, rect)) = hit {
-                            if let Some(p) = w.pane_mut(id) {
-                                if p.mouse_wanted {
-                                    // Master cell → the pane's inner (bordered)
-                                    // 1-based coords: content is inset one cell.
-                                    let inner_cols = rect.cols.saturating_sub(2).max(1);
-                                    let inner_rows = rect.rows.saturating_sub(2).max(1);
-                                    let cx =
-                                        mx.saturating_sub(rect.col + 1).min(inner_cols - 1) + 1;
-                                    let cy =
-                                        my.saturating_sub(rect.row + 1).min(inner_rows - 1) + 1;
-                                    let seq = format!("\x1b[<{notch};{cx};{cy}M");
-                                    let _ = p.pty.write(seq.as_bytes());
-                                }
-                            }
-                        }
-                    } else if let Some(p) = windows[active].focused_mut() {
-                        // Passthrough / zoom: the sole pane fills the area above the
-                        // bar; forward with the original coordinates.
-                        if p.mouse_wanted {
-                            let seq = format!("\x1b[<{notch};{col};{row}M");
-                            let _ = p.pty.write(seq.as_bytes());
-                        }
                     }
                 }
                 Action::KillPane => {

@@ -390,6 +390,14 @@ pub fn encode_sgr_click(col: usize, row: usize) -> String {
     format!("\x1b[<0;{col};{row}M\x1b[<0;{col};{row}m")
 }
 
+/// Encode one scroll-wheel notch as an SGR mouse report at 1-based
+/// `(col, row)`: button `64` is wheel up, `65` wheel down. Press only — a wheel
+/// notch has no release.
+pub fn encode_sgr_wheel(up: bool, col: usize, row: usize) -> String {
+    let notch = if up { 64 } else { 65 };
+    format!("\x1b[<{notch};{col};{row}M")
+}
+
 /// Map an arrow CSI final byte to a direction.
 fn arrow_dir(b: u8) -> Option<Dir> {
     match b {
@@ -511,6 +519,24 @@ mod scroll_tests {
         );
         assert_eq!(encode_sgr_click(1, 1), "\x1b[<0;1;1M\x1b[<0;1;1m");
         assert_eq!(encode_sgr_click(80, 24), "\x1b[<0;80;24M\x1b[<0;80;24m");
+    }
+
+    #[test]
+    fn encode_sgr_wheel_round_trips_through_the_scanner() {
+        use super::encode_sgr_wheel;
+        assert_eq!(encode_sgr_wheel(true, 12, 7), "\x1b[<64;12;7M");
+        assert_eq!(encode_sgr_wheel(false, 1, 1), "\x1b[<65;1;1M");
+        // What atrium forwards is exactly what it parses as the same notch.
+        let mut s = PrefixScanner::new();
+        s.set_mouse(true);
+        assert_eq!(
+            s.feed(encode_sgr_wheel(false, 3, 4).as_bytes()),
+            vec![Action::MouseScroll {
+                up: false,
+                col: 3,
+                row: 4
+            }]
+        );
     }
 
     #[test]

@@ -46,6 +46,39 @@ pub(crate) fn spawn_window(
     })
 }
 
+/// Open `command` as a new window mid-run — enrolled in the session job — and
+/// switch to it. A spawn failure is returned for the caller to word.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn open_window(
+    windows: &mut Vec<Window>,
+    active: &mut usize,
+    command: &[String],
+    identity: Option<&str>,
+    mode: atrium::ctl::TrustMode,
+    rows: u16,
+    cols: u16,
+    out: &mut impl std::io::Write,
+    flash: &mut Option<(String, Instant)>,
+    job: &atrium::reap::SessionJob,
+) -> std::io::Result<()> {
+    let w = spawn_window(
+        command,
+        rows,
+        cols,
+        windows.len(),
+        identity,
+        mode,
+        flash,
+        Some(job),
+        None,
+        None,
+    )?;
+    windows.push(w);
+    let last = windows.len() - 1;
+    switch_window(windows, active, last, rows, cols, out);
+    Ok(())
+}
+
 /// Mass-spawn a single window of N tiles laid out as a balanced `grid`. The
 /// split tree is built with [`layout::Tree::grid`] (ids `0..N`, focus 0) so
 /// focus/rects/close all keep working exactly as for a hand-split grid. Each
