@@ -41,6 +41,7 @@ mod overlay_keys;
 mod overview;
 mod pane_spawn;
 mod panels;
+mod prompt;
 mod renderer;
 mod safety_net;
 mod tiled;
@@ -52,6 +53,7 @@ pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
 pub(crate) use panels::*;
+pub(crate) use prompt::*;
 pub(crate) use renderer::*;
 pub(crate) use safety_net::*;
 pub(crate) use tiled::*;
@@ -1114,6 +1116,12 @@ fn run(
     // Held for the whole run — dropping it (or the process exiting) fires the
     // guarantee. Panes never inherit its handle, so they live until atrium exits.
     let session_job = atrium::reap::SessionJob::create();
+    // What `Ctrl+A c`, splits and the command prompt launch under.
+    let launch = Launch {
+        command,
+        identity,
+        job: &session_job,
+    };
     // The crash registry, session snapshot, warden and orphan watchdog (loop
     // phase 0b); see `safety_net`.
     let mut safety_net = SafetyNet::new();
@@ -1155,41 +1163,18 @@ fn run(
         // command line (not the panes), and the scanner is fed nothing. Enter opens
         // the typed command in a new pane; Esc/Ctrl+C cancels.
         let feed: &[u8] = if prompt.is_some() {
-            match edit_prompt(prompt.as_mut().unwrap(), &bytes) {
-                PromptEdit::Continue => {}
-                PromptEdit::Cancel => prompt = None,
-                PromptEdit::Submit => {
-                    let argv = split_cmdline(prompt.take().unwrap_or_default().trim());
-                    if !argv.is_empty() {
-                        match open_window(
-                            &mut windows,
-                            &mut active,
-                            &argv,
-                            identity,
-                            trust_mode(),
-                            rows,
-                            cols,
-                            &mut out,
-                            &mut flash,
-                            &session_job,
-                        ) {
-                            Ok(()) => renderer.reset(),
-                            Err(e) => {
-                                flash = Some((
-                                    format!("cannot start {:?}: {e}", argv[0]),
-                                    Instant::now(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-            // Repaint only when the user actually pressed something (the line
-            // changed, or it opened/closed) — NOT every idle tick, which made the
-            // prompt row flash rapidly.
-            if !bytes.is_empty() {
-                force_repaint = true;
-            }
+            feed_prompt(
+                &mut prompt,
+                &bytes,
+                &mut windows,
+                &mut active,
+                &launch,
+                rows,
+                cols,
+                &mut out,
+                &mut flash,
+            )
+            .apply(&mut renderer, &mut force_repaint);
             b""
         } else {
             &bytes
@@ -1208,14 +1193,8 @@ fn run(
                 &mut out,
                 &mut flash,
             ) {
-                if outcome.quit {
+                if outcome.apply(&mut renderer, &mut force_repaint) {
                     break 'outer;
-                }
-                if outcome.reset_frame {
-                    renderer.reset();
-                }
-                if outcome.repaint {
-                    force_repaint = true;
                 }
                 continue;
             }
@@ -1249,14 +1228,14 @@ fn run(
                     match open_window(
                         &mut windows,
                         &mut active,
-                        command,
-                        identity,
+                        launch.command,
+                        launch.identity,
                         trust_mode(),
                         rows,
                         cols,
                         &mut out,
                         &mut flash,
-                        &session_job,
+                        launch.job,
                     ) {
                         Ok(()) => renderer.reset(),
                         Err(e) => {
@@ -1283,7 +1262,7 @@ fn run(
                         cols,
                         &mut out,
                         &mut flash,
-                        &session_job,
+                        launch.job,
                     ) {
                         Ok(()) => renderer.reset(),
                         Err(e) => {
@@ -1391,7 +1370,7 @@ fn run(
                 | Action::MouseDrag { .. }
                 | Action::MouseRelease { .. }
                 | Action::MouseScroll { .. } => {
-                    let outcome = handle_mouse(
+                    handle_mouse(
                         &action,
                         &mut windows,
                         active,
@@ -1400,13 +1379,8 @@ fn run(
                         cols,
                         &mut out,
                         &mut flash,
-                    );
-                    if outcome.reset_frame {
-                        renderer.reset();
-                    }
-                    if outcome.repaint {
-                        force_repaint = true;
-                    }
+                    )
+                    .apply(&mut renderer, &mut force_repaint);
                 }
                 Action::KillPane => {
                     let w = &mut windows[active];
@@ -1838,68 +1812,6 @@ fn default_shell() -> String {
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
     }
-}
-
-/// The outcome of feeding a keystroke chunk to the open command prompt.
-enum PromptEdit {
-    /// The line changed (or nothing happened); keep the prompt open.
-    Continue,
-    /// Esc / Ctrl+C: close the prompt without running anything.
-    Cancel,
-    /// Enter: the caller runs the accumulated line.
-    Submit,
-}
-
-/// Apply a chunk of raw input `bytes` to the prompt line `buf`: printable ASCII is
-/// appended, Backspace deletes, Enter submits, Esc/Ctrl+C cancels. Other control
-/// bytes (including the rest of an arrow-key escape) are ignored. Returns as soon
-/// as a terminating key (Enter/Esc) is seen so trailing bytes don't leak.
-fn edit_prompt(buf: &mut String, bytes: &[u8]) -> PromptEdit {
-    for &b in bytes {
-        match b {
-            b'\r' | b'\n' => return PromptEdit::Submit,
-            0x1b | 0x03 => return PromptEdit::Cancel, // Esc or Ctrl+C
-            0x7f | 0x08 => {
-                buf.pop();
-            }
-            0x20..=0x7e => buf.push(b as char),
-            _ => {} // ignore other control bytes
-        }
-    }
-    PromptEdit::Continue
-}
-
-/// Split a command line into argv, honoring double quotes so a path with spaces
-/// stays one argument (`"C:\Program Files\Git\bin\bash.exe" --login`). Whitespace
-/// separates unquoted words; quotes are removed. Minimal by design — enough to
-/// launch a shell with a flag, not a full shell parser.
-fn split_cmdline(line: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut has = false;
-    for c in line.chars() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-                has = true;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if has {
-                    out.push(std::mem::take(&mut cur));
-                    has = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                has = true;
-            }
-        }
-    }
-    if has {
-        out.push(cur);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -2559,37 +2471,6 @@ mod tests {
             .iter()
             .any(|r| r.who == "lead" && r.text.contains("title")));
         assert!(rows.iter().any(|r| r.who == "ada" && r.text.contains("ui")));
-    }
-
-    #[test]
-    fn split_cmdline_splits_on_whitespace() {
-        assert_eq!(split_cmdline("wsl -d Ubuntu"), vec!["wsl", "-d", "Ubuntu"]);
-        assert_eq!(split_cmdline("  pwsh   -NoLogo "), vec!["pwsh", "-NoLogo"]);
-        assert!(split_cmdline("   ").is_empty());
-    }
-
-    #[test]
-    fn split_cmdline_keeps_quoted_paths_whole() {
-        assert_eq!(
-            split_cmdline(r#""C:\Program Files\Git\bin\bash.exe" --login"#),
-            vec![r"C:\Program Files\Git\bin\bash.exe", "--login"]
-        );
-    }
-
-    #[test]
-    fn edit_prompt_appends_backspaces_submits_and_cancels() {
-        let mut b = String::new();
-        assert!(matches!(edit_prompt(&mut b, b"wsl"), PromptEdit::Continue));
-        assert_eq!(b, "wsl");
-        // backspace deletes the last char
-        assert!(matches!(edit_prompt(&mut b, &[0x7f]), PromptEdit::Continue));
-        assert_eq!(b, "ws");
-        // Enter submits, keeping what was typed so far
-        assert!(matches!(edit_prompt(&mut b, b"l\r"), PromptEdit::Submit));
-        assert_eq!(b, "wsl");
-        // Esc cancels
-        let mut c = String::from("pwsh");
-        assert!(matches!(edit_prompt(&mut c, &[0x1b]), PromptEdit::Cancel));
     }
 
     // -- worktree_spawn_params error-path -------------------------------------

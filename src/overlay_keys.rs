@@ -103,6 +103,17 @@ impl KeyOutcome {
         reset_frame: false,
         repaint: false,
     };
+
+    /// Apply the frame and repaint requests to the loop; `true` means quit.
+    pub(crate) fn apply(self, renderer: &mut Renderer, force_repaint: &mut bool) -> bool {
+        if self.reset_frame {
+            renderer.reset();
+        }
+        if self.repaint {
+            *force_repaint = true;
+        }
+        self.quit
+    }
 }
 
 /// Handle `action` if an overlay is up. `None` means no overlay is open and the

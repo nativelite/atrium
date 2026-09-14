@@ -46,6 +46,15 @@ pub(crate) fn spawn_window(
     })
 }
 
+/// What a pane opened from the keyboard runs under, fixed for the whole run: the
+/// command `Ctrl+A c` and splits host, the identity it runs as, and the session
+/// job runtime spawns enroll in.
+pub(crate) struct Launch<'a> {
+    pub(crate) command: &'a [String],
+    pub(crate) identity: Option<&'a str>,
+    pub(crate) job: &'a atrium::reap::SessionJob,
+}
+
 /// Open `command` as a new window mid-run — enrolled in the session job — and
 /// switch to it. A spawn failure is returned for the caller to word.
 #[allow(clippy::too_many_arguments)]
