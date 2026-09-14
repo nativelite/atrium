@@ -1295,16 +1295,11 @@ fn run(
                     }
                     force_repaint = true;
                 }
+                // With no overlay up these only open one (closing, and switching
+                // between overlays, is `handle_overlay_key`'s). Opening is a full
+                // repaint: the overlay replaces the panes.
                 Action::ToggleBoard => {
-                    views.board = !views.board;
-                    views.feed_scroll = 0; // always open at the live/newest end
-                    views.decision_sel = 0;
-                    // Toggling either way is a full repaint: on → draw the panel
-                    // (it clears the screen); off → recompose/repaint the panes the
-                    // panel covered. On close, restore the cursor the panel hid.
-                    if !views.board {
-                        let _ = write!(out, "\x1b[?25h");
-                    }
+                    views.open_board();
                     renderer.reset();
                     force_repaint = true;
                 }
@@ -1315,26 +1310,13 @@ fn run(
                     force_repaint = true;
                 }
                 Action::ToggleOverview => {
-                    // Open the overview (close the board if it was up — one overlay
-                    // at a time). Selection starts at the focused agent so Enter
-                    // dives back into what you were watching.
-                    views.overview = true;
-                    views.board = false;
-                    let focus = windows[active].tree.focus();
-                    views.overview_sel = overview_nodes(&windows, &world)
-                        .iter()
-                        .position(|n| n.window == active && n.pane_id == focus)
-                        .unwrap_or(0);
+                    views.open_overview(&windows, active, &world);
                     let _ = write!(out, "\x1b[?25h");
                     renderer.reset();
                     force_repaint = true;
                 }
                 Action::ToggleLog => {
-                    // Open the activity log (one overlay at a time).
-                    views.log = true;
-                    views.board = false;
-                    views.overview = false;
-                    views.log_scroll = 0;
+                    views.open_log();
                     let _ = write!(out, "\x1b[?25h");
                     renderer.reset();
                     force_repaint = true;

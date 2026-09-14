@@ -8,7 +8,7 @@
 use crate::*;
 
 /// Which overlay is up, and each overlay's cursor.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Views {
     /// The mission-control overview (`Ctrl+A o`): the agent tree colored by
     /// status with a selection cursor; `overview_sel` is the selected agent.
@@ -33,6 +33,56 @@ impl Views {
     /// Is any overlay up (so keystrokes must not reach the panes)?
     pub(crate) fn any(&self) -> bool {
         self.overview || self.board || self.log
+    }
+
+    /// Open the board — one overlay at a time — at the live end of its feed
+    /// with the first decision selected.
+    pub(crate) fn open_board(&mut self) {
+        *self = Views {
+            board: true,
+            feed_scroll: 0,
+            decision_sel: 0,
+            ..self.closed()
+        };
+    }
+
+    /// Open the overview with the active window's focused agent selected, so
+    /// Enter dives back into what you were watching.
+    pub(crate) fn open_overview(
+        &mut self,
+        windows: &[Window],
+        active: usize,
+        world: &atrium::vendors::VendorWorlds,
+    ) {
+        let focus = windows[active].tree.focus();
+        let sel = overview_nodes(windows, world)
+            .iter()
+            .position(|n| n.window == active && n.pane_id == focus)
+            .unwrap_or(0);
+        *self = Views {
+            overview: true,
+            overview_sel: sel,
+            ..self.closed()
+        };
+    }
+
+    /// Open the activity log, tailing (scrolled to the newest event).
+    pub(crate) fn open_log(&mut self) {
+        *self = Views {
+            log: true,
+            log_scroll: 0,
+            ..self.closed()
+        };
+    }
+
+    /// These cursors with every overlay closed.
+    fn closed(&self) -> Views {
+        Views {
+            overview: false,
+            board: false,
+            log: false,
+            ..*self
+        }
     }
 }
 
@@ -87,17 +137,12 @@ pub(crate) fn handle_overlay_key(
                 // Switch straight from the overview to the board — one press,
                 // no need to close the overview first (the board render hides
                 // the cursor and clears the screen itself).
-                views.overview = false;
-                views.board = true;
-                views.feed_scroll = 0;
-                views.decision_sel = 0;
+                views.open_board();
                 outcome.reset_frame = true;
                 outcome.repaint = true;
             }
             Action::ToggleLog => {
-                views.overview = false;
-                views.log = true;
-                views.log_scroll = 0;
+                views.open_log();
                 outcome.reset_frame = true;
                 outcome.repaint = true;
             }
@@ -181,19 +226,12 @@ pub(crate) fn handle_overlay_key(
                 outcome.repaint = true;
             }
             Action::ToggleOverview => {
-                views.overview = true;
-                views.board = false;
-                views.overview_sel = overview_nodes(windows, world)
-                    .iter()
-                    .position(|n| n.window == *active && n.pane_id == windows[*active].tree.focus())
-                    .unwrap_or(0);
+                views.open_overview(windows, *active, world);
                 outcome.reset_frame = true;
                 outcome.repaint = true;
             }
             Action::ToggleLog => {
-                views.board = false;
-                views.log = true;
-                views.log_scroll = 0;
+                views.open_log();
                 let _ = write!(out, "\x1b[?25h");
                 outcome.reset_frame = true;
                 outcome.repaint = true;
@@ -279,20 +317,12 @@ pub(crate) fn handle_overlay_key(
                 outcome.repaint = true;
             }
             Action::ToggleBoard => {
-                views.log = false;
-                views.board = true;
-                views.feed_scroll = 0;
-                views.decision_sel = 0;
+                views.open_board();
                 outcome.reset_frame = true;
                 outcome.repaint = true;
             }
             Action::ToggleOverview => {
-                views.log = false;
-                views.overview = true;
-                views.overview_sel = overview_nodes(windows, world)
-                    .iter()
-                    .position(|n| n.window == *active && n.pane_id == windows[*active].tree.focus())
-                    .unwrap_or(0);
+                views.open_overview(windows, *active, world);
                 outcome.reset_frame = true;
                 outcome.repaint = true;
             }
@@ -331,4 +361,59 @@ pub(crate) fn handle_overlay_key(
         return Some(outcome);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every overlay up with scrolled cursors — no real state, but the worst
+    /// case for "one overlay at a time".
+    fn everything_open() -> Views {
+        Views {
+            overview: true,
+            overview_sel: 3,
+            board: true,
+            feed_scroll: 7,
+            decision_sel: 2,
+            log: true,
+            log_scroll: 9,
+        }
+    }
+
+    #[test]
+    fn opening_the_board_closes_the_others_and_rewinds_only_its_own_cursors() {
+        let mut v = everything_open();
+        v.open_board();
+        assert_eq!(
+            v,
+            Views {
+                board: true,
+                feed_scroll: 0,
+                decision_sel: 0,
+                overview: false,
+                log: false,
+                ..everything_open()
+            }
+        );
+    }
+
+    #[test]
+    fn opening_the_log_closes_the_others_and_tails() {
+        let mut v = everything_open();
+        v.open_log();
+        assert_eq!(
+            v,
+            Views {
+                log: true,
+                log_scroll: 0,
+                overview: false,
+                board: false,
+                ..everything_open()
+            }
+        );
+        assert!(v.any());
+        v.log = false;
+        assert!(!v.any());
+    }
 }
