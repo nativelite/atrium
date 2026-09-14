@@ -17,16 +17,18 @@ pub(crate) fn spawn_window(
     extra_norms: Option<&str>,
 ) -> std::io::Result<Window> {
     let pane = spawn_pane_full(
-        command,
+        PaneSpec {
+            command,
+            id: 0,
+            identity,
+            cwd,
+            mode,
+            extra_env: &[],
+            extra_norms,
+        },
         rows.saturating_sub(1).max(1),
         cols,
-        0,
-        identity,
-        cwd,
-        mode,
         flash,
-        &[],
-        extra_norms,
     )?;
     // Enroll a RUNTIME-spawned pane in the session Job synchronously, before it is
     // returned, so a pane spawned mid-loop is torn down with atrium even if atrium
@@ -116,16 +118,18 @@ pub(crate) fn spawn_pane(
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
     spawn_pane_full(
-        command,
+        PaneSpec {
+            command,
+            id,
+            identity,
+            cwd: None,
+            mode,
+            extra_env: &[],
+            extra_norms: None,
+        },
         rows,
         cols,
-        id,
-        identity,
-        None,
-        mode,
         flash,
-        &[],
-        None,
     )
 }
 
@@ -161,13 +165,6 @@ pub(crate) fn pane_base_env(
     env
 }
 
-/// The shared spawn core: build the agent's launch (session-id inject, Windows
-/// shim wrapping, identity env resolution), then spawn it on a pty of the given
-/// size in the given working directory. Every pane atrium hosts — the initial one,
-/// a split, a grid tile, and each fleet agent — is born here, so the identity /
-/// `--session-id` / effective-command discipline is written once and shared.
-///
-/// `command` is the *base* user command with any extra agent args already
 /// Combine an optional worktree-norms block with an optional ctl directive into
 /// a single `--append-system-prompt` payload.
 ///
@@ -183,23 +180,51 @@ pub(crate) fn combine_system_prompt(norms: Option<&str>, ctl: Option<&str>) -> O
     }
 }
 
-/// appended (e.g. the fleet loader's `--add-dir` / `--append-system-prompt` /
-/// `--model` / `--effort`); this function then appends `--session-id` when the
-/// pane is a bindable agent, exactly as before. `cwd` is `Some(dir)` for a fleet
-/// agent (so its `CLAUDE.md` auto-loads) and `None` everywhere else.
-#[allow(clippy::too_many_arguments)]
+/// What to launch in a new pane — everything [`spawn_pane_full`] needs besides
+/// the terminal geometry and the flash slot, by name. It replaces an 11-argument
+/// positional signature where three adjacent `Option<&str>`s (identity, cwd,
+/// norms) could be swapped without a compiler complaint (r10 audit B11).
+pub(crate) struct PaneSpec<'a> {
+    /// The command and its args, with any per-agent args (the fleet loader's
+    /// `--add-dir` / `--append-system-prompt` / `--model` / `--effort`) already
+    /// appended; `--session-id` is added here when the pane is a bindable agent.
+    pub(crate) command: &'a [String],
+    /// The pane's split-tree id within its window.
+    pub(crate) id: usize,
+    /// The credential identity name to resolve and inject, if any.
+    pub(crate) identity: Option<&'a str>,
+    /// Working directory: `Some(dir)` for a fleet/worktree agent (so its
+    /// `CLAUDE.md` auto-loads), `None` to inherit atrium's.
+    pub(crate) cwd: Option<&'a str>,
+    /// The effective trust posture for this pane.
+    pub(crate) mode: atrium::ctl::TrustMode,
+    /// Extra environment for this child only (e.g. context-sharing vars).
+    pub(crate) extra_env: &'a [(String, String)],
+    /// Worktree norms to fold into the pane's `--append-system-prompt`.
+    pub(crate) extra_norms: Option<&'a str>,
+}
+
+/// The shared spawn core: build the agent's launch from `spec` (session-id
+/// inject, trust flags, identity env, Windows shim resolution) and start it on a
+/// `rows x cols` pty. Every pane atrium hosts — the initial one, a split, a grid
+/// tile, and each fleet agent — is born here, so the identity / `--session-id` /
+/// effective-command discipline is written once and shared. Non-fatal problems
+/// (an unresolvable identity, stripped flags) are reported through `flash`.
 pub(crate) fn spawn_pane_full(
-    command: &[String],
+    spec: PaneSpec,
     rows: u16,
     cols: u16,
-    id: usize,
-    identity: Option<&str>,
-    cwd: Option<&str>,
-    mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
-    extra_env: &[(String, String)],
-    extra_norms: Option<&str>,
 ) -> std::io::Result<Pane> {
+    let PaneSpec {
+        command,
+        id,
+        identity,
+        cwd,
+        mode,
+        extra_env,
+        extra_norms,
+    } = spec;
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
     // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This

@@ -819,16 +819,18 @@ fn recover_cmd(args: &[String]) -> ExitCode {
     for record in &snap.panes {
         let argv = resume_argv(record);
         match spawn_pane_full(
-            &argv,
+            PaneSpec {
+                command: &argv,
+                id: record.id,
+                identity: record.identity.as_deref(),
+                cwd: record.cwd.as_deref(),
+                mode: trust_mode(),
+                extra_env: &[],
+                extra_norms: None,
+            },
             cell_rows,
             cols,
-            record.id,
-            record.identity.as_deref(),
-            record.cwd.as_deref(),
-            trust_mode(),
             &mut flash,
-            &[],
-            None,
         ) {
             Ok(mut pane) => {
                 pane.role = record.role.clone();

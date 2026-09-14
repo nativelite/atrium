@@ -987,16 +987,18 @@ pub(crate) fn spawn_fleet_window(
         // Per-agent identity else the fleet default.
         let identity = agent.identity.as_deref().or(fleet.identity.as_deref());
         match spawn_pane_full(
-            &command,
+            PaneSpec {
+                command: &command,
+                id,
+                identity,
+                cwd: cwd.as_deref(),
+                mode: agent_mode,
+                extra_env: &ctx_vars,
+                extra_norms: pane_norms.as_deref(),
+            },
             cell_rows,
             cell_cols,
-            id,
-            identity,
-            cwd.as_deref(),
-            agent_mode,
             flash,
-            &ctx_vars,
-            pane_norms.as_deref(),
         ) {
             Ok(mut pane) => {
                 // Tag the pane with the agent's fleet name as its role, so the

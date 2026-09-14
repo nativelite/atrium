@@ -562,16 +562,18 @@ pub(crate) fn dispatch_ctl(
             };
             let mut flash = None;
             let new_pane = match spawn_pane_full(
-                &cmd,
+                PaneSpec {
+                    command: &cmd,
+                    id: pane_slot_id,
+                    identity: identity_name.as_deref(),
+                    cwd: new_cwd.as_deref(),
+                    mode: trust_mode(),
+                    extra_env: &[],
+                    extra_norms: norms.as_deref(),
+                },
                 rows,
                 cols,
-                pane_slot_id,
-                identity_name.as_deref(),
-                new_cwd.as_deref(),
-                trust_mode(),
                 &mut flash,
-                &[],
-                norms.as_deref(),
             ) {
                 Ok(p) => p,
                 Err(e) => return ctl::reply_err(&format!("respawn failed: {e}")),
@@ -987,16 +989,18 @@ pub(crate) fn spawn_worker_here(
     };
     let mut flash = None;
     match spawn_pane_full(
-        &sp.argv,
+        PaneSpec {
+            command: &sp.argv,
+            id: new_id,
+            identity: sp.identity.as_deref(),
+            cwd: wt_cwd.as_deref(),
+            mode,
+            extra_env: &[],
+            extra_norms: wt_norms.as_deref(),
+        },
         pr.max(1),
         pc.max(1),
-        new_id,
-        sp.identity.as_deref(),
-        wt_cwd.as_deref(),
-        mode,
         &mut flash,
-        &[],
-        wt_norms.as_deref(),
     ) {
         Ok(mut pane) => {
             pane.role = sp.role.clone();
