@@ -39,6 +39,7 @@ mod loop_phases;
 mod mouse;
 mod overlay_keys;
 mod overview;
+mod pane_keys;
 mod pane_spawn;
 mod panels;
 mod prompt;
@@ -51,6 +52,7 @@ pub(crate) use loop_phases::*;
 pub(crate) use mouse::*;
 pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
+pub(crate) use pane_keys::*;
 pub(crate) use pane_spawn::*;
 pub(crate) use panels::*;
 pub(crate) use prompt::*;
@@ -1205,74 +1207,27 @@ fn run(
                         let _ = p.pty.write(&b);
                     }
                 }
-                Action::NextPane => {
-                    let next = (active + 1) % windows.len();
-                    switch_window(&mut windows, &mut active, next, rows, cols, &mut out);
-                    renderer.reset();
-                    force_repaint = true;
-                }
-                Action::PrevPane => {
-                    let prev = (active + windows.len() - 1) % windows.len();
-                    switch_window(&mut windows, &mut active, prev, rows, cols, &mut out);
-                    renderer.reset();
-                    force_repaint = true;
-                }
-                Action::SwitchTo(i) => {
-                    if i < windows.len() {
-                        switch_window(&mut windows, &mut active, i, rows, cols, &mut out);
-                        renderer.reset();
-                        force_repaint = true;
-                    }
-                }
-                Action::NewPane => {
-                    match open_window(
+                Action::NextPane
+                | Action::PrevPane
+                | Action::SwitchTo(_)
+                | Action::NewPane
+                | Action::NewShellPane
+                | Action::SplitH
+                | Action::SplitV
+                | Action::MoveFocus(_)
+                | Action::Zoom
+                | Action::KillPane => {
+                    handle_pane_action(
+                        &action,
                         &mut windows,
                         &mut active,
-                        launch.command,
-                        launch.identity,
-                        trust_mode(),
+                        &launch,
                         rows,
                         cols,
                         &mut out,
                         &mut flash,
-                        launch.job,
-                    ) {
-                        Ok(()) => renderer.reset(),
-                        Err(e) => {
-                            flash = Some((
-                                format!("cannot start {:?}: {e}", command[0]),
-                                Instant::now(),
-                            ));
-                        }
-                    }
-                    force_repaint = true;
-                }
-                Action::NewShellPane => {
-                    // A plain shell in a new window — no identity, no trust posture
-                    // (it's not an agent), but it still gets the ctl env injected,
-                    // so you can run `atrium ctl board list` here and see it rendered.
-                    let shell = vec![default_shell()];
-                    match open_window(
-                        &mut windows,
-                        &mut active,
-                        &shell,
-                        None,
-                        atrium::ctl::TrustMode::Off,
-                        rows,
-                        cols,
-                        &mut out,
-                        &mut flash,
-                        launch.job,
-                    ) {
-                        Ok(()) => renderer.reset(),
-                        Err(e) => {
-                            flash = Some((
-                                format!("cannot start shell {:?}: {e}", shell[0]),
-                                Instant::now(),
-                            ));
-                        }
-                    }
-                    force_repaint = true;
+                    )
+                    .apply(&mut renderer, &mut force_repaint);
                 }
                 // With no overlay up these only open one (closing, and switching
                 // between overlays, is `handle_overlay_key`'s). Opening is a full
@@ -1299,50 +1254,6 @@ fn run(
                     let _ = write!(out, "\x1b[?25h");
                     renderer.reset();
                     force_repaint = true;
-                }
-                Action::SplitH => {
-                    split_focused(
-                        &mut windows[active],
-                        layout::Dir::Horizontal,
-                        command,
-                        rows,
-                        cols,
-                        identity,
-                        &mut flash,
-                    );
-                    resize_window(&mut windows[active], rows, cols);
-                    renderer.reset();
-                    force_repaint = true;
-                }
-                Action::SplitV => {
-                    split_focused(
-                        &mut windows[active],
-                        layout::Dir::Vertical,
-                        command,
-                        rows,
-                        cols,
-                        identity,
-                        &mut flash,
-                    );
-                    resize_window(&mut windows[active], rows, cols);
-                    renderer.reset();
-                    force_repaint = true;
-                }
-                Action::MoveFocus(d) => {
-                    let outer = tiled_outer(rows, cols);
-                    windows[active].tree.move_focus(to_move(d), outer);
-                    renderer.reset();
-                    force_repaint = true;
-                }
-                Action::Zoom => {
-                    let w = &mut windows[active];
-                    // Zoom only means something with more than one pane.
-                    if w.panes.len() > 1 {
-                        w.zoomed = !w.zoomed;
-                        resize_window(w, rows, cols);
-                        renderer.reset();
-                        force_repaint = true;
-                    }
                 }
                 Action::ToggleMouse => {
                     mouse_on = !mouse_on;
@@ -1381,29 +1292,6 @@ fn run(
                         &mut flash,
                     )
                     .apply(&mut renderer, &mut force_repaint);
-                }
-                Action::KillPane => {
-                    let w = &mut windows[active];
-                    let victim = w.tree.focus();
-                    if w.panes.len() > 1 {
-                        // Multi-pane window: close synchronously so focus leaves
-                        // the dying pane at once (the next keystrokes must route
-                        // to the survivor, not the corpse) and the frame re-tiles
-                        // without waiting for the async reap.
-                        if let Some(p) = w.pane_mut(victim) {
-                            let _ = p.pty.kill();
-                        }
-                        w.tree.close(victim);
-                        w.panes.retain(|p| p.id != victim);
-                        w.zoomed = w.zoomed && w.panes.len() > 1;
-                        resize_window(w, rows, cols);
-                        renderer.reset();
-                        force_repaint = true;
-                    } else if let Some(p) = w.pane_mut(victim) {
-                        // Sole pane: async kill; the reap step drops the window
-                        // and the app exits when the last window is gone (0.1).
-                        let _ = p.pty.kill();
-                    }
                 }
                 Action::Quit => {
                     if std::env::var_os("ATRIUM_DEBUG").is_some() {
