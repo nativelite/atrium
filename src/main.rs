@@ -1182,6 +1182,23 @@ fn run(
             &bytes
         };
         for action in scanner.feed(feed) {
+            // Keys that arrived in the same read as the `Ctrl+A :` that opened
+            // the prompt belong to it (a paste or a fast typist), not the pane.
+            if let (Some(_), Action::Forward(b)) = (&prompt, &action) {
+                feed_prompt(
+                    &mut prompt,
+                    b,
+                    &mut windows,
+                    &mut active,
+                    &launch,
+                    rows,
+                    cols,
+                    &mut out,
+                    &mut flash,
+                )
+                .apply(&mut renderer, &mut force_repaint);
+                continue;
+            }
             if let Some(outcome) = handle_overlay_key(
                 &action,
                 &mut views,

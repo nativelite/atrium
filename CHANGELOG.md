@@ -99,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change for anyone constructing `PaneInfo` directly.)
 
 ### Fixed
+- **Keys typed right after `Ctrl+A :` go to the command prompt, not the pane.**
+  Only keys in a *later* terminal read reached the prompt: anything arriving in
+  the same read as the `:` — a paste, a fast typist, a slow link — was forwarded
+  to the focused pane, which ran it (and the prompt then swallowed whatever came
+  next). They are now fed to the prompt that just opened.
 - **Best-effort failures are no longer invisible.** A session snapshot that
   cannot be saved (so `atrium recover` would have nothing), an orphan watchdog
   that fails to start (unix), a warden decision the bus refuses, and a pane pty

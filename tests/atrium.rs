@@ -810,6 +810,28 @@ fn command_prompt_cancels_and_opens_a_window() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
+/// Keys that arrive in the same terminal read as Ctrl+A : (a paste, a fast
+/// typist, a slow link) belong to the prompt it just opened — they used to skip
+/// it and land in the pane, which then ran the command itself.
+#[test]
+fn command_prompt_keeps_keys_from_the_same_read() {
+    let mut p = spawn_atrium_shell(24, 80);
+    let (burst, two): (&[u8], &[u8]) = if cfg!(windows) {
+        (b"\x01:cmd /Q\r", b"2:cmd")
+    } else {
+        (b"\x01:sh -i\r", b"2:sh")
+    };
+    p.write(burst).unwrap();
+    let out = read_until(&mut p, two, Duration::from_secs(15));
+    assert!(
+        contains(&out, two),
+        "the command typed with Ctrl+A : did not open window 2: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
 // --- tiling (0.2): splits, focus, zoom, kill-retile -------------------------
 
 /// Spawn atrium hosting an interactive shell in a pty, returning it once the bar
