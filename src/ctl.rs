@@ -1157,77 +1157,316 @@ fn i(n: usize) -> Value {
     Value::Number(Number::Int(n as i64))
 }
 
+/// Every reply the control server sends — one variant per wire shape.
+///
+/// The request side has always been typed (`Cmd` and its payloads); the reply
+/// side was ~17 free functions each hand-assembling a `Value` from string keys,
+/// with the server then re-parsing its own JSON to learn what it had said (for the
+/// audit record). A key typo or a field added in one place and not another was
+/// invisible to the compiler (r10 audit B12). Now the shape of every reply is this
+/// type, [`Reply::to_value`] is the single serializer, and the server keeps the
+/// typed value until it writes the line. The `reply_*` functions remain as the
+/// named constructors, so call sites read the same.
+///
+/// The wire format is unchanged, byte for byte (same keys, same order): external
+/// consumers (agents parsing `atrium ctl` stdout) see no difference. Replies carry
+/// no type tag, so decoding a reply still needs to know the request it answers —
+/// a client-side concern this enum does not attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    /// `{"ok":false,"err":<msg>}` — the one failure shape.
+    Err(String),
+    BoardEntry {
+        key: String,
+        entry: Option<Value>,
+    },
+    BoardList(Value),
+    BoardDel {
+        key: String,
+        deleted: bool,
+    },
+    BoardClaim {
+        key: String,
+        granted: bool,
+        holder: Option<String>,
+        lease_ms: u64,
+        entry: Option<Value>,
+    },
+    BoardRelease {
+        key: String,
+        released: bool,
+    },
+    BusPublished {
+        event: Value,
+        subscribers: usize,
+    },
+    BusSubscribed(Vec<String>),
+    BusFeed {
+        feed: Value,
+        cursor: u64,
+    },
+    BusResolved {
+        seq: u64,
+        resolved: bool,
+    },
+    BusTopics(Vec<(String, usize)>),
+    Spawned {
+        pane: AgentId,
+        role: Option<String>,
+        session: Option<String>,
+        note: Option<String>,
+    },
+    Sent {
+        target: AgentId,
+        queued: bool,
+    },
+    Killed(Vec<AgentId>),
+    Audit {
+        entries: Vec<Value>,
+        oldest: Option<u64>,
+        latest: u64,
+    },
+    StatusOne {
+        pane: AgentId,
+        status: Option<String>,
+        idle_ms: u64,
+    },
+    Tree(Vec<ListNode>),
+}
+
+/// An owned org-chart node inside [`Reply::Tree`]; built from a [`TreeNode`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListNode {
+    pub id: AgentId,
+    pub parent: Option<AgentId>,
+    pub role: Option<String>,
+    pub title: String,
+    pub depth: usize,
+    pub status: Option<String>,
+    pub idle_ms: u64,
+}
+
+fn u(n: u64) -> Value {
+    Value::Number(Number::Int(n as i64))
+}
+
+fn opt_s(v: &Option<String>) -> Value {
+    v.as_deref().map(s).unwrap_or(Value::Null)
+}
+
+impl Reply {
+    /// Did the command succeed? (`false` only for [`Reply::Err`].)
+    pub fn is_ok(&self) -> bool {
+        !matches!(self, Reply::Err(_))
+    }
+
+    /// The single serializer: the exact wire object for this reply.
+    pub fn to_value(&self) -> Value {
+        let ok = ("ok", Value::Bool(true));
+        match self {
+            Reply::Err(msg) => obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]),
+            Reply::BoardEntry { key, entry } => obj(vec![
+                ok,
+                ("key", s(key)),
+                ("entry", entry.clone().unwrap_or(Value::Null)),
+            ]),
+            Reply::BoardList(board) => obj(vec![ok, ("board", board.clone())]),
+            Reply::BoardDel { key, deleted } => obj(vec![
+                ok,
+                ("key", s(key)),
+                ("deleted", Value::Bool(*deleted)),
+            ]),
+            Reply::BoardClaim {
+                key,
+                granted,
+                holder,
+                lease_ms,
+                entry,
+            } => obj(vec![
+                ok,
+                ("key", s(key)),
+                ("granted", Value::Bool(*granted)),
+                ("holder", opt_s(holder)),
+                ("lease_ms", u(*lease_ms)),
+                ("entry", entry.clone().unwrap_or(Value::Null)),
+            ]),
+            Reply::BoardRelease { key, released } => obj(vec![
+                ok,
+                ("key", s(key)),
+                ("released", Value::Bool(*released)),
+            ]),
+            Reply::BusPublished { event, subscribers } => obj(vec![
+                ok,
+                ("event", event.clone()),
+                ("subscribers", i(*subscribers)),
+            ]),
+            Reply::BusSubscribed(topics) => obj(vec![
+                ok,
+                (
+                    "subscribed",
+                    Value::Array(topics.iter().map(|t| s(t)).collect()),
+                ),
+            ]),
+            Reply::BusFeed { feed, cursor } => {
+                obj(vec![ok, ("feed", feed.clone()), ("cursor", u(*cursor))])
+            }
+            Reply::BusResolved { seq, resolved } => obj(vec![
+                ok,
+                ("seq", u(*seq)),
+                ("resolved", Value::Bool(*resolved)),
+            ]),
+            Reply::BusTopics(topics) => obj(vec![
+                ok,
+                (
+                    "topics",
+                    Value::Array(
+                        topics
+                            .iter()
+                            .map(|(topic, subs)| obj(vec![("topic", s(topic)), ("subs", i(*subs))]))
+                            .collect(),
+                    ),
+                ),
+            ]),
+            Reply::Spawned {
+                pane,
+                role,
+                session,
+                note,
+            } => obj(vec![
+                ok,
+                ("pane", i(pane.0)),
+                ("role", opt_s(role)),
+                ("session", opt_s(session)),
+                ("note", opt_s(note)),
+            ]),
+            Reply::Sent { target, queued } => obj(vec![
+                ok,
+                ("target", i(target.0)),
+                ("queued", Value::Bool(*queued)),
+            ]),
+            Reply::Killed(killed) => obj(vec![
+                ok,
+                (
+                    "killed",
+                    Value::Array(killed.iter().map(|id| i(id.0)).collect()),
+                ),
+            ]),
+            Reply::Audit {
+                entries,
+                oldest,
+                latest,
+            } => obj(vec![
+                ok,
+                ("audit", Value::Array(entries.clone())),
+                ("oldest_seq", oldest.map(u).unwrap_or(Value::Null)),
+                ("latest_seq", u(*latest)),
+            ]),
+            Reply::StatusOne {
+                pane,
+                status,
+                idle_ms,
+            } => obj(vec![
+                ok,
+                ("pane", i(pane.0)),
+                ("status", opt_s(status)),
+                ("idle_ms", u(*idle_ms)),
+            ]),
+            Reply::Tree(nodes) => obj(vec![
+                ok,
+                (
+                    "tree",
+                    Value::Array(
+                        nodes
+                            .iter()
+                            .map(|n| {
+                                obj(vec![
+                                    ("id", i(n.id.0)),
+                                    ("parent", n.parent.map(|p| i(p.0)).unwrap_or(Value::Null)),
+                                    ("role", opt_s(&n.role)),
+                                    ("title", s(&n.title)),
+                                    ("depth", i(n.depth)),
+                                    ("status", opt_s(&n.status)),
+                                    ("idle_ms", u(n.idle_ms)),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+        }
+    }
+
+    /// The reply as the one-line JSON the channel carries.
+    pub fn to_json(&self) -> String {
+        self.to_value().to_string()
+    }
+}
+
+impl std::fmt::Display for Reply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_value())
+    }
+}
+
 /// `{"ok":false,"err":"<msg>"}`
-pub fn reply_err(msg: &str) -> String {
-    obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]).to_string()
+pub fn reply_err(msg: &str) -> Reply {
+    Reply::Err(msg.to_string())
 }
 
 /// `{"ok":true,"key":<key>,"entry":<entry|null>}` — a board `get`/`set` result.
 /// `entry` (built by [`crate::board::entry_to_value`]) is `null` when the key is
 /// absent. The caller passes the rendered value so this layer stays independent of
 /// the board's internals.
-pub fn reply_board_entry(key: &str, entry: Option<Value>) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("key", s(key)),
-        ("entry", entry.unwrap_or(Value::Null)),
-    ])
-    .to_string()
+pub fn reply_board_entry(key: &str, entry: Option<Value>) -> Reply {
+    Reply::BoardEntry {
+        key: key.to_string(),
+        entry,
+    }
 }
 
 /// `{"ok":true,"board":[{key,by,ms,fields}, …]}` — the whole board (a `list`).
-pub fn reply_board_list(board: Value) -> String {
-    obj(vec![("ok", Value::Bool(true)), ("board", board)]).to_string()
+pub fn reply_board_list(board: Value) -> Reply {
+    Reply::BoardList(board)
 }
 
 /// `{"ok":true,"key":<key>,"deleted":<bool>}` — a board `del`.
-pub fn reply_board_del(key: &str, deleted: bool) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("key", s(key)),
-        ("deleted", Value::Bool(deleted)),
-    ])
-    .to_string()
+pub fn reply_board_del(key: &str, deleted: bool) -> Reply {
+    Reply::BoardDel {
+        key: key.to_string(),
+        deleted,
+    }
 }
 
 /// `{"ok":true,"key":<key>,"granted":<bool>,"holder":<who|null>,"lease_ms":<n>,
 /// "entry":<entry|null>}` — a board `claim`. On grant, `entry` carries the fresh
 /// claim; on denial, `holder`/`lease_ms` name who holds it and until when.
-pub fn reply_board_claim(key: &str, claim: &crate::board::Claim) -> String {
+pub fn reply_board_claim(key: &str, claim: &crate::board::Claim) -> Reply {
     use crate::board::{entry_to_value, Claim};
-    let (granted, holder, lease_ms, entry) = match claim {
-        Claim::Granted(e) => (
-            true,
-            e.claimed_by
-                .clone()
-                .map(Value::String)
-                .unwrap_or(Value::Null),
-            e.lease_ms,
-            entry_to_value(e),
-        ),
-        Claim::Denied { holder, lease_ms } => {
-            (false, Value::String(holder.clone()), *lease_ms, Value::Null)
-        }
-    };
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("key", s(key)),
-        ("granted", Value::Bool(granted)),
-        ("holder", holder),
-        ("lease_ms", Value::Number(Number::Int(lease_ms as i64))),
-        ("entry", entry),
-    ])
-    .to_string()
+    let key = key.to_string();
+    match claim {
+        Claim::Granted(e) => Reply::BoardClaim {
+            key,
+            granted: true,
+            holder: e.claimed_by.clone(),
+            lease_ms: e.lease_ms,
+            entry: Some(entry_to_value(e)),
+        },
+        Claim::Denied { holder, lease_ms } => Reply::BoardClaim {
+            key,
+            granted: false,
+            holder: Some(holder.clone()),
+            lease_ms: *lease_ms,
+            entry: None,
+        },
+    }
 }
 
 /// `{"ok":true,"key":<key>,"released":<bool>}` — a board `release`.
-pub fn reply_board_release(key: &str, released: bool) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("key", s(key)),
-        ("released", Value::Bool(released)),
-    ])
-    .to_string()
+pub fn reply_board_release(key: &str, released: bool) -> Reply {
+    Reply::BoardRelease {
+        key: key.to_string(),
+        released,
+    }
 }
 
 /// `{"ok":true,"event":<event>,"subscribers":<n>}` — a bus `pub` result: the
@@ -1236,47 +1475,27 @@ pub fn reply_board_release(key: &str, released: bool) -> String {
 /// is an **additive** field — existing consumers that read only `event`/`ok` are
 /// unaffected — and the client turns a `0` into a STDERR warning
 /// ([`zero_sub_warning`]), never touching this stdout JSON.
-pub fn reply_bus_published(event: Value, subscribers: usize) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("event", event),
-        ("subscribers", i(subscribers)),
-    ])
-    .to_string()
+pub fn reply_bus_published(event: Value, subscribers: usize) -> Reply {
+    Reply::BusPublished { event, subscribers }
 }
 
 /// `{"ok":true,"subscribed":[<topic>,…]}` — the caller's full topic set after a
 /// `sub`/`unsub`.
-pub fn reply_bus_subscribed(topics: Vec<String>) -> String {
-    let arr = topics.into_iter().map(Value::String).collect();
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("subscribed", Value::Array(arr)),
-    ])
-    .to_string()
+pub fn reply_bus_subscribed(topics: Vec<String>) -> Reply {
+    Reply::BusSubscribed(topics)
 }
 
 /// `{"ok":true,"feed":[<event>,…],"cursor":<seq>}` — the pulled events (already
 /// serialized + scoped by the caller) and the new cursor to pass as the next
 /// `--since`. `cursor` is the max seq returned, or the request's `since` when the
 /// pull was empty (so the cursor never goes backwards).
-pub fn reply_bus_feed(feed: Value, cursor: u64) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("feed", feed),
-        ("cursor", Value::Number(Number::Int(cursor as i64))),
-    ])
-    .to_string()
+pub fn reply_bus_feed(feed: Value, cursor: u64) -> Reply {
+    Reply::BusFeed { feed, cursor }
 }
 
 /// `{"ok":true,"seq":<seq>,"resolved":<bool>}` — a bus `resolve`.
-pub fn reply_bus_resolved(seq: u64, resolved: bool) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("seq", Value::Number(Number::Int(seq as i64))),
-        ("resolved", Value::Bool(resolved)),
-    ])
-    .to_string()
+pub fn reply_bus_resolved(seq: u64, resolved: bool) -> Reply {
+    Reply::BusResolved { seq, resolved }
 }
 
 /// `{"ok":true,"topics":[{"topic":<t>,"subs":<n>},…]}` — the active bus topics
@@ -1288,16 +1507,8 @@ pub fn reply_bus_resolved(seq: u64, resolved: bool) -> String {
 /// publishing to a topic nobody follows looks identical to publishing to a live
 /// one. `bus topics` makes the roster of live topics — and who is actually
 /// listening — visible before you publish.
-pub fn reply_bus_topics(topics: Vec<(String, usize)>) -> String {
-    let arr = topics
-        .into_iter()
-        .map(|(topic, subs)| obj(vec![("topic", s(&topic)), ("subs", i(subs))]))
-        .collect();
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("topics", Value::Array(arr)),
-    ])
-    .to_string()
+pub fn reply_bus_topics(topics: Vec<(String, usize)>) -> Reply {
+    Reply::BusTopics(topics)
 }
 
 /// Below this many milliseconds a pane is "active enough" that showing an idle
@@ -1367,76 +1578,54 @@ pub fn reply_spawned(
     role: Option<&str>,
     session: Option<&str>,
     note: Option<&str>,
-) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("pane", i(pane.0)),
-        ("role", role.map(s).unwrap_or(Value::Null)),
-        ("session", session.map(s).unwrap_or(Value::Null)),
-        ("note", note.map(s).unwrap_or(Value::Null)),
-    ])
-    .to_string()
+) -> Reply {
+    Reply::Spawned {
+        pane,
+        role: role.map(str::to_string),
+        session: session.map(str::to_string),
+        note: note.map(str::to_string),
+    }
 }
 
 /// `{"ok":true,"target":<id>,"queued":<bool>}` — a `send` was accepted. `queued`
 /// is true when the target was busy (delivery waits for it to go idle), false
 /// when it will go out immediately. Delivery itself is asynchronous.
-pub fn reply_sent(target: AgentId, queued: bool) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("target", i(target.0)),
-        ("queued", Value::Bool(queued)),
-    ])
-    .to_string()
+pub fn reply_sent(target: AgentId, queued: bool) -> Reply {
+    Reply::Sent { target, queued }
 }
 
 /// `{"ok":true,"killed":[<id>,…]}` — the set of panes torn down by a `kill`
 /// (the target plus every descendant), sorted. Empty only if the target
 /// vanished between resolve and teardown.
-pub fn reply_killed(killed: &[AgentId]) -> String {
-    let arr = killed.iter().map(|id| i(id.0)).collect();
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("killed", Value::Array(arr)),
-    ])
-    .to_string()
+pub fn reply_killed(killed: &[AgentId]) -> Reply {
+    Reply::Killed(killed.to_vec())
 }
 
 /// `{"ok":true,"audit":[<entry>,…]}` — the (already-serialized, already-scoped)
 /// audit entries, oldest-first. The caller builds each entry `Value` from its
 /// own log so this crate stays free of the log's storage type.
-pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> String {
+pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> Reply {
     // `oldest`/`latest` make eviction VISIBLE. The ring is bounded and drops the
     // tail without saying so, so a consumer could not distinguish "nothing
     // happened before this" from "the log has already rolled". `oldest > 1` means
     // entries are gone for good.
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("audit", Value::Array(entries)),
-        (
-            "oldest_seq",
-            match oldest {
-                Some(n) => Value::Number(Number::Int(n as i64)),
-                None => Value::Null,
-            },
-        ),
-        ("latest_seq", Value::Number(Number::Int(latest as i64))),
-    ])
-    .to_string()
+    Reply::Audit {
+        entries,
+        oldest,
+        latest,
+    }
 }
 
 /// `{"ok":true,"pane":<id>,"status":"<label>","idle_ms":<n>}` — a single target's
 /// status. `idle_ms` is the same **additive** u64-millisecond field as on
 /// [`reply_list`] nodes (`0` when active); the baseline `{pane,status}` keys are
 /// unchanged.
-pub fn reply_status_one(pane: AgentId, status: Option<&str>, idle_ms: u64) -> String {
-    obj(vec![
-        ("ok", Value::Bool(true)),
-        ("pane", i(pane.0)),
-        ("status", status.map(s).unwrap_or(Value::Null)),
-        ("idle_ms", Value::Number(Number::Int(idle_ms as i64))),
-    ])
-    .to_string()
+pub fn reply_status_one(pane: AgentId, status: Option<&str>, idle_ms: u64) -> Reply {
+    Reply::StatusOne {
+        pane,
+        status: status.map(str::to_string),
+        idle_ms,
+    }
 }
 
 /// One node in the org chart, as the run loop knows it. `idle_ms` is how long
@@ -1456,22 +1645,21 @@ pub struct TreeNode<'a> {
 /// baseline keys `{id,parent,role,title,depth,status}` are unchanged; `idle_ms`
 /// is an **additive** node field (u64 milliseconds, `0` when active) so consumers
 /// that ignore unknown keys still parse.
-pub fn reply_list(nodes: &[TreeNode]) -> String {
-    let arr = nodes
-        .iter()
-        .map(|n| {
-            obj(vec![
-                ("id", i(n.id.0)),
-                ("parent", n.parent.map(|p| i(p.0)).unwrap_or(Value::Null)),
-                ("role", n.role.map(s).unwrap_or(Value::Null)),
-                ("title", s(n.title)),
-                ("depth", i(n.depth)),
-                ("status", n.status.map(s).unwrap_or(Value::Null)),
-                ("idle_ms", Value::Number(Number::Int(n.idle_ms as i64))),
-            ])
-        })
-        .collect();
-    obj(vec![("ok", Value::Bool(true)), ("tree", Value::Array(arr))]).to_string()
+pub fn reply_list(nodes: &[TreeNode]) -> Reply {
+    Reply::Tree(
+        nodes
+            .iter()
+            .map(|n| ListNode {
+                id: n.id,
+                parent: n.parent,
+                role: n.role.map(str::to_string),
+                title: n.title.to_string(),
+                depth: n.depth,
+                status: n.status.map(str::to_string),
+                idle_ms: n.idle_ms,
+            })
+            .collect(),
+    )
 }
 
 // ---- client --------------------------------------------------------------
@@ -2299,7 +2487,7 @@ mod tests {
     #[test]
     fn reply_bus_topics_shape_is_topic_and_subs() {
         let json = reply_bus_topics(vec![("deploy".to_string(), 2), ("billing".to_string(), 0)]);
-        let parsed = json::parse(&json).unwrap();
+        let parsed = json::parse(&json.to_json()).unwrap();
         assert_eq!(parsed.get("ok").and_then(Value::as_bool), Some(true));
         let arr = parsed.get("topics").and_then(Value::as_array).unwrap();
         assert_eq!(arr.len(), 2);
@@ -2312,7 +2500,7 @@ mod tests {
     #[test]
     fn render_bus_topics_lists_topic_and_count() {
         let json = reply_bus_topics(vec![("deploy".to_string(), 3)]);
-        let view = render_bus(&json, true).expect("topics reply must render");
+        let view = render_bus(&json.to_json(), true).expect("topics reply must render");
         assert!(view.contains("deploy"), "names the topic: {view:?}");
         assert!(view.contains("subs=3"), "shows the count: {view:?}");
     }
@@ -2321,7 +2509,7 @@ mod tests {
     fn render_bus_topics_empty_is_explicit() {
         let json = reply_bus_topics(vec![]);
         assert_eq!(
-            render_bus(&json, true).as_deref(),
+            render_bus(&json.to_json(), true).as_deref(),
             Some("  (no active topics)")
         );
     }
@@ -2349,7 +2537,7 @@ mod tests {
     #[test]
     fn reply_status_one_carries_idle_ms_additively() {
         let json = reply_status_one(AgentId(2), Some("working"), 7_000);
-        let v = json::parse(&json).unwrap();
+        let v = json::parse(&json.to_json()).unwrap();
         assert_eq!(v.get("pane").and_then(Value::as_i64), Some(2));
         assert_eq!(v.get("status").and_then(Value::as_str), Some("working"));
         assert_eq!(v.get("idle_ms").and_then(Value::as_i64), Some(7_000));
@@ -3227,7 +3415,7 @@ mod tests {
                 lease_ms: 1100,
             },
         );
-        let view = render_board(&reply, true).expect("claim reply renders");
+        let view = render_board(&reply.to_json(), true).expect("claim reply renders");
         assert!(view.contains("held by scout"), "view was: {view}");
         // A granted claim shows the confirmation.
         let e = crate::board::Entry {
@@ -3236,7 +3424,7 @@ mod tests {
             ..Default::default()
         };
         let granted = reply_board_claim("cli", &crate::board::Claim::Granted(e));
-        let gview = render_board(&granted, true).expect("granted renders");
+        let gview = render_board(&granted.to_json(), true).expect("granted renders");
         assert!(gview.contains("claimed cli"), "view was: {gview}");
     }
 
@@ -3418,7 +3606,7 @@ mod tests {
     #[test]
     fn reply_killed_lists_the_torn_down_panes() {
         let r = reply_killed(&[AgentId(1), AgentId(2), AgentId(3)]);
-        let v = json::parse(&r).unwrap();
+        let v = json::parse(&r.to_json()).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(
             v.get("killed").and_then(Value::as_array).map(<[_]>::len),
@@ -3429,7 +3617,7 @@ mod tests {
     #[test]
     fn reply_builders_are_valid_json() {
         let spawned = reply_spawned(AgentId(3), Some("dev_1"), Some("abc-123"), None);
-        let v = json::parse(&spawned).unwrap();
+        let v = json::parse(&spawned.to_json()).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(true));
         assert_eq!(v.get("pane").and_then(Value::as_i64), Some(3));
         assert!(matches!(v.get("note"), Some(Value::Null)));
@@ -3441,7 +3629,7 @@ mod tests {
             None,
             Some("stripped --dangerously-skip-permissions"),
         );
-        let nv = json::parse(&noted).unwrap();
+        let nv = json::parse(&noted.to_json()).unwrap();
         assert_eq!(
             nv.get("note").and_then(Value::as_str),
             Some("stripped --dangerously-skip-permissions")
@@ -3457,7 +3645,7 @@ mod tests {
             idle_ms: 4_000,
         }];
         let listed = reply_list(&nodes);
-        let v = json::parse(&listed).unwrap();
+        let v = json::parse(&listed.to_json()).unwrap();
         assert_eq!(
             v.get("tree").and_then(Value::as_array).map(<[_]>::len),
             Some(1)
@@ -3470,7 +3658,167 @@ mod tests {
         }
 
         let err = reply_err("nope");
-        let v = json::parse(&err).unwrap();
+        let v = json::parse(&err.to_json()).unwrap();
         assert_eq!(v.get("ok").and_then(Value::as_bool), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod reply_wire_golden {
+    use super::*;
+
+    fn entry() -> crate::board::Entry {
+        let mut b = crate::board::Board::new();
+        b.set(
+            "cli",
+            &[("status".to_string(), "wip".to_string())],
+            Some("lead"),
+            1_000,
+        );
+        let c = b.claim("cli", "dev_1", 5_000, 2_000);
+        match c {
+            crate::board::Claim::Granted(e) => e,
+            _ => panic!("expected grant"),
+        }
+    }
+
+    /// The exact bytes the hand-written `reply_*` builders produced before the
+    /// `Reply` enum (r10 B12), captured by running that code. External consumers
+    /// parse this JSON; the enum must not change a byte.
+    fn golden(name: &str) -> &'static str {
+        match name {
+            "err" => r#"{"ok":false,"err":"no \"pane\" here"}"#,
+            "board_entry_some" => r#"{"ok":true,"key":"k","entry":{"a":1}}"#,
+            "board_entry_none" => r#"{"ok":true,"key":"k","entry":null}"#,
+            "board_list" => r#"{"ok":true,"board":[]}"#,
+            "board_del" => r#"{"ok":true,"key":"k","deleted":true}"#,
+            "board_claim_granted" => {
+                r#"{"ok":true,"key":"cli","granted":true,"holder":"dev_1","lease_ms":7000,"entry":{"by":"dev_1","ms":2000,"claimed_by":"dev_1","lease_ms":7000,"fields":{"status":"wip"}}}"#
+            }
+            "board_claim_denied" => {
+                r#"{"ok":true,"key":"cli","granted":false,"holder":"dev_2","lease_ms":9,"entry":null}"#
+            }
+            "board_release" => r#"{"ok":true,"key":"k","released":false}"#,
+            "bus_published" => {
+                r#"{"ok":true,"event":{"seq":4,"topic":"deploy","kind":"fyi"},"subscribers":0}"#
+            }
+            "bus_subscribed" => r#"{"ok":true,"subscribed":["a","b"]}"#,
+            "bus_feed" => r#"{"ok":true,"feed":[],"cursor":12}"#,
+            "bus_resolved" => r#"{"ok":true,"seq":7,"resolved":true}"#,
+            "bus_topics" => {
+                r#"{"ok":true,"topics":[{"topic":"deploy","subs":2},{"topic":"x","subs":0}]}"#
+            }
+            "spawned" => r#"{"ok":true,"pane":3,"role":"dev_1","session":null,"note":"note"}"#,
+            "sent" => r#"{"ok":true,"target":2,"queued":true}"#,
+            "killed" => r#"{"ok":true,"killed":[1,4]}"#,
+            "audit_some" => r#"{"ok":true,"audit":[{"seq":1}],"oldest_seq":1,"latest_seq":5}"#,
+            "audit_none" => r#"{"ok":true,"audit":[],"oldest_seq":null,"latest_seq":0}"#,
+            "status_one" => r#"{"ok":true,"pane":2,"status":"working","idle_ms":7000}"#,
+            "status_one_none" => r#"{"ok":true,"pane":2,"status":null,"idle_ms":0}"#,
+            "list" => {
+                r#"{"ok":true,"tree":[{"id":0,"parent":null,"role":"ceo","title":"claude","depth":0,"status":"working","idle_ms":4000},{"id":1,"parent":0,"role":null,"title":"sh","depth":1,"status":null,"idle_ms":0}]}"#
+            }
+            other => panic!("no golden for {other}"),
+        }
+    }
+
+    #[test]
+    fn every_reply_serializes_byte_identically_to_the_pre_enum_builders() {
+        let ev = json::parse(r#"{"seq":4,"topic":"deploy","kind":"fyi"}"#).unwrap();
+        let cases: Vec<(&str, String)> = vec![
+            ("err", reply_err("no \"pane\" here").to_string()),
+            (
+                "board_entry_some",
+                reply_board_entry("k", Some(json::parse(r#"{"a":1}"#).unwrap())).to_string(),
+            ),
+            ("board_entry_none", reply_board_entry("k", None).to_string()),
+            (
+                "board_list",
+                reply_board_list(json::parse("[]").unwrap()).to_string(),
+            ),
+            ("board_del", reply_board_del("k", true).to_string()),
+            (
+                "board_claim_granted",
+                reply_board_claim("cli", &crate::board::Claim::Granted(entry())).to_string(),
+            ),
+            (
+                "board_claim_denied",
+                reply_board_claim(
+                    "cli",
+                    &crate::board::Claim::Denied {
+                        holder: "dev_2".into(),
+                        lease_ms: 9,
+                    },
+                )
+                .to_string(),
+            ),
+            ("board_release", reply_board_release("k", false).to_string()),
+            (
+                "bus_published",
+                reply_bus_published(ev.clone(), 0).to_string(),
+            ),
+            (
+                "bus_subscribed",
+                reply_bus_subscribed(vec!["a".into(), "b".into()]).to_string(),
+            ),
+            (
+                "bus_feed",
+                reply_bus_feed(json::parse("[]").unwrap(), 12).to_string(),
+            ),
+            ("bus_resolved", reply_bus_resolved(7, true).to_string()),
+            (
+                "bus_topics",
+                reply_bus_topics(vec![("deploy".into(), 2), ("x".into(), 0)]).to_string(),
+            ),
+            (
+                "spawned",
+                reply_spawned(AgentId(3), Some("dev_1"), None, Some("note")).to_string(),
+            ),
+            ("sent", reply_sent(AgentId(2), true).to_string()),
+            (
+                "killed",
+                reply_killed(&[AgentId(1), AgentId(4)]).to_string(),
+            ),
+            (
+                "audit_some",
+                reply_audit(vec![json::parse(r#"{"seq":1}"#).unwrap()], Some(1), 5).to_string(),
+            ),
+            ("audit_none", reply_audit(vec![], None, 0).to_string()),
+            (
+                "status_one",
+                reply_status_one(AgentId(2), Some("working"), 7_000).to_string(),
+            ),
+            (
+                "status_one_none",
+                reply_status_one(AgentId(2), None, 0).to_string(),
+            ),
+            (
+                "list",
+                reply_list(&[
+                    TreeNode {
+                        id: AgentId(0),
+                        parent: None,
+                        role: Some("ceo"),
+                        title: "claude",
+                        depth: 0,
+                        status: Some("working"),
+                        idle_ms: 4_000,
+                    },
+                    TreeNode {
+                        id: AgentId(1),
+                        parent: Some(AgentId(0)),
+                        role: None,
+                        title: "sh",
+                        depth: 1,
+                        status: None,
+                        idle_ms: 0,
+                    },
+                ])
+                .to_string(),
+            ),
+        ];
+        for (name, json) in cases {
+            assert_eq!(json, golden(name), "wire drift in reply {name:?}");
+        }
     }
 }

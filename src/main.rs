@@ -2175,7 +2175,7 @@ fn run(
                             &mut bus,
                             &session_job,
                         );
-                        let _ = listener.respond(&reply);
+                        let _ = listener.respond(&reply.to_json());
                         prev_master = None;
                         force_repaint = true;
                     }
@@ -2928,7 +2928,7 @@ fn apply_ctl(
     board: &mut atrium::board::Board,
     bus: &mut atrium::bus::Bus,
     job: &atrium::reap::SessionJob,
-) -> String {
+) -> atrium::ctl::Reply {
     use atrium::ctl::{self, Cmd};
 
     let req = match ctl::parse_request(line) {
@@ -3081,7 +3081,7 @@ fn dispatch_ctl(
     board: &mut atrium::board::Board,
     bus: &mut atrium::bus::Bus,
     job: &atrium::reap::SessionJob,
-) -> String {
+) -> atrium::ctl::Reply {
     use atrium::ctl::{self, Cmd};
 
     match req.cmd {
@@ -3489,36 +3489,23 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Read `(ok, note)` back out of a reply line for the audit record: the error on
-/// failure, or a compact success tag naming the salient id(s).
-fn audit_outcome(reply: &str) -> (bool, String) {
-    let v = match json::parse(reply) {
-        Ok(v) => v,
-        Err(_) => return (false, "unparseable reply".to_string()),
-    };
-    let ok = v.get("ok").and_then(json::Value::as_bool).unwrap_or(false);
-    if !ok {
-        return (
-            false,
-            v.get("err")
-                .and_then(json::Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        );
-    }
-    let note = if let Some(p) = v.get("pane").and_then(json::Value::as_i64) {
-        format!("pane={p}")
-    } else if let Some(k) = v.get("killed").and_then(json::Value::as_array) {
-        let ids: Vec<String> = k
-            .iter()
-            .filter_map(json::Value::as_i64)
-            .map(|n| n.to_string())
-            .collect();
-        format!("killed={}", ids.join(","))
-    } else if let Some(t) = v.get("target").and_then(json::Value::as_i64) {
-        format!("target={t}")
-    } else {
-        String::new()
+/// `(ok, note)` for the audit record: the error on failure, or a compact success
+/// tag naming the salient id(s). Read from the typed [`atrium::ctl::Reply`] — it
+/// used to re-parse the server's own JSON reply by string keys (r10 audit B12).
+fn audit_outcome(reply: &atrium::ctl::Reply) -> (bool, String) {
+    use atrium::ctl::Reply;
+    let note = match reply {
+        Reply::Err(msg) => return (false, msg.clone()),
+        Reply::Spawned { pane, .. } | Reply::StatusOne { pane, .. } => format!("pane={pane}"),
+        Reply::Killed(ids) => format!(
+            "killed={}",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Reply::Sent { target, .. } => format!("target={target}"),
+        _ => String::new(),
     };
     (true, note)
 }
@@ -3532,7 +3519,7 @@ fn audit_reply(
     caller: Option<AgentId>,
     privileged: bool,
     tail: Option<usize>,
-) -> String {
+) -> atrium::ctl::Reply {
     let entries = if privileged {
         audit.view(tail, |_| true)
     } else if let Some(root) = caller {
@@ -3559,7 +3546,7 @@ fn reply_tree(
     windows: &[Window],
     world: &atrium::vendors::VendorWorlds,
     root: Option<AgentId>,
-) -> String {
+) -> atrium::ctl::Reply {
     let parents = ctl_parents(windows);
     let mut panes: Vec<&Pane> = windows
         .iter()
@@ -3595,7 +3582,7 @@ fn scope_denied(
     caller: Option<AgentId>,
     privileged: bool,
     target: AgentId,
-) -> Option<String> {
+) -> Option<atrium::ctl::Reply> {
     if privileged {
         return None;
     }
@@ -3648,7 +3635,7 @@ fn spawn_worker_window(
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
     job: &atrium::reap::SessionJob,
-) -> String {
+) -> atrium::ctl::Reply {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
         Ok(pair) => pair,
@@ -3701,7 +3688,7 @@ fn spawn_worker_here(
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
     job: &atrium::reap::SessionJob,
-) -> String {
+) -> atrium::ctl::Reply {
     let Some(caller_id) = caller else {
         return atrium::ctl::reply_err(
             "`--here` needs a caller pane; run it from inside an atrium pane",
@@ -4499,9 +4486,40 @@ fn effective_command(command: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_command, combine_system_prompt, pane_base_env, privilege_for, routed_wake,
-        sanitize_shim_arg, surface_once, worktree_spawn_params,
+        assemble_command, audit_outcome, combine_system_prompt, pane_base_env, privilege_for,
+        routed_wake, sanitize_shim_arg, surface_once, worktree_spawn_params,
     };
+
+    // -- audit_outcome over the typed Reply (r10 B12) ------------------------
+
+    #[test]
+    fn audit_outcome_names_the_salient_ids_from_the_typed_reply() {
+        use atrium::ctl::{self, AgentId};
+        assert_eq!(
+            audit_outcome(&ctl::reply_err("nope")),
+            (false, "nope".to_string())
+        );
+        assert_eq!(
+            audit_outcome(&ctl::reply_spawned(AgentId(3), Some("dev"), None, None)),
+            (true, "pane=3".to_string())
+        );
+        assert_eq!(
+            audit_outcome(&ctl::reply_status_one(AgentId(2), None, 0)),
+            (true, "pane=2".to_string())
+        );
+        assert_eq!(
+            audit_outcome(&ctl::reply_killed(&[AgentId(1), AgentId(4)])),
+            (true, "killed=1,4".to_string())
+        );
+        assert_eq!(
+            audit_outcome(&ctl::reply_sent(AgentId(5), false)),
+            (true, "target=5".to_string())
+        );
+        assert_eq!(
+            audit_outcome(&ctl::reply_bus_resolved(7, true)),
+            (true, String::new())
+        );
+    }
 
     // -- surface_once (r10 B8) -------------------------------------------------
 

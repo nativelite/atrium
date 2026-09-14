@@ -73,6 +73,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   share one separated/glued flag tokenizer (`argv::valued_flag`). The `/bin/ps`
   path and pid-column parsing used by the crash sweep, orphan scan and warden
   are single-sourced (`reap::PS_PATH`, `reap::pid_columns`).
+- **Control replies are a typed `ctl::Reply` enum.** The ~17 `reply_*` builders
+  each hand-assembled JSON from string keys, and the server re-parsed its own
+  reply to fill the audit log. Every reply shape is now a `Reply` variant with
+  one serializer (`Reply::to_value` / `to_json`); the builders return it, the
+  server keeps it typed until the socket write, and the audit outcome is read
+  from the enum. The wire JSON is byte-identical — pinned by a golden test whose
+  21 expected strings were captured by running the pre-enum builders. (r10 audit
+  B12; `reply_*` now return `Reply` instead of `String`.)
 - **`bar::PaneInfo` carries `attention: Attention` instead of three bools**
   (`activity`, `exited`, `waiting`), so contradictory combinations can't be
   built and the exit-over-waiting-over-activity precedence lives in
