@@ -41,6 +41,7 @@ mod overlay_keys;
 mod overview;
 mod pane_spawn;
 mod panels;
+mod safety_net;
 mod tiled;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
@@ -50,6 +51,7 @@ pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
 pub(crate) use panels::*;
+pub(crate) use safety_net::*;
 pub(crate) use tiled::*;
 
 /// A process-global, monotonic **agent id** stamped on every pane atrium hosts —
@@ -1125,6 +1127,15 @@ fn run(
     // holds the current frame (for diffing next tick) and the other is cleared
     // and overwritten. At most one fresh allocation per full-repaint reset.
     let mut tiled_buf: Option<ansi::Screen> = None;
+    // Session teardown container: on Windows a kill-on-close Job Object so no pane
+    // tree outlives atrium however it dies (TerminateProcess included); a no-op on
+    // unix (the process-group teardown + watchdog below already cover the tree).
+    // Held for the whole run — dropping it (or the process exiting) fires the
+    // guarantee. Panes never inherit its handle, so they live until atrium exits.
+    let session_job = atrium::reap::SessionJob::create();
+    // The crash registry, session snapshot, warden and orphan watchdog (loop
+    // phase 0b); see `safety_net`.
+    let mut safety_net = SafetyNet::new();
     // The last view identity (window / zoom / focused pane / overlay / size). A
     // passthrough (single or zoomed) pane only gets the heavy repaint nudge
     // (clear + resize) on a *real* transition — never on a routine `force_repaint`
@@ -1132,46 +1143,6 @@ fn run(
     // is cleared several times a second (every ctl request forces a repaint),
     // which reads as paint corruption and makes text selection impossible (the
     // clear wipes the drag). Sentinel start so the first frame counts as a change.
-    // The crash registry: the pane process groups a watchdog should kill if this
-    // process dies without running any teardown at all.
-    let registry_path = atrium::reap::registry_path(std::process::id());
-    let snapshot_path =
-        atrium::reap::registry_dir().join(format!("atrium-session-{}.json", std::process::id()));
-    let mut last_snapshot: Option<atrium::session::Snapshot> = None;
-    let mut last_snapshot_check = Instant::now();
-    // The warden: tripwires, not gates. atrium cannot stop an agent that can run
-    // commands from launching an unconstrained one (it could run claude directly
-    // with no atrium at all), so what it CAN do is notice - its own binary being
-    // edited to remove the ceiling, the registry that ceiling is read from being
-    // tampered with, or a session appearing that the ancestry cap did not explain.
-    let mut warden = atrium::warden::Warden::new(registry_path.clone());
-    let mut last_warden_check = Instant::now();
-    let mut cap_notice_raised = false;
-    let mut registered: Vec<u32> = Vec::new();
-    // Registry persistence state: `registry_dirty` = `registered` not yet on disk;
-    // `registry_failing` = the last attempt failed (surfaced once per streak);
-    // `registry_retry_at` = earliest next attempt after a failure.
-    let mut registry_dirty = false;
-    let mut registry_failing = false;
-    let mut registry_retry_at: Option<Instant> = None;
-    // A failing session snapshot is surfaced once per failure streak.
-    let mut snapshot_failing = false;
-    // Session teardown container: on Windows a kill-on-close Job Object so no pane
-    // tree outlives atrium however it dies (TerminateProcess included); a no-op on
-    // unix (the process-group teardown + watchdog below already cover the tree).
-    // Held for the whole run — dropping it (or the process exiting) fires the
-    // guarantee. Panes never inherit its handle, so they live until atrium exits.
-    let session_job = atrium::reap::SessionJob::create();
-    // Held for the whole run: dropping this Child closes the pipe atrium uses as its
-    // death signal, which would fire the watchdog early. Unix only — on Windows
-    // the Job Object replaces it (a watchdog there can't signal a process group
-    // and would block on its pipe forever, R5).
-    #[cfg(unix)]
-    let mut watchdog: Option<std::process::Child> = None;
-    #[cfg(unix)]
-    let mut watchdog_failing = false;
-    #[cfg(unix)]
-    let mut watchdog_retry_at: Option<Instant> = None;
     let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
         (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
 
@@ -1191,145 +1162,10 @@ fn run(
             }
             break 'outer;
         }
-        // 0b. Keep the crash registry current. Rewritten only when the pane set
-        // changes, so an idle session does no filesystem work; the watchdog
-        // re-reads it at teardown, which is how panes opened later are covered.
-        {
-            let cur: Vec<u32> = windows
-                .iter()
-                .flat_map(|w| w.panes.iter().map(|p| p.pty.pid()))
-                .filter(|p| *p != 0)
-                .collect();
-            if cur != registered {
-                // Assign any newly-appeared pane to the session job so its whole
-                // tree is torn down with atrium (no-op on unix). Only the new pids,
-                // so a process is never re-assigned.
-                for pid in cur.iter().filter(|p| !registered.contains(p)) {
-                    session_job.assign(*pid);
-                }
-                registered = cur;
-                registry_dirty = true;
-                registry_retry_at = None;
-                let saved = snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
-                surface_once(&mut snapshot_failing, saved, "session snapshot", &mut flash);
-                last_snapshot_check = Instant::now();
-            }
-            // Persist it. A failed write is neither dropped nor recorded as done
-            // (r10 audit B2): the warden keeps its baseline, the failure is
-            // surfaced once per streak (audit + bus + bar), and it is retried on
-            // the warden cadence until it lands.
-            if registry_dirty && registry_retry_at.map_or(true, |t| Instant::now() >= t) {
-                let written = atrium::reap::write_registry(
-                    &registry_path,
-                    &registered,
-                    trust_mode().policy_label(),
-                );
-                match warden.record_registry_write(&written) {
-                    None => {
-                        if registry_failing {
-                            flash = Some(("crash registry updated".to_string(), Instant::now()));
-                            force_repaint = true;
-                        }
-                        registry_dirty = false;
-                        registry_failing = false;
-                        registry_retry_at = None;
-                    }
-                    Some(alert) => {
-                        if !registry_failing {
-                            registry_failing = true;
-                            ctl_audit.record(None, alert.kind, &alert.detail, false, "");
-                            // The bar carries it whether or not the bus accepts it.
-                            let _ = bus.publish(
-                                "warden",
-                                atrium::bus::Kind::DecisionNeeded,
-                                None,
-                                &[("msg".to_string(), alert.detail.clone())],
-                                agsess::sessions::now_ms(),
-                            );
-                            flash = Some((alert.detail, Instant::now()));
-                            force_repaint = true;
-                        }
-                        registry_retry_at = Some(Instant::now() + WARDEN_INTERVAL);
-                    }
-                }
-            }
-            if last_snapshot_check.elapsed() >= SNAPSHOT_INTERVAL {
-                last_snapshot_check = Instant::now();
-                let saved = snapshot_if_changed(&windows, &snapshot_path, &mut last_snapshot);
-                surface_once(&mut snapshot_failing, saved, "session snapshot", &mut flash);
-            }
-            if last_warden_check.elapsed() >= WARDEN_INTERVAL {
-                last_warden_check = Instant::now();
-                // The live pane pids double as the second descent signal: `pty`
-                // makes each pane a session leader, so anything the agent spawns
-                // in a pane carries that session id even after a double-fork has
-                // erased its parent link.
-                let mut alerts = warden.check(&registered);
-                // The ancestry cap fired before the bus existed; raise it once now.
-                if let Some(note) = CAP_NOTICE.get() {
-                    if !cap_notice_raised {
-                        cap_notice_raised = true;
-                        alerts.push(atrium::warden::Alert {
-                            kind: "warden-nested-atrium",
-                            detail: note.clone(),
-                        });
-                    }
-                }
-                for alert in alerts {
-                    ctl_audit.record(None, alert.kind, &alert.detail, false, "");
-                    // A decision, not an FYI: these are exactly the events that
-                    // should stop the operator rather than scroll past them.
-                    // If the bus refuses it (rate/size cap), the audit record above
-                    // is a log, not an alert: put the decision in the bar instead
-                    // of losing the operator-facing signal (r10 audit B8).
-                    if let Err(e) = bus.publish(
-                        "warden",
-                        atrium::bus::Kind::DecisionNeeded,
-                        None,
-                        &[("msg".to_string(), alert.detail.clone())],
-                        agsess::sessions::now_ms(),
-                    ) {
-                        flash = Some((
-                            format!("warden: {} (bus refused: {e})", alert.detail),
-                            Instant::now(),
-                        ));
-                    }
-                    force_repaint = true;
-                }
-                // There is no enforcement branch here any more, and that is a
-                // decision rather than an omission: `ATRIUM_WARDEN=enforce` used to
-                // tear down anything judged an escapee, and both the judgement and
-                // the kill were unsound. `warden`'s module docs carry the full
-                // reasoning; the short version is that under a correct ancestry
-                // rule the enforceable set is empty, the only sessions left to
-                // accuse are indistinguishable from an ordinary reparenting, and
-                // the kill target was read out of a file the accused could write.
-            }
-            // The watchdog is the unix answer to a death no handler can catch.
-            // Windows does not need it and must not run it: the durable fix there
-            // is a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, which the
-            // kernel honours however atrium dies. A watchdog on Windows would spawn
-            // a second atrium that cannot signal a process group (`reap`'s
-            // non-unix `signal_group` returns false) and would sit blocked on its
-            // pipe forever. The Job Object attaches just above (`session_job`),
-            // in this same pane-set-changed block.
-            #[cfg(unix)]
-            if watchdog.is_none()
-                && !registered.is_empty()
-                && watchdog_retry_at.map_or(true, |t| Instant::now() >= t)
-            {
-                // A failed spawn is retried on the warden cadence (not every tick)
-                // and surfaced once, so a safety net that never comes up is visible
-                // (r10 audit B8).
-                let spawned = atrium::reap::spawn_watchdog(&registry_path);
-                watchdog_retry_at = spawned.is_err().then(|| Instant::now() + WARDEN_INTERVAL);
-                watchdog = surface_once(
-                    &mut watchdog_failing,
-                    spawned,
-                    "orphan watchdog (pane trees may outlive a crash)",
-                    &mut flash,
-                );
-            }
+        // 0b. The safety net: crash registry, session snapshot, warden tripwires,
+        // and (unix) the orphan watchdog.
+        if safety_net.tick(&windows, &session_job, &mut ctl_audit, &mut bus, &mut flash) {
+            force_repaint = true;
         }
         // 1. keystrokes -> scanner -> focused pane / commands
         let bytes = match term.read_bytes(Duration::from_millis(15)) {
@@ -2153,7 +1989,11 @@ fn run(
     // the watchdog then TERMs and KILLs precisely what is left, and a later
     // `atrium reap` finds the same short list rather than a stale full one. Panes
     // that did die are dropped from it, because a dead pane's pgid can be reused.
-    match atrium::reap::settle_registry(&registry_path, &survivors, trust_mode().policy_label()) {
+    match atrium::reap::settle_registry(
+        safety_net.registry_path(),
+        &survivors,
+        trust_mode().policy_label(),
+    ) {
         Ok(false) => {}
         Ok(true) => eprintln!(
             "atrium: warning: {} pane process group(s) survived teardown: {:?}",
@@ -2165,7 +2005,7 @@ fn run(
         Err(e) => eprintln!(
             "atrium: warning: could not update the crash registry {}: {e}; surviving pane \
              process group(s), if any, are not recorded for the watchdog: {:?}",
-            registry_path.display(),
+            safety_net.registry_path().display(),
             survivors
         ),
     }
