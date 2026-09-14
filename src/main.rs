@@ -41,6 +41,7 @@ mod overlay_keys;
 mod overview;
 mod pane_spawn;
 mod panels;
+mod renderer;
 mod safety_net;
 mod tiled;
 pub(crate) use ctl_server::*;
@@ -51,6 +52,7 @@ pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
 pub(crate) use panels::*;
+pub(crate) use renderer::*;
 pub(crate) use safety_net::*;
 pub(crate) use tiled::*;
 
@@ -1073,20 +1075,7 @@ fn run(
     let mut prompt: Option<String> = None;
     let mut buf = [0u8; 8192];
     let mut force_repaint = true;
-    let mut last_bar_paint = Instant::now();
     let mut last_size_check = Instant::now();
-    // Animation clock for the per-pane loading spinner (advances ~8 frames/sec).
-    // A blank (still-booting) pane's spinner changes with this, so the tiled diff
-    // repaints just those cells; once every pane has painted, the frame no longer
-    // affects the master, so it stops driving repaints.
-    let anim_start = Instant::now();
-    // The spinner frame last painted by the passthrough startup splash, so it
-    // redraws only when the frame advances (not every tick).
-    let mut last_splash_frame: usize = usize::MAX;
-    // The spin_frame value used by the last tiled composite. When any pane is
-    // still loading, a new spin_frame means new spinner content → must re-composite.
-    let mut last_tiled_spin: usize = usize::MAX;
-    let mut last_bar = String::new();
 
     // Agent session state (§5): one read-only `agsess::World` over the Claude
     // projects root, polled on the loop's existing `Instant`-throttle pattern —
@@ -1119,14 +1108,6 @@ fn run(
     world.refresh_since(process_start_ms);
     let mut last_agent_poll = Instant::now();
     let mut last_agent_discover = Instant::now();
-    // The previous composited master, kept per-frame so tiled mode diffs. Reset
-    // to None (full repaint) on mode/layout/window changes.
-    let mut prev_master: Option<ansi::Screen> = None;
-    // A persistent scratch buffer written into each tiled frame. After every
-    // render it swaps with `prev_master` so neither allocation is freed: one
-    // holds the current frame (for diffing next tick) and the other is cleared
-    // and overwritten. At most one fresh allocation per full-repaint reset.
-    let mut tiled_buf: Option<ansi::Screen> = None;
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
     // tree outlives atrium however it dies (TerminateProcess included); a no-op on
     // unix (the process-group teardown + watchdog below already cover the tree).
@@ -1136,15 +1117,9 @@ fn run(
     // The crash registry, session snapshot, warden and orphan watchdog (loop
     // phase 0b); see `safety_net`.
     let mut safety_net = SafetyNet::new();
-    // The last view identity (window / zoom / focused pane / overlay / size). A
-    // passthrough (single or zoomed) pane only gets the heavy repaint nudge
-    // (clear + resize) on a *real* transition — never on a routine `force_repaint`
-    // from bus/board/flash churn. Without this, a zoomed pane during a fleet run
-    // is cleared several times a second (every ctl request forces a repaint),
-    // which reads as paint corruption and makes text selection impossible (the
-    // clear wipes the drag). Sentinel start so the first frame counts as a change.
-    let mut last_view: (usize, bool, usize, bool, bool, bool, u16, u16) =
-        (usize::MAX, false, usize::MAX, false, false, false, 0, 0);
+    // The paint's memory between ticks (retained tiled frame, throttles); see
+    // `renderer`.
+    let mut renderer = Renderer::new();
 
     // The read at the top can fail (terminal gone) *and* commands deep inside
     // `break 'outer`; a labeled `loop` expresses both. clippy's while-let
@@ -1198,7 +1173,7 @@ fn run(
                             &mut flash,
                             &session_job,
                         ) {
-                            Ok(()) => prev_master = None,
+                            Ok(()) => renderer.reset(),
                             Err(e) => {
                                 flash = Some((
                                     format!("cannot start {:?}: {e}", argv[0]),
@@ -1237,7 +1212,7 @@ fn run(
                     break 'outer;
                 }
                 if outcome.reset_frame {
-                    prev_master = None;
+                    renderer.reset();
                 }
                 if outcome.repaint {
                     force_repaint = true;
@@ -1254,19 +1229,19 @@ fn run(
                 Action::NextPane => {
                     let next = (active + 1) % windows.len();
                     switch_window(&mut windows, &mut active, next, rows, cols, &mut out);
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::PrevPane => {
                     let prev = (active + windows.len() - 1) % windows.len();
                     switch_window(&mut windows, &mut active, prev, rows, cols, &mut out);
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::SwitchTo(i) => {
                     if i < windows.len() {
                         switch_window(&mut windows, &mut active, i, rows, cols, &mut out);
-                        prev_master = None;
+                        renderer.reset();
                         force_repaint = true;
                     }
                 }
@@ -1283,7 +1258,7 @@ fn run(
                         &mut flash,
                         &session_job,
                     ) {
-                        Ok(()) => prev_master = None,
+                        Ok(()) => renderer.reset(),
                         Err(e) => {
                             flash = Some((
                                 format!("cannot start {:?}: {e}", command[0]),
@@ -1310,7 +1285,7 @@ fn run(
                         &mut flash,
                         &session_job,
                     ) {
-                        Ok(()) => prev_master = None,
+                        Ok(()) => renderer.reset(),
                         Err(e) => {
                             flash = Some((
                                 format!("cannot start shell {:?}: {e}", shell[0]),
@@ -1330,7 +1305,7 @@ fn run(
                     if !views.board {
                         let _ = write!(out, "\x1b[?25h");
                     }
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::OpenPrompt => {
@@ -1351,7 +1326,7 @@ fn run(
                         .position(|n| n.window == active && n.pane_id == focus)
                         .unwrap_or(0);
                     let _ = write!(out, "\x1b[?25h");
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::ToggleLog => {
@@ -1361,7 +1336,7 @@ fn run(
                     views.overview = false;
                     views.log_scroll = 0;
                     let _ = write!(out, "\x1b[?25h");
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::SplitH => {
@@ -1375,7 +1350,7 @@ fn run(
                         &mut flash,
                     );
                     resize_window(&mut windows[active], rows, cols);
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::SplitV => {
@@ -1389,13 +1364,13 @@ fn run(
                         &mut flash,
                     );
                     resize_window(&mut windows[active], rows, cols);
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::MoveFocus(d) => {
                     let outer = tiled_outer(rows, cols);
                     windows[active].tree.move_focus(to_move(d), outer);
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
                 Action::Zoom => {
@@ -1404,7 +1379,7 @@ fn run(
                     if w.panes.len() > 1 {
                         w.zoomed = !w.zoomed;
                         resize_window(w, rows, cols);
-                        prev_master = None;
+                        renderer.reset();
                         force_repaint = true;
                     }
                 }
@@ -1445,7 +1420,7 @@ fn run(
                         &mut flash,
                     );
                     if outcome.reset_frame {
-                        prev_master = None;
+                        renderer.reset();
                     }
                     if outcome.repaint {
                         force_repaint = true;
@@ -1466,7 +1441,7 @@ fn run(
                         w.panes.retain(|p| p.id != victim);
                         w.zoomed = w.zoomed && w.panes.len() > 1;
                         resize_window(w, rows, cols);
-                        prev_master = None;
+                        renderer.reset();
                         force_repaint = true;
                     } else if let Some(p) = w.pane_mut(victim) {
                         // Sole pane: async kill; the reap step drops the window
@@ -1507,7 +1482,7 @@ fn run(
                             &session_job,
                         );
                         let _ = listener.respond(&reply.to_json());
-                        prev_master = None;
+                        renderer.reset();
                         force_repaint = true;
                     }
                     Ok(None) => break,
@@ -1549,7 +1524,7 @@ fn run(
                 .saturating_sub(empty_before_active)
                 .min(windows.len() - 1);
             resize_window(&mut windows[active], rows, cols);
-            prev_master = None;
+            renderer.reset();
             force_repaint = true;
         }
 
@@ -1595,8 +1570,8 @@ fn run(
                     // whole screen. The wipe is what fixes the tiled-resize
                     // garble: when the terminal shrinks, cells from the previous,
                     // larger frame lie outside the new master and would otherwise
-                    // linger; and a tiled recompose diffs against `prev_master`,
-                    // so without this clear + `prev_master = None` the first frame
+                    // linger; and a tiled recompose diffs against the retained
+                    // frame, so without this clear + `renderer.reset()` the first frame
                     // at the new size can paint over stale geometry. This mirrors
                     // the clear `switch_window`/`repaint_focused` already emit.
                     let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows - 1);
@@ -1642,7 +1617,7 @@ fn run(
                     // Force a full recompose at the new size: tiled repaints via
                     // `render_full` (which re-clears + paints every cell),
                     // passthrough nudges the focused pty to redraw.
-                    prev_master = None;
+                    renderer.reset();
                     force_repaint = true;
                 }
             }
@@ -1712,233 +1687,23 @@ fn run(
             adopt_sessions(&mut windows, &world);
         }
 
-        // 6. render the active window (tiled compose+diff, else passthrough is
-        //    already written above) then paint the bar. The tiled composite and
-        //    the bar are accumulated into one `frame` and emitted wrapped in
-        //    synchronized output (§`SYNC_BEGIN`), so the outer terminal paints
-        //    panes+bar atomically — no mid-frame tearing. An empty frame (idle
-        //    tick) emits nothing, so the markers never spam.
-        let spin_frame = (anim_start.elapsed().as_millis() / 120) as usize;
-        let mut frame: Vec<u8> = Vec::new();
-        // Set when this tick composited the startup splash into `frame`; its `2J`
-        // wipes the bar, so the bar is force-appended below to keep the frame whole.
-        let mut splash_drawn = false;
-        // A real view transition (which window, zoom, focused pane, overlay, or
-        // terminal size) — the only thing that should trigger a passthrough pane's
-        // clear+repaint nudge. Bus/board/flash `force_repaint`s don't change it.
-        let view_key = (
+        // 6-7. paint the active window and the bar as one synchronized frame.
+        renderer.paint(
+            &mut windows,
             active,
-            windows.get(active).map(|w| w.zoomed).unwrap_or(false),
-            windows
-                .get(active)
-                .map(|w| w.tree.focus())
-                .unwrap_or(usize::MAX),
-            views.board,
-            views.overview,
-            views.log,
+            &mut views,
+            &selection,
+            prompt.as_deref(),
+            &world,
+            &board,
+            &bus,
+            &mut flash,
+            force_repaint,
+            tiled_dirty,
             rows,
             cols,
+            &mut out,
         );
-        let view_changed = view_key != last_view;
-        last_view = view_key;
-        if views.overview {
-            // The overview replaces the panes. Clamp the selection to the live
-            // agent count (panes may have been reaped) and re-render on a repaint.
-            let count: usize = windows.iter().map(|w| w.panes.len()).sum();
-            views.overview_sel = views.overview_sel.min(count.saturating_sub(1));
-            if force_repaint {
-                let nodes = overview_nodes(&windows, &world);
-                frame.extend_from_slice(
-                    render_overview_panel(&windows, &bus, &nodes, views.overview_sel, rows, cols)
-                        .as_bytes(),
-                );
-            }
-        } else if views.board {
-            // The board overlay replaces the panes. Re-render only on a repaint
-            // (toggle, or a board write — every ctl request forces one), so idle
-            // ticks leave the panel steady; the bar still paints below.
-            if force_repaint {
-                frame.extend_from_slice(
-                    render_board_panel(
-                        &board,
-                        &bus,
-                        rows,
-                        cols,
-                        views.feed_scroll,
-                        views.decision_sel,
-                    )
-                    .as_bytes(),
-                );
-            }
-        } else if views.log {
-            // The activity log overlay: a live time-ordered merge of bus + board
-            // + agent actions. Re-rendered on a repaint (toggle, scroll, or any
-            // agent/ctl activity that forces one).
-            if force_repaint {
-                let now = agsess::sessions::now_ms();
-                frame.extend_from_slice(
-                    render_log_panel(
-                        &windows,
-                        &world,
-                        &board,
-                        &bus,
-                        rows,
-                        cols,
-                        views.log_scroll,
-                        now,
-                    )
-                    .as_bytes(),
-                );
-            }
-        } else if windows[active].tiled() {
-            let (cur_rows, cur_cols) = (rows as usize, cols as usize);
-            let any_loading = windows[active].panes.iter().any(|p| !p.painted);
-            let dirty = any_pane_dirty(tiled_dirty, any_loading, spin_frame != last_tiled_spin);
-            let view_changed = prev_master.is_none();
-            if needs_composite(dirty, view_changed, force_repaint) {
-                // Reuse the scratch buffer's allocation when the size is unchanged;
-                // reallocate only on a first frame or after a terminal resize.
-                match tiled_buf.as_mut() {
-                    Some(b) if b.rows() == cur_rows && b.cols() == cur_cols => b.clear(),
-                    _ => tiled_buf = Some(ansi::Screen::new(cur_rows, cur_cols)),
-                }
-                render_tiled(
-                    tiled_buf.as_mut().unwrap(),
-                    &windows[active],
-                    rows,
-                    cols,
-                    &world,
-                    spin_frame,
-                );
-                if let Some((win, sel)) = &selection {
-                    let w = &windows[active];
-                    let rect = w
-                        .tree
-                        .rects(tiled_outer(rows, cols))
-                        .into_iter()
-                        .find(|(id, _)| *id == sel.pane_id);
-                    if let (true, false, Some((_, rect))) = (*win == active, sel.is_empty(), rect) {
-                        atrium::select::highlight(sel, tiled_buf.as_mut().unwrap(), &rect);
-                    }
-                }
-                match &prev_master {
-                    Some(prev) => frame.extend_from_slice(&prev.diff(tiled_buf.as_ref().unwrap())),
-                    None => frame.extend_from_slice(&tiled_buf.as_ref().unwrap().render_full()),
-                };
-                // Rotate buffers: tiled_buf (just written) becomes prev_master for
-                // the next diff, and the old prev_master's allocation becomes the
-                // next scratch. After a full-repaint reset (prev_master == None),
-                // tiled_buf becomes None on this swap and is reallocated next tick.
-                std::mem::swap(&mut prev_master, &mut tiled_buf);
-                last_tiled_spin = spin_frame;
-            }
-        } else {
-            // Passthrough (single pane or zoomed). While the focused pane has not
-            // painted yet, animate the startup splash so the ~seconds of agent
-            // boot don't look like a hang; the drain wipes it and takes over on
-            // the pane's first bytes. Throttled to the spinner's ~8 fps.
-            let fp = windows[active].tree.focus();
-            let unpainted = windows[active]
-                .pane(fp)
-                .map(|p| !p.painted)
-                .unwrap_or(false);
-            if unpainted {
-                if spin_frame != last_splash_frame {
-                    draw_startup_splash(&mut frame, rows, cols, spin_frame);
-                    last_splash_frame = spin_frame;
-                    splash_drawn = true;
-                }
-            } else if view_changed {
-                // Nudge the focused pane's pty to repaint in full (the same trick
-                // 0.1 uses on window switch) — but ONLY on a real view transition,
-                // not on every force_repaint. A zoomed pane during a fleet run sees
-                // constant force_repaints (each ctl request forces one); nudging on
-                // those would clear + redraw it several times a second, wrecking the
-                // paint and any in-progress text selection. The pane paints its own
-                // steady-state output through passthrough; the nudge is only needed
-                // to recover after a transition cleared the screen.
-                repaint_focused(&mut windows[active], rows, cols, &mut out);
-            }
-        }
-
-        // 7. the bar (windows, with the active one starred)
-        let infos = bar_infos(&windows, active, &world);
-        if flash
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5))
-        {
-            flash = None;
-            force_repaint = true;
-        }
-        // A flash note wins; otherwise, if the bus has open `decision_needed`
-        // escalations, surface them on the bar so you see them without opening the
-        // `Ctrl+A b` panel — the bus's push channel to the human. A decision
-        // addressed to a live teammate (`to=<role>`) is that agent's to answer, so
-        // it is NOT counted here (the human still sees it in the board panel — the
-        // broker keeps full visibility, just isn't urgently pinged for it).
-        let decision_note = decision_note(&bus, &windows);
-        let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or({
-            if decision_note.is_empty() {
-                ""
-            } else {
-                decision_note.as_str()
-            }
-        });
-        // While the command prompt is open it takes over the bar row: a `:` and
-        // the line typed so far, cursor left right after it (visible) so you can
-        // see what you're launching. Otherwise the normal status bar.
-        let painted = if let Some(line) = &prompt {
-            format!(
-                "\x1b[{};1H\x1b[2K\x1b[1;38;2;70;235;255m:\x1b[0m{line}\x1b[?25h",
-                rows
-            )
-        } else {
-            bar_paint(&infos, rows, cols as usize, note)
-        };
-        let mut bar_appended = false;
-        if force_repaint
-            || splash_drawn
-            || painted != last_bar
-            // The 500ms periodic refresh keeps the status bar's activity markers
-            // live, but while the command prompt is open it would reflash the
-            // prompt row twice a second — skip it there (the prompt repaints on
-            // keystroke via `painted != last_bar`).
-            || (prompt.is_none() && last_bar_paint.elapsed() >= Duration::from_millis(500))
-        {
-            frame.extend_from_slice(painted.as_bytes());
-            last_bar = painted;
-            last_bar_paint = Instant::now();
-            bar_appended = true;
-        }
-        // The bar leaves the cursor parked on the bar row. Move it back to the
-        // pane's real cursor with an explicit CUP — NOT DECSC/DECRC, whose single
-        // save slot is shared with the hosted app (claude parks its cursor there
-        // for its own menus; saving/restoring around the bar corrupted it and left
-        // redraw fragments in passthrough). We track the cursor ourselves: the
-        // tiled master carries it, and even a passthrough pane is fed to its
-        // emulator, so `term.screen().cursor` is current. Both are 0-based; the
-        // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
-        // coordinates in either mode.
-        if bar_appended && !views.board && !views.overview && !views.log && prompt.is_none() {
-            let cur = if windows[active].tiled() {
-                prev_master.as_ref().map(|m| m.cursor)
-            } else {
-                let fp = windows[active].tree.focus();
-                windows[active].pane(fp).map(|p| p.term.screen().cursor)
-            };
-            if let Some((cr, cc)) = cur {
-                frame.extend_from_slice(format!("\x1b[{};{}H", cr + 1, cc + 1).as_bytes());
-            }
-        }
-        // Emit the tick's composite+bar as ONE synchronized frame, so the outer
-        // terminal never shows it half-drawn (the tiled "shutter"). Nothing to
-        // draw ⇒ no write, no markers.
-        if !frame.is_empty() {
-            let _ = out.write_all(SYNC_BEGIN);
-            let _ = out.write_all(&frame);
-            let _ = out.write_all(SYNC_END);
-            let _ = out.flush();
-        }
         force_repaint = false;
     }
 
