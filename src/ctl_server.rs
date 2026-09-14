@@ -1,0 +1,1112 @@
+//! The control-plane server: turn a `ctl` request line into its typed
+//! [`atrium::ctl::Reply`] against the live windows, and flush queued `ctl send`
+//! deliveries. Moved out of `main.rs` verbatim (r10 audit B11) — the run loop
+//! calls in here; nothing here owns the terminal.
+
+use crate::*;
+
+/// A `ctl send` awaiting delivery. The design queues a task until the target is
+/// **idle** (agsess-gated) rather than injecting into a live turn (Decision 4).
+/// Once the target is ready we write the text, then — after a short beat so the
+/// agent's TUI registers the line before the submit — write the Enter. The beat
+/// mirrors the C0 spike, which split the text and `\r` with a delay.
+pub(crate) struct PendingSend {
+    /// Target pane's global agent id (already resolved + scope-checked).
+    target: AgentId,
+    text: String,
+    /// When the send was accepted — a fallback so a target that never yields a
+    /// derivable status (a shell, a not-yet-bound agent) still gets it.
+    queued_at: Instant,
+    /// How many bytes of `text` the target's pty has actually accepted.
+    ///
+    /// `write(2)` returns a COUNT and may legitimately take less than offered —
+    /// a pty's input buffer is finite, and in canonical mode a single line is
+    /// capped near 1 KB. The old code discarded that count, marked the send
+    /// delivered, and submitted Enter regardless, so a long task arrived as a
+    /// fragment while `ctl` had already replied `ok:true`.
+    written: usize,
+    /// `Some(t)` once the text has been written IN FULL; `t` gates the follow-up
+    /// Enter. Never set on a partial write — Enter must not submit a fragment.
+    text_written_at: Option<Instant>,
+}
+
+/// How long after writing the task text we send the Enter that submits it.
+pub(crate) const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
+
+/// If a target never yields a derivable agsess status (non-agent / unbound),
+/// deliver anyway once the send has waited this long, so a queue never wedges.
+pub(crate) const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
+
+/// Find a hosted pane by its global agent id (immutable / mutable).
+pub(crate) fn pane_by_agent(windows: &[Window], id: AgentId) -> Option<&Pane> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .find(|p| p.agent_id == id)
+}
+
+pub(crate) fn pane_by_agent_mut(windows: &mut [Window], id: AgentId) -> Option<&mut Pane> {
+    windows
+        .iter_mut()
+        .flat_map(|w| w.panes.iter_mut())
+        .find(|p| p.agent_id == id)
+}
+
+/// `(agent_id, role)` for every live pane — the candidate set for target
+/// resolution.
+pub(crate) fn ctl_candidates(windows: &[Window]) -> Vec<(AgentId, Option<String>)> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .map(|p| (p.agent_id, p.role.clone()))
+        .collect()
+}
+
+/// `(agent_id, parent)` for every live pane — the spawn-tree edges the subtree
+/// guard walks.
+pub(crate) fn ctl_parents(windows: &[Window]) -> Vec<(AgentId, Option<AgentId>)> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .map(|p| (p.agent_id, p.parent))
+        .collect()
+}
+
+/// The **human** controls everything (Decision 3). A caller is human-privileged
+/// when it has no attributed pane, or when its pane is a *root* (one atrium opened,
+/// `parent == None`, depth 0) — i.e. where the operator sits. A spawned worker
+/// (depth > 0) is scoped to its own subtree.
+pub(crate) fn caller_privileged(windows: &[Window], caller: Option<AgentId>) -> bool {
+    // Look the caller up, then decide in a pure function so the DECISION can be
+    // tested without constructing panes (each of which needs a live pty). This
+    // gate had no tests at all: when its two `None` arms were flipped from
+    // `true` to `false` — a security fix — nothing in the suite changed, which is
+    // precisely the problem.
+    let pane_parent = caller
+        .and_then(|id| pane_by_agent(windows, id))
+        .map(|p| p.parent);
+    privilege_for(caller, pane_parent)
+}
+
+/// Resolve a spawn's permission mode against the session policy.
+///
+/// The session policy is a CEILING, and it now holds for everyone — including a
+/// root pane. It used to be bypassed outright for a "privileged" caller
+/// (`Some(req) if privileged => req`), on the reading that the root pane is the
+/// human and the human may elevate. Two things break that:
+///
+/// 1. `-n N` and `--grid` give every pane no parent, so EVERY pane in a
+///    mass-spawned session was classified as the operator. An agent could then
+///    ask for `skip` — a full permission bypass — in a session the human had
+///    deliberately set to `plan`.
+/// 2. atrium's own documentation calls `--trust` "the mode spawned agents run in,
+///    and the ceiling they are capped at". A ceiling that a pane can exceed is
+///    not a ceiling, and the human cannot tell from the outside which panes could.
+///
+/// So the bypass is gone. `--mode` may still DE-ESCALATE freely (asking for less
+/// than the policy is always allowed), which is the useful half; it can no longer
+/// escalate. To run agents at a higher posture, the human sets it at launch,
+/// where it is a visible, deliberate choice rather than something a pane can
+/// request. Returns the effective mode and a note when a request was capped.
+pub(crate) fn effective_mode(
+    requested: Option<atrium::ctl::TrustMode>,
+    policy: atrium::ctl::TrustMode,
+) -> (atrium::ctl::TrustMode, Option<String>) {
+    match requested {
+        None => (policy, None),
+        Some(req) if req.rank() <= policy.rank() => (req, None),
+        Some(req) => (
+            policy,
+            Some(format!(
+                "capped to {} (session policy); nothing may elevate itself to {} \
+                 — set the policy at launch with --trust",
+                policy.policy_label(),
+                req.policy_label()
+            )),
+        ),
+    }
+}
+
+/// The privilege decision, given only what it needs.
+///
+/// `pane_parent` says what the caller's capability token resolved to:
+/// - `None` — no such live pane (a stale or forged token), or no caller at all
+/// - `Some(None)` — a live pane with no parent: a root pane the human opened
+/// - `Some(Some(_))` — a live pane spawned by another: a worker
+pub(crate) fn privilege_for(caller: Option<AgentId>, pane_parent: Option<Option<AgentId>>) -> bool {
+    match caller {
+        // No authenticated caller is NOT the operator. This arm used to return
+        // `true`, which inverted the gate: holding no credential granted strictly
+        // more than holding a worker's, so `env -u ATRIUM_TOKEN atrium ctl ...`
+        // promoted you. `caller` is derived from the capability token, never
+        // self-reported, so `None` means exactly "unauthenticated" and must be
+        // the least trusted state, not the most.
+        None => false,
+        Some(_) => match pane_parent {
+            Some(parent) => parent.is_none(),
+            // A token resolving to no live pane is stale or forged, not the
+            // operator. Same inversion as above.
+            None => false,
+        },
+    }
+}
+
+/// The agsess status label the ctl protocol reports (stable strings the calling
+/// agent can match on).
+pub(crate) fn status_label(s: agsess::Status) -> &'static str {
+    match s {
+        agsess::Status::Working => "working",
+        agsess::Status::WaitingApproval => "waiting-approval",
+        agsess::Status::WaitingPrompt => "waiting-prompt",
+        agsess::Status::Idle => "idle",
+    }
+}
+
+/// Apply one ctl request against the live window set and return the JSON reply
+/// line, **recording it to the audit log** (design §5). Thin wrapper: parse,
+/// serve `audit` reads directly (they need the log and are not self-recorded),
+/// else [`dispatch_ctl`] the request and record its outcome. `spawn`/`send`/
+/// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
+/// delegation-scoped.
+#[allow(clippy::too_many_arguments)]
+/// Is this decision addressed to a live teammate (a `to=<role>` field naming a
+/// pane that exists)? Such a decision routes to that agent — the human isn't
+/// urgently pinged for it — implementing worker→lead escalation before lead→human.
+/// A `to` naming no live pane, or no `to` at all, is human-facing.
+pub(crate) fn decision_for_agent(e: &atrium::bus::Event, windows: &[Window]) -> bool {
+    e.fields.get("to").is_some_and(|to| {
+        windows
+            .iter()
+            .flat_map(|w| &w.panes)
+            .any(|p| p.role.as_deref() == Some(to.as_str()))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_ctl(
+    line: &str,
+    windows: &mut Vec<Window>,
+    rows: u16,
+    cols: u16,
+    max_depth: usize,
+    extra_allow: &[String],
+    pending: &mut Vec<PendingSend>,
+    world: &atrium::vendors::VendorWorlds,
+    session_identity: Option<&str>,
+    audit: &mut atrium::audit::Audit,
+    board: &mut atrium::board::Board,
+    bus: &mut atrium::bus::Bus,
+    job: &atrium::reap::SessionJob,
+) -> atrium::ctl::Reply {
+    use atrium::ctl::{self, Cmd};
+
+    let req = match ctl::parse_request(line) {
+        Ok(r) => r,
+        Err(e) => {
+            let reply = ctl::reply_err(&e);
+            // NEVER log the raw request. `build_request` emits
+            // `{"caller":N,"token":"` - a 21-character prefix - so an 80-char
+            // truncation wrote 59 of a 64-character token into a log that
+            // `ctl audit` hands to an unauthenticated reader. Record the shape
+            // and the parse error, which is what debugging actually needs, and
+            // nothing that was in the payload.
+            audit.record(
+                None,
+                "bad-request",
+                &format!("<unparseable, {} bytes>", line.len()),
+                false,
+                &e,
+            );
+            return reply;
+        }
+    };
+    // Authenticate the caller by its capability token, not its self-reported id:
+    // the caller *is* the pane whose minted token matches. This overwrites the
+    // self-reported `caller`, so a pane cannot claim another pane's id or claim
+    // operator (its own token forces its real, depth-scoped identity). A request
+    // with no token or a non-matching one is unauthenticated. Every pane atrium
+    // spawns in a ctl session is born with a token (the endpoint binds before any
+    // spawn), so a legitimate caller is never locked out; only an external or
+    // token-stripped request is. See §4.1 of the whitepaper for the threat model
+    // and the peer-credential hardening that closes the remaining raw-socket vector.
+    let authed = req
+        .token
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .and_then(|tok| {
+            windows
+                .iter()
+                .flat_map(|w| &w.panes)
+                // `as_deref()` so a pane with no token (entropy failure at
+                // spawn) can never match — `None == None` must not authenticate.
+                .find(|p| p.token.as_deref() == Some(tok))
+                .map(|p| p.agent_id)
+        });
+    let authenticated = authed.is_some();
+    // Reads (list/status/audit/board get/list/bus feed) are open; anything that
+    // mutates the fleet or its shared state requires an authenticated caller.
+    if !authenticated && !req.cmd.is_read_only() {
+        let reply = ctl::reply_err(
+            "unauthenticated: control request carries no valid pane token (ATRIUM_TOKEN)",
+        );
+        let (action, detail) = req.cmd.audit_label();
+        audit.record(None, action, &detail, false, "unauthenticated");
+        return reply;
+    }
+    // The AUTHENTICATED caller, typed apart from the request's self-reported
+    // `caller: Option<usize>` hint so the two can never be confused (r10 B4).
+    let caller: Option<AgentId> = authed;
+    let privileged = caller_privileged(windows, caller);
+
+    // `audit` reads the log, and IS recorded. It used to be exempt on the
+    // reasoning that a query shouldn't pollute what it queries — but that made
+    // the most sensitive read the only one leaving no trace, so exfiltrating the
+    // log was invisible after the fact. The entry is written before the reply is
+    // built, so a reader sees its own access: self-documenting, not hidden.
+    // Subtree-scoped like any read: a worker sees only its own subtree.
+    if let Cmd::Audit(ar) = &req.cmd {
+        audit.record(caller, "audit", "read", true, "");
+        return audit_reply(audit, windows, caller, privileged, ar.tail);
+    }
+
+    let (action, detail) = req.cmd.audit_label();
+    let reply = dispatch_ctl(
+        req,
+        caller,
+        windows,
+        rows,
+        cols,
+        max_depth,
+        extra_allow,
+        pending,
+        world,
+        session_identity,
+        privileged,
+        board,
+        bus,
+        job,
+    );
+    let (ok, note) = audit_outcome(&reply);
+    audit.record(caller, action, &detail, ok, &note);
+    reply
+}
+
+/// A bus message carrying a `to` field is a directed hand-off. The bus is
+/// pull-based, so an idle target never sees it until it runs `bus feed` — and if
+/// it isn't subscribed to that topic, not even then. So a routed publish also
+/// queues a best-effort wake that carries the content itself. Returns
+/// `(target-role, wake-text)` when the message is routed, else `None`. Pure: the
+/// role resolution and scope-gating stay at the call site, where a routed wake
+/// gets the same scope check as `ctl send` and so grants no new reach.
+pub(crate) fn routed_wake(
+    fields: &std::collections::BTreeMap<String, String>,
+    topic: &str,
+    seq: u64,
+    kind: atrium::bus::Kind,
+    who: &str,
+) -> Option<(String, String)> {
+    let to = fields.get("to")?;
+    // The human-readable payload lives in `msg` (fyi) or `q` (a decision); fall
+    // back to a pointer if a routed message carried neither.
+    let body = fields
+        .get("msg")
+        .or_else(|| fields.get("q"))
+        .map(String::as_str)
+        .unwrap_or("(see: atrium ctl bus feed)");
+    // The terse-headline convention: long evidence rides a `detail=<pointer>`
+    // (board key / path / URL), surfaced after the headline so the target knows
+    // where to look without the bus line carrying the whole payload.
+    let tail = fields
+        .get("detail")
+        .map(|d| format!(" (detail: {d})"))
+        .unwrap_or_default();
+    let text = format!(
+        "[atrium bus #{seq} {} / {who} -> you on \"{topic}\"] {body}{tail}",
+        kind.as_str()
+    );
+    Some((to.clone(), text))
+}
+
+/// The server side of the control channel: turn one parsed [`atrium::ctl::Request`]
+/// into its JSON reply. `list`/`status` serialize the spawn tree (agsess status
+/// folded in); `spawn` opens a visible worker after the pure allowlist/depth
+/// guard ([`atrium::ctl::evaluate_spawn`]) and the credential-delegation guard
+/// ([`atrium::ctl::delegation_allowed`]); `send` enqueues a queue-until-idle
+/// delivery; `kill` tears down the target's subtree (the reap step reaps them).
+/// `send`/`status`/`kill` with a target are subtree-scoped.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_ctl(
+    req: atrium::ctl::Request,
+    caller: Option<AgentId>,
+    windows: &mut Vec<Window>,
+    rows: u16,
+    cols: u16,
+    max_depth: usize,
+    extra_allow: &[String],
+    pending: &mut Vec<PendingSend>,
+    world: &atrium::vendors::VendorWorlds,
+    session_identity: Option<&str>,
+    privileged: bool,
+    board: &mut atrium::board::Board,
+    bus: &mut atrium::bus::Bus,
+    job: &atrium::reap::SessionJob,
+) -> atrium::ctl::Reply {
+    use atrium::ctl::{self, Cmd};
+
+    match req.cmd {
+        Cmd::List => reply_tree(windows, world, None),
+        Cmd::Status(sr) => match sr.target {
+            None => {
+                // No target: the caller's subtree (whole tree for the operator).
+                let root = if privileged { None } else { caller };
+                reply_tree(windows, world, root)
+            }
+            Some(t) => {
+                let candidates = ctl_candidates(windows);
+                let id = match ctl::resolve_target(&t, &candidates) {
+                    Ok(id) => id,
+                    Err(e) => return ctl::reply_err(&e),
+                };
+                if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                    return deny;
+                }
+                let pane = pane_by_agent(windows, id);
+                let status =
+                    pane.and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label));
+                let idle = pane
+                    .map(|p| atrium::ipc::idle_ms(p.last_activity, std::time::Instant::now()))
+                    .unwrap_or(0);
+                ctl::reply_status_one(id, status, idle)
+            }
+        },
+        Cmd::Send(sr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&sr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            // Queued iff the target is mid-turn now; either way delivery is async
+            // and happens when the target is idle.
+            let busy = matches!(
+                pane_by_agent(windows, id).and_then(|p| world.status_for(p.session_id.as_deref())),
+                Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
+            );
+            pending.push(PendingSend {
+                target: id,
+                text: sr.text,
+                queued_at: Instant::now(),
+                written: 0,
+                text_written_at: None,
+            });
+            ctl::reply_sent(id, busy)
+        }
+        Cmd::Spawn(mut sp) => {
+            // Capability check, FIRST. Creating teammates used to be implied by
+            // having ctl access at all - so every agent in a fleet could do it,
+            // and in a seven-agent review fleet all seven could, when only the
+            // lead should. A depth cap bounds how FAR fan-out goes; it never says
+            // who may start it.
+            //
+            // Before the depth cap and the trust ceiling, not instead of them: a
+            // pane that may spawn is still capped on both.
+            if let Some(c) = caller {
+                let allowed = pane_by_agent(windows, c)
+                    .map(|p| p.can_spawn)
+                    .unwrap_or(false);
+                if !allowed {
+                    return ctl::reply_err(
+                        "this agent is not permitted to create teammates \
+                         (set \"can_spawn\": true for it in the fleet file)",
+                    );
+                }
+            }
+            // atrium owns the permission posture. Two layers, both surfaced (never
+            // silent) in the reply `note`:
+            //
+            //  1. Strip RAW claude permission flags the agent slipped into the argv
+            //     (`--dangerously-skip-permissions`, `--permission-mode`, …). Agents
+            //     request a mode through `--mode`, not raw flags, so atrium stays the
+            //     single source of truth.
+            //  2. Resolve the effective mode from the per-spawn `--mode` under the
+            //     session policy: the **operator** (the human's root pane) may set
+            //     ANY mode (elevation is the human directing); a non-operator
+            //     **worker** is capped at the policy — it may match or de-escalate
+            //     but never elevate itself. No `--mode` ⇒ inherit the policy.
+            // Vet before anything else: an unknown vendor or a flag a teammate
+            // may not choose is refused outright, not quietly cleaned. Stripping
+            // only ever covered three names, and the surface it guards — MCP
+            // servers, plugin dirs, settings files, all of which execute code at
+            // startup — is far larger than that.
+            let stripped = match ctl::vet_spawn_argv(&sp.argv) {
+                ctl::ArgvVerdict::Refused(why) => return ctl::reply_err(&why),
+                ctl::ArgvVerdict::Ok { argv, stripped } => {
+                    sp.argv = argv;
+                    stripped
+                }
+            };
+            let mut notes: Vec<String> = Vec::new();
+            if !stripped.is_empty() {
+                notes.push(format!(
+                    "ignored raw {} — request a mode with --mode instead",
+                    stripped.join(", ")
+                ));
+            }
+            let policy = trust_mode();
+            let (effective, cap_note) = effective_mode(sp.mode, policy);
+            if let Some(n) = cap_note {
+                notes.push(n);
+            }
+            let note = if notes.is_empty() {
+                None
+            } else {
+                Some(notes.join("; "))
+            };
+            let note = note.as_deref();
+            let caller_depth = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .map(|p| p.depth)
+                .unwrap_or(0);
+            let new_depth =
+                match ctl::evaluate_spawn(&sp.argv, caller_depth, max_depth, extra_allow) {
+                    Ok(d) => d,
+                    Err(denied) => return ctl::reply_err(&denied.message()),
+                };
+            // Pane cap (host-resource guard): the depth guard bounds recursion; this
+            // bounds total *breadth* so a runaway fan-out can't exhaust the machine
+            // (agent processes dominate RAM, not atrium). Host-derived, overridable
+            // with ATRIUM_MAX_PANES.
+            let live = windows.iter().map(|w| w.panes.len()).sum::<usize>();
+            let cap = atrium::resources::effective_cap();
+            if live >= cap {
+                return ctl::reply_err(&format!(
+                    "pane cap reached ({live}/{cap}) — reap an agent or raise it with ATRIUM_MAX_PANES"
+                ));
+            }
+            // Credential-delegation guard (§5): a worker may only pass down an
+            // identity it itself holds (its own or the session default); the
+            // operator delegates anything.
+            let caller_identity = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .and_then(|p| p.identity.clone());
+            if let Err(msg) = ctl::delegation_allowed(
+                sp.identity.as_deref(),
+                caller_identity.as_deref(),
+                session_identity,
+                privileged,
+            ) {
+                return ctl::reply_err(&msg);
+            }
+            if sp.new_window {
+                spawn_worker_window(
+                    windows, &sp, caller, new_depth, rows, cols, effective, note, job,
+                )
+            } else {
+                spawn_worker_here(
+                    windows, &sp, caller, new_depth, rows, cols, effective, note, job,
+                )
+            }
+        }
+        Cmd::Kill(kr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&kr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            // Tear down the target and every descendant. We only mark the panes
+            // dead (kill the pty, set `exited`); the run loop's reap step (§4)
+            // then collapses the split trees, drops the panes, and removes any
+            // window left empty — the same proven path an interactive `x` uses.
+            let parents = ctl_parents(windows);
+            let mut killed: Vec<AgentId> = Vec::new();
+            for w in windows.iter_mut() {
+                for p in w.panes.iter_mut() {
+                    if atrium::ctl::in_subtree(p.agent_id, id, &parents) {
+                        let _ = p.pty.kill();
+                        p.exited = true;
+                        killed.push(p.agent_id);
+                    }
+                }
+            }
+            killed.sort_unstable();
+            ctl::reply_killed(&killed)
+        }
+        Cmd::Respawn(rr) => {
+            let candidates = ctl_candidates(windows);
+            let id = match ctl::resolve_target(&rr.target, &candidates) {
+                Ok(id) => id,
+                Err(e) => return ctl::reply_err(&e),
+            };
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            // Capture the info we need before mutating the pane.
+            let (pane_slot_id, cmd, identity_name) = {
+                let Some(p) = pane_by_agent(windows, id) else {
+                    return ctl::reply_err("respawn: target pane not found");
+                };
+                (p.id, vec![p.title.clone()], p.identity.clone())
+            };
+            // Build the new working directory. When worktree is named, create it
+            // (idempotent) and use its dir; otherwise the new process inherits
+            // atrium's own cwd, same as a plain spawn.
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let (new_cwd, norms) = match worktree_spawn_params(&cwd, rr.worktree.as_deref()) {
+                Ok(pair) => pair,
+                Err(e) => return ctl::reply_err(&format!("spawn failed: {e}")),
+            };
+            let mut flash = None;
+            let new_pane = match spawn_pane_full(
+                &cmd,
+                rows,
+                cols,
+                pane_slot_id,
+                identity_name.as_deref(),
+                new_cwd.as_deref(),
+                trust_mode(),
+                &mut flash,
+                &[],
+                norms.as_deref(),
+            ) {
+                Ok(p) => p,
+                Err(e) => return ctl::reply_err(&format!("respawn failed: {e}")),
+            };
+            job.assign(new_pane.pty.pid());
+            // In-place replacement: kill the old child then swap in the new pty,
+            // term, and session fields. Role/parent/depth/can_spawn are preserved.
+            let p = pane_by_agent_mut(windows, id).unwrap();
+            let _ = p.pty.kill();
+            p.pty = new_pane.pty;
+            p.term = new_pane.term;
+            p.filter = new_pane.filter;
+            p.exited = false;
+            p.session_id = new_pane.session_id.clone();
+            p.launch_ms = new_pane.launch_ms;
+            p.cwd = new_pane.cwd;
+            p.agent_id = new_pane.agent_id;
+            p.token = new_pane.token;
+            p.activity = false;
+            p.painted = false;
+            let new_id = p.agent_id;
+            let role = p.role.clone();
+            ctl::reply_spawned(
+                new_id,
+                role.as_deref(),
+                new_pane.session_id.as_deref(),
+                None,
+            )
+        }
+        // `audit` is handled in `apply_ctl` (it needs the log); never reaches here.
+        Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
+        Cmd::Board(op) => {
+            // The board is SHARED team state: any pane in the session reads and
+            // writes the same source of truth (no subtree scoping — coordination
+            // is the team's job, and `updated_by` + the audit log keep it
+            // accountable). Single-writer daemon ⇒ no locking.
+            let by = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .map(|p| {
+                    p.role
+                        .clone()
+                        // 1-based to match the status bar's `1:`, `2:` numbering
+                        // (agent_id is 0-based internally). Roles are the stable
+                        // identity; this is the human-friendly fallback label.
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id.0 + 1))
+                })
+                .or_else(|| Some("operator".to_string()));
+            match op {
+                ctl::BoardOp::Set { key, fields } => {
+                    let e = board.set(&key, &fields, by.as_deref(), agsess::sessions::now_ms());
+                    ctl::reply_board_entry(&key, Some(atrium::board::entry_to_value(&e)))
+                }
+                ctl::BoardOp::Get { key } => {
+                    let entry = board.get(&key).map(atrium::board::entry_to_value);
+                    ctl::reply_board_entry(&key, entry)
+                }
+                ctl::BoardOp::List => {
+                    ctl::reply_board_list(atrium::board::entries_to_value(&board.list()))
+                }
+                ctl::BoardOp::Del { key } => {
+                    let deleted = board.del(&key);
+                    ctl::reply_board_del(&key, deleted)
+                }
+                ctl::BoardOp::Claim { key, ttl_ms } => {
+                    // The owner is the caller (`by`), derived server-side — a
+                    // worker can't claim as someone else. Default the lease to the
+                    // board's DEFAULT_LEASE_MS unless the caller set --ttl.
+                    let owner = by.as_deref().unwrap_or("operator");
+                    let ttl = ttl_ms.unwrap_or(atrium::board::DEFAULT_LEASE_MS);
+                    let outcome = board.claim(&key, owner, ttl, agsess::sessions::now_ms());
+                    ctl::reply_board_claim(&key, &outcome)
+                }
+                ctl::BoardOp::Release { key } => {
+                    let released = board.release(&key, agsess::sessions::now_ms());
+                    ctl::reply_board_release(&key, released)
+                }
+            }
+        }
+        Cmd::Bus(op) => {
+            // The bus is SHARED like the board. The server derives `who` (the
+            // caller's role, else its pane, else the operator) so a worker
+            // publishes and subscribes *as itself* — it cannot forge another
+            // sender. `who` is stable per pane, so the no-echo filter and a
+            // subscriber's cursor stay consistent across calls.
+            let who = caller
+                .and_then(|cid| pane_by_agent(windows, cid))
+                .map(|p| {
+                    p.role
+                        .clone()
+                        // 1-based to match the status bar's `1:`, `2:` numbering
+                        // (agent_id is 0-based internally). Roles are the stable
+                        // identity; this is the human-friendly fallback label.
+                        .unwrap_or_else(|| format!("pane {}", p.agent_id.0 + 1))
+                })
+                .unwrap_or_else(|| "operator".to_string());
+            let now = agsess::sessions::now_ms();
+            match op {
+                ctl::BusOp::Pub {
+                    topic,
+                    kind,
+                    fields,
+                    create,
+                } => match bus
+                    .admit_topic(&topic, create)
+                    .and_then(|()| bus.publish(&topic, kind, Some(&who), &fields, now))
+                {
+                    Ok(e) => {
+                        // No-echo-accurate: how many *other* subscribers receive
+                        // it (the publisher is excluded), so the client can warn on
+                        // a publish that reached nobody.
+                        let subs = bus.subscriber_count(&e.topic, Some(&who));
+                        // A message routed to a role (`--to`) is DELIVERED, not just
+                        // recorded: without this an idle target never acts on it (it
+                        // sits unseen on the pull-based bus). Best-effort and scope-
+                        // gated exactly like `ctl send`, so it grants no new reach;
+                        // the message still lives on the bus as the durable record.
+                        if let Some((to, text)) =
+                            routed_wake(&e.fields, &e.topic, e.seq, e.kind, &who)
+                        {
+                            let candidates = ctl_candidates(windows);
+                            if let Ok(tid) = ctl::resolve_target(&to, &candidates) {
+                                if caller != Some(tid)
+                                    && scope_denied(windows, caller, privileged, tid).is_none()
+                                {
+                                    pending.push(PendingSend {
+                                        target: tid,
+                                        text,
+                                        queued_at: Instant::now(),
+                                        written: 0,
+                                        text_written_at: None,
+                                    });
+                                }
+                            }
+                        }
+                        ctl::reply_bus_published(atrium::bus::event_to_value(&e), subs)
+                    }
+                    Err(msg) => ctl::reply_err(&msg),
+                },
+                ctl::BusOp::Sub { topics } => {
+                    // A declared (strict) fleet gates subscriptions too: you may
+                    // only listen on a declared topic. The soft-gate admits any
+                    // topic for *listening* (create=true), so subscribing to a
+                    // not-yet-published topic is fine — only publishing into the
+                    // void needs the deliberate --new.
+                    if let Some(bad) = topics.iter().find_map(|t| bus.admit_topic(t, true).err()) {
+                        ctl::reply_err(&bad)
+                    } else {
+                        bus.subscribe(&who, &topics);
+                        ctl::reply_bus_subscribed(current_subs(bus, &who))
+                    }
+                }
+                ctl::BusOp::Unsub { topics } => {
+                    bus.unsubscribe(&who, &topics);
+                    ctl::reply_bus_subscribed(current_subs(bus, &who))
+                }
+                ctl::BusOp::Feed { since } => {
+                    let events = bus.feed(&who, since);
+                    // The new cursor is the max seq pulled, or `since` when empty,
+                    // so it never rewinds.
+                    let cursor = events.iter().map(|e| e.seq).max().unwrap_or(since);
+                    ctl::reply_bus_feed(atrium::bus::events_to_value(&events), cursor)
+                }
+                ctl::BusOp::Resolve { seq } => ctl::reply_bus_resolved(seq, bus.resolve(seq)),
+                ctl::BusOp::Topics => ctl::reply_bus_topics(bus.topics_with_counts()),
+            }
+        }
+    }
+}
+
+/// A subscriber's current topic set as a `Vec` (for the `sub`/`unsub` reply).
+pub(crate) fn current_subs(bus: &atrium::bus::Bus, who: &str) -> Vec<String> {
+    bus.subscriptions(who)
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Truncate a string to `n` chars (char-safe), appending `…` when cut. Keeps a
+/// bad-request line short in the audit log.
+pub(crate) fn truncate(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        s.chars().take(n).collect::<String>() + "…"
+    }
+}
+
+/// `(ok, note)` for the audit record: the error on failure, or a compact success
+/// tag naming the salient id(s). Read from the typed [`atrium::ctl::Reply`] — it
+/// used to re-parse the server's own JSON reply by string keys (r10 audit B12).
+pub(crate) fn audit_outcome(reply: &atrium::ctl::Reply) -> (bool, String) {
+    use atrium::ctl::Reply;
+    let note = match reply {
+        Reply::Err(msg) => return (false, msg.clone()),
+        Reply::Spawned { pane, .. } | Reply::StatusOne { pane, .. } => format!("pane={pane}"),
+        Reply::Killed(ids) => format!(
+            "killed={}",
+            ids.iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Reply::Sent { target, .. } => format!("target={target}"),
+        _ => String::new(),
+    };
+    (true, note)
+}
+
+/// Serve a `ctl audit` read: the in-memory log, subtree-scoped. The operator
+/// sees everything; a worker sees only entries issued from within its own
+/// subtree (operator/`None`-caller entries are hidden from it).
+pub(crate) fn audit_reply(
+    audit: &atrium::audit::Audit,
+    windows: &[Window],
+    caller: Option<AgentId>,
+    privileged: bool,
+    tail: Option<usize>,
+) -> atrium::ctl::Reply {
+    let entries = if privileged {
+        audit.view(tail, |_| true)
+    } else if let Some(root) = caller {
+        let parents = ctl_parents(windows);
+        audit.view(tail, |e| match e.caller {
+            Some(c) => atrium::ctl::in_subtree(c, root, &parents),
+            None => false, // operator actions are hidden from a worker
+        })
+    } else {
+        // An UNAUTHENTICATED caller (no token, so `caller == None`) used to land
+        // here, and this branch was byte-identical to the privileged one - so
+        // holding no credential returned the entire fleet-wide audit trail,
+        // including the operator actions the branch above deliberately hides
+        // from a worker. That is the same "absent means most trusted" inversion
+        // `privilege_for` was fixed to remove, left standing in one call site.
+        Vec::new()
+    };
+    atrium::ctl::reply_audit(entries, audit.oldest_seq(), audit.latest_seq())
+}
+
+/// Serialize the spawn tree as a `list`/`status` reply. `root == Some(id)` limits
+/// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
+pub(crate) fn reply_tree(
+    windows: &[Window],
+    world: &atrium::vendors::VendorWorlds,
+    root: Option<AgentId>,
+) -> atrium::ctl::Reply {
+    let parents = ctl_parents(windows);
+    let mut panes: Vec<&Pane> = windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .filter(|p| match root {
+            None => true,
+            Some(r) => atrium::ctl::in_subtree(p.agent_id, r, &parents),
+        })
+        .collect();
+    panes.sort_by_key(|p| p.agent_id);
+    // One monotonic reading for the whole snapshot so every node's idle is
+    // measured against the same instant (no per-pane clock drift within a reply).
+    let now = std::time::Instant::now();
+    let nodes: Vec<atrium::ctl::TreeNode> = panes
+        .iter()
+        .map(|p| atrium::ctl::TreeNode {
+            id: p.agent_id,
+            parent: p.parent,
+            role: p.role.as_deref(),
+            title: &p.title,
+            depth: p.depth,
+            status: world.status_for(p.session_id.as_deref()).map(status_label),
+            idle_ms: atrium::ipc::idle_ms(p.last_activity, now),
+        })
+        .collect();
+    atrium::ctl::reply_list(&nodes)
+}
+
+/// Subtree-scope guard: `None` if the caller may act on `target`, else a ready
+/// JSON refusal. The operator (privileged) may act on anything.
+pub(crate) fn scope_denied(
+    windows: &[Window],
+    caller: Option<AgentId>,
+    privileged: bool,
+    target: AgentId,
+) -> Option<atrium::ctl::Reply> {
+    if privileged {
+        return None;
+    }
+    let root = caller?; // non-privileged implies a known caller pane
+    if atrium::ctl::in_subtree(target, root, &ctl_parents(windows)) {
+        None
+    } else {
+        Some(atrium::ctl::reply_err(&format!(
+            "pane {target} is outside your subtree; a worker may only steer what it spawned"
+        )))
+    }
+}
+
+/// Resolve an optional ad-hoc worktree name into `(cwd, norms)` for a ctl spawn.
+///
+/// When `wt_name` is `Some`, creates the worktree (idempotent) and returns its
+/// directory as cwd plus the behavioral norms text. `None` → `Ok((None, None))`,
+/// which leaves the spawned pane in atrium's own cwd with no extra norms.
+/// Returns `Err` (with a human-readable message) when the worktree cannot be
+/// created — the caller must surface this as a ctl error rather than spawning
+/// a child into a directory that does not exist.
+///
+/// `junction_sibling_deps` is best-effort: failures are silently ignored so a
+/// missing junction never prevents the worktree from being usable.
+pub(crate) fn worktree_spawn_params(
+    cwd: &std::path::Path,
+    wt_name: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let Some(name) = wt_name else {
+        return Ok((None, None));
+    };
+    let plan = atrium::worktree::plan_for(cwd, name);
+    atrium::worktree::ensure(cwd, &plan)
+        .map_err(|e| format!("could not create worktree '{name}': {e}"))?;
+    let _ = atrium::worktree::junction_sibling_deps(cwd, &plan);
+    let dir = plan.dir.to_string_lossy().into_owned();
+    let norms = atrium::worktree::worktree_norms(&plan.name, &plan.branch);
+    Ok((Some(dir), Some(norms)))
+}
+
+/// `ctl spawn` (default): a visible worker in a brand-new window.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_worker_window(
+    windows: &mut Vec<Window>,
+    sp: &atrium::ctl::SpawnReq,
+    caller: Option<AgentId>,
+    new_depth: usize,
+    rows: u16,
+    cols: u16,
+    mode: atrium::ctl::TrustMode,
+    note: Option<&str>,
+    job: &atrium::reap::SessionJob,
+) -> atrium::ctl::Reply {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+        Ok(pair) => pair,
+        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    };
+    let mut flash = None;
+    match spawn_window(
+        &sp.argv,
+        rows,
+        cols,
+        windows.len(),
+        sp.identity.as_deref(),
+        mode,
+        &mut flash,
+        Some(job),
+        wt_cwd.as_deref(),
+        wt_norms.as_deref(),
+    ) {
+        Ok(mut w) => {
+            let pane = &mut w.panes[0];
+            pane.role = sp.role.clone();
+            pane.parent = caller;
+            pane.depth = new_depth;
+            pane.worktree = sp.worktree.clone();
+            let agent_id = pane.agent_id;
+            let session = pane.session_id.clone();
+            windows.push(w);
+            // Size the new window's pane to its true rect now, so the agent
+            // paints full-height immediately instead of at the rough spawn size
+            // (which otherwise needs a manual terminal resize to correct).
+            let last = windows.len() - 1;
+            resize_window(&mut windows[last], rows, cols);
+            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+        }
+        Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    }
+}
+
+/// `ctl spawn --here`: tile the worker *beside* the caller, in the caller's own
+/// window, so a lead and its ICs sit in one view. Falls back to an error if the
+/// caller's pane can't be located (nothing to sit beside).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_worker_here(
+    windows: &mut [Window],
+    sp: &atrium::ctl::SpawnReq,
+    caller: Option<AgentId>,
+    new_depth: usize,
+    rows: u16,
+    cols: u16,
+    mode: atrium::ctl::TrustMode,
+    note: Option<&str>,
+    job: &atrium::reap::SessionJob,
+) -> atrium::ctl::Reply {
+    let Some(caller_id) = caller else {
+        return atrium::ctl::reply_err(
+            "`--here` needs a caller pane; run it from inside an atrium pane",
+        );
+    };
+    // Locate the window holding the caller and that caller's per-window pane id.
+    let Some((wi, caller_pane_id)) = windows.iter().enumerate().find_map(|(i, w)| {
+        w.panes
+            .iter()
+            .find(|p| p.agent_id == caller_id)
+            .map(|p| (i, p.id))
+    }) else {
+        return atrium::ctl::reply_err("`--here`: caller pane not found (rerun without --here)");
+    };
+
+    let w = &mut windows[wi];
+    let new_id = w.next_id;
+    // Rough half-cell inner size; the caller resizes the window right after.
+    let (pr, pc) = (
+        (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
+        (cols / 2).saturating_sub(2),
+    );
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+        Ok(pair) => pair,
+        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    };
+    let mut flash = None;
+    match spawn_pane_full(
+        &sp.argv,
+        pr.max(1),
+        pc.max(1),
+        new_id,
+        sp.identity.as_deref(),
+        wt_cwd.as_deref(),
+        mode,
+        &mut flash,
+        &[],
+        wt_norms.as_deref(),
+    ) {
+        Ok(mut pane) => {
+            pane.role = sp.role.clone();
+            pane.parent = caller;
+            pane.depth = new_depth;
+            pane.worktree = sp.worktree.clone();
+            let agent_id = pane.agent_id;
+            let session = pane.session_id.clone();
+            // Enroll this ctl-spawned pane in the session Job synchronously (same
+            // #94 guarantee as spawn_window; idempotent, unix no-op, graceful).
+            job.assign(pane.pty.pid());
+            w.panes.push(pane);
+            w.next_id += 1;
+            // Re-tile the WHOLE window into a balanced near-square grid over all
+            // its panes (keeping their stable ids), rather than just splitting the
+            // caller side-by-side. A plain `split_pane` each time stacks every
+            // `--here` worker into one column, so N of them degrade to an
+            // unusable `1×N` strip; re-gridding keeps 2→1×2, 4→2×2, 6→2×3,
+            // 12→3×4, … balanced. Focus lands on the fresh worker.
+            let _ = caller_pane_id; // (kept for the error message above)
+            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
+            w.tree = Tree::grid_from_ids(&ids);
+            w.tree.focus_pane(new_id);
+            w.zoomed = false;
+            // Resize the whole window so both the caller and the fresh worker get
+            // their exact inner rects — without this the worker keeps its rough
+            // half-size and paints short (blank below), fixed only by a manual
+            // terminal resize. Mirrors what the interactive split handlers do.
+            resize_window(&mut windows[wi], rows, cols);
+            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+        }
+        Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+    }
+}
+
+/// Flush queued `ctl send`s (Decision 4: queue until the target is idle). For
+/// each pending send: once the target reports a ready status (or the unbound
+/// fallback elapses), write the text; a beat later write the Enter and drop it.
+/// A vanished target is dropped. Returns whether anything was written (so the
+/// caller can request a repaint).
+pub(crate) fn flush_sends(
+    pending: &mut Vec<PendingSend>,
+    windows: &mut [Window],
+    world: &atrium::vendors::VendorWorlds,
+) -> bool {
+    if pending.is_empty() {
+        return false;
+    }
+    let now = Instant::now();
+    let mut wrote = false;
+    pending.retain_mut(|ps| {
+        match ps.text_written_at {
+            None => {
+                // Decide readiness from the target's live status, an open
+                // dialog, and any unsent human draft (see atrium::deliver).
+                let ready = match pane_by_agent(windows, ps.target) {
+                    None => return false, // target gone — drop the send
+                    Some(p) => {
+                        let sid = p.session_id.as_deref();
+                        atrium::deliver::ready(
+                            world.status_for(sid),
+                            world.awaiting_tool_for(sid),
+                            p.draft.holds(now),
+                            now.duration_since(ps.queued_at),
+                            SEND_UNBOUND_FALLBACK,
+                        )
+                    }
+                };
+                if ready {
+                    if let Some(p) = pane_by_agent_mut(windows, ps.target) {
+                        // Write from where we left off and advance by what was
+                        // actually accepted. A short write is normal, not an
+                        // error: the pty's buffer is finite. Resuming across
+                        // ticks — rather than looping here until the whole thing
+                        // lands — is deliberate, because this runs on the single
+                        // event loop and a blocking write into a full buffer
+                        // would freeze every pane until the target drained it.
+                        let bytes = ps.text.as_bytes();
+                        match p.pty.write(&bytes[ps.written..]) {
+                            Ok(0) => {} // took nothing this tick; try the next
+                            Ok(n) => {
+                                ps.written += n;
+                                wrote = true;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(_) => return false, // target unwritable — drop it
+                        }
+                        // Only now is the send real. Enter waits for the last byte.
+                        if ps.written >= bytes.len() {
+                            ps.text_written_at = Some(now);
+                        }
+                    } else {
+                        return false;
+                    }
+                }
+                true
+            }
+            Some(t) => {
+                if now.duration_since(t) >= SEND_ENTER_DELAY {
+                    if let Some(p) = pane_by_agent_mut(windows, ps.target) {
+                        let _ = p.pty.write(b"\r");
+                        wrote = true;
+                    }
+                    false // delivered — drop
+                } else {
+                    true
+                }
+            }
+        }
+    });
+    wrote
+}
