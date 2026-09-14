@@ -16,6 +16,14 @@
 
 /// A sub-rectangle of the screen, 0-based `(row, col)` origin with a size. All
 /// coordinates are in the master (outer) grid the compositor paints into.
+///
+/// Size is not validated: the fields are public, so a zero `rows` or `cols` is
+/// representable. [`Tree::rects`] never yields one — it gives every pane at least
+/// one cell — but that minimum means that on an area too small to split, panes
+/// extend **past** `outer`. Code that paints a rect must therefore clip to the
+/// screen (`Screen::set` ignores out-of-bounds writes) and derive inner sizes with
+/// `saturating_sub`, returning early on zero, as the compositor's `draw_border`,
+/// `draw_loading` and `blit_inner` do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub row: usize,
@@ -451,6 +459,24 @@ mod tests {
         rows: 24,
         cols: 80,
     };
+
+    #[test]
+    fn an_area_too_small_to_split_yields_panes_past_the_outer_rect_never_empty_ones() {
+        // The documented `Rect` contract: a one-row area split top/bottom gives
+        // each pane its 1-cell minimum, so the second lands below the area.
+        let one_row = Rect {
+            row: 0,
+            col: 0,
+            rows: 1,
+            cols: 10,
+        };
+        let mut t = Tree::new(0);
+        t.split(Dir::Horizontal, 1);
+        let rects = t.rects(one_row);
+        assert!(rects.iter().all(|(_, r)| r.rows >= 1 && r.cols >= 1));
+        let bottom = rects.iter().find(|(id, _)| *id == 1).unwrap().1;
+        assert_eq!((bottom.row, bottom.rows), (1, 1), "past the 1-row area");
+    }
 
     #[test]
     fn single_pane_fills_the_outer_rect() {
