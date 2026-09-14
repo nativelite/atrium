@@ -675,6 +675,141 @@ fn new_pane_opens_and_switches() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
+/// Set a shell variable in the focused pane, and the `echo` whose OUTPUT (not
+/// its echoed input, which still reads `%V%`/`${V}`) is `{tag}-{value}`.
+fn set_var_cmd(value: &str) -> String {
+    if cfg!(windows) {
+        format!("set ATRIUM_W={value}\r\n")
+    } else {
+        format!("ATRIUM_W={value}\r\n")
+    }
+}
+fn echo_var_cmd(tag: &str) -> String {
+    if cfg!(windows) {
+        format!("echo {tag}-%ATRIUM_W%\r\n")
+    } else {
+        format!("echo {tag}-${{ATRIUM_W}}\r\n")
+    }
+}
+
+/// Ctrl+A n / Ctrl+A p cycle windows and wrap at both ends: each shell carries
+/// its own variable, so the echo proves which window received the keys.
+#[test]
+fn next_and_prev_window_wrap_and_route_input() {
+    let mut p = spawn_atrium_shell(24, 80);
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(set_var_cmd("one").as_bytes()).unwrap();
+    p.write(b"\x01c").unwrap();
+    let out = read_until(&mut p, two, Duration::from_secs(15));
+    assert!(contains(&out, two), "no second window after Ctrl+A c");
+    p.write(set_var_cmd("two").as_bytes()).unwrap();
+
+    p.write(b"\x01n").unwrap(); // from window 2, next wraps to window 1
+    p.write(echo_var_cmd("nx").as_bytes()).unwrap();
+    let out = read_until(&mut p, b"nx-one", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"nx-one"),
+        "Ctrl+A n did not wrap to window 1: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    p.write(b"\x01p").unwrap(); // from window 1, prev wraps to window 2
+    p.write(echo_var_cmd("pv").as_bytes()).unwrap();
+    let out = read_until(&mut p, b"pv-two", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"pv-two"),
+        "Ctrl+A p did not wrap to window 2: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Ctrl+A ! opens the platform shell in a new window, live.
+#[test]
+fn shell_window_opens_live() {
+    let mut p = spawn_atrium_shell(24, 80);
+    // The same resolution atrium uses (COMSPEC / SHELL), as the bar labels it.
+    let var = if cfg!(windows) { "COMSPEC" } else { "SHELL" };
+    let fallback = if cfg!(windows) { "cmd" } else { "sh" };
+    let shell = std::env::var(var).unwrap_or_else(|_| fallback.into());
+    let stem = std::path::Path::new(&shell)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| fallback.into());
+    let label = format!("2:{stem}");
+    p.write(b"\x01!").unwrap();
+    let out = read_until(&mut p, label.as_bytes(), Duration::from_secs(15));
+    assert!(
+        contains(&out, label.as_bytes()),
+        "no {label} window after Ctrl+A !: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"echo atrium-shellwin\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-shellwin", Duration::from_secs(15));
+    assert!(contains(&out, b"atrium-shellwin"), "shell window not live");
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
+/// Let atrium drain and act on what was written so far, the way the gap between
+/// a human's keystrokes does, so the next write lands in a separate read.
+fn settle(p: &mut pty::Pty) {
+    read_until(p, b"\x00never-printed\x00", Duration::from_millis(700));
+}
+
+/// Ctrl+A : captures keys into a command line: Esc closes it without running
+/// anything (keys reach the pane again), Enter opens the typed command in a new
+/// window. Keys are paced like typing (see `settle`).
+#[test]
+fn command_prompt_cancels_and_opens_a_window() {
+    let mut p = spawn_atrium_shell(24, 80);
+    // Cancelled: the typed text never runs, and the next keys reach the pane.
+    p.write(b"\x01:").unwrap();
+    settle(&mut p);
+    p.write(b"echo atrium-never\x1b").unwrap();
+    settle(&mut p);
+    p.write(set_var_cmd("still-one").as_bytes()).unwrap();
+    p.write(echo_var_cmd("esc").as_bytes()).unwrap();
+    let out = read_until(&mut p, b"esc-still-one", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"esc-still-one"),
+        "keys did not reach the pane after Esc closed the prompt: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    // Submitted: the command opens as window 2 and is live.
+    let (cmd, two): (&[u8], &[u8]) = if cfg!(windows) {
+        (b"cmd /Q\r", b"2:cmd")
+    } else {
+        (b"sh -i\r", b"2:sh")
+    };
+    p.write(b"\x01:").unwrap();
+    settle(&mut p);
+    p.write(cmd).unwrap();
+    let out = read_until(&mut p, two, Duration::from_secs(15));
+    assert!(
+        contains(&out, two),
+        "prompt did not open the command as window 2: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(echo_var_cmd("sub").as_bytes()).unwrap();
+    // A fresh shell: the variable set in window 1 is not defined here.
+    let fresh: &[u8] = if cfg!(windows) {
+        b"sub-%ATRIUM_W%"
+    } else {
+        b"sub-\r"
+    };
+    let out = read_until(&mut p, fresh, Duration::from_secs(15));
+    assert!(
+        contains(&out, fresh),
+        "keys did not reach the new window: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
 // --- tiling (0.2): splits, focus, zoom, kill-retile -------------------------
 
 /// Spawn atrium hosting an interactive shell in a pty, returning it once the bar
