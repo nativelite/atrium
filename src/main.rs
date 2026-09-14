@@ -35,12 +35,14 @@ use std::time::{Duration, Instant};
 
 mod ctl_server;
 mod fleet_cli;
+mod overlay_keys;
 mod overview;
 mod pane_spawn;
 mod panels;
 mod tiled;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
+pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
 pub(crate) use panels::*;
@@ -1057,28 +1059,8 @@ fn run(
     // you switch to a non-mouse pane the terminal keeps sending motion events and
     // they get forwarded into that pane as garbage text. See the re-assert below.
     let mut outer_mouse_off = false;
-    // The full-screen board dashboard overlay (`Ctrl+A b`). While on, the panes
-    // keep running (drained, emulated) but are not painted, and keystrokes don't
-    // reach them — it's a read-only view of the shared board.
-    let mut board_view = false;
-    // The mission-control overview (`Ctrl+A o`): the agent tree colored by status
-    // with a selection cursor. While on, keystrokes drive the cursor / dive-in
-    // instead of reaching the panes. `overview_sel` is the selected agent index.
-    let mut overview_view = false;
-    let mut overview_sel = 0usize;
-    // Scrollback offset for the board panel's bus feed: how many of the newest FYI
-    // events to skip so older ones come into view (`0` = live/newest). Reset when
-    // the panel opens; driven by PgUp/PgDn while it's up.
-    let mut feed_scroll = 0usize;
-    // Which open decision is selected in the board panel (index into the pending
-    // list). j/k move it; `r` resolves it; `g`/Enter jumps to the agent that
-    // raised it. The detail bar shows the selected decision's full question.
-    let mut decision_sel = 0usize;
-    // The activity log (`Ctrl+A l`): a time-ordered merge of bus + board + agent
-    // actions. `log_scroll` is how many events back from the newest (bottom) the
-    // view is scrolled; `0` = tailing the latest.
-    let mut log_view = false;
-    let mut log_scroll = 0usize;
+    // The full-screen overlays (overview / board / activity log) and their cursors.
+    let mut views = Views::default();
     // The command prompt (`Ctrl+A :`): `Some(line)` while the operator is typing a
     // command to open in a new pane (any shell/program, not just the launch one).
     // Keystrokes edit the line instead of reaching the panes; Enter opens it.
@@ -1410,268 +1392,27 @@ fn run(
             &bytes
         };
         for action in scanner.feed(feed) {
-            // While the overview is open, keystrokes drive the selection cursor and
-            // dive-in — not the panes. `Ctrl+A o` (toggle) and `Ctrl+A q` (quit)
-            // still work via the scanner; everything else is consumed here.
-            if overview_view {
-                let count: usize = windows.iter().map(|w| w.panes.len()).sum();
-                match &action {
-                    Action::ToggleOverview => {
-                        overview_view = false;
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleBoard => {
-                        // Switch straight from the overview to the board — one press,
-                        // no need to close the overview first (the board render hides
-                        // the cursor and clears the screen itself).
-                        overview_view = false;
-                        board_view = true;
-                        feed_scroll = 0;
-                        decision_sel = 0;
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleLog => {
-                        overview_view = false;
-                        log_view = true;
-                        log_scroll = 0;
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::Quit => break 'outer,
-                    Action::MoveFocus(Dir::Up) => {
-                        overview_sel = overview_sel.saturating_sub(1);
-                        force_repaint = true;
-                    }
-                    Action::MoveFocus(Dir::Down) => {
-                        overview_sel = (overview_sel + 1).min(count.saturating_sub(1));
-                        force_repaint = true;
-                    }
-                    Action::Forward(b) => {
-                        let s = b.as_slice();
-                        if s == b"\r" || s == b"\n" {
-                            // Dive into the selected agent: focus its pane, zoom it
-                            // full-screen, and RESIZE it (as `Ctrl+A z` does) — the
-                            // pane was a small tile, so without the resize it would
-                            // paint into a corner.
-                            let target = overview_nodes(&windows, &world)
-                                .get(overview_sel)
-                                .map(|n| (n.window, n.pane_id));
-                            if let Some((wi, pid)) = target {
-                                active = wi;
-                                windows[active].tree.focus_pane(pid);
-                                windows[active].zoomed = windows[active].panes.len() > 1;
-                                resize_window(&mut windows[active], rows, cols);
-                                overview_view = false;
-                                prev_master = None;
-                                force_repaint = true;
-                            }
-                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
-                            overview_sel = (overview_sel + 1).min(count.saturating_sub(1));
-                            force_repaint = true;
-                        } else if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
-                            overview_sel = overview_sel.saturating_sub(1);
-                            force_repaint = true;
-                        } else if s == b"\x1b" {
-                            overview_view = false;
-                            prev_master = None;
-                            force_repaint = true;
-                        }
-                    }
-                    _ => {} // swallow every other command while the overview is up
+            if let Some(outcome) = handle_overlay_key(
+                &action,
+                &mut views,
+                &mut windows,
+                &world,
+                &board,
+                &mut bus,
+                &mut active,
+                rows,
+                cols,
+                &mut out,
+                &mut flash,
+            ) {
+                if outcome.quit {
+                    break 'outer;
                 }
-                continue;
-            }
-            // While the board panel is up, keystrokes drive it (scroll / switch /
-            // quit) rather than reaching the hidden panes. Mirrors the overview
-            // block above; `Ctrl+A b` closes, `Ctrl+A o` switches to the overview.
-            if board_view {
-                // Snapshot the selected decision's seq + source before any mutation
-                // (pending_decisions borrows the bus; resolving needs it free).
-                let decisions_now = bus.pending_decisions();
-                let dcount = decisions_now.len();
-                let dsel = decision_sel.min(dcount.saturating_sub(1));
-                let sel_seq = decisions_now.get(dsel).map(|e| e.seq);
-                let sel_from = decisions_now.get(dsel).and_then(|e| e.from.clone());
-                drop(decisions_now);
-                let scroll_max = bus.tail(atrium::bus::RING_CAP).len().saturating_sub(1);
-                // Up/down select a decision when there are any; otherwise they
-                // scroll the FYI history. PgUp/PgDn always scroll it.
-                let nav = |up: bool, decision_sel: &mut usize, feed_scroll: &mut usize| {
-                    if dcount > 0 {
-                        *decision_sel = if up {
-                            dsel.saturating_sub(1)
-                        } else {
-                            (dsel + 1).min(dcount - 1)
-                        };
-                    } else if up {
-                        *feed_scroll = (*feed_scroll + 1).min(scroll_max);
-                    } else {
-                        *feed_scroll = feed_scroll.saturating_sub(1);
-                    }
-                };
-                match &action {
-                    Action::ToggleBoard => {
-                        board_view = false;
-                        let _ = write!(out, "\x1b[?25h");
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleOverview => {
-                        overview_view = true;
-                        board_view = false;
-                        overview_sel = overview_nodes(&windows, &world)
-                            .iter()
-                            .position(|n| {
-                                n.window == active && n.pane_id == windows[active].tree.focus()
-                            })
-                            .unwrap_or(0);
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleLog => {
-                        board_view = false;
-                        log_view = true;
-                        log_scroll = 0;
-                        let _ = write!(out, "\x1b[?25h");
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::Quit => break 'outer,
-                    Action::MoveFocus(Dir::Up) => {
-                        nav(true, &mut decision_sel, &mut feed_scroll);
-                        force_repaint = true;
-                    }
-                    Action::MoveFocus(Dir::Down) => {
-                        nav(false, &mut decision_sel, &mut feed_scroll);
-                        force_repaint = true;
-                    }
-                    Action::Forward(b) => {
-                        let s = b.as_slice();
-                        if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
-                            nav(true, &mut decision_sel, &mut feed_scroll);
-                            force_repaint = true;
-                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
-                            nav(false, &mut decision_sel, &mut feed_scroll);
-                            force_repaint = true;
-                        } else if s == b"\x1b[5~" {
-                            feed_scroll = (feed_scroll + 10).min(scroll_max);
-                            force_repaint = true;
-                        } else if s == b"\x1b[6~" {
-                            feed_scroll = feed_scroll.saturating_sub(10);
-                            force_repaint = true;
-                        } else if s == b"r" || s == b"R" {
-                            // Resolve the selected decision (after you've answered it
-                            // in the agent's pane); clear it from the awaiting list.
-                            if let Some(seq) = sel_seq {
-                                bus.resolve(seq);
-                                flash = Some((format!("resolved decision #{seq}"), Instant::now()));
-                                decision_sel = decision_sel.min(dcount.saturating_sub(2));
-                                force_repaint = true;
-                            }
-                        } else if s == b"g" || s == b"\r" || s == b"\n" {
-                            // Jump to the pane of the agent that raised the decision
-                            // (by role), zoomed, and close the panel — go answer it.
-                            let target = sel_from.as_ref().and_then(|role| {
-                                windows.iter().enumerate().find_map(|(wi, w)| {
-                                    w.panes
-                                        .iter()
-                                        .find(|p| p.role.as_deref() == Some(role.as_str()))
-                                        .map(|p| (wi, p.id))
-                                })
-                            });
-                            if let Some((wi, pid)) = target {
-                                active = wi;
-                                windows[active].tree.focus_pane(pid);
-                                windows[active].zoomed = windows[active].panes.len() > 1;
-                                resize_window(&mut windows[active], rows, cols);
-                                board_view = false;
-                                let _ = write!(out, "\x1b[?25h");
-                                prev_master = None;
-                                force_repaint = true;
-                            } else {
-                                flash = Some((
-                                    format!(
-                                        "no pane for agent {}",
-                                        sel_from.clone().unwrap_or_default()
-                                    ),
-                                    Instant::now(),
-                                ));
-                                force_repaint = true;
-                            }
-                        } else if s == b"\x1b" {
-                            board_view = false;
-                            let _ = write!(out, "\x1b[?25h");
-                            prev_master = None;
-                            force_repaint = true;
-                        }
-                    }
-                    _ => {} // swallow every other command while the board is up
+                if outcome.reset_frame {
+                    prev_master = None;
                 }
-                continue;
-            }
-            // While the activity log is up, keystrokes scroll it or switch views.
-            if log_view {
-                let total = collect_log(&windows, &world, &board, &bus).len();
-                let scroll_max = total.saturating_sub(1);
-                match &action {
-                    Action::ToggleLog => {
-                        log_view = false;
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleBoard => {
-                        log_view = false;
-                        board_view = true;
-                        feed_scroll = 0;
-                        decision_sel = 0;
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::ToggleOverview => {
-                        log_view = false;
-                        overview_view = true;
-                        overview_sel = overview_nodes(&windows, &world)
-                            .iter()
-                            .position(|n| {
-                                n.window == active && n.pane_id == windows[active].tree.focus()
-                            })
-                            .unwrap_or(0);
-                        prev_master = None;
-                        force_repaint = true;
-                    }
-                    Action::Quit => break 'outer,
-                    // Up/k = older (scroll back); down/j = newer; PgUp/PgDn ×10.
-                    Action::MoveFocus(Dir::Up) => {
-                        log_scroll = (log_scroll + 1).min(scroll_max);
-                        force_repaint = true;
-                    }
-                    Action::MoveFocus(Dir::Down) => {
-                        log_scroll = log_scroll.saturating_sub(1);
-                        force_repaint = true;
-                    }
-                    Action::Forward(b) => {
-                        let s = b.as_slice();
-                        if s == b"k" || s == b"\x1b[A" || s == b"\x1bOA" {
-                            log_scroll = (log_scroll + 1).min(scroll_max);
-                            force_repaint = true;
-                        } else if s == b"j" || s == b"\x1b[B" || s == b"\x1bOB" {
-                            log_scroll = log_scroll.saturating_sub(1);
-                            force_repaint = true;
-                        } else if s == b"\x1b[5~" {
-                            log_scroll = (log_scroll + 10).min(scroll_max);
-                            force_repaint = true;
-                        } else if s == b"\x1b[6~" {
-                            log_scroll = log_scroll.saturating_sub(10);
-                            force_repaint = true;
-                        } else if s == b"\x1b" {
-                            log_view = false;
-                            prev_master = None;
-                            force_repaint = true;
-                        }
-                    }
-                    _ => {}
+                if outcome.repaint {
+                    force_repaint = true;
                 }
                 continue;
             }
@@ -1764,13 +1505,13 @@ fn run(
                     }
                 }
                 Action::ToggleBoard => {
-                    board_view = !board_view;
-                    feed_scroll = 0; // always open at the live/newest end
-                    decision_sel = 0;
+                    views.board = !views.board;
+                    views.feed_scroll = 0; // always open at the live/newest end
+                    views.decision_sel = 0;
                     // Toggling either way is a full repaint: on → draw the panel
                     // (it clears the screen); off → recompose/repaint the panes the
                     // panel covered. On close, restore the cursor the panel hid.
-                    if !board_view {
+                    if !views.board {
                         let _ = write!(out, "\x1b[?25h");
                     }
                     prev_master = None;
@@ -1786,10 +1527,10 @@ fn run(
                     // Open the overview (close the board if it was up — one overlay
                     // at a time). Selection starts at the focused agent so Enter
                     // dives back into what you were watching.
-                    overview_view = true;
-                    board_view = false;
+                    views.overview = true;
+                    views.board = false;
                     let focus = windows[active].tree.focus();
-                    overview_sel = overview_nodes(&windows, &world)
+                    views.overview_sel = overview_nodes(&windows, &world)
                         .iter()
                         .position(|n| n.window == active && n.pane_id == focus)
                         .unwrap_or(0);
@@ -1799,10 +1540,10 @@ fn run(
                 }
                 Action::ToggleLog => {
                     // Open the activity log (one overlay at a time).
-                    log_view = true;
-                    board_view = false;
-                    overview_view = false;
-                    log_scroll = 0;
+                    views.log = true;
+                    views.board = false;
+                    views.overview = false;
+                    views.log_scroll = 0;
                     let _ = write!(out, "\x1b[?25h");
                     prev_master = None;
                     force_repaint = true;
@@ -2092,7 +1833,7 @@ fn run(
                             pane.painted = true;
                         }
                         if !tiled && pane.id == focus {
-                            if board_view || overview_view || log_view {
+                            if views.any() {
                                 // An overlay (board / overview) is up: keep the
                                 // passthrough filter state current, but don't paint
                                 // the pane over the panel. (The emulator was already
@@ -2364,7 +2105,7 @@ fn run(
             did_refresh = true;
             // Keep the overview and activity log live but calm: repaint once per
             // status poll (~1 Hz), not every tick, so they update without flicker.
-            if overview_view || log_view {
+            if views.overview || views.log {
                 force_repaint = true;
             }
         }
@@ -2434,45 +2175,61 @@ fn run(
                 .get(active)
                 .map(|w| w.tree.focus())
                 .unwrap_or(usize::MAX),
-            board_view,
-            overview_view,
-            log_view,
+            views.board,
+            views.overview,
+            views.log,
             rows,
             cols,
         );
         let view_changed = view_key != last_view;
         last_view = view_key;
-        if overview_view {
+        if views.overview {
             // The overview replaces the panes. Clamp the selection to the live
             // agent count (panes may have been reaped) and re-render on a repaint.
             let count: usize = windows.iter().map(|w| w.panes.len()).sum();
-            overview_sel = overview_sel.min(count.saturating_sub(1));
+            views.overview_sel = views.overview_sel.min(count.saturating_sub(1));
             if force_repaint {
                 let nodes = overview_nodes(&windows, &world);
                 frame.extend_from_slice(
-                    render_overview_panel(&windows, &bus, &nodes, overview_sel, rows, cols)
+                    render_overview_panel(&windows, &bus, &nodes, views.overview_sel, rows, cols)
                         .as_bytes(),
                 );
             }
-        } else if board_view {
+        } else if views.board {
             // The board overlay replaces the panes. Re-render only on a repaint
             // (toggle, or a board write — every ctl request forces one), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
                 frame.extend_from_slice(
-                    render_board_panel(&board, &bus, rows, cols, feed_scroll, decision_sel)
-                        .as_bytes(),
+                    render_board_panel(
+                        &board,
+                        &bus,
+                        rows,
+                        cols,
+                        views.feed_scroll,
+                        views.decision_sel,
+                    )
+                    .as_bytes(),
                 );
             }
-        } else if log_view {
+        } else if views.log {
             // The activity log overlay: a live time-ordered merge of bus + board
             // + agent actions. Re-rendered on a repaint (toggle, scroll, or any
             // agent/ctl activity that forces one).
             if force_repaint {
                 let now = agsess::sessions::now_ms();
                 frame.extend_from_slice(
-                    render_log_panel(&windows, &world, &board, &bus, rows, cols, log_scroll, now)
-                        .as_bytes(),
+                    render_log_panel(
+                        &windows,
+                        &world,
+                        &board,
+                        &bus,
+                        rows,
+                        cols,
+                        views.log_scroll,
+                        now,
+                    )
+                    .as_bytes(),
                 );
             }
         } else if windows[active].tiled() {
@@ -2639,7 +2396,7 @@ fn run(
         // emulator, so `term.screen().cursor` is current. Both are 0-based; the
         // passthrough pane fills the screen from (0,0), so +1 gives 1-based screen
         // coordinates in either mode.
-        if bar_appended && !board_view && !overview_view && !log_view && prompt.is_none() {
+        if bar_appended && !views.board && !views.overview && !views.log && prompt.is_none() {
             let cur = if windows[active].tiled() {
                 prev_master.as_ref().map(|m| m.cursor)
             } else {

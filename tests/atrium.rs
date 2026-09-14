@@ -1572,6 +1572,66 @@ fn closing_an_overlay_repaints_the_pane() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// The three overlays hand keys between each other and back to the pane, and
+/// `Ctrl+A q` quits from inside one (r10 B11 carved these handlers out of the
+/// event loop into `overlay_keys`; this drives every transition through the real
+/// binary so the carve is held to the old behavior).
+#[test]
+fn overlays_switch_between_each_other_close_on_esc_and_quit_from_inside() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
+    let marker_cmd: &[u8] = if cfg!(windows) {
+        b"echo overlay^=marker\r\n"
+    } else {
+        b"m=overlay; echo \"$m\"\"=marker\"\r\n"
+    };
+    p.write(marker_cmd).unwrap();
+    let out = read_until(&mut p, b"overlay=marker", Duration::from_secs(15));
+    assert!(contains(&out, b"overlay=marker"), "pane never painted");
+
+    // Pane -> overview -> board -> log, each switch in one keystroke.
+    for (keys, header) in [
+        (&b"\x01o"[..], &b"overview"[..]),
+        (b"\x01b", b"board + bus"),
+        (b"\x01a", b"activity log"),
+    ] {
+        p.write(keys).unwrap();
+        let seen = read_until(&mut p, header, Duration::from_secs(10));
+        assert!(
+            contains(&seen, header),
+            "{:?} did not open {:?}: {:?}",
+            String::from_utf8_lossy(keys),
+            String::from_utf8_lossy(header),
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    // Esc closes the log and the pane comes back.
+    p.write(b"\x1b").unwrap();
+    let back = read_until(&mut p, b"overlay=marker", Duration::from_secs(10));
+    assert!(
+        contains(&back, b"overlay=marker"),
+        "Esc did not return to the pane: {:?}",
+        String::from_utf8_lossy(&back)
+    );
+
+    // Quit from inside an open overlay.
+    p.write(b"\x01o").unwrap();
+    read_until(&mut p, b"overview", Duration::from_secs(10));
+    p.write(b"\x01q").unwrap();
+    assert_eq!(
+        wait_exit(&mut p, 15),
+        0,
+        "Ctrl+A q inside the overview must quit"
+    );
+}
+
 /// **A pane's whole process tree must die with it** (review finding #2).
 ///
 /// `Pty::kill` is `SIGKILL` to the direct child only, so everything that child
