@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 mod ctl_server;
 mod fleet_cli;
+mod loop_phases;
 mod overlay_keys;
 mod overview;
 mod pane_spawn;
@@ -42,6 +43,7 @@ mod panels;
 mod tiled;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
+pub(crate) use loop_phases::*;
 pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
 pub(crate) use pane_spawn::*;
@@ -1796,158 +1798,18 @@ fn run(
         // 2. drain every pane in the active window (all panes are live in
         //    tiled mode); feed the emulator, and in passthrough also write the
         //    focused pane's cleaned bytes straight through.
-        let tiled = windows[active].tiled();
-        let focus = windows[active].tree.focus();
-        for pane in windows[active].panes.iter_mut() {
-            // Drain each active pane *fully* before we composite, so a big data
-            // burst (a large `ctl send`, a wall of tool output) is a whole frame
-            // rather than a truncated one — a partial drain that straddles a
-            // `?2026` block stalls the outer terminal (the "shutter"). The loop
-            // still breaks the instant there is no more data, so the high cap only
-            // bites on a genuinely huge burst; it never adds latency when idle.
-            for i in 0..DRAIN_READS_PER_TICK {
-                let wait = if i == 0 {
-                    Duration::from_millis(5)
-                } else {
-                    Duration::ZERO
-                };
-                match pane.pty.read_timeout(&mut buf, wait) {
-                    Ok(Some(n)) if n > 0 => {
-                        // Always feed the emulator so a later switch/split/zoom
-                        // renders the current screen without a repaint nudge.
-                        pane.term.feed(&buf[..n]);
-                        // This pane just produced output → it is active now. Stamp
-                        // the monotonic activity clock for ctl `idle_ms` (covers the
-                        // focused pane and any background pane in the active window).
-                        pane.last_activity = std::time::Instant::now();
-                        // Track whether this pane's app wants the mouse (so scroll
-                        // routes to it, not a bare shell).
-                        if let Some(m) = sniff_mouse_mode(&buf[..n]) {
-                            pane.mouse_wanted = m;
-                        }
-                        // "painted" = the emulator now has *visible* content, not
-                        // merely that setup bytes arrived — so the splash stays up
-                        // until the agent's first frame.
-                        let first_paint = !pane.painted && !term_blank(&pane.term);
-                        if first_paint {
-                            pane.painted = true;
-                        }
-                        if !tiled && pane.id == focus {
-                            if views.any() {
-                                // An overlay (board / overview) is up: keep the
-                                // passthrough filter state current, but don't paint
-                                // the pane over the panel. (The emulator was already
-                                // fed above, so a toggle-off repaints from the
-                                // current screen.)
-                                let _ = pane.filter.feed(&buf[..n]);
-                            } else if first_paint {
-                                // Hand off from the splash: restore the cursor the
-                                // splash hid, then paint the agent's current screen
-                                // straight from the emulator (its `render_full`
-                                // already clears + reflects everything fed so far),
-                                // and resume live passthrough from here.
-                                let full = pane.term.screen().render_full();
-                                let _ = out.write_all(b"\x1b[?25h");
-                                let _ = out.write_all(&full);
-                                // render_full cleared the whole screen (the bar row
-                                // too); repaint the bar this tick so it never blinks
-                                // out during the handoff.
-                                force_repaint = true;
-                            } else if pane.painted {
-                                let cleaned = pane.filter.feed(&buf[..n]);
-                                let _ = out.write_all(&cleaned);
-                                // A full-screen clear from the app (claude emits one
-                                // at startup, and again as its UI settles) ignores
-                                // the scroll region and wipes the bar row. Repaint the
-                                // bar this tick so it doesn't vanish until some later
-                                // trigger (which is why it only appeared once ctl/
-                                // remote-control connected).
-                                if clears_screen(&buf[..n]) {
-                                    force_repaint = true;
-                                }
-                            } else {
-                                // Still on the splash: keep the passthrough filter's
-                                // state current, but suppress output so the agent's
-                                // setup bytes don't scribble under the splash.
-                                let _ = pane.filter.feed(&buf[..n]);
-                            }
-                        } else if pane.id != focus {
-                            pane.activity = true;
-                        }
-                    }
-                    Ok(Some(_)) => {
-                        pane.exited = true;
-                        break;
-                    }
-                    _ => break,
-                }
-            }
+        let drained = drain_active_window(&mut windows[active], views.any(), &mut buf, &mut out);
+        if drained.force_repaint {
+            force_repaint = true;
         }
-        if !tiled {
-            let _ = out.flush();
-        }
-
-        // Collect per-pane dirty bits for the active window in one pass after
-        // all draining is done. fold (not any) is required so every term's
-        // flag is reset even when an earlier pane was already dirty.
-        let tiled_dirty = windows[active]
-            .panes
-            .iter_mut()
-            .fold(false, |d, p| d | p.term.take_dirty());
+        let tiled_dirty = drained.tiled_dirty;
 
         // 3. background windows: drain (discarded — emulator/ConPTY keep the
         //    screen) and flag activity so the bar shows it.
-        for (i, w) in windows.iter_mut().enumerate() {
-            if i == active {
-                continue;
-            }
-            for pane in w.panes.iter_mut() {
-                // Bounded exactly like the focused drain above. This used to be
-                // an unbounded `while let`, so one noisy background agent could
-                // hold the loop for as long as it kept producing output —
-                // starving keystrokes, signal handling and ctl for the whole
-                // session. A fleet makes that likely rather than theoretical.
-                let mut reads = 0usize;
-                while reads < DRAIN_READS_PER_TICK {
-                    let Ok(Some(n)) = pane.pty.read_timeout(&mut buf, Duration::ZERO) else {
-                        break;
-                    };
-                    reads += 1;
-                    if n == 0 {
-                        pane.exited = true;
-                        break;
-                    }
-                    pane.term.feed(&buf[..n]);
-                    pane.last_activity = std::time::Instant::now();
-                    if let Some(m) = sniff_mouse_mode(&buf[..n]) {
-                        pane.mouse_wanted = m;
-                    }
-                    pane.activity = true;
-                }
-            }
-        }
+        drain_background_windows(&mut windows, active, &mut buf);
 
         // 4. reap exits; drop dead panes and empty windows, re-tiling.
-        let mut layout_changed = false;
-        for w in windows.iter_mut() {
-            for pane in w.panes.iter_mut() {
-                if let Ok(Some(_)) = pane.pty.try_wait() {
-                    pane.exited = true;
-                }
-            }
-            if w.panes.iter().any(|p| p.exited) {
-                let dead: Vec<usize> = w.panes.iter().filter(|p| p.exited).map(|p| p.id).collect();
-                for id in dead {
-                    // Collapse the tree first (keeps focus valid), then drop the
-                    // pane. A last-pane close leaves the tree single; the window
-                    // itself is removed below when its panes go empty.
-                    let _ = w.tree.close(id);
-                }
-                w.panes.retain(|p| !p.exited);
-                w.zoomed = w.zoomed && w.panes.len() > 1;
-                layout_changed = true;
-            }
-        }
+        let layout_changed = drop_exited_panes(&mut windows);
         if layout_changed {
             let empty_before_active = windows[..active]
                 .iter()
@@ -2121,37 +1983,7 @@ fn run(
         //     considered; a successful adopt fills `session_id` so later passes skip
         //     it.
         if did_refresh {
-            let sessions = world.sessions();
-            if !sessions.is_empty() {
-                for w in &mut windows {
-                    for p in &mut w.panes {
-                        if p.session_id.is_some() || p.exited {
-                            continue;
-                        }
-                        // Only a *known non-claude* vendor pane adopts (claude
-                        // panes already carry an injected id). Scope the candidate
-                        // pool to this pane's own vendor via `AgentSession.vendor`,
-                        // so a gemini pane can never adopt the newest claude session
-                        // that happens to sit in the merged pool.
-                        let Some(vendor) = atrium::vendors::vendor_for_stem(&p.title) else {
-                            continue;
-                        };
-                        if vendor == agsess::Vendor::ClaudeCode {
-                            continue;
-                        }
-                        let mine: Vec<&agsess::AgentSession> = sessions
-                            .iter()
-                            .copied()
-                            .filter(|s| s.vendor == vendor)
-                            .collect();
-                        if let Some(id) =
-                            atrium::vendors::adopt_session_for(&mine, p.cwd.as_deref(), p.launch_ms)
-                        {
-                            p.session_id = Some(id);
-                        }
-                    }
-                }
-            }
+            adopt_sessions(&mut windows, &world);
         }
 
         // 6. render the active window (tiled compose+diff, else passthrough is
@@ -2304,33 +2136,7 @@ fn run(
         }
 
         // 7. the bar (windows, with the active one starred)
-        let infos: Vec<PaneInfo> = windows
-            .iter()
-            .enumerate()
-            .map(|(i, w)| PaneInfo {
-                title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
-                active: i == active,
-                // A window is "waiting" when a bound agent pane in it is blocked
-                // on the human (§4.2 rung 3). Status only.
-                attention: atrium::bar::Attention::from_facts(
-                    w.panes.iter().all(|p| p.exited),
-                    w.panes.iter().any(|p| {
-                        matches!(
-                            world.status_for(p.session_id.as_deref()),
-                            Some(agsess::Status::WaitingApproval)
-                        )
-                    }),
-                    w.panes.iter().any(|p| p.activity),
-                ),
-                // The window's identity tag: the bar pane's identity name (all
-                // panes in a window inherit the same identity in v1). Name only.
-                identity: w.bar_pane().and_then(|p| p.identity.clone()),
-                // The window's persona/role (fleet agent name or ctl --role) —
-                // of the FOCUSED pane, so the entry reads `N:claude:persona` for
-                // the agent you are looking at, zoomed or tiled.
-                role: w.bar_pane().and_then(|p| p.role.clone()),
-            })
-            .collect();
+        let infos = bar_infos(&windows, active, &world);
         if flash
             .as_ref()
             .is_some_and(|(_, at)| at.elapsed() > Duration::from_secs(5))
@@ -2344,16 +2150,7 @@ fn run(
         // addressed to a live teammate (`to=<role>`) is that agent's to answer, so
         // it is NOT counted here (the human still sees it in the board panel — the
         // broker keeps full visibility, just isn't urgently pinged for it).
-        let decisions_open = bus
-            .pending_decisions()
-            .iter()
-            .filter(|e| !decision_for_agent(e, &windows))
-            .count();
-        let decision_note = match decisions_open {
-            0 => String::new(),
-            1 => "1 decision needs you \u{00b7} Ctrl+A b".to_string(),
-            n => format!("{n} decisions need you \u{00b7} Ctrl+A b"),
-        };
+        let decision_note = decision_note(&bus, &windows);
         let note = flash.as_ref().map(|(m, _)| m.as_str()).unwrap_or({
             if decision_note.is_empty() {
                 ""
