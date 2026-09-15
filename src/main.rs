@@ -144,6 +144,11 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// the pane has no more data, so this cap only matters on a genuine flood.
 const DRAIN_READS_PER_TICK: usize = 64;
 
+/// The longest the loop sleeps with nothing arriving: its timed work (the splash
+/// spinner, the bar refresh, resize checks, ctl polling, the safety net) runs at
+/// least this often. Keys and pane output wake it immediately.
+const LOOP_TICK: Duration = Duration::from_millis(20);
+
 /// How long exit waits for the terminal to take atrium's last output (the
 /// screen restore) before leaving anyway.
 const SCREEN_FINISH: Duration = Duration::from_secs(3);
@@ -300,6 +305,11 @@ fn cap_trust_to_ancestor(mut trust: atrium::ctl::TrustMode) -> atrium::ctl::Trus
 /// passthrough filter (for the passthrough / zoom path), and bar metadata. Each
 /// pane has a stable `id` the window's split tree refers to.
 pub(crate) struct Pane {
+    /// This pane's output, from its reader thread; `None` until the loop starts
+    /// one. **Declared before `pty` on purpose**: fields drop in order, and the
+    /// inbox must go first so its reader stops before the `Pty`'s drop waits on
+    /// the console host (see `atrium::events::PaneInbox`).
+    pub(crate) inbox: Option<atrium::events::PaneInbox>,
     pub(crate) id: usize,
     pub(crate) pty: pty::Pty,
     pub(crate) term: vterm::Term,
@@ -1144,6 +1154,11 @@ fn run(
     // `renderer`.
     let mut renderer = Renderer::new();
 
+    // What wakes the loop: keys on their own thread, and a reader thread per
+    // pane (started at the top of each tick), all ringing one doorbell.
+    let (bell, wake) = atrium::events::doorbell();
+    let mut keys = atrium::events::KeyReader::start(term.input(), bell.clone()).ok();
+
     // The read at the top can fail (terminal gone) *and* commands deep inside
     // `break 'outer`; a labeled `loop` expresses both. clippy's while-let
     // rewrite can't host the labeled break, so allow it here.
@@ -1165,10 +1180,23 @@ fn run(
         if safety_net.tick(&windows, session_job, &mut ctl_audit, &mut bus, &mut flash) {
             force_repaint = true;
         }
-        // 1. keystrokes -> scanner -> focused pane / commands
-        let bytes = match term.read_bytes(Duration::from_millis(15)) {
-            Ok(b) => b,
-            Err(_) => break,
+        // 1. wait for a key or pane output — woken the moment either arrives —
+        //    or at most a tick, for the loop's timed work. Then keystrokes ->
+        //    scanner -> focused pane / commands.
+        start_pane_readers(&mut windows, &bell);
+        let bytes = match &keys {
+            Some(keys) => {
+                wake.wait(LOOP_TICK);
+                match keys.take() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                }
+            }
+            // No key thread could be started: wait on the keyboard as before.
+            None => match term.read_bytes(Duration::from_millis(15)) {
+                Ok(b) => b,
+                Err(_) => break,
+            },
         };
         if !bytes.is_empty() && std::env::var_os("ATRIUM_DEBUG").is_some() {
             let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -1588,6 +1616,10 @@ fn run(
     }
 
     let dbg = std::env::var_os("ATRIUM_DEBUG").is_some();
+    // Stop reading keys before the caller restores the terminal.
+    if let Some(k) = keys.as_mut() {
+        k.stop();
+    }
     // The upkeep thread first: it must not be stopping builds while the panes
     // are torn down, nor holding the session job's handle when it is closed.
     safety_net.stop_upkeep();

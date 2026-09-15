@@ -5,6 +5,42 @@
 
 use crate::*;
 
+/// Take a pane's next output without waiting: `Some(n)` bytes into `buf`,
+/// `Some(0)` when its output has ended, `None` when nothing is waiting. From the
+/// pane's reader thread once it has one; before that (or if a reader could not
+/// be started) a zero-wait read of the pty itself. Never both at once: the loop
+/// starts a reader before a tick's drains, and only reads the pty while it has
+/// none.
+pub(crate) fn pane_read(pane: &mut Pane, buf: &mut [u8]) -> Option<usize> {
+    match &pane.inbox {
+        Some(inbox) => match inbox.take(buf) {
+            atrium::events::PaneRead::Bytes(n) => Some(n),
+            atrium::events::PaneRead::Ended => Some(0),
+            atrium::events::PaneRead::Empty => None,
+        },
+        None => match pane.pty.read_timeout(buf, Duration::ZERO) {
+            Ok(Some(n)) => Some(n),
+            _ => None,
+        },
+    }
+}
+
+/// Start a reader thread for every pane that has none, each ringing `bell`.
+/// Cheap when there is nothing new: a scan of the panes.
+pub(crate) fn start_pane_readers(windows: &mut [Window], bell: &atrium::events::Doorbell) {
+    for pane in windows.iter_mut().flat_map(|w| w.panes.iter_mut()) {
+        if pane.inbox.is_none() && !pane.exited {
+            if let Ok(inbox) = pane
+                .pty
+                .reader()
+                .and_then(|r| atrium::events::PaneInbox::start(r, bell.clone()))
+            {
+                pane.inbox = Some(inbox);
+            }
+        }
+    }
+}
+
 /// What draining the active window this tick asks of the loop.
 pub(crate) struct ActiveDrain {
     /// Repaint the bar/frame this tick (a first paint or a full-screen clear
@@ -35,18 +71,11 @@ pub(crate) fn drain_active_window(
         // `?2026` block stalls the outer terminal (the "shutter"). The loop
         // still breaks the instant there is no more data, so the high cap only
         // bites on a genuinely huge burst; it never adds latency when idle.
-        for i in 0..DRAIN_READS_PER_TICK {
-            // Only the focused pane — the one keys go to — waits briefly for its
-            // echo; every other pane is read without waiting. A 5 ms wait per
-            // pane cost a tiled window of 8 about 40 ms of every tick (measured:
-            // key echo p50 65 ms at 8 panes, 6 ms at 1).
-            let wait = if i == 0 && pane.id == focus {
-                Duration::from_millis(5)
-            } else {
-                Duration::ZERO
-            };
-            match pane.pty.read_timeout(buf, wait) {
-                Ok(Some(n)) if n > 0 => {
+        // No read waits here: the loop is woken the moment any pane writes (see
+        // `atrium::events`), so whatever is due has already arrived.
+        for _ in 0..DRAIN_READS_PER_TICK {
+            match pane_read(pane, buf) {
+                Some(n) if n > 0 => {
                     // Always feed the emulator so a later switch/split/zoom
                     // renders the current screen without a repaint nudge.
                     pane.term.feed(&buf[..n]);
@@ -98,11 +127,11 @@ pub(crate) fn drain_active_window(
                         pane.activity = true;
                     }
                 }
-                Ok(Some(_)) => {
+                Some(_) => {
                     pane.exited = true;
                     break;
                 }
-                _ => break,
+                None => break,
             }
         }
     }
@@ -189,7 +218,7 @@ pub(crate) fn drain_background_windows(windows: &mut [Window], active: usize, bu
             // session. A fleet makes that likely rather than theoretical.
             let mut reads = 0usize;
             while reads < DRAIN_READS_PER_TICK {
-                let Ok(Some(n)) = pane.pty.read_timeout(buf, Duration::ZERO) else {
+                let Some(n) = pane_read(pane, buf) else {
                     break;
                 };
                 reads += 1;

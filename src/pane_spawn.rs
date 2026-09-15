@@ -579,6 +579,8 @@ pub(crate) fn spawn_pane_full(
         cg.assign(pty.pid());
     }
     Ok(Pane {
+        // The run loop starts the reader thread, with its doorbell.
+        inbox: None,
         id,
         pty,
         term: vterm::Term::new(r as usize, c as usize),

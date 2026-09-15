@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still launches. `ctl spawn` still refuses past the cap at runtime.
 
 ### Changed
+- **The run loop wakes on events instead of polling.** Keys are read on their
+  own thread and each pane's output on one of its own, and all of them wake the
+  loop the moment something arrives. Before, the loop waited up to 15 ms on the
+  keyboard and polled every pane with a timed read, a sleep per pane on
+  Windows. Only the loop's timed work (the splash spinner, the bar refresh,
+  ctl, the safety net) still runs on a 20 ms tick. Measured on Windows (release;
+  output timestamped on a reader thread; bare `cmd` echoes in 0.1 ms):
+  - one pane: key echo median ~6 ms → 0.4–0.5 ms
+  - eight tiled panes: median 65 ms → 0.4–0.6 ms
+  - idle CPU: 1–2% of a core
+  - rare outliers of ~16 ms remain, cause not confirmed
+
+  An earlier step made only the focused pane wait for output. Needs
+  `nativelite-pty` with `Pty::reader` and `nativelite-rawterm` with
+  `Terminal::input`.
 - **Agent status is refreshed off the run loop.** Refreshing the vendor worlds
   walked every transcript in the history once a second on the loop: most of
   atrium's idle CPU, and the loop stalled up to 153 ms. A thread now refreshes
