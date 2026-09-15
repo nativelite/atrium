@@ -751,6 +751,56 @@ fn show_str(s: &str) -> String {
     format!("\"{}\"", shorten(&sanitize(s), BANNER_MAX))
 }
 
+/// Width of the preflight block's top and bottom rules.
+const PREFLIGHT_RULE: usize = 64;
+
+/// The banner's preflight warnings as one block that is hard to skim past.
+///
+/// A preflight warning never stops a launch — the operator decides at the
+/// Enter prompt — so it has to be loud instead: a bold yellow header band, a
+/// yellow bar down every warning, and a closing rule. `color` is false when
+/// stderr is not a terminal (or `NO_COLOR` is set); the block is then plain
+/// `atrium fleet: warning: …` lines, so a log stays greppable and escape-free.
+/// No lines at all when there is nothing to warn about.
+///
+/// Callers pass text that is already defanged: every file-supplied string in a
+/// warning goes through [`sanitize`] first.
+pub fn preflight_block(warnings: &[String], color: bool) -> Vec<String> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    if !color {
+        return warnings
+            .iter()
+            .map(|w| format!("atrium fleet: warning: {w}"))
+            .collect();
+    }
+    const BAND: &str = "\x1b[1;30;43m";
+    const YELLOW: &str = "\x1b[1;33m";
+    const RESET: &str = "\x1b[0m";
+    let count = match warnings.len() {
+        1 => "1 warning".to_string(),
+        n => format!("{n} warnings"),
+    };
+    let title = format!(" ▲ PREFLIGHT · {count} · launching anyway ");
+    let fill = PREFLIGHT_RULE.saturating_sub(title.chars().count() + 3);
+    let mut lines = vec![
+        String::new(),
+        format!(
+            "{YELLOW}┏━━{RESET}{BAND}{title}{RESET}{YELLOW}{}{RESET}",
+            "━".repeat(fill)
+        ),
+    ];
+    for w in warnings {
+        lines.push(format!("{YELLOW}┃  ▲ {w}{RESET}"));
+    }
+    lines.push(format!(
+        "{YELLOW}┗{}{RESET}",
+        "━".repeat(PREFLIGHT_RULE - 1)
+    ));
+    lines
+}
+
 /// Strip Windows' verbatim `\\?\` prefix that `canonicalize` adds.
 ///
 /// The resolved path is not just printed — it is what the child is spawned with,
@@ -2636,5 +2686,41 @@ mod tests {
         .unwrap();
         let ctx = f.get("f").unwrap().context.as_ref().unwrap();
         assert_eq!(ctx.share, crate::context::Share::Knowledge);
+    }
+
+    #[test]
+    fn preflight_warnings_are_a_loud_block_on_a_terminal_and_plain_in_a_log() {
+        let warnings = vec![
+            "40 agents is over the pane cap".to_string(),
+            "ctl is on but no agent may spawn".to_string(),
+        ];
+        assert!(
+            preflight_block(&[], true).is_empty(),
+            "nothing to warn about"
+        );
+
+        let loud = preflight_block(&warnings, true);
+        // Header band, one bar per warning, a closing rule (plus the spacer).
+        assert_eq!(loud.len(), warnings.len() + 3, "{loud:#?}");
+        assert!(loud[1].contains("PREFLIGHT · 2 warnings · launching anyway"));
+        assert!(
+            loud[1].contains("\x1b[1;30;43m"),
+            "the header is a yellow band"
+        );
+        for (line, w) in loud[2..4].iter().zip(&warnings) {
+            assert!(line.starts_with("\x1b[1;33m┃") && line.contains(w.as_str()));
+        }
+        assert!(loud[4].contains('┗'));
+
+        // A log gets greppable, escape-free lines instead.
+        let plain = preflight_block(&warnings, false);
+        assert_eq!(
+            plain,
+            vec![
+                "atrium fleet: warning: 40 agents is over the pane cap",
+                "atrium fleet: warning: ctl is on but no agent may spawn",
+            ]
+        );
+        assert!(plain.iter().all(|l| !l.contains('\x1b')));
     }
 }

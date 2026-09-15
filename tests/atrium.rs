@@ -1328,6 +1328,51 @@ fn a_cwd_that_names_a_regular_file_is_refused_before_the_terminal_is_taken() {
     );
 }
 
+/// A roster past the pane cap is a preflight WARNING: it is printed with the
+/// other warnings before the verdict, and the launch carries on to the terminal
+/// handoff instead of stopping.
+#[test]
+fn a_roster_past_the_pane_cap_warns_and_still_launches() {
+    let lab = FleetLab::new("panecap");
+    lab.file(
+        r#"{"fleets":{"t":{"agents":[
+            {"name":"one","cmd":["claude"]},
+            {"name":"two","cmd":["claude"]},
+            {"name":"three","cmd":["claude"]}]}}}"#,
+    );
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+        .args(["fleet", "up", "t"])
+        .current_dir(lab.proj())
+        .env("HOME", lab.root.join("home"))
+        .env("USERPROFILE", lab.root.join("home"))
+        .env("XDG_CONFIG_HOME", lab.root.join("cfg"))
+        .env("APPDATA", lab.root.join("cfg"))
+        .env("ATRIUM_MAX_PANES", "2")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let warning = err
+        .lines()
+        .find(|l| l.contains("pane cap of 2"))
+        .unwrap_or_else(|| panic!("no pane-cap warning: {err}"));
+    // Piped stderr is a log: plain and greppable, no escapes.
+    assert!(
+        warning.starts_with("atrium fleet: warning: 3 agents"),
+        "{warning}"
+    );
+    assert!(!err.contains('\x1b'), "{err}");
+    let verdict = err
+        .find("every agent dir resolves inside")
+        .unwrap_or_else(|| panic!("no verdict: {err}"));
+    assert!(
+        err.find("pane cap of 2").unwrap() < verdict,
+        "warnings precede the verdict: {err}"
+    );
+    // Not refused: it went on to take the terminal (and, with none, stopped there).
+    assert!(err.contains("must be a terminal"), "{err}");
+}
+
 /// The decisive lines are the LAST lines: on a 24-row terminal whatever prints
 /// first is what scrolls away before the Enter is asked for.
 #[test]

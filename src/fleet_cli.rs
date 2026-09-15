@@ -185,6 +185,29 @@ fn ctl_without_spawner(allow_ctl: bool, spawner_count: usize) -> bool {
     allow_ctl && spawner_count == 0
 }
 
+/// The preflight warning for a roster at or past the host's pane cap
+/// ([`atrium::resources::effective_cap`]), or `None` when it fits. Never a
+/// refusal: every agent in the roster starts. What the cap still governs is a
+/// mid-run `ctl spawn`, so a full roster with a spawner is worth a warning too.
+fn pane_cap_warning(agents: usize, spawners: usize, cap: usize) -> Option<String> {
+    if agents > cap {
+        Some(format!(
+            "{agents} agents is more than this machine's pane cap of {cap} — all of them will \
+             start, but each agent uses real memory; raise the cap with {} if the machine can \
+             carry it",
+            atrium::resources::ENV_MAX_PANES
+        ))
+    } else if agents == cap && spawners > 0 {
+        Some(format!(
+            "this roster fills the pane cap of {cap} — its spawners can't add teammates mid-run \
+             (raise the cap with {})",
+            atrium::resources::ENV_MAX_PANES
+        ))
+    } else {
+        None
+    }
+}
+
 /// Names of the agents a `deny` rule is aimed at but can't bind: every
 /// non-claude agent when the fleet has session-wide rules, and any non-claude
 /// agent with rules of its own.
@@ -512,8 +535,8 @@ pub(crate) fn fleet_up(
     //
     // Its notes are collected rather than printed here: everything the operator
     // must weigh has to be on the screen at the Enter prompt, so the printing
-    // order is chosen once, below.
-    let mut notes: Vec<String> = Vec::new();
+    // order is chosen once, below. They are preflight warnings: loud, never fatal.
+    let mut warnings: Vec<String> = Vec::new();
     for a in &fleet.agents {
         match atrium::ctl::vet_spawn_argv(&a.cmd) {
             atrium::ctl::ArgvVerdict::Refused(why) => {
@@ -521,7 +544,7 @@ pub(crate) fn fleet_up(
                 return ExitCode::FAILURE;
             }
             atrium::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
-                notes.push(format!(
+                warnings.push(format!(
                     "agent \"{}\": ignoring {} — set the posture with \"trust\" instead",
                     fsan(&a.name),
                     fsan(&stripped.join(", "))
@@ -608,9 +631,6 @@ pub(crate) fn fleet_up(
     for line in plan.banner_lines() {
         eprintln!("atrium fleet: {line}");
     }
-    for note in &notes {
-        eprintln!("atrium fleet: {note}");
-    }
     // Always say the posture out loud. A fleet file can be authored by an agent
     // and skimmed by a human; a line naming what everything is about to run under
     // is the difference between reviewing it and assuming it.
@@ -643,17 +663,22 @@ pub(crate) fn fleet_up(
     // rule is aimed at an agent it can't bind, rather than let it read as enforced.
     let unbound = deny_unbound(&fleet);
     if !unbound.is_empty() {
-        eprintln!(
-            "atrium fleet: warning: deny rules apply to claude agents only — not enforced for {}",
+        warnings.push(format!(
+            "deny rules apply to claude agents only — not enforced for {}",
             unbound
                 .iter()
                 .map(|n| fsan(n))
                 .collect::<Vec<_>>()
                 .join(", ")
-        );
+        ));
     }
     if let Some(warning) = pool_warning {
-        eprintln!("atrium fleet: {warning}");
+        warnings.push(
+            warning
+                .strip_prefix("warning: ")
+                .unwrap_or(&warning)
+                .to_string(),
+        );
     }
     // Name any agent that runs at a DIFFERENT posture than the session — part of
     // what the human approves (a mixed-model fleet often runs its haiku agents at
@@ -691,10 +716,21 @@ pub(crate) fn fleet_up(
     // first mid-run spawn is denied. Surface it here, where the roster can
     // still be fixed.
     if ctl_without_spawner(allow_ctl, spawners.len()) {
-        eprintln!(
-            "atrium fleet: warning: ctl is on but no agent may spawn teammates \
-             — if this fleet coordinates by spawning, set \"can_spawn\": true on its lead"
+        warnings.push(
+            "ctl is on but no agent may spawn teammates — if this fleet coordinates by \
+             spawning, set \"can_spawn\": true on its lead"
+                .to_string(),
         );
+    }
+    // The pane cap is a preflight warning, not a gate: the operator chose this
+    // roster and the machine may well carry it. What the cap still does is refuse
+    // a mid-run `ctl spawn` past it, and that is worth knowing before launch.
+    if let Some(w) = pane_cap_warning(
+        fleet.agents.len(),
+        spawners.len(),
+        atrium::resources::effective_cap(),
+    ) {
+        warnings.push(w);
     }
     // Per-agent worktrees: say which agents leave the main tree, where, and on
     // what branch — isolation the operator is approving as much as the dirs above.
@@ -720,12 +756,18 @@ pub(crate) fn fleet_up(
                 );
             }
         } else {
-            eprintln!(
-                "atrium fleet: warning: this fleet asks for per-agent worktrees, but {} is not a \
-                 git repo — every agent shares the main tree",
-                cwd.display()
-            );
+            warnings.push(format!(
+                "this fleet asks for per-agent worktrees, but {} is not a git repo — every \
+                 agent shares the main tree",
+                atrium::fleet::show_path(&cwd)
+            ));
         }
+    }
+    // Every preflight warning, together, as the last thing before the verdict.
+    let color = std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && std::env::var_os("NO_COLOR").is_none();
+    for line in atrium::fleet::preflight_block(&warnings, color) {
+        eprintln!("{line}");
     }
     // The last line before the block, so it cannot scroll: it NAMES the
     // destinations rather than counting them. A surviving summary line that
@@ -940,7 +982,15 @@ pub(crate) fn fleet_launch(
     // overview by a painter that filters nothing, so an agent name carrying an
     // ESC would repaint the live TUI - the crossing the banner closes one screen
     // earlier.
-    (agent.args(&dirs), cwd, disclosed.label.clone())
+    //
+    // The governed permission flags in `cmd` are dropped here, which is what the
+    // banner's "ignoring …" line promises: atrium sets the posture itself. Only
+    // `cmd` is sanitized — the fields appended after it are the file's own
+    // values, and a prompt may legitimately mention a flag's name.
+    let (cmd, _) = atrium::ctl::sanitize_spawn_argv(&agent.cmd);
+    let mut argv = agent.args(&dirs);
+    argv.splice(..agent.cmd.len(), cmd);
+    (argv, cwd, disclosed.label.clone())
 }
 
 /// Compute (and create) the stable per-fleet context directory.
@@ -1122,9 +1172,24 @@ pub(crate) fn spawn_fleet_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pool_line, ctl_without_spawner, deny_unbound, plugin_value_enabled,
+        build_pool_line, ctl_without_spawner, deny_unbound, pane_cap_warning, plugin_value_enabled,
         preflight_context_mode, up_alias,
     };
+
+    #[test]
+    fn a_roster_past_the_pane_cap_is_warned_about_never_refused() {
+        assert_eq!(pane_cap_warning(8, 1, 30), None, "fits");
+        assert_eq!(pane_cap_warning(30, 0, 30), None, "full, but nobody spawns");
+        let over = pane_cap_warning(40, 0, 30).expect("over the cap");
+        assert!(
+            over.contains("40 agents") && over.contains("pane cap of 30"),
+            "{over}"
+        );
+        assert!(over.contains("all of them will start"), "{over}");
+        assert!(over.contains("ATRIUM_MAX_PANES"), "{over}");
+        let full = pane_cap_warning(30, 1, 30).expect("full with a spawner");
+        assert!(full.contains("can't add teammates"), "{full}");
+    }
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

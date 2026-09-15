@@ -2112,6 +2112,45 @@ mod tests {
         assert!(!role.chars().any(|c| c.is_control()));
     }
 
+    /// The fleet banner says a governed flag in `cmd` is ignored, so the launch
+    /// must actually drop it — with its value — and keep everything else.
+    #[test]
+    fn a_fleet_agent_is_launched_without_the_flags_the_banner_ignored() {
+        use atrium::fleet::{Agent, AgentPlan};
+        let agent = Agent {
+            name: "lead".to_string(),
+            cmd: vec![
+                "claude".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "bypassPermissions".to_string(),
+                "--allowedTools=Bash(*)".to_string(),
+                "--model".to_string(),
+                "opus".to_string(),
+            ],
+            prompt: Some("--allowedTools is atrium's to set".to_string()),
+            ..Default::default()
+        };
+        let disclosed = AgentPlan {
+            label: "lead".to_string(),
+            identity: None,
+            opaque: None,
+            cwd: None,
+            add_dirs: vec![],
+        };
+        let (argv, _, _) = super::fleet_launch(&agent, &disclosed);
+        assert_eq!(
+            argv,
+            vec![
+                "claude",
+                "--model",
+                "opus",
+                "--append-system-prompt",
+                "--allowedTools is atrium's to set",
+            ]
+        );
+    }
+
     /// A token that matches no live pane is stale or forged — not the operator.
     #[test]
     fn a_token_resolving_to_no_live_pane_is_not_the_operator() {
