@@ -126,6 +126,11 @@ pub struct Fleet {
     /// Absent → one job per core, bounded by RAM. `ATRIUM_BUILD_JOBS` still wins,
     /// because a checked-in fleet file can't know the machine it runs on.
     pub build_jobs: Option<usize>,
+    /// A fixed ceiling, in MiB, on the committed memory of everything the agents
+    /// run ([`crate::memguard`]). `0` turns the guard off. Absent → the dynamic
+    /// ceiling that tracks the machine's free commit. A fixed value never exceeds
+    /// the dynamic one, and `ATRIUM_MEMORY_MB` still wins. Windows only.
+    pub memory_mb: Option<u64>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -380,6 +385,16 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         ),
         None => None,
     };
+    let memory_mb = match get("memory_mb") {
+        Some(v) => Some(
+            v.as_i64()
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or_else(|| {
+                    format!("fleet {name:?}: \"memory_mb\" must be a whole number, 0 or more")
+                })?,
+        ),
+        None => None,
+    };
 
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
@@ -405,6 +420,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         worktree_base,
         worktree_seed,
         build_jobs,
+        memory_mb,
         agents,
     })
 }
@@ -1507,6 +1523,27 @@ mod tests {
     }
 
     #[test]
+    fn memory_mb_sets_a_fixed_ceiling() {
+        let text = |v: &str| {
+            format!(
+                r#"{{ "fleets": {{ "f": {{ "memory_mb": {v}, "agents": [{{ "name": "a", "cmd": ["claude"] }}] }} }} }}"#
+            )
+        };
+        assert_eq!(
+            parse(&text("32768")).unwrap().get("f").unwrap().memory_mb,
+            Some(32768)
+        );
+        assert_eq!(
+            parse(&text("0")).unwrap().get("f").unwrap().memory_mb,
+            Some(0)
+        );
+        for bad in ["-5", "1.5", "\"8G\"", "null"] {
+            let err = parse(&text(bad)).unwrap_err();
+            assert!(err.contains("memory_mb"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn preserves_fleet_order() {
         let text = r#"{ "fleets": {
           "b": { "agents": [{ "name": "x", "cmd": ["sh"] }] },
@@ -1985,6 +2022,7 @@ mod tests {
             worktree_base: None,
             worktree_seed: None,
             build_jobs: None,
+            memory_mb: None,
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -2250,6 +2288,7 @@ mod tests {
             worktree_base: None,
             worktree_seed: None,
             build_jobs: None,
+            memory_mb: None,
             agents,
         };
         let anchor = Anchor {

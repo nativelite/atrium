@@ -24,6 +24,9 @@ pub(crate) struct SafetyNet {
     last_warden_check: Instant,
     /// When the compile pool was last checked for tokens leaked by killed builds.
     last_pool_check: Instant,
+    /// The panes' memory ceiling (Windows): keeps the session job's limit current
+    /// and stops the largest build under pressure.
+    memguard: atrium::memguard::Guard,
     cap_notice_raised: bool,
     /// The live pane pids last written to the registry.
     registered: Vec<u32>,
@@ -58,6 +61,7 @@ impl SafetyNet {
             warden: atrium::warden::Warden::new(registry_path.clone()),
             last_warden_check: Instant::now(),
             last_pool_check: Instant::now(),
+            memguard: atrium::memguard::Guard::new(),
             cap_notice_raised: false,
             registered: Vec::new(),
             registry_dirty: false,
@@ -216,6 +220,20 @@ impl SafetyNet {
                     true,
                     "",
                 );
+            }
+            // The memory ceiling rides the same cadence. When it acts (or can't),
+            // that is an operator decision, not a log line: audit, bus and bar.
+            if let Some(msg) = self.memguard.tick(session_job) {
+                ctl_audit.record(None, "memory-guard", &msg, true, "");
+                let _ = bus.publish(
+                    "memguard",
+                    atrium::bus::Kind::DecisionNeeded,
+                    None,
+                    &[("msg".to_string(), msg.clone())],
+                    agsess::sessions::now_ms(),
+                );
+                *flash = Some((msg, Instant::now()));
+                repaint = true;
             }
         }
         // The watchdog is the unix answer to a death no handler can catch.

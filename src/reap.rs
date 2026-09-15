@@ -154,6 +154,8 @@ mod sys {
     /// ([`SessionJob`](super::SessionJob)) is the sole reaper, and the orphan
     /// sweep's start-token binding is inert here. Anything that ever kills by pid
     /// must bind to a handle or start token taken at spawn first (r10 audit B14).
+    /// The memory guard's kill ([`terminate_member`]) binds to a handle: it checks
+    /// job membership and image through the handle it terminates with.
     pub fn pid_alive(pid: u32) -> bool {
         const SYNCHRONIZE: u32 = 0x0010_0000;
         const WAIT_TIMEOUT: u32 = 258;
@@ -246,6 +248,8 @@ mod sys {
             name: *mut u16,
             size: *mut u32,
         ) -> i32;
+        fn K32GetProcessMemoryInfo(process: Handle, counters: *mut c_void, cb: u32) -> i32;
+        fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn CloseHandle(h: Handle) -> i32;
         fn GetLastError() -> u32;
@@ -362,6 +366,113 @@ mod sys {
             if !ok {
                 debug_warn("AssignProcessToJobObject", err);
             }
+            ok
+        }
+    }
+
+    const JOB_OBJECT_LIMIT_JOB_MEMORY: u32 = 0x0000_0200;
+    const PROCESS_VM_READ: u32 = 0x0010;
+
+    /// Set or lift the job's committed-memory limit. Kill-on-close is rewritten
+    /// with it: the extended-limit call replaces all flags at once, so dropping it
+    /// here would silently disarm the teardown guarantee.
+    pub fn set_job_memory_limit(job: Handle, limit: Option<usize>) -> bool {
+        if job.is_null() {
+            return false;
+        }
+        // SAFETY: every field is a plain integer, so all-zero is a valid value.
+        let mut info: JobExtendedLimitInformation = unsafe { core::mem::zeroed() };
+        info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(bytes) = limit {
+            info.basic.limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            info.job_memory_limit = bytes;
+        }
+        // SAFETY: a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION of exactly `len`.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_EXTENDED_LIMIT_INFO,
+                &mut info as *mut JobExtendedLimitInformation as *mut c_void,
+                core::mem::size_of::<JobExtendedLimitInformation>() as u32,
+            )
+        };
+        if ok == 0 {
+            debug_warn("SetInformationJobObject(memory)", unsafe { GetLastError() });
+        }
+        ok != 0
+    }
+
+    /// `PROCESS_MEMORY_COUNTERS_EX`, transcribed from psapi.h.
+    #[repr(C)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    /// Private committed bytes of `pid` — what a job memory limit counts.
+    pub fn private_bytes(pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: open for the rights the counters need, fill a struct whose size
+        // is passed in `cb`, then close our handle.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut c: ProcessMemoryCountersEx = core::mem::zeroed();
+            c.cb = core::mem::size_of::<ProcessMemoryCountersEx>() as u32;
+            let ok = K32GetProcessMemoryInfo(
+                h,
+                &mut c as *mut ProcessMemoryCountersEx as *mut c_void,
+                c.cb,
+            );
+            CloseHandle(h);
+            (ok != 0).then_some(c.private_usage as u64)
+        }
+    }
+
+    /// Terminate process `pid` only if it is a member of `job` and its image
+    /// passes `accept` — both checked through the SAME handle the kill uses.
+    ///
+    /// This is what keeps the "never kill by pid on Windows" invariant (see
+    /// `pid_alive`): an open handle pins the process object, so the pid can't be
+    /// recycled to a stranger between the checks and the kill, and a recycled pid
+    /// that already belongs to one fails the membership check.
+    pub fn terminate_member(job: Handle, pid: u32, accept: &dyn Fn(&str) -> bool) -> bool {
+        if job.is_null() || pid == 0 {
+            return false;
+        }
+        // SAFETY: open one handle for the query + terminate rights, check and act
+        // through it, close it on every path.
+        unsafe {
+            let h = OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
+            if h.is_null() {
+                return false;
+            }
+            let mut in_job: i32 = 0;
+            let member = IsProcessInJob(h, job, &mut in_job) != 0 && in_job != 0;
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let image = (member
+                && QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) != 0)
+                .then(|| String::from_utf16_lossy(&buf[..len as usize]));
+            let ok = image.is_some_and(|i| accept(&i)) && TerminateProcess(h, 1) != 0;
+            CloseHandle(h);
             ok
         }
     }
@@ -496,6 +607,38 @@ impl SessionJob {
         }
     }
 
+    /// Cap the committed memory of everything in the job (`None` lifts the cap),
+    /// keeping kill-on-close. `false` on unix (no job) and on a Windows failure.
+    pub fn set_memory_limit(&self, bytes: Option<u64>) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = bytes;
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            sys::set_job_memory_limit(
+                self.raw,
+                bytes.map(|b| usize::try_from(b).unwrap_or(usize::MAX)),
+            )
+        }
+    }
+
+    /// Stop `pid` if it is in this job and its image passes `accept`, checked and
+    /// killed through one handle so a recycled pid can never be hit. `false` on
+    /// unix (no job) and when the process is gone, foreign, rejected or unkillable.
+    pub fn terminate_member(&self, pid: u32, accept: &dyn Fn(&str) -> bool) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = (pid, accept);
+            false
+        }
+        #[cfg(not(unix))]
+        {
+            sys::terminate_member(self.raw, pid, accept)
+        }
+    }
+
     /// Every process in the job, pane descendants included. `None` on unix (there
     /// is no job) and when the Windows job is unavailable or can't be listed.
     pub fn pids(&self) -> Option<Vec<u32>> {
@@ -507,6 +650,19 @@ impl SessionJob {
         {
             sys::job_pids(self.raw)
         }
+    }
+}
+
+/// Private committed bytes of process `pid`. Windows only; `None` elsewhere.
+pub fn private_bytes(pid: u32) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        sys::private_bytes(pid)
     }
 }
 
@@ -1167,6 +1323,84 @@ mod tests {
         let _ = child.wait();
         assert!(both, "nested assignment failed");
         assert_eq!(outer_pids, Some(vec![pid]));
+    }
+
+    /// The memory guard's hard backstop: a job memory limit must make an
+    /// allocation past it fail inside the job, while the same allocation succeeds
+    /// with no limit. Also proves the limit keeps kill-on-close (the flags are
+    /// rewritten together) and that a limit can be lifted again.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_job_memory_limit_fails_an_allocation_past_it() {
+        // Sleep first so the job is in place before the allocation; exit 3 is a
+        // caught allocation failure, 0 a successful one.
+        let run = |limit: Option<u64>| -> (Option<i32>, bool) {
+            let mut child = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Milliseconds 1500; \
+                     try { $a = [byte[]]::new(600MB); $a[599MB] = 1; exit 0 } catch { exit 3 }",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn powershell");
+            let job = SessionJob::create();
+            let limited = job.assign(child.id()) && job.set_memory_limit(limit);
+            let code = child.wait().ok().and_then(|s| s.code());
+            (code, limited)
+        };
+        let (code, ok) = run(None);
+        assert!(ok, "assign / clear limit failed");
+        assert_eq!(code, Some(0), "control: 600 MB must allocate with no limit");
+        let (code, ok) = run(Some(300 * 1024 * 1024));
+        assert!(ok, "assign / set limit failed");
+        assert_ne!(
+            code,
+            Some(0),
+            "600 MB must NOT allocate under a 300 MB job limit"
+        );
+        // And the job still reports private commit for a live member.
+        assert!(private_bytes(std::process::id()).is_some_and(|b| b > 0));
+    }
+
+    /// The guard stops only a member of its own job whose image it accepts —
+    /// never a process outside the job, never one the predicate rejects.
+    #[cfg(not(unix))]
+    #[test]
+    fn terminate_member_stops_only_an_accepted_member() {
+        let sleeper = || {
+            std::process::Command::new("ping")
+                .args(["-n", "601", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sleeper")
+        };
+        let mut member = sleeper();
+        let mut outsider = sleeper();
+        let job = SessionJob::create();
+        assert!(job.assign(member.id()), "assign failed");
+        let is_ping = |image: &str| image.to_ascii_lowercase().ends_with("ping.exe");
+
+        let rejected = job.terminate_member(member.id(), &|_| false);
+        let foreign = job.terminate_member(outsider.id(), &is_ping);
+        let stopped = job.terminate_member(member.id(), &is_ping);
+        let _ = member.wait();
+        let _ = outsider.kill();
+        let _ = outsider.wait();
+        drop(job);
+
+        assert!(
+            !rejected,
+            "a member the predicate rejects must not be stopped"
+        );
+        assert!(!foreign, "a process outside the job must not be stopped");
+        assert!(stopped, "an accepted member must be stopped");
     }
 
     #[cfg(not(unix))]

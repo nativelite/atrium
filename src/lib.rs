@@ -33,6 +33,7 @@ pub mod identity;
 pub mod input;
 pub mod ipc;
 pub mod layout;
+pub mod memguard;
 pub mod orphan;
 pub mod reap;
 pub mod resolve;

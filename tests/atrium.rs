@@ -1362,6 +1362,7 @@ fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
         .find(|l| l.contains("starting 8 agent(s)"))
         .unwrap_or_default();
     assert!(posture.contains("compile jobs shared"), "{posture}");
+    assert!(posture.contains("memory"), "{posture}");
     // Deduplicated: eight agents naming ONE sibling checkout is one line.
     assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
     // And the banner as a whole still fits a terminal.
@@ -2151,6 +2152,57 @@ fn a_pane_is_given_a_live_build_pool_windows() {
     );
     assert_eq!(maximum, 3, "ATRIUM_BUILD_JOBS=3 must size the pool");
     assert_eq!(current, 3, "an idle pool holds all its tokens");
+}
+
+/// **The memory guard holds a real pane under its ceiling** (Windows).
+///
+/// atrium runs with `ATRIUM_MEMORY_MB=400`; the pane waits for the guard's first
+/// tick, then tries to commit 800 MB and records whether it could. The same
+/// allocation succeeds outside a limited job (`reap`'s unit test is the control),
+/// so a `FAIL` here is the guard's limit reaching the pane, not PowerShell.
+#[cfg(windows)]
+#[test]
+fn the_memory_guard_holds_a_pane_under_its_ceiling_windows() {
+    let marker = std::env::temp_dir().join(format!("atrium-memguard-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mpath = marker.display().to_string().replace('\\', "/");
+    // 7 s covers lazy job assignment plus the guard's 3 s cadence.
+    let script = format!(
+        "Start-Sleep -Seconds 7; \
+         try {{ $a = [byte[]]::new(800MB); $a[799MB] = 1; $r = 'OK' }} catch {{ $r = 'FAIL' }}; \
+         Set-Content -Path '{mpath}' -Value $r; Start-Sleep -Seconds 600"
+    );
+    let argv = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ];
+    let env = [("ATRIUM_MEMORY_MB".to_string(), "400".to_string())];
+    let mut p =
+        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80, &env).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                break t;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane never reported its allocation"
+        );
+        // Keep reading atrium's screen while waiting. An undrained pty fills, the
+        // next frame write blocks, and the whole run loop — guard included —
+        // stalls until someone reads (measured: 6.9 s frozen in the resize phase).
+        read_until(&mut p, b"\x00never-printed\x00", Duration::from_millis(200));
+    };
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(seen, "FAIL", "an 800 MB allocation got past a 400 MB guard");
 }
 
 /// A pane script that spawns a long-lived grandchild (`ping`), records its pid to

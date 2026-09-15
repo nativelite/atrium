@@ -605,8 +605,12 @@ pub(crate) fn fleet_up(
         atrium::buildpool::planned_size(fleet.build_jobs),
         atrium::buildpool::inherited(),
     );
+    let memory = atrium::memguard::describe(
+        atrium::memguard::planned_cap(fleet.memory_mb),
+        atrium::memguard::supported(),
+    );
     eprintln!(
-        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}",
+        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}, {memory}",
         fsan(name),
         fleet.agents.len(),
         trust.policy_label(),
@@ -711,7 +715,11 @@ pub(crate) fn fleet_up(
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
-    // Approved: create the compile pool at the fleet's size, before any pane
+    // Approved: record the fleet's memory ceiling for the session guard.
+    if let Some(mb) = fleet.memory_mb {
+        atrium::memguard::set_fleet_mb(mb);
+    }
+    // Create the compile pool at the fleet's size, before any pane
     // spawns, so every agent inherits this one and not a lazily-made default.
     if atrium::buildpool::planned_size(fleet.build_jobs).is_some()
         && atrium::buildpool::init(fleet.build_jobs).is_none()

@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outer pool, and tokens lost when a build is killed are restored once no
   build is running. Windows uses a named semaphore; unix uses a FIFO, which
   is compiled but not yet run on a unix host.
+- **A memory guard for everything the panes run (Windows).** atrium puts a
+  commit limit on the session Job Object every pane runs in; atrium itself is
+  not in the job, so it keeps running when the panes hit the limit. The
+  default ceiling is dynamic: what the panes use now plus the machine's free
+  commit, minus a reserve, recomputed every 3 seconds, so a session can never
+  be what exhausts the machine. A fleet's `memory_mb` or `ATRIUM_MEMORY_MB`
+  sets a fixed ceiling (`0`/`off` disables it). At 90% the guard stops the
+  largest build process, never an agent, and raises it on the bus and the bar.
+  The kill checks job membership and the image through the same handle it
+  terminates with, so a recycled pid is never hit.
 
 ### Fixed
 - **A fleet agent's `prompt` is no longer silently dropped.** The `prompt` key

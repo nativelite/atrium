@@ -114,18 +114,25 @@ fn cores() -> usize {
 /// per-core cap. Detected on Windows and Linux; other platforms return `None`.
 #[cfg(windows)]
 fn total_ram_bytes() -> Option<u64> {
-    #[repr(C)]
-    struct MemoryStatusEx {
-        dw_length: u32,
-        dw_memory_load: u32,
-        ull_total_phys: u64,
-        ull_avail_phys: u64,
-        ull_total_page_file: u64,
-        ull_avail_page_file: u64,
-        ull_total_virtual: u64,
-        ull_avail_virtual: u64,
-        ull_avail_extended_virtual: u64,
-    }
+    memory_status().map(|m| m.ull_total_phys)
+}
+
+#[cfg(windows)]
+#[repr(C)]
+struct MemoryStatusEx {
+    dw_length: u32,
+    dw_memory_load: u32,
+    ull_total_phys: u64,
+    ull_avail_phys: u64,
+    ull_total_page_file: u64,
+    ull_avail_page_file: u64,
+    ull_total_virtual: u64,
+    ull_avail_virtual: u64,
+    ull_avail_extended_virtual: u64,
+}
+
+#[cfg(windows)]
+fn memory_status() -> Option<MemoryStatusEx> {
     #[link(name = "kernel32")]
     extern "system" {
         fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
@@ -144,7 +151,21 @@ fn total_ram_bytes() -> Option<u64> {
     // SAFETY: `m` is a valid, fully-initialized MEMORYSTATUSEX with `dw_length`
     // set to its own size, exactly as the Win32 contract requires.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
-    (ok != 0).then_some(m.ull_total_phys)
+    (ok != 0).then_some(m)
+}
+
+/// The machine's `(commit limit, commit available)` in bytes — RAM plus pagefile,
+/// the budget whose exhaustion fails allocations system-wide. Windows only:
+/// `MEMORYSTATUSEX`'s "page file" fields are the commit charge, despite the name.
+#[cfg(windows)]
+pub fn system_commit() -> Option<(u64, u64)> {
+    memory_status().map(|m| (m.ull_total_page_file, m.ull_avail_page_file))
+}
+
+/// Unix overcommits by default, so there is no comparable commit budget to read.
+#[cfg(not(windows))]
+pub fn system_commit() -> Option<(u64, u64)> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -193,6 +214,19 @@ mod tests {
         assert_eq!(
             pane_cap(None, None, 0, 768 << 20),
             MIN_CAP.max(AGENTS_PER_CORE)
+        );
+    }
+
+    /// The guard's dynamic limit is only as good as this reading: the commit
+    /// limit must exceed physical RAM's share and available must fit inside it.
+    #[cfg(windows)]
+    #[test]
+    fn system_commit_reads_a_plausible_budget() {
+        let (limit, available) = system_commit().expect("GlobalMemoryStatusEx");
+        assert!(limit > 0 && available <= limit, "{limit} / {available}");
+        assert!(
+            limit >= total_ram_bytes().unwrap() / 2,
+            "commit limit below half of RAM"
         );
     }
 
