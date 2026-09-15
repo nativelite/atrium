@@ -1722,8 +1722,8 @@ fn default_shell() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_command, audit_outcome, combine_system_prompt, pane_base_env, privilege_for,
-        routed_wake, sanitize_shim_arg, surface_once, worktree_spawn_params,
+        assemble_command, audit_outcome, combine_system_prompt, fold_system_prompt, pane_base_env,
+        privilege_for, routed_wake, sanitize_shim_arg, surface_once, worktree_spawn_params,
     };
 
     // -- audit_outcome over the typed Reply (r10 B12) ------------------------
@@ -1906,6 +1906,41 @@ mod tests {
     #[test]
     fn combine_neither_returns_none() {
         assert!(combine_system_prompt(None, None).is_none());
+    }
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_fleet_agents_own_prompt_survives_the_ctl_block() {
+        // A fleet agent's `prompt` key is already in its command as
+        // --append-system-prompt. Pushing the ctl/norms block as a second flag
+        // made claude (last-wins) silently drop the agent's own instructions.
+        let cmd = args(&[
+            "claude",
+            "--append-system-prompt",
+            "ROLE",
+            "--model",
+            "opus",
+            "go",
+            "--append-system-prompt=INLINE",
+        ]);
+        let out = fold_system_prompt(cmd, Some("BLOCK"));
+        let flags: Vec<_> = out
+            .iter()
+            .filter(|a| a.starts_with("--append-system-prompt"))
+            .collect();
+        assert_eq!(flags.len(), 1, "exactly one flag: {out:?}");
+        let payload = out.last().unwrap();
+        assert_eq!(payload, "ROLE\n\nINLINE\n\nBLOCK");
+        assert_eq!(&out[..4], &args(&["claude", "--model", "opus", "go"])[..]);
+    }
+
+    #[test]
+    fn fold_without_a_block_leaves_the_command_untouched() {
+        let cmd = args(&["claude", "--append-system-prompt", "ROLE", "go"]);
+        assert_eq!(fold_system_prompt(cmd.clone(), None), cmd);
     }
 
     fn wake_fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {

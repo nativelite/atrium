@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A fleet agent's `prompt` is no longer silently dropped.** The `prompt` key
+  becomes `--append-system-prompt`, and atrium then appended its own ctl
+  directive and worktree norms as a second flag. claude keeps only the last
+  one, so in any fleet with `allow_ctl` or worktrees the agent never saw its
+  own prompt. atrium now folds every system-prompt payload into one flag: the
+  agent's own first, then atrium's.
 - **A pane that never takes delivery can no longer grow the send queue without
   bound.** Undelivered `ctl send`s were queued with no limit, and a pane wedged
   on an open dialog never drains its queue. Each target now holds at most 32.

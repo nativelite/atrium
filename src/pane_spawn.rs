@@ -222,6 +222,37 @@ pub(crate) fn combine_system_prompt(norms: Option<&str>, ctl: Option<&str>) -> O
     }
 }
 
+/// Push `block` as the command's single `--append-system-prompt`, folding in any
+/// the command already carries (a fleet agent's `prompt` key, or one inlined in
+/// its `cmd`, as `--append-system-prompt P` or `--append-system-prompt=P`).
+///
+/// Claude is last-wins on the flag, so appending the block as a second flag
+/// silently dropped the agent's own prompt in every coordinated or worktree
+/// fleet. The existing payloads come first, in order, then `block`. With no
+/// `block` the command is returned untouched.
+pub(crate) fn fold_system_prompt(command: Vec<String>, block: Option<&str>) -> Vec<String> {
+    const FLAG: &str = "--append-system-prompt";
+    let Some(block) = block else {
+        return command;
+    };
+    let mut out = Vec::with_capacity(command.len() + 2);
+    let mut payloads: Vec<String> = Vec::new();
+    let mut args = command.into_iter().peekable();
+    while let Some(a) = args.next() {
+        if a == FLAG && args.peek().is_some() {
+            payloads.extend(args.next());
+        } else if let Some(p) = a.strip_prefix("--append-system-prompt=") {
+            payloads.push(p.to_string());
+        } else {
+            out.push(a);
+        }
+    }
+    payloads.push(block.to_string());
+    out.push(FLAG.to_string());
+    out.push(payloads.join("\n\n"));
+    out
+}
+
 /// What to launch in a new pane — everything [`spawn_pane_full`] needs besides
 /// the terminal geometry and the flash slot, by name. It replaces an 11-argument
 /// positional signature where three adjacent `Option<&str>`s (identity, cwd,
@@ -344,10 +375,9 @@ pub(crate) fn spawn_pane_full(
         } else {
             None
         };
-        if let Some(block) = combine_system_prompt(extra_norms, ctl) {
-            base.push("--append-system-prompt".to_string());
-            base.push(block);
-        }
+        // Folded, not pushed: a fleet agent's own prompt is already in `base`.
+        let block = combine_system_prompt(extra_norms, ctl);
+        base = fold_system_prompt(base, block.as_deref());
     }
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
