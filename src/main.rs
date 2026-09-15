@@ -1119,11 +1119,10 @@ fn run(
     if let Some(topics) = &canonical_topics {
         bus.set_canonical(topics);
     }
-    let mut world = atrium::vendors::VendorWorlds::new();
-    let process_start_ms = agsess::sessions::now_ms();
-    world.refresh_since(process_start_ms);
-    let mut last_agent_poll = Instant::now();
-    let mut last_agent_discover = Instant::now();
+    // Agent state is refreshed on its own thread (`AgentWatch`); the loop holds the
+    // newest snapshot and never reads a transcript itself.
+    let agents = atrium::vendors::AgentWatch::start(agsess::sessions::now_ms());
+    let mut world = atrium::vendors::AgentState::default();
     // Session teardown container: on Windows a kill-on-close Job Object so no pane
     // tree outlives atrium however it dies (TerminateProcess included); a no-op on
     // unix (the process-group teardown + watchdog below already cover the tree).
@@ -1508,51 +1507,27 @@ fn run(
             }
         }
 
-        // 5b. agent state (§5). `refresh` tails only files that grew, so the
-        //     bound-pane tick is cheap; discovery is the full `read_dir`, run
-        //     rarely — but accelerated while any agent pane still lacks its
-        //     transcript so a fresh agent binds promptly.
-        let any_unbound = windows.iter().any(|w| {
-            w.panes.iter().any(|p| {
-                p.session_id
-                    .as_deref()
-                    .is_some_and(|id| world.status_for(Some(id)).is_none())
-            })
-        });
-        let discover_every = if any_unbound {
-            Duration::from_millis(1000)
+        // 5b. agent state (§5), from the `AgentWatch` thread. Refresh every second
+        //     while anything on screen shows agent state — an agent pane, or the
+        //     overview / activity log — and every five seconds otherwise.
+        let agent_on_screen = views.overview
+            || views.log
+            || windows.iter().any(|w| {
+                w.panes.iter().any(|p| {
+                    p.session_id.is_some() || atrium::vendors::vendor_for_stem(&p.title).is_some()
+                })
+            });
+        agents.set_interval(if agent_on_screen {
+            atrium::vendors::AgentWatch::ACTIVE
         } else {
-            Duration::from_millis(5000)
-        };
-        // While the sole pane is still on the startup splash, skip the refresh
-        // entirely: nothing is bound yet (so the bar has nothing to show), and the
-        // discovery pass is a full `read_dir` over the projects root that can block
-        // the loop for the better part of a second — which froze the splash spinner
-        // for a beat right at ~1 s in. Once the agent paints, polling resumes and
-        // it binds on the next tick.
-        let booting_splash = !windows[active].tiled()
-            && windows[active]
-                .pane(windows[active].tree.focus())
-                .map(|p| !p.painted)
-                .unwrap_or(false);
+            atrium::vendors::AgentWatch::QUIET
+        });
         let mut did_refresh = false;
-        if booting_splash {
-            // hold off — resumes as soon as the pane paints
-        } else if last_agent_discover.elapsed() >= discover_every {
-            // Discovery + tail: a full refresh picks up new transcripts and
-            // tails grown ones in one pass.
-            world.refresh();
-            last_agent_discover = Instant::now();
-            last_agent_poll = Instant::now();
-            did_refresh = true;
-        } else if last_agent_poll.elapsed() >= Duration::from_millis(1000) {
-            // Bound-pane tick: refresh tails only files whose length grew, so
-            // this is ~a handful of stats for a small grid.
-            world.refresh();
-            last_agent_poll = Instant::now();
+        if let Some(snapshot) = agents.latest() {
+            world = snapshot;
             did_refresh = true;
             // Keep the overview and activity log live but calm: repaint once per
-            // status poll (~1 Hz), not every tick, so they update without flicker.
+            // refresh (~1 Hz), not every tick, so they update without flicker.
             if views.overview || views.log {
                 force_repaint = true;
             }
@@ -2527,7 +2502,7 @@ mod tests {
             Some("lead"),
             100,
         );
-        let world = atrium::vendors::VendorWorlds::new(); // no sessions (unrefreshed)
+        let world = atrium::vendors::AgentState::default(); // no sessions
         let rows = collect_log(&[], &world, &board, &bus);
         assert!(rows.len() >= 2, "bus + board rows present");
         assert!(

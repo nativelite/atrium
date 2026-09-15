@@ -26,7 +26,7 @@ pub(crate) struct OverviewNode {
 /// cursor indexes into — the same list at 3 agents and 300.
 pub(crate) fn overview_nodes(
     windows: &[Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
 ) -> Vec<OverviewNode> {
     let mut nodes = Vec::new();
     for (wi, w) in windows.iter().enumerate() {

@@ -52,7 +52,7 @@ impl Views {
         &mut self,
         windows: &[Window],
         active: usize,
-        world: &atrium::vendors::VendorWorlds,
+        world: &atrium::vendors::AgentState,
     ) {
         let focus = windows[active].tree.focus();
         let sel = overview_nodes(windows, world)
@@ -123,7 +123,7 @@ pub(crate) fn handle_overlay_key(
     action: &Action,
     views: &mut Views,
     windows: &mut [Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     board: &atrium::board::Board,
     bus: &mut atrium::bus::Bus,
     active: &mut usize,

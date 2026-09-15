@@ -32,7 +32,7 @@ pub(crate) fn render_tiled(
     w: &Window,
     rows: u16,
     cols: u16,
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     frame: usize,
 ) {
     let outer = tiled_outer(rows, cols);

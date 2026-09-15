@@ -213,7 +213,7 @@ pub(crate) fn apply_ctl(
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     session_identity: Option<&str>,
     audit: &mut atrium::audit::Audit,
     board: &mut atrium::board::Board,
@@ -366,7 +366,7 @@ pub(crate) fn dispatch_ctl(
     max_depth: usize,
     extra_allow: &[String],
     pending: &mut Vec<PendingSend>,
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     session_identity: Option<&str>,
     privileged: bool,
     board: &mut atrium::board::Board,
@@ -834,7 +834,7 @@ pub(crate) fn audit_reply(
 /// it to that pane's subtree (subtree-scoped status); `None` is the whole tree.
 pub(crate) fn reply_tree(
     windows: &[Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     root: Option<AgentId>,
 ) -> atrium::ctl::Reply {
     let parents = ctl_parents(windows);
@@ -1064,7 +1064,7 @@ pub(crate) fn spawn_worker_here(
 pub(crate) fn flush_sends(
     pending: &mut Vec<PendingSend>,
     windows: &mut [Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
 ) -> bool {
     if pending.is_empty() {
         return false;

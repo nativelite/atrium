@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pane cap, or one that fills the cap and has a spawner, is warned about and
   still launches. `ctl spawn` still refuses past the cap at runtime.
 
+### Changed
+- **Agent status is refreshed off the run loop.** Refreshing the vendor worlds
+  walked every transcript in the history once a second on the loop: most of
+  atrium's idle CPU, and the loop stalled up to 153 ms. A thread now refreshes
+  and hands the loop a snapshot of what the UI reads. It refreshes every second
+  while an agent pane, the overview or the activity log is on screen, and every
+  five seconds otherwise. Measured (Windows, release, one idle `cmd` pane):
+  idle CPU 12.3% of a core → 1.4%, key echo p90 170 ms → 7.5 ms, worst case
+  531 ms → 8.2 ms. Also uses `nativelite-agsess`'s cheaper refresh.
+
 ### Fixed
 - **A terminal that stops reading no longer freezes atrium.** atrium wrote
   every frame straight to the terminal from its run loop, and asked the

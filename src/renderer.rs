@@ -102,7 +102,7 @@ impl Renderer {
         views: &mut Views,
         selection: &Option<(usize, Selection)>,
         prompt: Option<&str>,
-        world: &atrium::vendors::VendorWorlds,
+        world: &atrium::vendors::AgentState,
         board: &atrium::board::Board,
         bus: &atrium::bus::Bus,
         flash: &mut Option<(String, Instant)>,

@@ -202,7 +202,7 @@ pub(crate) struct LogRow {
 /// persona via the pane that owns its session.
 pub(crate) fn collect_log(
     windows: &[Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     board: &atrium::board::Board,
     bus: &atrium::bus::Bus,
 ) -> Vec<LogRow> {
@@ -278,7 +278,7 @@ pub(crate) fn ago(now_ms: u64, ts_ms: u64) -> String {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_log_panel(
     windows: &[Window],
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
     board: &atrium::board::Board,
     bus: &atrium::bus::Bus,
     rows: u16,

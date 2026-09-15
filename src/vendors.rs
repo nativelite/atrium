@@ -295,6 +295,190 @@ impl Default for VendorWorlds {
     }
 }
 
+impl VendorWorlds {
+    /// What the UI reads, copied out: the run loop holds this, never the worlds.
+    pub fn snapshot(&self) -> AgentState {
+        AgentState {
+            sessions: self
+                .worlds
+                .iter()
+                .flat_map(|w| w.sessions.iter())
+                .map(SessionView::from)
+                .collect(),
+        }
+    }
+}
+
+/// One session as the UI reads it: status for the bar and ctl, the facts
+/// [`adopt_session_for`] decides on, and the last action for the overview and
+/// the activity log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub id: String,
+    pub vendor: Vendor,
+    pub status: Status,
+    /// [`agsess::AgentSession::awaiting_tool`], evaluated at the snapshot.
+    pub awaiting_tool: bool,
+    pub cwd: Option<String>,
+    pub first_seen_ms: u64,
+    pub last_ts_ms: Option<u64>,
+    pub last_action: String,
+}
+
+impl From<&agsess::AgentSession> for SessionView {
+    fn from(s: &agsess::AgentSession) -> SessionView {
+        SessionView {
+            id: s.id.clone(),
+            vendor: s.vendor,
+            status: s.status,
+            awaiting_tool: s.awaiting_tool(),
+            cwd: s.cwd.clone(),
+            first_seen_ms: s.first_seen_ms,
+            last_ts_ms: s.last_ts_ms,
+            last_action: s.last_action.clone(),
+        }
+    }
+}
+
+/// A snapshot of every vendor world, answering the same questions as
+/// [`VendorWorlds`] without touching a file. The run loop reads this; the worlds
+/// are refreshed on an [`AgentWatch`] thread.
+#[derive(Debug, Clone, Default)]
+pub struct AgentState {
+    sessions: Vec<SessionView>,
+}
+
+impl AgentState {
+    /// See [`VendorWorlds::status_for`].
+    pub fn status_for(&self, session_id: Option<&str>) -> Option<Status> {
+        let id = session_id?;
+        self.sessions.iter().find(|s| s.id == id).map(|s| s.status)
+    }
+
+    /// See [`VendorWorlds::awaiting_tool_for`].
+    pub fn awaiting_tool_for(&self, session_id: Option<&str>) -> bool {
+        session_id.is_some_and(|id| {
+            self.sessions
+                .iter()
+                .find(|s| s.id == id)
+                .is_some_and(|s| s.awaiting_tool)
+        })
+    }
+
+    /// See [`VendorWorlds::sessions`].
+    pub fn sessions(&self) -> Vec<&SessionView> {
+        self.sessions.iter().collect()
+    }
+}
+
+/// The vendor worlds, refreshed on a thread of their own.
+///
+/// A refresh walks every transcript root and stats every session in the history
+/// — measured at ~135 ms on a 439-session root before `agsess` was made cheaper,
+/// ~35 ms after — and it ran on the run loop once a second. That was both most
+/// of atrium's idle CPU and its worst key-echo latency (the loop stalled up to
+/// 153 ms). The thread refreshes and sends an [`AgentState`]; the loop takes the
+/// newest one whenever it ticks.
+pub struct AgentWatch {
+    rx: std::sync::mpsc::Receiver<AgentState>,
+    /// How often to refresh, in ms; the loop tunes it to what is on screen.
+    every_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl AgentWatch {
+    /// The refresh interval while an agent pane or an agent view is up.
+    pub const ACTIVE: std::time::Duration = std::time::Duration::from_millis(1000);
+    /// The refresh interval when nothing on screen shows agent state.
+    pub const QUIET: std::time::Duration = std::time::Duration::from_millis(5000);
+
+    /// Start the thread. Its first refresh uses `cutoff_ms` (see
+    /// [`VendorWorlds::refresh_since`]); later ones are full.
+    pub fn start(cutoff_ms: u64) -> AgentWatch {
+        use std::sync::atomic::Ordering;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let every_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            Self::ACTIVE.as_millis() as u64,
+        ));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (interval, stopping) = (every_ms.clone(), stop.clone());
+        let _ = std::thread::Builder::new()
+            .name("atrium-agents".to_string())
+            .spawn(move || {
+                let mut worlds = VendorWorlds::new();
+                worlds.refresh_since(cutoff_ms);
+                let mut last = std::time::Instant::now();
+                if tx.send(worlds.snapshot()).is_err() {
+                    return;
+                }
+                while !stopping.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let every = std::time::Duration::from_millis(interval.load(Ordering::SeqCst));
+                    if last.elapsed() < every {
+                        continue;
+                    }
+                    last = std::time::Instant::now();
+                    worlds.refresh();
+                    if tx.send(worlds.snapshot()).is_err() {
+                        return;
+                    }
+                }
+            });
+        AgentWatch { rx, every_ms, stop }
+    }
+
+    /// The newest snapshot since the last call, if any.
+    pub fn latest(&self) -> Option<AgentState> {
+        self.rx.try_iter().last()
+    }
+
+    /// Refresh at most every `every` from now on.
+    pub fn set_interval(&self, every: std::time::Duration) {
+        self.every_ms.store(
+            every.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+}
+
+impl Drop for AgentWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The facts [`adopt_session_for`] decides on, so it works on a live
+/// [`agsess::AgentSession`] and on a [`SessionView`] snapshot alike.
+pub trait AdoptFacts {
+    fn session_id(&self) -> &str;
+    fn session_cwd(&self) -> Option<&str>;
+    fn first_seen(&self) -> u64;
+}
+
+impl AdoptFacts for agsess::AgentSession {
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+    fn session_cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    fn first_seen(&self) -> u64 {
+        self.first_seen_ms
+    }
+}
+
+impl AdoptFacts for SessionView {
+    fn session_id(&self) -> &str {
+        &self.id
+    }
+    fn session_cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+    fn first_seen(&self) -> u64 {
+        self.first_seen_ms
+    }
+}
+
 /// Associate a *started* non-claude pane with a discovered session, returning the
 /// session id to stamp on the pane so [`VendorWorlds::status_for`] can bind it.
 ///
@@ -336,17 +520,17 @@ impl Default for VendorWorlds {
 /// - **Vendors without transcript cwd** (Gemini, …): the cwd filter does nothing,
 ///   so simultaneous launches of those vendors in *different* directories may bind
 ///   to each other. Increasing the poll rate shrinks the window.
-pub fn adopt_session_for(
-    sessions: &[&agsess::AgentSession],
+pub fn adopt_session_for<S: AdoptFacts>(
+    sessions: &[&S],
     pane_cwd: Option<&str>,
     launch_ms: u64,
 ) -> Option<String> {
     // Phase 1: time gate — transcripts first seen before this pane launched
     // belong to prior runs of the same vendor, not to this pane.
-    let candidates: Vec<&agsess::AgentSession> = sessions
+    let candidates: Vec<&S> = sessions
         .iter()
         .copied()
-        .filter(|s| s.first_seen_ms >= launch_ms)
+        .filter(|s| s.first_seen() >= launch_ms)
         .collect();
 
     if candidates.is_empty() {
@@ -357,11 +541,11 @@ pub fn adopt_session_for(
     // cwd matches the pane's working directory. Vendors that do not write cwd
     // to their transcripts leave session.cwd == None; those produce an empty
     // cwd_match set and fall through to the full candidate pool.
-    let pool: Vec<&agsess::AgentSession> = if let Some(cwd) = pane_cwd {
-        let cwd_match: Vec<&agsess::AgentSession> = candidates
+    let pool: Vec<&S> = if let Some(cwd) = pane_cwd {
+        let cwd_match: Vec<&S> = candidates
             .iter()
             .copied()
-            .filter(|s| s.cwd.as_deref() == Some(cwd))
+            .filter(|s| s.session_cwd() == Some(cwd))
             .collect();
         if cwd_match.is_empty() {
             candidates
@@ -375,8 +559,8 @@ pub fn adopt_session_for(
     // Phase 3: newest by first_seen_ms — among equal-confidence candidates, the
     // most recently discovered transcript is the best guess for the just-started pane.
     pool.into_iter()
-        .max_by_key(|s| s.first_seen_ms)
-        .map(|s| s.id.clone())
+        .max_by_key(|s| s.first_seen())
+        .map(|s| s.session_id().to_string())
 }
 
 /// The overview glyph/label decoration for a node's vendor: a short 2–3 char
@@ -855,5 +1039,41 @@ mod tests {
         );
         // Sanity: an unstamped pane (no id) still binds to nothing.
         assert_eq!(worlds.status_for(None), None);
+
+        // The run loop holds a snapshot, not the worlds: it must answer exactly
+        // the same, and adoption must pick the same session from it.
+        let snap = worlds.snapshot();
+        assert_eq!(snap.sessions().len(), worlds.sessions().len());
+        assert_eq!(snap.status_for(Some(&id)), worlds.status_for(Some(&id)));
+        assert_eq!(
+            snap.awaiting_tool_for(Some(&id)),
+            worlds.awaiting_tool_for(Some(&id))
+        );
+        let codex_views: Vec<&SessionView> = snap
+            .sessions()
+            .into_iter()
+            .filter(|s| s.vendor == Vendor::Codex)
+            .collect();
+        assert_eq!(
+            adopt_session_for(&codex_views, None, launch_ms).as_deref(),
+            Some("rollout-live-1")
+        );
+    }
+
+    /// The watch thread delivers a first snapshot without the loop doing any
+    /// file work, and newer snapshots replace older ones.
+    #[test]
+    fn the_agent_watch_publishes_snapshots_off_the_loop() {
+        let watch = AgentWatch::start(agsess::sessions::now_ms());
+        watch.set_interval(std::time::Duration::from_millis(100));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut got = 0;
+        while got < 2 && std::time::Instant::now() < deadline {
+            if watch.latest().is_some() {
+                got += 1;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        assert_eq!(got, 2, "the thread must keep publishing");
     }
 }

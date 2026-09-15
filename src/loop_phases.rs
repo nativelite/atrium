@@ -235,7 +235,7 @@ pub(crate) fn drop_exited_panes(windows: &mut [Window]) -> bool {
 /// non-claude agent pane with the newest session its vendor wrote at/after the
 /// pane's launch (cwd-preferred), so it binds through the normal `status_for` path.
 /// Claude panes already carry an injected `--session-id` and are skipped.
-pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::VendorWorlds) {
+pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::AgentState) {
     let sessions = world.sessions();
     if !sessions.is_empty() {
         for w in windows.iter_mut() {
@@ -254,7 +254,7 @@ pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::Ve
                 if vendor == agsess::Vendor::ClaudeCode {
                     continue;
                 }
-                let mine: Vec<&agsess::AgentSession> = sessions
+                let mine: Vec<&atrium::vendors::SessionView> = sessions
                     .iter()
                     .copied()
                     .filter(|s| s.vendor == vendor)
@@ -274,7 +274,7 @@ pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::Ve
 pub(crate) fn bar_infos(
     windows: &[Window],
     active: usize,
-    world: &atrium::vendors::VendorWorlds,
+    world: &atrium::vendors::AgentState,
 ) -> Vec<PaneInfo> {
     windows
         .iter()
