@@ -36,7 +36,11 @@ pub(crate) fn drain_active_window(
         // still breaks the instant there is no more data, so the high cap only
         // bites on a genuinely huge burst; it never adds latency when idle.
         for i in 0..DRAIN_READS_PER_TICK {
-            let wait = if i == 0 {
+            // Only the focused pane — the one keys go to — waits briefly for its
+            // echo; every other pane is read without waiting. A 5 ms wait per
+            // pane cost a tiled window of 8 about 40 ms of every tick (measured:
+            // key echo p50 65 ms at 8 panes, 6 ms at 1).
+            let wait = if i == 0 && pane.id == focus {
                 Duration::from_millis(5)
             } else {
                 Duration::ZERO
