@@ -841,6 +841,7 @@ fn recover_cmd(args: &[String]) -> ExitCode {
                 mode: trust_mode(),
                 extra_env: &[],
                 extra_norms: None,
+                deny: &[],
             },
             cell_rows,
             cols,

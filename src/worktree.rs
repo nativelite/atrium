@@ -531,6 +531,7 @@ mod tests {
             worktree_seed: None,
             build_jobs: None,
             memory_mb: None,
+            deny: Vec::new(),
             agents: agents
                 .iter()
                 .map(|(n, w)| Agent {

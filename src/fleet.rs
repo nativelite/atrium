@@ -131,6 +131,12 @@ pub struct Fleet {
     /// ceiling that tracks the machine's free commit. A fixed value never exceeds
     /// the dynamic one, and `ATRIUM_MEMORY_MB` still wins. Windows only.
     pub memory_mb: Option<u64>,
+    /// Commands no agent in the session may run — including workers a lead
+    /// spawns later over ctl. Each entry is a claude permission rule
+    /// (`"Bash(git push --force*)"`) or a bare command prefix
+    /// (`"cargo test --workspace"`). Added to `ATRIUM_DENY` and the built-in
+    /// fail-safes ([`crate::trust::deny_args`]). Claude agents only.
+    pub deny: Vec<String>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -191,6 +197,10 @@ pub struct Agent {
     /// unless at least one agent sets this (or the fleet sets `worktrees: true`),
     /// so coding isolation is a layer you switch on, not a change to what atrium is.
     pub worktree: Option<String>,
+    /// Commands this agent may not run, on top of the fleet's `deny` and the
+    /// built-in fail-safes ([`crate::trust::deny_args`]). Each entry is a claude
+    /// permission rule or a bare command prefix. Claude agents only.
+    pub deny: Vec<String>,
     /// An initial **user** prompt appended as the final positional argument, so
     /// the agent starts working the moment the fleet comes up instead of waiting
     /// for the human to type. For claude this is `claude … "<kickoff>"`, which
@@ -396,6 +406,8 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         None => None,
     };
 
+    let deny = deny_list(get("deny"), &format!("fleet {name:?}"))?;
+
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
     let agent_items = agents_val
@@ -421,8 +433,22 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         worktree_seed,
         build_jobs,
         memory_mb,
+        deny,
         agents,
     })
+}
+
+/// A `deny` list: an array of strings, or an error naming `whose` field.
+fn deny_list(v: Option<&json::Value>, whose: &str) -> Result<Vec<String>, String> {
+    let Some(v) = v else {
+        return Ok(Vec::new());
+    };
+    let err = || format!("{whose}: \"deny\" must be an array of strings");
+    v.as_array()
+        .ok_or_else(err)?
+        .iter()
+        .map(|e| e.as_str().map(str::to_string).ok_or_else(err))
+        .collect()
 }
 
 fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, String> {
@@ -506,7 +532,9 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
         None => Vec::new(),
     };
 
+    let deny = deny_list(get("deny"), &format!("fleet {fleet:?} agent {name:?}"))?;
     Ok(Agent {
+        deny,
         name,
         cmd,
         identity,
@@ -1523,6 +1551,31 @@ mod tests {
     }
 
     #[test]
+    fn deny_is_parsed_at_fleet_and_agent_level() {
+        let text = r#"{ "fleets": { "f": {
+            "deny": ["cargo test --workspace", "Bash(git push --force*)"],
+            "agents": [
+              { "name": "a", "cmd": ["claude"], "deny": ["npm publish"] },
+              { "name": "b", "cmd": ["claude"] }
+            ] } } }"#;
+        let fleets = parse(text).unwrap();
+        let f = fleets.get("f").unwrap();
+        assert_eq!(
+            f.deny,
+            s(&["cargo test --workspace", "Bash(git push --force*)"])
+        );
+        assert_eq!(f.agents[0].deny, s(&["npm publish"]));
+        assert!(f.agents[1].deny.is_empty());
+        for bad in [r#""deny": "x""#, r#""deny": [1]"#] {
+            let t = format!(
+                r#"{{ "fleets": {{ "f": {{ {bad}, "agents": [{{ "name": "a", "cmd": ["claude"] }}] }} }} }}"#
+            );
+            let err = parse(&t).unwrap_err();
+            assert!(err.contains("deny"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn memory_mb_sets_a_fixed_ceiling() {
         let text = |v: &str| {
             format!(
@@ -2023,6 +2076,7 @@ mod tests {
             worktree_seed: None,
             build_jobs: None,
             memory_mb: None,
+            deny: Vec::new(),
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -2289,6 +2343,7 @@ mod tests {
             worktree_seed: None,
             build_jobs: None,
             memory_mb: None,
+            deny: Vec::new(),
             agents,
         };
         let anchor = Anchor {

@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   largest build process, never an agent, and raises it on the bus and the bar.
   The kill checks job membership and the image through the same handle it
   terminates with, so a recycled pid is never hit.
+- **A deny list for agents.** Fleets take `deny` (session-wide, including
+  ctl-spawned workers) and per-agent `deny`; `ATRIUM_DENY` adds operator
+  rules. Entries are claude permission rules or bare command prefixes, and
+  every claude pane also carries built-in rules refusing any command that
+  names `CARGO_MAKEFLAGS`, so an agent can't strip the compile pool. The rules
+  go to claude's `--disallowedTools`, which was measured to hold under
+  `--dangerously-skip-permissions`, to beat a matching allow rule, and to
+  check each part of a compound command. It matches command text, so it is a
+  guardrail, not a sandbox. The fleet banner counts the rules and warns when
+  a rule targets a non-claude agent it can't bind.
 
 ### Fixed
 - **A fleet agent's `prompt` is no longer silently dropped.** The `prompt` key

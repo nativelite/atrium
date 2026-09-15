@@ -123,6 +123,89 @@ pub fn accept_edits_args(extra: &[String]) -> Vec<String> {
     args
 }
 
+/// Environment knob (comma-separated) of commands no agent in the session may
+/// run: each entry is a claude permission rule (`Bash(git push --force*)`) or a
+/// bare command prefix (`cargo test --workspace`). Set by the human who launches
+/// atrium; a fleet's `deny` adds to it.
+pub const ENV_DENY: &str = "ATRIUM_DENY";
+
+/// Rules every claude pane carries, whatever its trust posture: the fail-safes
+/// that protect atrium's own limits. An agent that clears `CARGO_MAKEFLAGS`
+/// escapes the session compile pool, and with it the protection against a fleet
+/// of machine-sized builds, so any command naming the variable is refused.
+///
+/// Measured against claude: a deny rule blocks a command even under
+/// `--dangerously-skip-permissions`, beats a matching allow rule, is checked on
+/// each part of a compound command (`cd . && …`), and a leading `*` matches
+/// mid-command. Rules match command TEXT, so a determined wrapper can still get
+/// round one: this is a guardrail that catches an agent, not a sandbox.
+pub const DEFAULT_DENY: &[&str] = &["Bash(*CARGO_MAKEFLAGS*)", "PowerShell(*CARGO_MAKEFLAGS*)"];
+
+/// One `deny` entry as a claude rule. Kept as-is when it is already a rule: a
+/// tool with a pattern (`Bash(git push*)`) or a bare tool name (`WebFetch` —
+/// claude's tool names are CamelCase words, which commands are not). Anything
+/// else is a command prefix, matched as `Bash(<prefix>*)`. Blank → `None`.
+pub fn deny_rule(entry: &str) -> Option<String> {
+    let e = entry.trim();
+    if e.is_empty() {
+        return None;
+    }
+    let tool_word = |s: &str| {
+        s.starts_with(|c: char| c.is_ascii_uppercase())
+            && s.chars().all(|c| c.is_ascii_alphanumeric())
+    };
+    let names_a_tool =
+        tool_word(e) || (e.ends_with(')') && e.find('(').is_some_and(|i| tool_word(&e[..i])));
+    Some(if names_a_tool {
+        e.to_string()
+    } else {
+        format!("Bash({e}*)")
+    })
+}
+
+/// The `--disallowedTools` args for a claude pane: [`DEFAULT_DENY`], then the
+/// session's rules (`ATRIUM_DENY` + the fleet's `deny`), then the agent's own,
+/// normalised by [`deny_rule`] and de-duplicated in that order.
+pub fn deny_args(session: &[String], agent: &[String]) -> Vec<String> {
+    let mut rules: Vec<String> = Vec::new();
+    let entries = DEFAULT_DENY
+        .iter()
+        .map(|s| s.to_string())
+        .chain(session.iter().cloned())
+        .chain(agent.iter().cloned());
+    for rule in entries.filter_map(|e| deny_rule(&e)) {
+        if !rules.contains(&rule) {
+            rules.push(rule);
+        }
+    }
+    let mut args = vec!["--disallowedTools".to_string()];
+    args.extend(rules);
+    args
+}
+
+/// A fleet's `deny`, recorded once for the whole session so ctl-spawned workers
+/// are held to the same rules as the fleet's own agents.
+static FLEET_DENY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record a fleet's session-wide `deny`. First call wins.
+pub fn set_fleet_deny(rules: Vec<String>) {
+    let _ = FLEET_DENY.set(rules);
+}
+
+/// The entries in `ATRIUM_DENY` (comma-separated, trimmed, empties dropped).
+pub fn parse_deny_env() -> Vec<String> {
+    crate::ctl::parse_allow_list(ENV_DENY)
+}
+
+/// The session-wide deny entries: `ATRIUM_DENY`, then the fleet's `deny`.
+pub fn session_deny() -> Vec<String> {
+    let mut v = parse_deny_env();
+    if let Some(fleet) = FLEET_DENY.get() {
+        v.extend(fleet.iter().cloned());
+    }
+    v
+}
+
 /// Build the **codex** (OpenAI) CLI args for a trust posture — the codex analog
 /// of [`accept_edits_args`]. codex has no claude-style `--permission-mode`; its
 /// autonomy is governed by `--ask-for-approval <policy>` + `--sandbox <mode>`
@@ -456,6 +539,58 @@ mod tests {
         assert!(set_trusted_in(&mut root, "D:/x"));
         assert_eq!(trusted(&root, "D:/x"), Some(true));
         assert_eq!(root.get("numStartups").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn a_deny_entry_is_a_raw_rule_or_a_command_prefix() {
+        assert_eq!(
+            deny_rule("Bash(git push --force*)").as_deref(),
+            Some("Bash(git push --force*)")
+        );
+        // Bare tool names deny the whole tool.
+        assert_eq!(deny_rule("WebFetch").as_deref(), Some("WebFetch"));
+        assert_eq!(deny_rule("Edit").as_deref(), Some("Edit"));
+        // A hyphenated cmdlet or a lowercase command is a prefix, not a tool.
+        assert_eq!(
+            deny_rule("Remove-Item").as_deref(),
+            Some("Bash(Remove-Item*)")
+        );
+        assert_eq!(deny_rule("shutdown").as_deref(), Some("Bash(shutdown*)"));
+        assert_eq!(deny_rule("rm (x)").as_deref(), Some("Bash(rm (x)*)"));
+        assert_eq!(
+            deny_rule("  cargo test --workspace ").as_deref(),
+            Some("Bash(cargo test --workspace*)")
+        );
+        assert_eq!(
+            deny_rule("PowerShell(Stop-Computer*)").as_deref(),
+            Some("PowerShell(Stop-Computer*)")
+        );
+        assert_eq!(deny_rule("   "), None);
+    }
+
+    #[test]
+    fn deny_args_always_carry_the_fail_safes_first_and_dedupe() {
+        let bare = deny_args(&[], &[]);
+        assert_eq!(bare[0], "--disallowedTools");
+        assert_eq!(
+            &bare[1..],
+            DEFAULT_DENY,
+            "the built-ins ride on every claude pane"
+        );
+        let full = deny_args(
+            &["cargo test --workspace".into(), "Bash(git push*)".into()],
+            &["Bash(git push*)".into(), "npm publish".into()],
+        );
+        assert_eq!(
+            &full[1..],
+            &[
+                "Bash(*CARGO_MAKEFLAGS*)",
+                "PowerShell(*CARGO_MAKEFLAGS*)",
+                "Bash(cargo test --workspace*)",
+                "Bash(git push*)",
+                "Bash(npm publish*)",
+            ]
+        );
     }
 
     #[test]

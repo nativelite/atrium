@@ -185,6 +185,23 @@ fn ctl_without_spawner(allow_ctl: bool, spawner_count: usize) -> bool {
     allow_ctl && spawner_count == 0
 }
 
+/// Names of the agents a `deny` rule is aimed at but can't bind: every
+/// non-claude agent when the fleet has session-wide rules, and any non-claude
+/// agent with rules of its own.
+fn deny_unbound(fleet: &atrium::fleet::Fleet) -> Vec<String> {
+    fleet
+        .agents
+        .iter()
+        .filter(|a| !fleet.deny.is_empty() || !a.deny.is_empty())
+        .filter(|a| {
+            a.cmd
+                .first()
+                .is_some_and(|c| !atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)))
+        })
+        .map(|a| a.name.clone())
+        .collect()
+}
+
 /// The session compile pool as the banner states it: a suffix for the posture
 /// line, plus a warning line when builds will run unpooled. `size` is the pool
 /// this session created; `inherited` means an enclosing session's pool is already
@@ -609,13 +626,32 @@ pub(crate) fn fleet_up(
         atrium::memguard::planned_cap(fleet.memory_mb),
         atrium::memguard::supported(),
     );
+    // Session-wide deny rules as every claude pane will carry them (built-ins
+    // + ATRIUM_DENY + the fleet's); per-agent rules add to this.
+    let mut session_deny = atrium::trust::parse_deny_env();
+    session_deny.extend(fleet.deny.iter().cloned());
+    let denied = atrium::trust::deny_args(&session_deny, &[]).len() - 1;
     eprintln!(
-        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}, {memory}",
+        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}, {memory}, \
+         {denied} deny rules",
         fsan(name),
         fleet.agents.len(),
         trust.policy_label(),
         if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
+    // Deny rules only reach claude (codex has no equivalent flag). Say so when a
+    // rule is aimed at an agent it can't bind, rather than let it read as enforced.
+    let unbound = deny_unbound(&fleet);
+    if !unbound.is_empty() {
+        eprintln!(
+            "atrium fleet: warning: deny rules apply to claude agents only — not enforced for {}",
+            unbound
+                .iter()
+                .map(|n| fsan(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if let Some(warning) = pool_warning {
         eprintln!("atrium fleet: {warning}");
     }
@@ -715,7 +751,9 @@ pub(crate) fn fleet_up(
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
     }
-    // Approved: record the fleet's memory ceiling for the session guard.
+    // Approved: record the fleet's deny rules for every pane in the session.
+    atrium::trust::set_fleet_deny(fleet.deny.clone());
+    // Record the fleet's memory ceiling for the session guard.
     if let Some(mb) = fleet.memory_mb {
         atrium::memguard::set_fleet_mb(mb);
     }
@@ -1048,6 +1086,7 @@ pub(crate) fn spawn_fleet_window(
                 mode: agent_mode,
                 extra_env: &ctx_vars,
                 extra_norms: pane_norms.as_deref(),
+                deny: &agent.deny,
             },
             cell_rows,
             cell_cols,
@@ -1083,8 +1122,8 @@ pub(crate) fn spawn_fleet_window(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pool_line, ctl_without_spawner, plugin_value_enabled, preflight_context_mode,
-        up_alias,
+        build_pool_line, ctl_without_spawner, deny_unbound, plugin_value_enabled,
+        preflight_context_mode, up_alias,
     };
 
     fn v(args: &[&str]) -> Vec<String> {
@@ -1184,6 +1223,51 @@ mod tests {
     fn no_ctl_never_warns() {
         // Without the control plane there are no teammates to spawn — silence.
         assert!(!ctl_without_spawner(false, 0));
+    }
+
+    #[test]
+    fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
+        let fleet = |fleet_deny: &[&str], agents: &[(&str, &str, &[&str])]| atrium::fleet::Fleet {
+            grid: None,
+            identity: None,
+            trust: None,
+            allow_ctl: None,
+            context: None,
+            topics: None,
+            worktrees: None,
+            worktree_base: None,
+            worktree_seed: None,
+            build_jobs: None,
+            memory_mb: None,
+            deny: fleet_deny.iter().map(|s| s.to_string()).collect(),
+            agents: agents
+                .iter()
+                .map(|(name, cmd, deny)| atrium::fleet::Agent {
+                    name: name.to_string(),
+                    cmd: vec![cmd.to_string()],
+                    deny: deny.iter().map(|s| s.to_string()).collect(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        // No rules anywhere: nothing to warn about, whatever the agents are.
+        assert!(deny_unbound(&fleet(&[], &[("c", "codex", &[])])).is_empty());
+        // Fleet-wide rules reach claude but not codex.
+        assert_eq!(
+            deny_unbound(&fleet(
+                &["npm publish"],
+                &[("a", "claude", &[]), ("c", "codex", &[])]
+            )),
+            vec!["c".to_string()]
+        );
+        // A non-claude agent's own rules are unbound; a claude agent's are fine.
+        assert_eq!(
+            deny_unbound(&fleet(
+                &[],
+                &[("a", "claude", &["x"]), ("c", "codex", &["y"])]
+            )),
+            vec!["c".to_string()]
+        );
     }
 
     #[test]

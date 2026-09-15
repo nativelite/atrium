@@ -1363,6 +1363,10 @@ fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
         .unwrap_or_default();
     assert!(posture.contains("compile jobs shared"), "{posture}");
     assert!(posture.contains("memory"), "{posture}");
+    assert!(
+        posture.contains("2 deny rules"),
+        "built-in fail-safes only: {posture}"
+    );
     // Deduplicated: eight agents naming ONE sibling checkout is one line.
     assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
     // And the banner as a whole still fits a terminal.
@@ -2152,6 +2156,57 @@ fn a_pane_is_given_a_live_build_pool_windows() {
     );
     assert_eq!(maximum, 3, "ATRIUM_BUILD_JOBS=3 must size the pool");
     assert_eq!(current, 3, "an idle pool holds all its tokens");
+}
+
+/// **A claude pane is launched with the deny list** (Windows).
+///
+/// A fake `claude.cmd` records the argv atrium actually launched it with. It must
+/// carry `--disallowedTools` with the built-in fail-safe first and the
+/// session's `ATRIUM_DENY` entry normalised to a rule — proof the rules reach
+/// claude, not just that the rule builder is right.
+#[cfg(windows)]
+#[test]
+fn a_claude_pane_is_launched_with_the_deny_list_windows() {
+    let dir = std::env::temp_dir().join(format!("atrium-deny-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let argv_file = dir.join("argv.txt");
+    std::fs::write(
+        dir.join("claude.cmd"),
+        "@echo off\r\necho %* > \"%~dp0argv.txt\"\r\nping -n 600 127.0.0.1 > nul\r\n",
+    )
+    .unwrap();
+    let claude = dir.join("claude.cmd").display().to_string();
+    let env = [("ATRIUM_DENY".to_string(), "npm publish".to_string())];
+    let mut p =
+        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), &[&claude], 24, 80, &env).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&argv_file) {
+            if t.contains("disallowedTools") || t.trim().len() > 10 {
+                break t;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fake claude never recorded its argv"
+        );
+        read_until(&mut p, b"\x00never-printed\x00", Duration::from_millis(200));
+    };
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let flag = seen
+        .find("--disallowedTools")
+        .unwrap_or_else(|| panic!("no deny flag: {seen}"));
+    let builtin = seen
+        .find("Bash(*CARGO_MAKEFLAGS*)")
+        .unwrap_or_else(|| panic!("{seen}"));
+    let session = seen
+        .find("Bash(npm publish*)")
+        .unwrap_or_else(|| panic!("{seen}"));
+    assert!(flag < builtin && builtin < session, "order: {seen}");
 }
 
 /// **The memory guard holds a real pane under its ceiling** (Windows).

@@ -25,6 +25,7 @@ pub(crate) fn spawn_window(
             mode,
             extra_env: &[],
             extra_norms,
+            deny: &[],
         },
         rows.saturating_sub(1).max(1),
         cols,
@@ -168,6 +169,7 @@ pub(crate) fn spawn_pane(
             mode,
             extra_env: &[],
             extra_norms: None,
+            deny: &[],
         },
         rows,
         cols,
@@ -286,6 +288,9 @@ pub(crate) struct PaneSpec<'a> {
     pub(crate) extra_env: &'a [(String, String)],
     /// Worktree norms to fold into the pane's `--append-system-prompt`.
     pub(crate) extra_norms: Option<&'a str>,
+    /// This agent's own deny entries (a fleet agent's `deny`), on top of the
+    /// built-in fail-safes and the session's rules every claude pane carries.
+    pub(crate) deny: &'a [String],
 }
 
 /// The shared spawn core: build the agent's launch from `spec` (session-id
@@ -308,6 +313,7 @@ pub(crate) fn spawn_pane_full(
         mode,
         extra_env,
         extra_norms,
+        deny,
     } = spec;
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
@@ -370,6 +376,17 @@ pub(crate) fn spawn_pane_full(
     } else {
         command.to_vec()
     };
+    // Every claude pane, at every trust posture, carries the deny list: the
+    // built-in fail-safes, the session's rules (so a ctl-spawned worker is held to
+    // the fleet's rules too) and the agent's own. Appended after the trust flags
+    // and before the folded system prompt, which terminates the variadic list —
+    // the same placement `--allowedTools` relies on.
+    if is_claude {
+        base.extend(atrium::trust::deny_args(
+            &atrium::trust::session_deny(),
+            deny,
+        ));
+    }
     // When the ctl channel is live, teach every agent pane — the initial one and
     // ctl-spawned workers alike — to delegate through `atrium ctl` (visible panes)
     // instead of its own invisible Task/background-agents tool. This is the
