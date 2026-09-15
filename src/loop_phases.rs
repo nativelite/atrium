@@ -56,13 +56,15 @@ pub(crate) fn drain_active_window(
                         pane.mouse_wanted = m;
                     }
                     // "painted" = the emulator now has *visible* content, not
-                    // merely that setup bytes arrived — so the splash stays up
-                    // until the agent's first frame.
-                    let first_paint = !pane.painted && !term_blank(&pane.term);
-                    if first_paint {
+                    // merely that setup bytes arrived. The focused passthrough
+                    // pane is the one under the splash: it is handed off by
+                    // [`finish_splash`] instead, which also holds the logo up
+                    // for its minimum time.
+                    let under_splash = !tiled && pane.id == focus;
+                    if !under_splash && !pane.painted && !term_blank(&pane.term) {
                         pane.painted = true;
                     }
-                    if !tiled && pane.id == focus {
+                    if under_splash {
                         if overlay_up {
                             // An overlay (board / overview) is up: keep the
                             // passthrough filter state current, but don't paint
@@ -70,19 +72,6 @@ pub(crate) fn drain_active_window(
                             // fed above, so a toggle-off repaints from the
                             // current screen.)
                             let _ = pane.filter.feed(&buf[..n]);
-                        } else if first_paint {
-                            // Hand off from the splash: restore the cursor the
-                            // splash hid, then paint the agent's current screen
-                            // straight from the emulator (its `render_full`
-                            // already clears + reflects everything fed so far),
-                            // and resume live passthrough from here.
-                            let full = pane.term.screen().render_full();
-                            let _ = out.write_all(b"\x1b[?25h");
-                            let _ = out.write_all(&full);
-                            // render_full cleared the whole screen (the bar row
-                            // too); repaint the bar this tick so it never blinks
-                            // out during the handoff.
-                            force_repaint = true;
                         } else if pane.painted {
                             let cleaned = pane.filter.feed(&buf[..n]);
                             let _ = out.write_all(&cleaned);
@@ -128,6 +117,56 @@ pub(crate) fn drain_active_window(
         force_repaint,
         tiled_dirty,
     }
+}
+
+/// Whether the startup splash may hand off to its pane now: the pane has drawn
+/// something, and either the logo has been up for its minimum time or the pane
+/// has already exited (a one-shot command's output must not be lost to the
+/// logo). Pure, so the rule is testable without a terminal.
+pub(crate) fn splash_may_hand_off(has_content: bool, hold_over: bool, exited: bool) -> bool {
+    has_content && (hold_over || exited)
+}
+
+/// Phase 2b of the loop: hand the focused passthrough pane off from the startup
+/// splash once [`splash_may_hand_off`] allows it. Runs every tick, not only when
+/// bytes arrive, so a shell that printed its prompt and went quiet during the
+/// hold still takes over when the hold ends. Returns whether the bar must be
+/// repainted this tick.
+pub(crate) fn finish_splash(
+    w: &mut Window,
+    overlay_up: bool,
+    hold_over: bool,
+    out: &mut impl std::io::Write,
+) -> bool {
+    if w.tiled() {
+        return false;
+    }
+    let focus = w.tree.focus();
+    let Some(pane) = w.pane_mut(focus) else {
+        return false;
+    };
+    if pane.painted || term_blank(&pane.term) {
+        return false;
+    }
+    let exited = pane.exited || matches!(pane.pty.try_wait(), Ok(Some(_)));
+    if !splash_may_hand_off(true, hold_over, exited) {
+        return false;
+    }
+    pane.painted = true;
+    if overlay_up {
+        // The overlay's close repaints the pane from its emulator.
+        return false;
+    }
+    // Restore the cursor the splash hid, then paint the pane's current screen
+    // straight from the emulator (`render_full` clears and reflects everything
+    // fed so far), and resume live passthrough from here.
+    let full = pane.term.screen().render_full();
+    let _ = out.write_all(b"\x1b[?25h");
+    let _ = out.write_all(&full);
+    let _ = out.flush();
+    // render_full cleared the whole screen, bar row included: repaint the bar
+    // this tick so it never blinks out during the handoff.
+    true
 }
 
 /// Phase 3 of the loop: drain every background window (output is discarded —

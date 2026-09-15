@@ -11,6 +11,14 @@
 use crate::*;
 use atrium::select::Selection;
 
+/// How long the startup logo stays up once it has appeared, even when the pane
+/// behind it is ready sooner. A plain `atrium` hosts a shell that prints its
+/// prompt within milliseconds, which used to wipe the splash before its first
+/// frame reached the screen; the hold is what makes the logo visible at all
+/// there. An agent that takes longer to boot is unaffected — its splash was
+/// already up for seconds. A pane that exits during the hold ends it at once.
+pub(crate) const SPLASH_MIN: Duration = Duration::from_millis(1200);
+
 /// What the paint remembers between ticks.
 pub(crate) struct Renderer {
     /// Animation clock for the per-pane loading spinner (advances ~8 frames/sec).
@@ -21,6 +29,10 @@ pub(crate) struct Renderer {
     /// The spinner frame last painted by the passthrough startup splash, so it
     /// redraws only when the frame advances (not every tick).
     last_splash_frame: usize,
+    /// When the startup splash was first drawn, which starts [`SPLASH_MIN`].
+    /// Set once per run: a window opened later reuses the splash but not the
+    /// hold, so it hands off as soon as its pane paints.
+    splash_shown_at: Option<Instant>,
     /// The spin_frame value used by the last tiled composite. When any pane is
     /// still loading, a new spin_frame means new spinner content → must re-composite.
     last_tiled_spin: usize,
@@ -49,6 +61,7 @@ impl Renderer {
         Renderer {
             anim_start: Instant::now(),
             last_splash_frame: usize::MAX,
+            splash_shown_at: None,
             last_tiled_spin: usize::MAX,
             last_bar: String::new(),
             last_bar_paint: Instant::now(),
@@ -62,6 +75,14 @@ impl Renderer {
     /// (a mode, layout, window or size change).
     pub(crate) fn reset(&mut self) {
         self.prev_master = None;
+    }
+
+    /// Whether the startup logo has been up for [`SPLASH_MIN`]. False until it
+    /// has been drawn at all: the first drain runs before the first paint, and
+    /// handing off then is exactly how a fast shell hid the logo.
+    pub(crate) fn splash_hold_over(&self) -> bool {
+        self.splash_shown_at
+            .is_some_and(|at| at.elapsed() >= SPLASH_MIN)
     }
 
     /// Render the active window (an overlay, the tiled compose+diff, or — in
@@ -221,6 +242,7 @@ impl Renderer {
                 .map(|p| !p.painted)
                 .unwrap_or(false);
             if unpainted {
+                self.splash_shown_at.get_or_insert_with(Instant::now);
                 if spin_frame != self.last_splash_frame {
                     draw_startup_splash(&mut frame, rows, cols, spin_frame);
                     self.last_splash_frame = spin_frame;

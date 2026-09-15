@@ -608,6 +608,53 @@ fn passthrough_and_auto_exit() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
+/// A plain `atrium` shows its startup logo. The hosted shell prints its prompt
+/// within milliseconds, and that used to wipe the splash before its first frame
+/// was ever written; the logo now holds until it has been seen, then the shell
+/// takes over and still answers.
+#[test]
+fn a_plain_start_shows_the_logo_before_the_shell() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
+    let out = read_until(&mut p, b"where your agents gather", Duration::from_secs(15));
+    let logo_at = Instant::now();
+    assert!(
+        contains(&out, b"where your agents gather"),
+        "no logo in: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Seen means held: the shell's own first screen must not replace the logo
+    // in the same breath. (A frame that is written and wiped a few ms later is
+    // in the byte stream but never on the screen.)
+    let prompt: &[u8] = if cfg!(windows) { b"Microsoft" } else { b"$ " };
+    let out = read_until(&mut p, prompt, Duration::from_secs(15));
+    assert!(
+        contains(&out, prompt),
+        "no shell screen: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        logo_at.elapsed() >= Duration::from_millis(800),
+        "the logo was replaced after only {:?}",
+        logo_at.elapsed()
+    );
+    p.write(b"echo atrium-logo-then-shell\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-logo-then-shell", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"atrium-logo-then-shell"),
+        "the shell never took over: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
+
 /// Interactive session: keystrokes reach the hosted shell through atrium,
 /// its response comes back, the bar is painted, and Ctrl+A q quits.
 #[test]

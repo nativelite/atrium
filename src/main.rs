@@ -1365,6 +1365,16 @@ fn run(
         if drained.force_repaint {
             force_repaint = true;
         }
+        // 2b. hand the focused pane off from the startup logo once it has drawn
+        //     something and the logo has been up long enough to be seen.
+        if finish_splash(
+            &mut windows[active],
+            views.any(),
+            renderer.splash_hold_over(),
+            &mut out,
+        ) {
+            force_repaint = true;
+        }
         let tiled_dirty = drained.tiled_dirty;
 
         // 3. background windows: drain (discarded — emulator/ConPTY keep the
@@ -2110,6 +2120,20 @@ mod tests {
         // `role` is painted into the status bar and the overview unfiltered.
         assert_eq!(role, "lead");
         assert!(!role.chars().any(|c| c.is_control()));
+    }
+
+    /// The startup logo holds until it has been seen, but never hides a pane that
+    /// has nothing to show, and never outlives a pane that already exited.
+    #[test]
+    fn the_startup_logo_holds_until_seen_unless_the_pane_is_done() {
+        use super::splash_may_hand_off as may;
+        assert!(!may(true, false, false), "a fast shell waits out the hold");
+        assert!(may(true, true, false), "then hands off");
+        assert!(!may(false, true, false), "nothing drawn yet: keep the logo");
+        assert!(
+            may(true, false, true),
+            "an exited one-shot shows its output at once"
+        );
     }
 
     /// The fleet banner says a governed flag in `cmd` is ignored, so the launch
