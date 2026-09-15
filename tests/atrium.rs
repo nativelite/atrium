@@ -2207,6 +2207,90 @@ fn the_soft_memory_guard_stops_a_runaway_build_linux() {
     assert_eq!(seen, "exit=137", "the build must be SIGKILLed by the guard");
 }
 
+/// **Under a delegated scope the Linux cap is hard** (needs a systemd user
+/// manager, so it only runs when asked: `cargo test --test atrium -- --ignored
+/// a_delegated_scope`).
+///
+/// atrium is launched the documented way — `systemd-run --user --scope -p
+/// Delegate=yes atrium …` — with a 64 MB cap. The pane records its own cgroup
+/// and then runs a 300 MB "build". Proven, in order: the pane was moved into
+/// atrium's `panes` leaf, that leaf's `memory.max` is the cap, and the build was
+/// stopped.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs systemd-run --user with delegation"]
+fn a_delegated_scope_holds_panes_under_a_hard_cap_linux() {
+    let dir = std::env::temp_dir().join(format!("atrium-hardcap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("rustc");
+    std::os::unix::fs::symlink("/usr/bin/python3", &shim).unwrap();
+    let marker = dir.join("out.txt");
+    let script = format!(
+        "sleep 4; echo \"cg=$(cut -d: -f3 /proc/self/cgroup)\" > '{marker}'; \
+         '{shim}' -c 'import time; b = b\"x\" * (300 * 1024 * 1024); time.sleep(60)'; \
+         echo \"exit=$?\" >> '{marker}'; sleep 600",
+        shim = shim.display(),
+        marker = marker.display()
+    );
+    let env = [("ATRIUM_MEMORY_MB".to_string(), "64".to_string())];
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let mut p = pty::Pty::spawn_with_env(
+        "systemd-run",
+        &[
+            "--user",
+            "--scope",
+            "-p",
+            "Delegate=yes",
+            "--quiet",
+            atrium,
+            "sh",
+            "-c",
+            &script,
+        ],
+        24,
+        80,
+        &env,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if t.contains("exit=") {
+                break t;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pane never finished: {:?}",
+            std::fs::read_to_string(&marker)
+        );
+        read_until(&mut p, b"\x00never-printed\x00", Duration::from_millis(200));
+    };
+    let cg = seen
+        .lines()
+        .find_map(|l| l.strip_prefix("cg="))
+        .unwrap_or_default()
+        .to_string();
+    let max = std::fs::read_to_string(format!("/sys/fs/cgroup{cg}/memory.max")).unwrap_or_default();
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        cg.ends_with("/panes"),
+        "the pane was not moved into the panes leaf: {cg:?}"
+    );
+    assert_eq!(
+        max.trim(),
+        (64 * 1024 * 1024).to_string(),
+        "memory.max is not the cap"
+    );
+    assert!(
+        seen.contains("exit=137"),
+        "the build was not stopped: {seen}"
+    );
+}
+
 /// **A claude pane is launched with the deny list** (Windows).
 ///
 /// A fake `claude.cmd` records the argv atrium actually launched it with. It must

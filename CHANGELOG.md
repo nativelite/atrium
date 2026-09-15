@@ -37,6 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start time (a pidfd on Linux). On Linux every build also gets a raised
   `oom_score_adj`, so the kernel's OOM killer takes a build before atrium or the
   desktop. The banner says `(soft)`. macOS is compiled but not yet run on a Mac.
+- **A hard memory cap on Linux, when atrium owns its cgroup.** Launched under
+  `systemd-run --user --scope -p Delegate=yes`, atrium splits its scope into a
+  leaf for itself and a leaf for the panes. The panes' leaf gets `memory.max`
+  sized from the kernel's own `memory.current` with headroom that shrinks
+  geometrically inside the machine's reserve (never pinned to current use),
+  `memory.high` at 90% of that headroom, and swap closed, since
+  `memory.max` counts RAM only and a capped pane with swap open was measured
+  swapping instead of stopping. Past the cap the kernel's cgroup OOM killer
+  acts inside the panes. The cgroup is taken before the first pane spawns (a
+  pane inherits atrium's cgroup, and atrium can only take one it's alone in),
+  and each pane moves in right after its spawn.
 - **A deny list for agents.** Fleets take `deny` (session-wide, including
   ctl-spawned workers) and per-agent `deny`; `ATRIUM_DENY` adds operator
   rules. Entries are claude permission rules or bare command prefixes, and

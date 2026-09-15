@@ -20,6 +20,7 @@ pub mod audit;
 pub mod bar;
 pub mod bind;
 pub mod buildpool;
+pub mod cgroup;
 pub mod context;
 pub mod ctl;
 pub mod deliver;

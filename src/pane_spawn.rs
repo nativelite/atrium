@@ -482,6 +482,9 @@ pub(crate) fn spawn_pane_full(
     // The session compile pool, created on the first spawn if the fleet path
     // hasn't already sized it.
     let build_pool = atrium::buildpool::init(None).map(|p| p.makeflags());
+    // Linux: take the panes' capped cgroup BEFORE the first pane exists — a pane
+    // inherits atrium's cgroup, and atrium can only take one it's alone in.
+    let pane_cgroup = atrium::cgroup::session();
     let mut base_env = pane_base_env(
         atrium::orphan::session_key().as_ref(),
         match (CTL_ADDRESS.get(), token.as_ref()) {
@@ -547,6 +550,11 @@ pub(crate) fn spawn_pane_full(
     // here; the stamp covers every pane. It records the pane's own start token,
     // so a stale file cannot become a kill order against a recycled pid.
     atrium::orphan::stamp(pty.pid());
+    // Into the capped leaf at once, not at the next safety-net tick, so little
+    // the pane starts in its first moments lands outside the cap.
+    if let Some(cg) = pane_cgroup {
+        cg.assign(pty.pid());
+    }
     Ok(Pane {
         id,
         pty,

@@ -585,7 +585,9 @@ pub struct SessionJob {
 }
 
 impl SessionJob {
-    /// Create the container: a kill-on-close Job Object on Windows, nothing on unix.
+    /// Create the container: a kill-on-close Job Object on Windows, nothing on
+    /// unix (where Linux's capped cgroup is the session-wide
+    /// [`crate::cgroup::session`], taken before the first pane spawns).
     pub fn create() -> Self {
         #[cfg(unix)]
         {
@@ -599,11 +601,23 @@ impl SessionJob {
         }
     }
 
-    /// Assign a pane process (by pid) so its whole tree is torn down with atrium.
-    /// `false` on unix (no-op) and on a Windows assignment failure (kept non-fatal).
+    /// Linux: the panes' capped cgroup, if this session holds one.
+    #[cfg(target_os = "linux")]
+    pub fn pane_cgroup(&self) -> Option<&'static crate::cgroup::PaneCgroup> {
+        crate::cgroup::session()
+    }
+
+    /// Assign a pane process (by pid) so its whole tree is torn down with atrium
+    /// (Windows) or held under the panes' memory cap (Linux, when a cgroup is
+    /// held). `false` when there is nothing to assign to, and on a failure (kept
+    /// non-fatal).
     pub fn assign(&self, pid: u32) -> bool {
         #[cfg(unix)]
         {
+            #[cfg(target_os = "linux")]
+            if let Some(cg) = crate::cgroup::session() {
+                return cg.assign(pid);
+            }
             let _ = pid;
             false
         }

@@ -23,10 +23,14 @@
 //!   never an agent — and says so. The hard limit is the backstop for what that
 //!   can't relieve: allocations past it fail inside the panes, not across the box.
 //!
-//! **Unix is soft.** There is no Job Object, and its closest equivalent (a
-//! cgroup) isn't reliably available to an unprivileged process: a shell in a
-//! terminal usually shares a cgroup it doesn't own with its siblings. So on Linux
-//! and macOS the guard watches instead of capping: it finds each pane's processes
+//! **Linux can be hard.** When atrium owns its cgroup (launched under
+//! `systemd-run --user --scope -p Delegate=yes`), [`crate::cgroup`] caps the
+//! panes with `memory.high`/`memory.max` sized by [`cgroup_limits`], and the
+//! guard's kill policy below runs in front of it.
+//!
+//! **Otherwise unix is soft.** There is no Job Object, and a shell in a terminal
+//! usually shares a cgroup it doesn't own with its siblings, so there is nothing
+//! to cap. On Linux and macOS the guard then watches instead of capping: it finds each pane's processes
 //! by session (every pane is a session leader), stops the largest build when the
 //! machine drops into its reserve or the panes reach a fixed cap, and binds that
 //! kill to the victim's start time. On Linux it also marks every build as the
@@ -103,6 +107,46 @@ pub fn job_limit(cap: Cap, job_used: u64, commit_limit: u64, commit_available: u
         Cap::Off => None,
         Cap::Dynamic => Some(dynamic),
         Cap::Fixed(bytes) => Some(bytes.min(dynamic)),
+    }
+}
+
+/// The smallest growth room the Linux cgroup cap ever leaves above what the
+/// panes use now.
+const MIN_CGROUP_HEADROOM: u64 = 64 * MIB;
+
+/// Linux cgroup limits `(memory.high, memory.max)` for the panes, from the
+/// kernel's own `current` usage (`memory.current`: resident memory PLUS page
+/// cache, tmpfs and kernel memory — what `memory.max` actually gates).
+///
+/// Unlike the Windows job limit this never pins the cap to current use. Setting
+/// `memory.max` to usage measured any other way (resident size) put it below
+/// what the kernel counts, and a cap at exactly current use throttles and kills
+/// ordinary work the instant it lands (review of the cgroup cap). So there is
+/// always headroom: the free memory above the reserve, or, once the machine is
+/// inside its reserve, a quarter of what is still available — shrinking
+/// geometrically rather than snapping to zero. `memory.high` sits at 90% of
+/// that headroom, so throttling starts as the panes approach the cap, not at
+/// once. The kernel cap is the runaway backstop; which build stops is the
+/// guard's decision. A fixed cap below this is honoured as given.
+pub fn cgroup_limits(
+    cap: Cap,
+    current: u64,
+    mem_total: u64,
+    mem_available: u64,
+) -> Option<(u64, u64)> {
+    let reserve = reserve(mem_total);
+    let headroom = if mem_available > reserve {
+        mem_available - reserve
+    } else {
+        mem_available / 4
+    }
+    .max(MIN_CGROUP_HEADROOM);
+    let max = current.saturating_add(headroom).max(MIN_LIMIT);
+    let high = current.saturating_add(headroom / 10 * 9).min(max);
+    match cap {
+        Cap::Off => None,
+        Cap::Fixed(bytes) if bytes < max => Some((bytes / 100 * 90, bytes)),
+        _ => Some((high, max)),
     }
 }
 
@@ -186,9 +230,16 @@ pub enum Enforcement {
     None,
 }
 
-/// This platform's [`Enforcement`].
+/// This platform's [`Enforcement`], as a session started now would get it:
+/// Windows is hard; Linux is hard when atrium owns its cgroup
+/// ([`crate::cgroup::can_establish`], e.g. launched under
+/// `systemd-run --user --scope -p Delegate=yes`) and soft otherwise; macOS is
+/// soft. Asked before the session job exists — the fleet banner — since taking
+/// the cgroup changes the answer.
 pub fn enforcement() -> Enforcement {
-    if cfg!(windows) {
+    if cfg!(windows)
+        || (cfg!(target_os = "linux") && (crate::cgroup::held() || crate::cgroup::can_establish()))
+    {
         Enforcement::Hard
     } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         Enforcement::Soft
@@ -341,9 +392,11 @@ pub fn session_cap() -> Cap {
     )
 }
 
-/// Whether this platform has any guard, hard or soft.
+/// Whether this platform has any guard, hard or soft. A compile-time answer:
+/// it is read on every guard tick, where [`enforcement`]'s live cgroup probe
+/// would be needless I/O.
 pub fn supported() -> bool {
-    enforcement() != Enforcement::None
+    cfg!(any(windows, target_os = "linux", target_os = "macos"))
 }
 
 /// The guard's memory between ticks.
@@ -369,6 +422,10 @@ impl Guard {
     /// well.
     pub fn tick(&mut self, job: &crate::reap::SessionJob, panes: &[u32]) -> Option<String> {
         let cap = session_cap();
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = job.pane_cgroup() {
+            return self.tick_cgroup(cap, cg, panes);
+        }
         #[cfg(unix)]
         {
             let _ = job;
@@ -412,6 +469,59 @@ impl Guard {
                 show_bytes(total)
             ),
         };
+        self.relieve(victim(&procs), !over_own_cap, &why, |v| {
+            unix::kill_bound(v.pid, v.start)
+        })
+    }
+
+    /// Linux with a held cgroup: the Windows policy on a cgroup. The panes'
+    /// `memory.max` (with `memory.high` below it) tracks the dynamic limit, the
+    /// guard still stops the largest build under pressure, and the kernel's
+    /// cgroup OOM killer is the backstop — inside the cgroup, where every build
+    /// already carries a raised `oom_score_adj`.
+    #[cfg(target_os = "linux")]
+    fn tick_cgroup(
+        &mut self,
+        cap: Cap,
+        cg: &crate::cgroup::PaneCgroup,
+        panes: &[u32],
+    ) -> Option<String> {
+        if cap == Cap::Off {
+            if self.applied != Some(None) && cg.set_limits(None) {
+                self.applied = Some(None);
+            }
+            return None;
+        }
+        let procs = unix::pane_processes(panes)?;
+        for p in procs.iter().filter(|p| is_victim_image(&p.image)) {
+            unix::prefer_for_oom(p.pid);
+        }
+        let (total, available) = unix::memory()?;
+        let rss: u64 = procs.iter().map(|m| m.private).sum();
+        // The cap is sized from what the KERNEL counts against it, not from
+        // resident size, so it can never land below current use.
+        let current = cg.usage().unwrap_or(rss);
+        let (high, max) = cgroup_limits(cap, current, total, available)?;
+        let stale = match self.applied {
+            Some(Some(prev)) => max < prev || max.abs_diff(prev) > (prev / 100).max(64 * MIB),
+            _ => true,
+        };
+        if stale && cg.set_limits(Some((high, max))) {
+            self.applied = Some(Some(max));
+        }
+        // Which build stops is decided exactly as on the soft path; the kernel
+        // cap only backstops a runaway between ticks.
+        if !soft_pressure(cap, rss, total, available) {
+            self.stuck_reported = false;
+            return None;
+        }
+        let over_own_cap = matches!(cap, Cap::Fixed(bytes) if under_pressure(rss, bytes));
+        let why = format!(
+            "panes at {} (cgroup cap {}), machine at {} available",
+            show_bytes(current),
+            show_bytes(max),
+            show_bytes(available)
+        );
         self.relieve(victim(&procs), !over_own_cap, &why, |v| {
             unix::kill_bound(v.pid, v.start)
         })
@@ -1127,6 +1237,40 @@ mod tests {
             total > GIB / 4 && available <= total,
             "{total} / {available}"
         );
+    }
+
+    /// Review of the cgroup cap: a limit pinned to current use throttled and
+    /// killed ordinary work. There is always headroom above what the kernel
+    /// counts, it shrinks geometrically inside the reserve, and high sits below
+    /// max.
+    #[test]
+    fn cgroup_limits_always_leave_headroom_above_current_use() {
+        let total = 32 * GIB; // reserve 3.2 GiB
+                              // Plenty free: headroom is everything above the reserve.
+        let (high, max) = cgroup_limits(Cap::Dynamic, 4 * GIB, total, 20 * GIB).unwrap();
+        assert_eq!(max, 4 * GIB + (20 * GIB - total / 10));
+        assert!(high > 4 * GIB && high < max);
+        // Inside the reserve: a quarter of what's left, never zero.
+        let (high, max) = cgroup_limits(Cap::Dynamic, 10 * GIB, total, 2 * GIB).unwrap();
+        assert_eq!(max, 10 * GIB + 2 * GIB / 4);
+        assert!(
+            high > 10 * GIB,
+            "throttling must not start below current use"
+        );
+        // Nearly nothing left: the minimum headroom still applies.
+        let (_, max) = cgroup_limits(Cap::Dynamic, 10 * GIB, total, MIB).unwrap();
+        assert_eq!(max, 10 * GIB + MIN_CGROUP_HEADROOM);
+        // An empty cgroup still gets the floor.
+        assert_eq!(
+            cgroup_limits(Cap::Dynamic, 0, total, MIB).unwrap().1,
+            MIN_LIMIT
+        );
+        // A fixed cap below the dynamic max is honoured as given.
+        assert_eq!(
+            cgroup_limits(Cap::Fixed(64 * MIB), 0, total, 20 * GIB),
+            Some((64 * MIB / 100 * 90, 64 * MIB))
+        );
+        assert_eq!(cgroup_limits(Cap::Off, GIB, total, GIB), None);
     }
 
     /// Review: outside pressure made the guard kill the session's next build
