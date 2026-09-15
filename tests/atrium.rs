@@ -2158,6 +2158,55 @@ fn a_pane_is_given_a_live_build_pool_windows() {
     assert_eq!(current, 3, "an idle pool holds all its tokens");
 }
 
+/// **The soft memory guard stops a pane's runaway build** (Linux).
+///
+/// atrium runs with `ATRIUM_MEMORY_MB=64`. The pane starts a "build" — python
+/// run through a symlink named `rustc`, so its `comm` is a build image — that
+/// fills 300 MB and sleeps. Within a few guard ticks it must be SIGKILLed (the
+/// shell reports 137); a guard that doesn't act lets it sleep out its minute.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_soft_memory_guard_stops_a_runaway_build_linux() {
+    let dir = std::env::temp_dir().join(format!("atrium-softguard-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim = dir.join("rustc");
+    std::os::unix::fs::symlink("/usr/bin/python3", &shim).unwrap();
+    let marker = dir.join("exit.txt");
+    let script = format!(
+        "'{shim}' -c 'import time; b = b\"x\" * (300 * 1024 * 1024); time.sleep(60)'; \
+         echo \"exit=$?\" > '{marker}'; sleep 600",
+        shim = shim.display(),
+        marker = marker.display()
+    );
+    let env = [("ATRIUM_MEMORY_MB".to_string(), "64".to_string())];
+    let mut p = pty::Pty::spawn_with_env(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["sh", "-c", &script],
+        24,
+        80,
+        &env,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if t.contains("exit=") {
+                break t.trim().to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runaway build was never stopped"
+        );
+        read_until(&mut p, b"\x00never-printed\x00", Duration::from_millis(200));
+    };
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(seen, "exit=137", "the build must be SIGKILLed by the guard");
+}
+
 /// **A claude pane is launched with the deny list** (Windows).
 ///
 /// A fake `claude.cmd` records the argv atrium actually launched it with. It must
@@ -2519,11 +2568,22 @@ fn an_argv0_shim_does_not_shadow_the_real_parent() {
     std::thread::sleep(Duration::from_millis(700));
 
     // Replace the pane shell with one that LOOKS like atrium to `ps`, then launch
-    // the real atrium underneath it. The trailing `; :` matters: with a single
-    // command `sh -c` execs it in place, which would leave the shim out of the
-    // chain entirely and quietly turn this into a test of nothing.
+    // the real atrium underneath it. The shim is /bin/sh run through a symlink
+    // NAMED `atrium` — the same forged `comm`/argv[0] as `exec -a atrium`, but
+    // portable: Ubuntu's /bin/sh is dash, which has no `exec -a`. The trailing
+    // `; :` matters: with a single command `sh -c` execs it in place, which
+    // would leave the shim out of the chain and quietly test nothing.
+    let shim_dir = std::env::temp_dir().join(format!("atrium-shim-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&shim_dir);
+    std::fs::create_dir_all(&shim_dir).unwrap();
+    let shim = shim_dir.join("atrium");
+    std::os::unix::fs::symlink("/bin/sh", &shim).unwrap();
     p.write(
-        format!("exec -a atrium /bin/sh -c '\"{atrium}\" --trust skip sh -i; :'\r\n").as_bytes(),
+        format!(
+            "exec '{}' -c '\"{atrium}\" --trust skip sh -i; :'\r\n",
+            shim.display()
+        )
+        .as_bytes(),
     )
     .unwrap();
     let out = read_until(&mut p, b"capped to", Duration::from_secs(15));
@@ -2535,6 +2595,7 @@ fn an_argv0_shim_does_not_shadow_the_real_parent() {
 
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&shim_dir);
 }
 
 /// **Deleting the parent's registry must not lift the ceiling** (fail-closed).

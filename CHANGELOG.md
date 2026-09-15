@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   largest build process, never an agent, and raises it on the bus and the bar.
   The kill checks job membership and the image through the same handle it
   terminates with, so a recycled pid is never hit.
+- **A soft memory guard on Linux and macOS.** Unix has no Job Object, so the
+  guard watches instead of capping. It finds each pane's processes by session,
+  and when available memory drops into the reserve or the panes reach a fixed
+  `memory_mb`, it stops the largest build with a kill bound to the process's
+  start time (a pidfd on Linux). On Linux every build also gets a raised
+  `oom_score_adj`, so the kernel's OOM killer takes a build before atrium or the
+  desktop. The banner says `(soft)`. macOS is compiled but not yet run on a Mac.
 - **A deny list for agents.** Fleets take `deny` (session-wide, including
   ctl-spawned workers) and per-agent `deny`; `ATRIUM_DENY` adds operator
   rules. Entries are claude permission rules or bare command prefixes, and
@@ -42,6 +49,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a rule targets a non-claude agent it can't bind.
 
 ### Fixed
+- **The ancestry check works on Linux under ssh, sudo and WSL.** The first run
+  of the test suite on Linux found that every ancestry walk ended in "unknown":
+  `/proc/<pid>/exe` of another user's process (`sshd-session`, `sudo`, WSL's
+  root relay) is unreadable, and that was treated as "cannot tell". Another
+  user's process can't have been renamed by our agent, so its name now decides
+  it; one calling itself `atrium` still fails closed, as does any unreadable
+  process of our own uid.
+- **The suite passes on Linux.** Five tests assumed macOS: `exec -a` (Ubuntu's
+  `/bin/sh` is dash), a small socket send buffer, a global git identity, and
+  two tests that shared a socket path. The compile pool's FIFO transport is now
+  tested on Linux, and cargo was measured obeying it there too.
 - **A fleet agent's `prompt` is no longer silently dropped.** The `prompt` key
   becomes `--append-system-prompt`, and atrium then appended its own ctl
   directive and worktree norms as a second flag. claude keeps only the last

@@ -279,7 +279,7 @@ control plane exists.
 | `ATRIUM_BUILD_JOBS` | size of the session's shared compile pool (default: one job per core, bounded by RAM); `off` disables it |
 | `CARGO_MAKEFLAGS` | set by atrium in every pane: the compile pool every agent's cargo builds share |
 | `ATRIUM_DENY` | commands no claude agent in the session may run (comma-separated claude rules like `Bash(git push --force*)` or command prefixes); added to the built-in fail-safes |
-| `ATRIUM_MEMORY_MB` | fixed ceiling on the panes' committed memory (default: dynamic, tracking the machine's free commit); `off` disables it. Windows only |
+| `ATRIUM_MEMORY_MB` | fixed ceiling on the panes' memory (default: dynamic, tracking the machine's free memory); `off` disables it. Hard limit on Windows, soft guard on Linux/macOS |
 | `ATRIUM_DEBUG` | `=1` adds stage markers on stderr |
 
 ### Subcommands

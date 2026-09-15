@@ -223,7 +223,7 @@ impl SafetyNet {
             }
             // The memory ceiling rides the same cadence. When it acts (or can't),
             // that is an operator decision, not a log line: audit, bus and bar.
-            if let Some(msg) = self.memguard.tick(session_job) {
+            if let Some(msg) = self.memguard.tick(session_job, &self.registered) {
                 ctl_audit.record(None, "memory-guard", &msg, true, "");
                 let _ = bus.publish(
                     "memguard",

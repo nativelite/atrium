@@ -624,7 +624,7 @@ pub(crate) fn fleet_up(
     );
     let memory = atrium::memguard::describe(
         atrium::memguard::planned_cap(fleet.memory_mb),
-        atrium::memguard::supported(),
+        atrium::memguard::enforcement(),
     );
     // Session-wide deny rules as every claude pane will carry them (built-ins
     // + ATRIUM_DENY + the fleet's); per-agent rules add to this.

@@ -2469,7 +2469,20 @@ mod tests {
                 .output()
         };
         git(&["init"]).unwrap();
-        git(&["commit", "--allow-empty", "-m", "init"]).unwrap();
+        // An explicit identity: on a machine with no global git user (a fresh
+        // Linux box, CI) the commit silently fails and there is no HEAD to branch.
+        let commit = git(&[
+            "-c",
+            "user.name=atrium-test",
+            "-c",
+            "user.email=atrium-test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .unwrap();
+        assert!(commit.status.success(), "fixture commit failed: {commit:?}");
         let result = worktree_spawn_params(&tmp, Some("test-wt"));
         assert!(result.is_ok(), "expected Ok for valid git repo: {result:?}");
         let (dir, norms) = result.unwrap();

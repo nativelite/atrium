@@ -3209,7 +3209,10 @@ mod tests {
 
         let addr = test_addr(47004);
         let mut server = Listener::bind(&addr).expect("bind");
-        let pad = "z".repeat(200_000);
+        // Larger than any platform's socket send buffer so every reply parks: a
+        // Linux unix socket buffers ~212 KB, so a 200 KB reply went straight
+        // through there and nothing was ever refused.
+        let pad = "z".repeat(1_000_000);
 
         // MAX_OUTBOX + 1 clients, each with a complete request, none of which
         // reads a byte — so every reply parks.
@@ -3721,7 +3724,10 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::net::UnixStream;
 
-        let addr = test_addr(47011);
+        // Its own nonce: 47011 is also used by a test that runs in parallel in the
+        // same process, and the shared socket path failed one of them with
+        // AddrInUse.
+        let addr = test_addr(47013);
         let mut server = Listener::bind(&addr).expect("bind");
 
         // Connects, asks, and then never calls read(). Held open for the whole

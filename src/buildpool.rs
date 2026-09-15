@@ -472,6 +472,20 @@ mod sys {
         pub fn cleanup(&self) {
             let _ = std::fs::remove_file(&self.path);
         }
+
+        /// Take one token as a client would (read a byte). Tests only; callers
+        /// check `available()` first, since the FIFO end is blocking.
+        #[cfg(test)]
+        pub fn try_take(&self) -> bool {
+            use std::io::Read;
+            self.available().is_some_and(|n| n > 0)
+                && (&self.file).read(&mut [0u8; 1]).map_or(false, |n| n == 1)
+        }
+
+        #[cfg(test)]
+        pub fn path(&self) -> &std::path::Path {
+            &self.path
+        }
     }
 
     /// Remove pool FIFOs left by sessions that are gone. A session that crashes,
@@ -662,7 +676,6 @@ mod tests {
         assert_eq!(tokens_to_restore(5, 3, false), 0);
     }
 
-    #[cfg(windows)]
     #[test]
     fn a_leaked_token_is_restored_but_never_past_the_size() {
         let pool = BuildPool::create(3).expect("create pool");
@@ -686,5 +699,58 @@ mod tests {
         assert!(auth.is_ascii());
         // A second pool under the same name is refused, not shared.
         assert!(sys::Pool::create(&auth, 2).is_err());
+    }
+
+    /// Unix: the auth is `fifo:<path>` to a private FIFO that exists for the
+    /// pool's life and is removed by cleanup; a name already taken is refused.
+    #[cfg(unix)]
+    #[test]
+    fn the_pool_is_a_private_fifo_that_cleanup_removes() {
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let pool = BuildPool::create(2).expect("create pool");
+        let auth = jobserver_auth(&pool.makeflags()).expect("auth").to_string();
+        let path = auth.strip_prefix("fifo:").expect("fifo auth");
+        assert_eq!(std::path::Path::new(path), pool.sys.path());
+        let meta = std::fs::metadata(path).expect("fifo exists");
+        assert!(meta.file_type().is_fifo(), "{path} is not a FIFO");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "only this user");
+        let name = std::path::Path::new(path)
+            .file_stem()
+            .unwrap()
+            .to_string_lossy();
+        assert!(
+            sys::Pool::create(&name, 2).is_err(),
+            "a taken name is refused"
+        );
+        pool.cleanup();
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "cleanup removes the FIFO"
+        );
+    }
+
+    /// Unix: a FIFO left by a dead session is swept when a new pool is made;
+    /// one belonging to a live pid is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_dead_sessions_fifo_is_swept_and_a_live_one_kept() {
+        let dir = std::env::temp_dir();
+        let dead = dir.join(format!(
+            "atrium-build-{}-00ff00ff00ff00ff.fifo",
+            u32::MAX - 7
+        ));
+        let live = dir.join(format!(
+            "atrium-build-{}-00ff00ff00ff00fe.fifo",
+            std::process::id()
+        ));
+        std::fs::write(&dead, b"").unwrap();
+        std::fs::write(&live, b"").unwrap();
+        let pool = BuildPool::create(1).expect("create pool");
+        let (dead_gone, live_kept) = (!dead.exists(), live.exists());
+        pool.cleanup();
+        let _ = std::fs::remove_file(&live);
+        let _ = std::fs::remove_file(&dead);
+        assert!(dead_gone, "a dead session's FIFO must be swept");
+        assert!(live_kept, "a live session's FIFO must be kept");
     }
 }

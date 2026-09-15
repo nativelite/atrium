@@ -700,10 +700,62 @@ impl ExeIds {
         if let Some(hit) = self.seen.get(&pid) {
             return *hit;
         }
-        let ans = exe_identity(pid).map(|id| id == mine);
+        let ans = match exe_identity(pid) {
+            Some(id) => Some(id == mine),
+            None => {
+                let (foreign, comm) = owner_and_name(pid);
+                unreadable_hop(foreign, comm.as_deref())
+            }
+        };
         self.seen.insert(pid, ans);
         ans
     }
+}
+
+/// The verdict for a hop whose executable could not be read.
+///
+/// On Linux `/proc/<pid>/exe` is ptrace-gated, so another user's process —
+/// `sshd-session` under ssh, `sudo`, `su`, WSL's root `Relay` — is unreadable to
+/// us, and treating that as "cannot tell" made every ancestry walk through one
+/// end in `Unknown` (found by the first run of this suite on Linux).
+///
+/// A process owned by ANOTHER uid is one our agent can't have exec'd or renamed,
+/// so its name is not attacker-chosen the way a same-uid `comm` is. Reading it
+/// as "not an atrium" only lets the walk continue upward, and skipping a hop can
+/// never hide an atrium above it. The one name that could matter — a foreign
+/// process calling itself atrium, e.g. an atrium run as root — still fails
+/// closed. A same-uid unreadable hop stays "cannot tell": an agent could have
+/// made it. Pure, so the decision is tested on every platform.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn unreadable_hop(foreign_owner: bool, comm: Option<&str>) -> Option<bool> {
+    if !foreign_owner {
+        return None;
+    }
+    match comm {
+        Some(name) if !name.trim().starts_with("atrium") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `pid` belongs to a different uid than this process, and its kernel
+/// `comm` name. Linux reads both from `/proc`; elsewhere there is nothing to add
+/// (macOS `proc_pidpath` resolves any pid, so its images don't go unreadable
+/// this way), which leaves the hop at "cannot tell".
+#[cfg(target_os = "linux")]
+fn owner_and_name(pid: u32) -> (bool, Option<String>) {
+    use std::os::unix::fs::MetadataExt;
+    let owner = std::fs::metadata(format!("/proc/{pid}")).map(|m| m.uid());
+    let me = std::fs::metadata("/proc/self").map(|m| m.uid());
+    let foreign = matches!((owner, me), (Ok(o), Ok(m)) if o != m);
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim_end().to_string());
+    (foreign, comm)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn owner_and_name(_pid: u32) -> (bool, Option<String>) {
+    (false, None)
 }
 
 /// Is the process at `pid` running the **same executable file** as this one?
@@ -1142,18 +1194,27 @@ mod tests {
     #[test]
     fn exe_identity_is_the_file_not_the_name() {
         let me = exe_identity(std::process::id()).expect("our own executable must resolve");
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "exec -a atrium sleep 5"])
+        // The impostor is `sleep` run through a symlink NAMED `atrium`, so its
+        // `comm` (and macOS `ps` argv[0]) says atrium while the kernel's image is
+        // sleep. A symlink rather than `exec -a`: Ubuntu's `/bin/sh` is dash, which
+        // has no `exec -a`, so that version exited at once and resolved nothing.
+        let dir = std::env::temp_dir().join(format!("atrium-impostor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("atrium");
+        std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+        let mut child = std::process::Command::new(&fake)
+            .arg("5")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn the impostor");
         let pid = child.id();
-        // `exec` replaces the shell in place, so the pid is the sleep itself.
         std::thread::sleep(std::time::Duration::from_millis(300));
         let theirs = exe_identity(pid);
         let _ = child.kill();
         let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             theirs.is_some(),
             "a live same-uid child's executable must be resolvable"
@@ -1212,5 +1273,31 @@ mod tests {
     #[test]
     fn a_normal_launch_has_no_atrium_ancestor() {
         assert_eq!(atrium_ancestor(), Ancestry::NoneFound);
+    }
+
+    /// Linux: a hop whose image can't be read. Same uid stays "cannot tell";
+    /// another user's process is decided by its name, which our uid can't forge —
+    /// except that one calling itself atrium still fails closed.
+    #[test]
+    fn an_unreadable_hop_is_decided_by_who_owns_it() {
+        // Same uid: an agent could have made it, so no answer.
+        assert_eq!(unreadable_hop(false, Some("sshd")), None);
+        // Another user's sshd / sudo / WSL relay: not an atrium, keep walking.
+        assert_eq!(unreadable_hop(true, Some("sshd-session")), Some(false));
+        assert_eq!(unreadable_hop(true, Some("Relay(282)")), Some(false));
+        assert_eq!(unreadable_hop(true, Some("sudo")), Some(false));
+        // Another user's process named atrium: it may really be one. Fail closed.
+        assert_eq!(unreadable_hop(true, Some("atrium")), None);
+        // No name to go on.
+        assert_eq!(unreadable_hop(true, None), None);
+    }
+
+    /// The live version of the above: pid 1 belongs to root, so on Linux an
+    /// unprivileged test can't read its image, and it must still come back as
+    /// "not atrium" rather than stalling every ancestry walk at the top.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn init_is_not_an_atrium_even_when_its_image_is_unreadable() {
+        assert_eq!(same_binary(1), Some(false));
     }
 }
