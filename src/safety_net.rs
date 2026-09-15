@@ -22,11 +22,8 @@ pub(crate) struct SafetyNet {
     /// tampered with, or a session appearing that the ancestry cap did not explain.
     warden: atrium::warden::Warden,
     last_warden_check: Instant,
-    /// When the compile pool was last checked for tokens leaked by killed builds.
-    last_pool_check: Instant,
-    /// The panes' memory ceiling (Windows): keeps the session job's limit current
-    /// and stops the largest build under pressure.
-    memguard: atrium::memguard::Guard,
+    /// The memory guard and the compile-pool refill, on their own thread.
+    upkeep: Upkeep,
     cap_notice_raised: bool,
     /// The live pane pids last written to the registry.
     registered: Vec<u32>,
@@ -60,8 +57,7 @@ impl SafetyNet {
             last_snapshot_check: Instant::now(),
             warden: atrium::warden::Warden::new(registry_path.clone()),
             last_warden_check: Instant::now(),
-            last_pool_check: Instant::now(),
-            memguard: atrium::memguard::Guard::new(),
+            upkeep: Upkeep::start(atrium::reap::SessionJob::session()),
             cap_notice_raised: false,
             registered: Vec::new(),
             registry_dirty: false,
@@ -81,6 +77,13 @@ impl SafetyNet {
     /// The crash registry file, for the teardown to settle.
     pub(crate) fn registry_path(&self) -> &std::path::Path {
         &self.registry_path
+    }
+
+    /// Stop the upkeep thread and wait for it. Teardown calls this before it
+    /// kills the panes and closes the session job: the thread must not be
+    /// stopping builds, or holding the job handle, while either happens.
+    pub(crate) fn stop_upkeep(&mut self) {
+        self.upkeep.stop();
     }
 
     /// Keep the crash registry current. Rewritten only when the pane set changes,
@@ -109,6 +112,7 @@ impl SafetyNet {
             for pid in cur.iter().filter(|p| !self.registered.contains(p)) {
                 session_job.assign(*pid);
             }
+            self.upkeep.set_panes(&cur);
             self.registered = cur;
             self.registry_dirty = true;
             self.registry_retry_at = None;
@@ -207,34 +211,38 @@ impl SafetyNet {
             // accuse are indistinguishable from an ordinary reparenting, and
             // the kill target was read out of a file the accused could write.
         }
-        // A build killed mid-compile never returns its pool tokens, so the pool
-        // would shrink for the rest of the session. Top it back up whenever no
-        // build is running (see `buildpool::refill` for why that is race-free).
-        if self.last_pool_check.elapsed() >= WARDEN_INTERVAL {
-            self.last_pool_check = Instant::now();
-            let restored = atrium::buildpool::refill(session_job, &self.registered);
-            if restored > 0 {
-                ctl_audit.record(
-                    None,
-                    "build-pool-refill",
-                    &format!("restored {restored} compile job(s) leaked by a killed build"),
-                    true,
-                    "",
-                );
-            }
-            // The memory ceiling rides the same cadence. When it acts (or can't),
-            // that is an operator decision, not a log line: audit, bus and bar.
-            if let Some(msg) = self.memguard.tick(session_job, &self.registered) {
-                ctl_audit.record(None, "memory-guard", &msg, true, "");
-                let _ = bus.publish(
-                    "memguard",
-                    atrium::bus::Kind::DecisionNeeded,
-                    None,
-                    &[("msg".to_string(), msg.clone())],
-                    agsess::sessions::now_ms(),
-                );
-                *flash = Some((msg, Instant::now()));
-                repaint = true;
+        // What the upkeep thread did since the last tick. It acts on its own
+        // cadence; only the reporting waits for the loop.
+        if let Some(err) = self.upkeep.take_start_error() {
+            ctl_audit.record(None, "memory-guard", &err, false, "");
+            *flash = Some((err, Instant::now()));
+            repaint = true;
+        }
+        for event in self.upkeep.events() {
+            match event {
+                UpkeepEvent::Refilled(restored) => {
+                    ctl_audit.record(
+                        None,
+                        "build-pool-refill",
+                        &format!("restored {restored} compile job(s) leaked by a killed build"),
+                        true,
+                        "",
+                    );
+                }
+                // When the guard acts (or can't), that is an operator decision,
+                // not a log line: audit, bus and bar.
+                UpkeepEvent::Guard(msg) => {
+                    ctl_audit.record(None, "memory-guard", &msg, true, "");
+                    let _ = bus.publish(
+                        "memguard",
+                        atrium::bus::Kind::DecisionNeeded,
+                        None,
+                        &[("msg".to_string(), msg.clone())],
+                        agsess::sessions::now_ms(),
+                    );
+                    *flash = Some((msg, Instant::now()));
+                    repaint = true;
+                }
             }
         }
         // The watchdog is the unix answer to a death no handler can catch.
@@ -263,5 +271,123 @@ impl SafetyNet {
             );
         }
         repaint
+    }
+}
+
+/// What the upkeep thread reports back to the loop.
+pub(crate) enum UpkeepEvent {
+    /// Compile-pool tokens restored after a killed build leaked them.
+    Refilled(usize),
+    /// The memory guard acted, or can't.
+    Guard(String),
+}
+
+/// The memory guard and the compile-pool refill, on a thread of their own.
+///
+/// They used to run inside the loop's safety-net tick, and the loop blocks
+/// whenever atrium's terminal stops reading its output: a stopped terminal, or a
+/// console with a QuickEdit selection held. Every frame write then waits, and
+/// the guard waited with it — measured, a pane committed 800 MB past a 400 MB
+/// ceiling because the loop stalled before the guard's first tick. The screen
+/// being stuck must never pause the one thing protecting the machine.
+///
+/// The thread owns the guard's state and reads the live pane pids from a shared
+/// list the loop keeps current; anything worth telling the operator comes back
+/// over a channel and is surfaced (audit, bus, bar) when the loop next ticks.
+pub(crate) struct Upkeep {
+    panes: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    events: std::sync::mpsc::Receiver<UpkeepEvent>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    start_error: Option<String>,
+}
+
+impl Upkeep {
+    /// How often the stop flag is checked between ticks.
+    const POLL: Duration = Duration::from_millis(100);
+
+    pub(crate) fn start(job: &'static atrium::reap::SessionJob) -> Upkeep {
+        use std::sync::atomic::Ordering;
+        let panes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, events) = std::sync::mpsc::channel();
+        let (shared, stopping) = (panes.clone(), stop.clone());
+        let thread = std::thread::Builder::new()
+            .name("atrium-upkeep".to_string())
+            .spawn(move || {
+                let mut guard = atrium::memguard::Guard::new();
+                let mut next = Instant::now() + WARDEN_INTERVAL;
+                while !stopping.load(Ordering::SeqCst) {
+                    if Instant::now() >= next {
+                        next = Instant::now() + WARDEN_INTERVAL;
+                        let panes: Vec<u32> = shared
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone();
+                        // A build killed mid-compile never returns its pool
+                        // tokens; top the pool back up whenever no build runs
+                        // (see `buildpool::refill` for why that is race-free).
+                        let restored = atrium::buildpool::refill(job, &panes);
+                        if restored > 0 {
+                            let _ = tx.send(UpkeepEvent::Refilled(restored));
+                        }
+                        if let Some(msg) = guard.tick(job, &panes) {
+                            let _ = tx.send(UpkeepEvent::Guard(msg));
+                        }
+                    }
+                    std::thread::sleep(Self::POLL);
+                }
+            });
+        // Unable to start a thread at all: the session runs without the guard,
+        // and the loop says so once rather than implying it is there.
+        let (thread, start_error) = match thread {
+            Ok(t) => (Some(t), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "memory guard and compile-pool upkeep could not start ({e}) — running \
+                     without them"
+                )),
+            ),
+        };
+        Upkeep {
+            panes,
+            events,
+            stop,
+            thread,
+            start_error,
+        }
+    }
+
+    /// The start failure, if any — handed out once.
+    pub(crate) fn take_start_error(&mut self) -> Option<String> {
+        self.start_error.take()
+    }
+
+    /// Replace the live pane pids the thread works from.
+    pub(crate) fn set_panes(&self, pids: &[u32]) {
+        *self
+            .panes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pids.to_vec();
+    }
+
+    /// Everything reported since the last call, without waiting.
+    pub(crate) fn events(&self) -> Vec<UpkeepEvent> {
+        self.events.try_iter().collect()
+    }
+
+    /// Stop the thread and wait for its current tick to finish. Idempotent.
+    pub(crate) fn stop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for Upkeep {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

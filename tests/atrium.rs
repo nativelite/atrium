@@ -1815,9 +1815,17 @@ fn closing_an_overlay_repaints_the_pane() {
         String::from_utf8_lossy(&out)
     );
 
-    // Open the board overlay, which clears the screen and covers the pane.
+    // Open the board overlay, which clears the screen and covers the pane. Wait
+    // for the panel's own heading: the status bar always reads `b:board`, so
+    // waiting on "board" returned before the overlay opened, and both toggles
+    // then landed in one tick — open and closed with nothing ever drawn.
     p.write(b"\x01b").unwrap();
-    read_until(&mut p, b"board", Duration::from_secs(10));
+    let opened = read_until(&mut p, b"board + bus", Duration::from_secs(10));
+    assert!(
+        contains(&opened, b"board + bus"),
+        "the board never opened: {:?}",
+        String::from_utf8_lossy(&opened)
+    );
 
     // Close it. That is a real view transition, so the pane must come back —
     // painted by atrium, because `sh` will not repaint itself.
@@ -2483,6 +2491,59 @@ fn the_memory_guard_holds_a_pane_under_its_ceiling_windows() {
     assert_eq!(wait_exit(&mut p, 15), 0);
     let _ = std::fs::remove_file(&marker);
     assert_eq!(seen, "FAIL", "an 800 MB allocation got past a 400 MB guard");
+}
+
+/// **The memory guard keeps working while atrium's screen is stuck** (Windows).
+///
+/// Nothing reads atrium's terminal here — a stopped terminal, or a console with
+/// a QuickEdit selection held. Its frame writes block, and the run loop blocks
+/// with them. The guard must not: the pane still has to run under its ceiling.
+#[cfg(windows)]
+#[test]
+fn the_memory_guard_holds_while_the_screen_is_not_being_read_windows() {
+    let marker = std::env::temp_dir().join(format!("atrium-stuck-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mpath = marker.display().to_string().replace('\\', "/");
+    // The pane prints nothing (a pane that prints would block on its own output
+    // once atrium stops reading it); atrium's own frames are what back up. It
+    // waits out the guard's first tick, then tries to commit 800 MB.
+    let script = format!(
+        "Start-Sleep -Seconds 7; \
+         try {{ $a = [byte[]]::new(800MB); $a[799MB] = 1; $r = 'OK' }} catch {{ $r = 'FAIL' }}; \
+         Set-Content -Path '{mpath}' -Value $r; Start-Sleep -Seconds 600"
+    );
+    let argv = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ];
+    let env = [("ATRIUM_MEMORY_MB".to_string(), "400".to_string())];
+    let mut p =
+        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80, &env).unwrap();
+    // Deliberately NOT reading atrium's output while the pane works.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                break Some(t);
+            }
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 30), 0);
+    let _ = std::fs::remove_file(&marker);
+    let seen = seen.expect("pane never reported its allocation");
+    assert_eq!(
+        seen, "FAIL",
+        "an 800 MB allocation got past a 400 MB guard while the screen was stuck"
+    );
 }
 
 /// A pane script that spawns a long-lived grandchild (`ping`), records its pid to

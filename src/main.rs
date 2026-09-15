@@ -1582,6 +1582,9 @@ fn run(
     }
 
     let dbg = std::env::var_os("ATRIUM_DEBUG").is_some();
+    // The upkeep thread first: it must not be stopping builds while the panes
+    // are torn down, nor holding the session job's handle when it is closed.
+    safety_net.stop_upkeep();
     // Kill process TREES, not processes. `pty.kill()` is SIGKILL to the direct
     // child alone, so everything an agent spawned — MCP servers, language
     // servers, node helpers — outlived atrium and was reparented onto init. That

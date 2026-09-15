@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Fleet preflight warnings are one loud block.** Every warning the fleet
+  banner raises (flags it ignores, deny rules that can't bind, the build pool
+  off, ctl with no spawner, worktrees outside a git repo) is gathered and
+  printed right before the verdict. On a terminal it's a bold yellow
+  `PREFLIGHT` band with a bar down each warning. When stderr is piped it stays
+  plain `atrium fleet: warning:` lines. A warning never stops the launch.
+- **The pane cap is a preflight warning for fleets.** A roster over the host
+  pane cap, or one that fills the cap and has a spawner, is warned about and
+  still launches. `ctl spawn` still refuses past the cap at runtime.
+
+### Fixed
+- **The startup logo shows on a plain `atrium`.** The hosted shell prints its
+  prompt within milliseconds, and the splash used to hand off on that first
+  output, so the logo was never drawn, or was wiped ~20 ms later. The logo now
+  stays up for at least 1.2 s once it appears, while the shell or agent boots
+  behind it. A pane that exits during the hold hands off at once, so a
+  one-shot command's output is never lost.
+- **The memory guard keeps working when the screen is stuck.** The guard and
+  the compile-pool refill ran inside the run loop. The loop blocks whenever
+  the terminal stops reading atrium's output (a stopped terminal, or a console
+  with a QuickEdit selection held), and the guard stopped with it: measured, a
+  pane committed 800 MB past a 400 MB ceiling. They now run on their own
+  thread and report back to the bar and bus when the loop resumes.
+- **A pane joins the session job before it runs (Windows).** Panes were added
+  to the session Job Object after they started (a fleet's, only at the run
+  loop's first tick), and anything a pane started before that stayed outside
+  the memory limit and wasn't killed with atrium. Panes are now created
+  suspended, assigned, then resumed. Needs `nativelite-pty` with
+  `Pty::spawn_suspended`.
+- **Fleet `cmd` flags the banner says are ignored are now removed.** A governed
+  permission flag (`--dangerously-skip-permissions`, `--permission-mode`,
+  `--allowedTools`) in an agent's `cmd` was announced as ignored but still
+  reached the agent.
+
 ## [0.33.0] - 2026-09-15
 
 ### Added
