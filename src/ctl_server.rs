@@ -37,6 +37,28 @@ pub(crate) const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
 /// deliver anyway once the send has waited this long, so a queue never wedges.
 pub(crate) const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
 
+/// Most undelivered sends one target may hold. A pane wedged on an open dialog
+/// never takes delivery, and each send can be a max-size ctl request, so an
+/// uncapped queue grows for as long as the pane stays wedged. 32 is far past any
+/// real backlog and bounds one target at about 2 MiB.
+pub(crate) const MAX_PENDING_PER_TARGET: usize = 32;
+
+/// Queue `text` for `target` unless that target already holds
+/// [`MAX_PENDING_PER_TARGET`] undelivered sends. Returns whether it was queued.
+fn queue_send(pending: &mut Vec<PendingSend>, target: AgentId, text: String) -> bool {
+    if pending.iter().filter(|ps| ps.target == target).count() >= MAX_PENDING_PER_TARGET {
+        return false;
+    }
+    pending.push(PendingSend {
+        target,
+        text,
+        queued_at: Instant::now(),
+        written: 0,
+        text_written_at: None,
+    });
+    true
+}
+
 /// Find a hosted pane by its global agent id (immutable / mutable).
 pub(crate) fn pane_by_agent(windows: &[Window], id: AgentId) -> Option<&Pane> {
     windows
@@ -394,13 +416,13 @@ pub(crate) fn dispatch_ctl(
                 pane_by_agent(windows, id).and_then(|p| world.status_for(p.session_id.as_deref())),
                 Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
             );
-            pending.push(PendingSend {
-                target: id,
-                text: sr.text,
-                queued_at: Instant::now(),
-                written: 0,
-                text_written_at: None,
-            });
+            if !queue_send(pending, id, sr.text) {
+                return ctl::reply_err(&format!(
+                    "agent {id} already has {MAX_PENDING_PER_TARGET} undelivered sends; \
+                     it is not taking delivery (busy, a dialog open, or a draft). \
+                     Check `ctl status` before sending more"
+                ));
+            }
             ctl::reply_sent(id, busy)
         }
         Cmd::Spawn(mut sp) => {
@@ -698,13 +720,9 @@ pub(crate) fn dispatch_ctl(
                                 if caller != Some(tid)
                                     && scope_denied(windows, caller, privileged, tid).is_none()
                                 {
-                                    pending.push(PendingSend {
-                                        target: tid,
-                                        text,
-                                        queued_at: Instant::now(),
-                                        written: 0,
-                                        text_written_at: None,
-                                    });
+                                    // Over the cap the wake is skipped; the
+                                    // message itself is still on the bus.
+                                    queue_send(pending, tid, text);
                                 }
                             }
                         }
@@ -1113,4 +1131,24 @@ pub(crate) fn flush_sends(
         }
     });
     wrote
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_target_that_never_takes_delivery_cannot_grow_the_queue_without_bound() {
+        // A pane wedged on an open dialog never becomes ready, so its sends are
+        // never drained; each one can carry a max-size ctl request. The queue per
+        // target is capped, and one wedged target doesn't block the others.
+        let mut pending = Vec::new();
+        let wedged = AgentId(1);
+        for _ in 0..MAX_PENDING_PER_TARGET {
+            assert!(queue_send(&mut pending, wedged, "task".into()));
+        }
+        assert!(!queue_send(&mut pending, wedged, "one too many".into()));
+        assert_eq!(pending.len(), MAX_PENDING_PER_TARGET);
+        assert!(queue_send(&mut pending, AgentId(2), "other".into()));
+    }
 }

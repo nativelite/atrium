@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A pane that never takes delivery can no longer grow the send queue without
+  bound.** Undelivered `ctl send`s were queued with no limit, and a pane wedged
+  on an open dialog never drains its queue. Each target now holds at most 32.
+  Past that, `ctl send` returns an error telling the sender to check `ctl
+  status`, and a bus `--to` wake is skipped (the message stays on the bus).
+- **Transcript tailing is bounded more tightly** (agsess): an endless line can't
+  grow a session's buffer, and the largest single read is 4 MiB instead of
+  16 MiB. That 16 MiB read was the allocation that aborted atrium when a
+  fleet's parallel builds exhausted system memory.
+
 ## [0.32.0] - 2026-09-14
 
 ### Added
