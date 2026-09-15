@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **One shared compile pool per session.** Every pane now gets
+  `CARGO_MAKEFLAGS` pointing at a jobserver atrium owns, so all the agents'
+  cargo builds share one budget of compiler jobs, however many start a build.
+  Before this, each agent's build sized itself to the whole machine, and seven
+  agents running `cargo test --workspace` at once exhausted a 64 GB machine.
+  The default is one job per core, bounded by RAM (about 3 GiB per job). A
+  fleet sets `build_jobs` (`0` = off) and `ATRIUM_BUILD_JOBS` overrides both.
+  The fleet banner states the budget. An agent's `-j` or `CARGO_BUILD_JOBS`
+  can't get past the pool. A session inside another atrium's pane shares the
+  outer pool, and tokens lost when a build is killed are restored once no
+  build is running. Windows uses a named semaphore; unix uses a FIFO, which
+  is compiled but not yet run on a unix host.
+
 ### Fixed
 - **A fleet agent's `prompt` is no longer silently dropped.** The `prompt` key
   becomes `--append-system-prompt`, and atrium then appended its own ctl

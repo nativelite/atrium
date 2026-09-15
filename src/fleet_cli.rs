@@ -185,6 +185,30 @@ fn ctl_without_spawner(allow_ctl: bool, spawner_count: usize) -> bool {
     allow_ctl && spawner_count == 0
 }
 
+/// The session compile pool as the banner states it: a suffix for the posture
+/// line, plus a warning line when builds will run unpooled. `size` is the pool
+/// this session created; `inherited` means an enclosing session's pool is already
+/// in the environment. It rides on the posture line because the banner must fit a
+/// short terminal (see the banner-order test) and the budget is part of the
+/// posture being approved.
+fn build_pool_line(size: Option<usize>, inherited: bool) -> (String, Option<String>) {
+    match (size, inherited) {
+        (Some(n), _) => (format!(", {n} compile jobs shared"), None),
+        (None, true) => (
+            ", compile jobs shared with the enclosing session".to_string(),
+            None,
+        ),
+        (None, false) => (
+            ", build pool OFF".to_string(),
+            Some(format!(
+                "warning: build pool OFF — each agent's builds size themselves to the whole \
+                 machine (set build_jobs or {})",
+                atrium::buildpool::ENV_BUILD_JOBS
+            )),
+        ),
+    }
+}
+
 /// List the fleet names in the discovered fleet file, in file order. A missing
 /// file or a malformed one is a clear error on stderr (non-zero exit).
 pub(crate) fn fleet_ls() -> ExitCode {
@@ -573,13 +597,24 @@ pub(crate) fn fleet_up(
     // Always say the posture out loud. A fleet file can be authored by an agent
     // and skimmed by a human; a line naming what everything is about to run under
     // is the difference between reviewing it and assuming it.
+    //
+    // The compile budget is part of that posture: a fleet's builds are what
+    // exhaust a machine, not its agents. Stated from the plan here; the pool
+    // itself is created only once the operator approves (below).
+    let (pool_suffix, pool_warning) = build_pool_line(
+        atrium::buildpool::planned_size(fleet.build_jobs),
+        atrium::buildpool::inherited(),
+    );
     eprintln!(
-        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}",
+        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}",
         fsan(name),
         fleet.agents.len(),
         trust.policy_label(),
         if allow_ctl { ", ctl on" } else { ", ctl OFF" }
     );
+    if let Some(warning) = pool_warning {
+        eprintln!("atrium fleet: {warning}");
+    }
     // Name any agent that runs at a DIFFERENT posture than the session — part of
     // what the human approves (a mixed-model fleet often runs its haiku agents at
     // `accept` under an `automode` session).
@@ -675,6 +710,16 @@ pub(crate) fn fleet_up(
     if !fleet_ack() {
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
+    }
+    // Approved: create the compile pool at the fleet's size, before any pane
+    // spawns, so every agent inherits this one and not a lazily-made default.
+    if atrium::buildpool::planned_size(fleet.build_jobs).is_some()
+        && atrium::buildpool::init(fleet.build_jobs).is_none()
+    {
+        eprintln!(
+            "atrium fleet: warning: could not create the build pool — agents' builds will \
+             run unpooled"
+        );
     }
 
     // Now that the operator has approved, materialize the worktrees off HEAD —
@@ -1029,7 +1074,10 @@ pub(crate) fn spawn_fleet_window(
 
 #[cfg(test)]
 mod tests {
-    use super::{ctl_without_spawner, plugin_value_enabled, preflight_context_mode, up_alias};
+    use super::{
+        build_pool_line, ctl_without_spawner, plugin_value_enabled, preflight_context_mode,
+        up_alias,
+    };
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
@@ -1128,6 +1176,21 @@ mod tests {
     fn no_ctl_never_warns() {
         // Without the control plane there are no teammates to spawn — silence.
         assert!(!ctl_without_spawner(false, 0));
+    }
+
+    #[test]
+    fn the_banner_names_the_compile_budget() {
+        let (pooled, warn) = build_pool_line(Some(16), false);
+        assert_eq!(pooled, ", 16 compile jobs shared");
+        assert_eq!(warn, None);
+        // Inherited from an enclosing session: shared, just not ours to size.
+        let (nested, warn) = build_pool_line(None, true);
+        assert!(nested.contains("enclosing"), "{nested}");
+        assert_eq!(warn, None);
+        // Off (or failed to create) must add a warning line, not pass silently.
+        let (off, warn) = build_pool_line(None, false);
+        assert!(off.contains("OFF"), "{off}");
+        assert!(warn.is_some_and(|w| w.starts_with("warning:")));
     }
 
     // -- worktree norms injection --------------------------------------------

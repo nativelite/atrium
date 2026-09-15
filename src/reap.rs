@@ -233,6 +233,19 @@ mod sys {
         fn SetInformationJobObject(job: Handle, class: i32, info: *mut c_void, len: u32) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn QueryInformationJobObject(
+            job: Handle,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+        fn QueryFullProcessImageNameW(
+            process: Handle,
+            flags: u32,
+            name: *mut u16,
+            size: *mut u32,
+        ) -> i32;
         fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         fn CloseHandle(h: Handle) -> i32;
         fn GetLastError() -> u32;
@@ -353,6 +366,78 @@ mod sys {
         }
     }
 
+    /// `JobObjectBasicProcessIdList` information class.
+    const JOB_BASIC_PROCESS_ID_LIST: i32 = 3;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_MORE_DATA: u32 = 234;
+
+    /// Every process currently in `job`, descendants included (they inherit it).
+    /// `None` if the job is null or can't be queried.
+    pub fn job_pids(job: Handle) -> Option<Vec<u32>> {
+        if job.is_null() {
+            return None;
+        }
+        // JOBOBJECT_BASIC_PROCESS_ID_LIST is two DWORD counts followed by a
+        // ULONG_PTR array, so the array starts 8 bytes in on both 32- and 64-bit.
+        // A `usize` buffer keeps that alignment.
+        let word = core::mem::size_of::<usize>();
+        let header_words = 8usize.div_ceil(word);
+        let mut capacity = 256usize;
+        loop {
+            let mut buf = vec![0usize; header_words + capacity];
+            // SAFETY: `buf` is `len` bytes of usize-aligned storage, which is the
+            // whole contract of the call.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    job,
+                    JOB_BASIC_PROCESS_ID_LIST,
+                    buf.as_mut_ptr() as *mut c_void,
+                    (buf.len() * word) as u32,
+                    core::ptr::null_mut(),
+                )
+            };
+            // SAFETY: the first 8 bytes are the two u32 counts, initialised above.
+            let (assigned, listed) = unsafe {
+                let p = buf.as_ptr() as *const u32;
+                (p.read() as usize, p.add(1).read() as usize)
+            };
+            if ok == 0 {
+                // SAFETY: read immediately after the failing call.
+                if unsafe { GetLastError() } != ERROR_MORE_DATA || assigned <= capacity {
+                    return None;
+                }
+                capacity = assigned + 64;
+                continue;
+            }
+            return Some(
+                buf[header_words..header_words + listed.min(capacity)]
+                    .iter()
+                    .map(|&pid| pid as u32)
+                    .collect(),
+            );
+        }
+    }
+
+    /// The full image path of process `pid`, or `None` if it can't be opened.
+    pub fn image_name(pid: u32) -> Option<String> {
+        if pid == 0 {
+            return None;
+        }
+        // SAFETY: open for the least right the name query needs, read the name into
+        // a buffer whose size is passed, then close our handle.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(h);
+            (ok != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]))
+        }
+    }
+
     /// Close atrium's handle to `job`; the kernel then fires kill-on-close.
     pub fn close_job(job: Handle) {
         if !job.is_null() {
@@ -409,6 +494,33 @@ impl SessionJob {
         {
             sys::assign_to_job(self.raw, pid)
         }
+    }
+
+    /// Every process in the job, pane descendants included. `None` on unix (there
+    /// is no job) and when the Windows job is unavailable or can't be listed.
+    pub fn pids(&self) -> Option<Vec<u32>> {
+        #[cfg(unix)]
+        {
+            None
+        }
+        #[cfg(not(unix))]
+        {
+            sys::job_pids(self.raw)
+        }
+    }
+}
+
+/// The image path of process `pid`, where the platform offers one cheaply.
+/// Windows only; `None` elsewhere and for a process that can't be opened.
+pub fn image_name(pid: u32) -> Option<String> {
+    #[cfg(unix)]
+    {
+        let _ = pid;
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        sys::image_name(pid)
     }
 }
 
@@ -1001,5 +1113,65 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(gone, "kill-on-close must terminate the assigned process");
+    }
+
+    /// The build pool's refill trusts this list to see every build in the
+    /// session, so it must name an assigned process and its image correctly
+    /// (and, like the test above, it proves the transcribed buffer layout).
+    #[cfg(not(unix))]
+    #[test]
+    fn job_lists_an_assigned_process_and_its_image() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "601", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = child.id();
+        let job = SessionJob::create();
+        let assigned = job.assign(pid);
+        let pids = job.pids();
+        let image = image_name(pid);
+        drop(job);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(assigned, "assign failed (runner inside a non-nesting job?)");
+        assert_eq!(pids, Some(vec![pid]));
+        let image = image.expect("image name").to_ascii_lowercase();
+        assert!(image.ends_with("ping.exe"), "{image}");
+    }
+
+    /// A nested atrium creates its own session job inside the outer one. The
+    /// outer session's pool refill must still see builds running in the inner
+    /// session's panes, or it would restore tokens a live build holds.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_outer_job_lists_processes_in_a_nested_job() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "601", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = child.id();
+        let outer = SessionJob::create();
+        let inner = SessionJob::create();
+        // Assigning to a second job nests it inside the first (Windows 8+).
+        let both = outer.assign(pid) && inner.assign(pid);
+        let outer_pids = outer.pids();
+        drop(inner);
+        drop(outer);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(both, "nested assignment failed");
+        assert_eq!(outer_pids, Some(vec![pid]));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn image_name_of_a_missing_process_is_none() {
+        assert_eq!(image_name(0), None);
     }
 }

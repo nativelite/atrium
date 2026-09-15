@@ -191,9 +191,14 @@ pub(crate) fn spawn_pane(
 /// by the watchdog, by `atrium reap`, by a human with `ps`. Holding it authorises
 /// nothing, and forging it can only nominate the forger's own process group for
 /// collection, and then only once the atrium it names is already dead.
+///
+/// `build_pool` is the session compile pool's `CARGO_MAKEFLAGS` value
+/// ([`atrium::buildpool`]). Like the marker it is independent of ctl: every
+/// pane's builds share the one pool, whether or not the pane can reach ctl.
 pub(crate) fn pane_base_env(
     session: Option<&atrium::orphan::SessionKey>,
     ctl: Option<(&str, &str, &str)>,
+    build_pool: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
     if let Some(key) = session {
@@ -203,6 +208,12 @@ pub(crate) fn pane_base_env(
         env.push((atrium::ctl::ENV_ADDRESS.to_string(), addr.to_string()));
         env.push((atrium::ctl::ENV_PANE.to_string(), pane.to_string()));
         env.push((atrium::ctl::ENV_TOKEN.to_string(), token.to_string()));
+    }
+    if let Some(flags) = build_pool {
+        env.push((
+            atrium::buildpool::ENV_CARGO_MAKEFLAGS.to_string(),
+            flags.to_string(),
+        ));
     }
     env
 }
@@ -451,12 +462,16 @@ pub(crate) fn spawn_pane_full(
         );
     }
     let pane_id = agent_id.to_string();
+    // The session compile pool, created on the first spawn if the fleet path
+    // hasn't already sized it.
+    let build_pool = atrium::buildpool::init(None).map(|p| p.makeflags());
     let mut base_env = pane_base_env(
         atrium::orphan::session_key().as_ref(),
         match (CTL_ADDRESS.get(), token.as_ref()) {
             (Some(addr), Some(tok)) => Some((addr.as_str(), pane_id.as_str(), tok.as_str())),
             _ => None,
         },
+        build_pool.as_deref(),
     );
     base_env.extend_from_slice(extra_env);
 

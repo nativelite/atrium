@@ -22,6 +22,8 @@ pub(crate) struct SafetyNet {
     /// tampered with, or a session appearing that the ancestry cap did not explain.
     warden: atrium::warden::Warden,
     last_warden_check: Instant,
+    /// When the compile pool was last checked for tokens leaked by killed builds.
+    last_pool_check: Instant,
     cap_notice_raised: bool,
     /// The live pane pids last written to the registry.
     registered: Vec<u32>,
@@ -55,6 +57,7 @@ impl SafetyNet {
             last_snapshot_check: Instant::now(),
             warden: atrium::warden::Warden::new(registry_path.clone()),
             last_warden_check: Instant::now(),
+            last_pool_check: Instant::now(),
             cap_notice_raised: false,
             registered: Vec::new(),
             registry_dirty: false,
@@ -198,6 +201,22 @@ impl SafetyNet {
             // rule the enforceable set is empty, the only sessions left to
             // accuse are indistinguishable from an ordinary reparenting, and
             // the kill target was read out of a file the accused could write.
+        }
+        // A build killed mid-compile never returns its pool tokens, so the pool
+        // would shrink for the rest of the session. Top it back up whenever no
+        // build is running (see `buildpool::refill` for why that is race-free).
+        if self.last_pool_check.elapsed() >= WARDEN_INTERVAL {
+            self.last_pool_check = Instant::now();
+            let restored = atrium::buildpool::refill(session_job, &self.registered);
+            if restored > 0 {
+                ctl_audit.record(
+                    None,
+                    "build-pool-refill",
+                    &format!("restored {restored} compile job(s) leaked by a killed build"),
+                    true,
+                    "",
+                );
+            }
         }
         // The watchdog is the unix answer to a death no handler can catch.
         // Windows does not need it and must not run it: the durable fix there

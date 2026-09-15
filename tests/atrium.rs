@@ -1355,6 +1355,13 @@ fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
         "{err}"
     );
     assert!(at("may spawn teammates") < at("GRANTS"), "{err}");
+    // The compile budget is stated on the posture line itself, not a line of its
+    // own that would push the banner past a short terminal.
+    let posture = err
+        .lines()
+        .find(|l| l.contains("starting 8 agent(s)"))
+        .unwrap_or_default();
+    assert!(posture.contains("compile jobs shared"), "{posture}");
     // Deduplicated: eight agents naming ONE sibling checkout is one line.
     assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
     // And the banner as a whole still fits a terminal.
@@ -2043,6 +2050,108 @@ fn a_pane_launched_without_ctl_still_carries_the_session_marker() {
 // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` that atrium holds for its whole life, so the
 // kernel terminates every pane and everything a pane spawned the instant atrium's
 // handle closes — however atrium exits.
+
+/// **A pane is born pointing at a live compile pool** (the fleet OOM fix).
+///
+/// The pane reports its `CARGO_MAKEFLAGS`, and the test then opens the named
+/// semaphore exactly as cargo's `jobserver` client does and reads its count. That
+/// proves the whole chain: atrium created the pool, sized it from
+/// `ATRIUM_BUILD_JOBS`, injected its name, and it is reachable from another
+/// process. An inherited `CARGO_MAKEFLAGS` (this test running inside an atrium
+/// pane) is blanked so the atrium under test must create its own.
+#[cfg(windows)]
+#[test]
+fn a_pane_is_given_a_live_build_pool_windows() {
+    use core::ffi::c_void;
+    extern "system" {
+        fn OpenSemaphoreW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQuerySemaphore(
+            sem: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+    }
+    const SEMAPHORE_QUERY_STATE: u32 = 0x0001;
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+
+    let marker = std::env::temp_dir().join(format!("atrium-pool-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let mpath = marker.display().to_string().replace('\\', "/");
+    let script = format!(
+        "Set-Content -Path '{mpath}' -Value ('[' + $env:CARGO_MAKEFLAGS + ']'); \
+         Start-Sleep -Seconds 600"
+    );
+    let argv = [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ];
+    let env = [
+        ("CARGO_MAKEFLAGS".to_string(), String::new()),
+        ("ATRIUM_BUILD_JOBS".to_string(), "3".to_string()),
+    ];
+    let mut p =
+        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80, &env).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let seen = loop {
+        if let Ok(t) = std::fs::read_to_string(&marker) {
+            if let (Some(a), Some(b)) = (t.find('['), t.rfind(']')) {
+                break t[a + 1..b].to_string();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane never reported CARGO_MAKEFLAGS"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let counts = atrium::buildpool::jobserver_auth(&seen).map(|auth| {
+        let wide: Vec<u16> = auth.encode_utf16().chain(Some(0)).collect();
+        // SAFETY: a null-terminated name; the handle is closed below.
+        let sem = unsafe { OpenSemaphoreW(SEMAPHORE_QUERY_STATE | SYNCHRONIZE, 0, wide.as_ptr()) };
+        let mut info = [0i32; 2];
+        // SAFETY: SEMAPHORE_BASIC_INFORMATION is two LONGs; the length says so.
+        let status = if sem.is_null() {
+            -1
+        } else {
+            unsafe {
+                NtQuerySemaphore(
+                    sem,
+                    0,
+                    info.as_mut_ptr() as *mut c_void,
+                    8,
+                    core::ptr::null_mut(),
+                )
+            }
+        };
+        if !sem.is_null() {
+            // SAFETY: closing the handle opened above.
+            unsafe { CloseHandle(sem) };
+        }
+        (status, info)
+    });
+    p.write(b"\x01q").unwrap();
+    assert_eq!(wait_exit(&mut p, 15), 0);
+    let _ = std::fs::remove_file(&marker);
+
+    let (status, [current, maximum]) =
+        counts.unwrap_or_else(|| panic!("pane's CARGO_MAKEFLAGS names no jobserver: {seen:?}"));
+    assert_eq!(
+        status, 0,
+        "the pool named in {seen:?} could not be opened by name"
+    );
+    assert_eq!(maximum, 3, "ATRIUM_BUILD_JOBS=3 must size the pool");
+    assert_eq!(current, 3, "an idle pool holds all its tokens");
+}
 
 /// A pane script that spawns a long-lived grandchild (`ping`), records its pid to
 /// `marker`, and waits on it — the Windows analog of `sleep 600 & echo $! ; wait`.

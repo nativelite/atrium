@@ -121,6 +121,11 @@ pub struct Fleet {
     /// as a fallback. Build caches are never seeded — those belong to a per-agent
     /// env var. Default empty/opt-in: atrium seeds nothing unless told.
     pub worktree_seed: Option<Vec<String>>,
+    /// Size of the session's shared compile pool ([`crate::buildpool`]): how many
+    /// compiler jobs every agent's builds share in total. `0` turns the pool off.
+    /// Absent → one job per core, bounded by RAM. `ATRIUM_BUILD_JOBS` still wins,
+    /// because a checked-in fleet file can't know the machine it runs on.
+    pub build_jobs: Option<usize>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -365,6 +370,17 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         None => None,
     };
 
+    let build_jobs = match get("build_jobs") {
+        Some(v) => Some(
+            v.as_i64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or_else(|| {
+                    format!("fleet {name:?}: \"build_jobs\" must be a whole number, 0 or more")
+                })?,
+        ),
+        None => None,
+    };
+
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
     let agent_items = agents_val
@@ -388,6 +404,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         worktrees,
         worktree_base,
         worktree_seed,
+        build_jobs,
         agents,
     })
 }
@@ -1466,6 +1483,30 @@ mod tests {
     }
 
     #[test]
+    fn build_jobs_sizes_the_compile_pool() {
+        let text = |v: &str| {
+            format!(
+                r#"{{ "fleets": {{ "f": {{ "build_jobs": {v}, "agents": [{{ "name": "a", "cmd": ["claude"] }}] }} }} }}"#
+            )
+        };
+        assert_eq!(
+            parse(&text("6")).unwrap().get("f").unwrap().build_jobs,
+            Some(6)
+        );
+        // 0 is how a fleet turns the pool off.
+        assert_eq!(
+            parse(&text("0")).unwrap().get("f").unwrap().build_jobs,
+            Some(0)
+        );
+        for bad in ["-1", "2.5", "\"4\"", "true"] {
+            let err = parse(&text(bad)).unwrap_err();
+            assert!(err.contains("build_jobs"), "{bad}: {err}");
+        }
+        let absent = r#"{ "fleets": { "f": { "agents": [{ "name": "a", "cmd": ["claude"] }] } } }"#;
+        assert_eq!(parse(absent).unwrap().get("f").unwrap().build_jobs, None);
+    }
+
+    #[test]
     fn preserves_fleet_order() {
         let text = r#"{ "fleets": {
           "b": { "agents": [{ "name": "x", "cmd": ["sh"] }] },
@@ -1943,6 +1984,7 @@ mod tests {
             worktrees: None,
             worktree_base: None,
             worktree_seed: None,
+            build_jobs: None,
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -2207,6 +2249,7 @@ mod tests {
             worktrees: None,
             worktree_base: None,
             worktree_seed: None,
+            build_jobs: None,
             agents,
         };
         let anchor = Anchor {

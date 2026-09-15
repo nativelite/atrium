@@ -276,6 +276,8 @@ control plane exists.
 | `ATRIUM_CTL_AUDIT` | mirror the ctl audit log to a JSONL file |
 | `ATRIUM_TRUST_ALLOW` | extra safe-command prefixes for `--trust accept` |
 | `ATRIUM_SESSION` | owner marker atrium injects for orphan reaping |
+| `ATRIUM_BUILD_JOBS` | size of the session's shared compile pool (default: one job per core, bounded by RAM); `off` disables it |
+| `CARGO_MAKEFLAGS` | set by atrium in every pane: the compile pool every agent's cargo builds share |
 | `ATRIUM_DEBUG` | `=1` adds stage markers on stderr |
 
 ### Subcommands

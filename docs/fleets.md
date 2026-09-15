@@ -90,6 +90,11 @@ The file is read **read-only**. atrium never writes it.
 | `worktrees` | optional | `true` gives **every** agent its own git worktree and branch (a full fan-out), so parallel workers never clobber one shared tree. See [worktrees](worktrees.md). |
 | `worktree_base` | optional | Where those worktrees are created; defaults to a sibling of the repo so they never show up as untracked files inside it. See [worktrees](worktrees.md). |
 | `worktree_seed` | optional | Untracked paths (an array of strings) linked from the main tree into each fresh worktree — config or build inputs git does not track. Best-effort (junction/symlink, copy fallback); never fails a launch. See [worktrees](worktrees.md). |
+| `build_jobs` | optional | Total compiler jobs the whole fleet's builds share (a whole number; `0` = off). Default: one per core, bounded by RAM. |
+
+**`build_jobs`** (optional) sizes the fleet's **shared compile pool**: the total number of compiler jobs all the agents' builds may run at once, however many agents start a build. `0` turns the pool off. Omit it and the pool gets one job per core, bounded by RAM (about 3 GiB per job), so the whole fleet compiles within the budget of one developer's `cargo build`. `ATRIUM_BUILD_JOBS` on the machine wins over the file. The banner's posture line states the budget ("16 compile jobs shared").
+
+The pool is a jobserver: atrium sets `CARGO_MAKEFLAGS` in every pane, and cargo takes a token before each compiler job, so neither `-j` nor `CARGO_BUILD_JOBS` in an agent's command gets past it. Without it, seven agents running `cargo test --workspace` start seven machine-sized builds at once, which is how a fleet exhausted a 64 GB machine. Only cargo builds are pooled today; other compilers (`make`, `ninja`, `go`) are not. A build killed mid-compile loses its tokens; atrium refills the pool whenever no build is running.
 
 **`identity`** is resolved via `akey` and injected per pane exactly as `--identity` does. The pane shows the `·<name>` tag (the **name** only, never a secret), and a resolve failure is flashed and the pane runs without it, never silently unauthenticated. See [credential identity](identity.md).
 

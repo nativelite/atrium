@@ -1615,6 +1615,9 @@ fn run(
     // the watchdog then TERMs and KILLs precisely what is left, and a later
     // `atrium reap` finds the same short list rather than a stale full one. Panes
     // that did die are dropped from it, because a dead pane's pgid can be reused.
+    // The panes are gone, so nothing holds the compile pool; remove its FIFO
+    // (unix) rather than leave a stale path in the temp directory.
+    atrium::buildpool::cleanup();
     match atrium::reap::settle_registry(
         safety_net.registry_path(),
         &survivors,
@@ -1992,7 +1995,7 @@ mod tests {
             owner: 17686,
             started: 99,
         };
-        let bare = pane_base_env(Some(&key), None);
+        let bare = pane_base_env(Some(&key), None, None);
         assert_eq!(
             bare,
             vec![("ATRIUM_SESSION".to_string(), "17686:99".to_string())],
@@ -2002,7 +2005,7 @@ mod tests {
         // With ctl on, the marker is still there, still first, and the three ctl
         // variables are unchanged. Spelled as literals on purpose: this pins the
         // WIRE names a child reads, so renaming a const without the child is caught.
-        let full = pane_base_env(Some(&key), Some(("/tmp/sock", "3", "deadbeef")));
+        let full = pane_base_env(Some(&key), Some(("/tmp/sock", "3", "deadbeef")), None);
         let names: Vec<&str> = full.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(
             names,
@@ -2021,10 +2024,27 @@ mod tests {
     /// a live unrelated process after the pid is reused.
     #[test]
     fn a_pane_is_never_marked_with_a_key_we_could_not_compute() {
-        assert!(pane_base_env(None, None).is_empty());
-        let ctl_only = pane_base_env(None, Some(("/tmp/sock", "3", "deadbeef")));
+        assert!(pane_base_env(None, None, None).is_empty());
+        let ctl_only = pane_base_env(None, Some(("/tmp/sock", "3", "deadbeef")), None);
         assert!(!ctl_only.iter().any(|(k, _)| k == "ATRIUM_SESSION"));
         assert_eq!(ctl_only.len(), 3);
+    }
+
+    /// Every pane gets the session's compile pool, with or without ctl, under
+    /// the wire name cargo reads. A pane that misses it builds unpooled — the
+    /// exact fleet OOM this exists to prevent — and nothing would say so.
+    #[test]
+    fn every_pane_gets_the_build_pool() {
+        let flags = "-j --jobserver-fds=atrium-build-1-ab --jobserver-auth=atrium-build-1-ab";
+        let bare = pane_base_env(None, None, Some(flags));
+        assert_eq!(
+            bare,
+            vec![("CARGO_MAKEFLAGS".to_string(), flags.to_string())]
+        );
+        let full = pane_base_env(None, Some(("/tmp/sock", "3", "deadbeef")), Some(flags));
+        assert!(full.contains(&("CARGO_MAKEFLAGS".to_string(), flags.to_string())));
+        // No pool (disabled, inherited, or failed): nothing is injected.
+        assert!(pane_base_env(None, None, None).is_empty());
     }
 
     /// **Dropping your token must not promote you** (review #1).

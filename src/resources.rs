@@ -77,6 +77,32 @@ pub fn effective_cap() -> usize {
     )
 }
 
+/// Memory budgeted per concurrent compiler job when sizing the build pool.
+///
+/// A rustc job on a large crate peaks around 1–2 GiB, and linking more. The pool
+/// exists to keep builds from exhausting the machine, so, like
+/// [`DEFAULT_AGENT_MB`], this over-estimates: guessing high costs build speed,
+/// guessing low costs the machine.
+const BUILD_JOB_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// The default build pool size: one job per core, but no more jobs than RAM
+/// carries at [`BUILD_JOB_BYTES`] each, and never below one. Unknown RAM falls
+/// back to cores. On a 16-core/64 GiB box that is 16 — the whole fleet compiles
+/// with the budget one developer's `cargo build` would take — and on an
+/// 8-core/16 GiB laptop it is 5.
+pub fn build_jobs(ram_bytes: Option<u64>, cores: usize) -> usize {
+    let cores = cores.max(1);
+    match ram_bytes {
+        Some(r) => cores.min((r / BUILD_JOB_BYTES) as usize).max(1),
+        None => cores,
+    }
+}
+
+/// [`build_jobs`] for this host.
+pub fn default_build_jobs() -> usize {
+    build_jobs(total_ram_bytes(), cores())
+}
+
 /// Logical CPU count (std, portable); `1` if it can't be determined.
 fn cores() -> usize {
     std::thread::available_parallelism()
@@ -168,6 +194,18 @@ mod tests {
             pane_cap(None, None, 0, 768 << 20),
             MIN_CAP.max(AGENTS_PER_CORE)
         );
+    }
+
+    #[test]
+    fn build_jobs_is_bounded_by_cores_and_ram() {
+        // Plenty of RAM: one job per core.
+        assert_eq!(build_jobs(Some(64 * GB), 16), 16);
+        // A laptop: RAM binds first (16 GiB / 3 GiB = 5).
+        assert_eq!(build_jobs(Some(16 * GB), 8), 5);
+        // Tiny or unknown hosts still get a pool that builds.
+        assert_eq!(build_jobs(Some(GB), 8), 1);
+        assert_eq!(build_jobs(None, 12), 12);
+        assert_eq!(build_jobs(None, 0), 1);
     }
 
     #[test]

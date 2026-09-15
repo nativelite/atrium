@@ -529,6 +529,7 @@ mod tests {
             worktrees,
             worktree_base: base.map(str::to_string),
             worktree_seed: None,
+            build_jobs: None,
             agents: agents
                 .iter()
                 .map(|(n, w)| Agent {
