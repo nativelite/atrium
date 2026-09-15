@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A checked-in benchmark: `cargo bench --bench terminal`.** It measures key
+  echo latency, idle CPU and output-flood throughput against the bare shell,
+  with output timestamped where it arrives. Baselines for 0.34.0 on Windows and
+  Linux are in `benches/README.md`, so the performance numbers in the 0.34.0
+  notes can now be re-run. It found two things to fix:
+  - ~16 ms key-echo outliers that occur only on Windows
+  - output-flood throughput about 9x below `cat` on Linux
+
 ### Fixed
 - **Windows sessions no longer open with "1 decision needs you".** The warden
   can't detect nested atrium sessions on Windows, and said so once per session

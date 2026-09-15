@@ -27,3 +27,9 @@ path = "src/lib.rs"
 [[bin]]
 name = "atrium"
 path = "src/main.rs"
+
+# Key echo, idle CPU and output-flood throughput against the bare shell.
+# `cargo bench --bench terminal`; under `cargo test` it only builds.
+[[bench]]
+name = "terminal"
+harness = false
