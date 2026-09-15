@@ -508,6 +508,16 @@ pub(crate) fn spawn_pane_full(
     // Resolve failure (no such target, vault locked) is surfaced in the bar and
     // the pane spawns with plain env (ambient creds) but still in `cwd` — visible,
     // not silent, and never unauthenticated-without-saying-so (§7).
+    // Windows: the pane is created SUSPENDED and joins the session job before it
+    // runs a single instruction. Assigned after an ordinary spawn, anything it
+    // started first — `claude.cmd` is a cmd.exe that starts node at once — would
+    // sit outside the job for good: outside the memory ceiling, and not killed
+    // with atrium. The job is also session-wide now, so a fleet's panes, which
+    // spawn before the run loop, are enrolled here like every other pane.
+    #[cfg(windows)]
+    let spawn = pty::Pty::spawn_suspended;
+    #[cfg(not(windows))]
+    let spawn = pty::Pty::spawn_full;
     let pty = if inject {
         let name = identity.expect("wants_env implies Some");
         // An identity may be a comma-separated list (`work,hf`) so one agent gets
@@ -539,9 +549,22 @@ pub(crate) fn spawn_pane_full(
                 Instant::now(),
             ));
         }
-        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &merged, cwd)?
+        spawn(&effective[0], &argrefs, r, c, &merged, cwd)?
     } else {
-        pty::Pty::spawn_full(&effective[0], &argrefs, r, c, &base_env, cwd)?
+        spawn(&effective[0], &argrefs, r, c, &base_env, cwd)?
+    };
+    #[cfg(windows)]
+    let pty = {
+        // A failed assign degrades to a pane outside the job (as before, R1),
+        // never a refused pane. A failed resume would leave a pane that never
+        // starts, so that one is fatal for this spawn.
+        let mut pty = pty;
+        atrium::reap::SessionJob::session().assign(pty.pid());
+        if let Err(e) = pty.resume() {
+            let _ = pty.kill();
+            return Err(e);
+        }
+        pty
     };
     // The second marker, on disk. Measured on macOS 26: `ps -E` prints the
     // environment of ordinary binaries but NOTHING for a SIP/platform binary,

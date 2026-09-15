@@ -1021,9 +1021,9 @@ fn run(
     let initial = match initial_window {
         Some(w) => Ok(w),
         None => match grid {
-            // Startup panes (created before the session Job exists) enroll via the
-            // run loop's lazy pass on the first tick — status quo; not a
-            // kill-after-spawn race. Hence `None` here.
+            // Every pane enrolls in the session job at its own spawn (Windows:
+            // created suspended, assigned, then resumed), so there is nothing to
+            // pass for enrollment here.
             Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash, None),
             None => spawn_window(
                 command,
@@ -1118,12 +1118,14 @@ fn run(
     // unix (the process-group teardown + watchdog below already cover the tree).
     // Held for the whole run — dropping it (or the process exiting) fires the
     // guarantee. Panes never inherit its handle, so they live until atrium exits.
-    let session_job = atrium::reap::SessionJob::create();
+    // Process-wide, so every pane — a fleet's, spawned before this loop, included
+    // — is enrolled at its own spawn; closed explicitly at teardown below.
+    let session_job = atrium::reap::SessionJob::session();
     // What `Ctrl+A c`, splits and the command prompt launch under.
     let launch = Launch {
         command,
         identity,
-        job: &session_job,
+        job: session_job,
     };
     // The crash registry, session snapshot, warden and orphan watchdog (loop
     // phase 0b); see `safety_net`.
@@ -1150,7 +1152,7 @@ fn run(
         }
         // 0b. The safety net: crash registry, session snapshot, warden tripwires,
         // and (unix) the orphan watchdog.
-        if safety_net.tick(&windows, &session_job, &mut ctl_audit, &mut bus, &mut flash) {
+        if safety_net.tick(&windows, session_job, &mut ctl_audit, &mut bus, &mut flash) {
             force_repaint = true;
         }
         // 1. keystrokes -> scanner -> focused pane / commands
@@ -1341,7 +1343,7 @@ fn run(
                             &mut ctl_audit,
                             &mut board,
                             &mut bus,
-                            &session_job,
+                            session_job,
                         );
                         let _ = listener.respond(&reply.to_json());
                         renderer.reset();
@@ -1665,6 +1667,10 @@ fn run(
     if dbg {
         eprint!("[atrium-dbg panes-dropped]\r\n");
     }
+    // The session job is static, so nothing drops it: close it here, where the
+    // run loop's own job used to go out of scope, so kill-on-close still fires
+    // before a fleet's worktree teardown rather than at process exit.
+    session_job.close();
     ExitCode::SUCCESS
 }
 

@@ -360,10 +360,22 @@ mod sys {
         // AssignProcessToJobObject needs, assign it, then close our process handle
         // — the JOB holds the process, not this handle.
         unsafe {
-            let h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            let h = OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                pid,
+            );
             if h.is_null() {
                 debug_warn("OpenProcess", GetLastError());
                 return false;
+            }
+            // Already a member (a pane is enrolled at spawn, and the older
+            // enrollment sites still run): nothing to do, and asking again would
+            // only be a second chance to fail.
+            let mut in_job: i32 = 0;
+            if IsProcessInJob(h, job, &mut in_job) != 0 && in_job != 0 {
+                CloseHandle(h);
+                return true;
             }
             let ok = AssignProcessToJobObject(job, h) != 0;
             // Capture the error BEFORE CloseHandle, which would clobber last-error.
@@ -574,17 +586,48 @@ mod sys {
 /// the process-group teardown and the pipe-EOF watchdog already cover the tree,
 /// and there is no Job Object to use.
 ///
-/// Hold one for atrium's whole run and [`assign`](SessionJob::assign) each pane
-/// after spawn; dropping it (or the process exiting) fires the guarantee. A
+/// atrium uses the process-wide [`session`](SessionJob::session) job, enrolls
+/// each pane at spawn, and [`close`](SessionJob::close)s it at teardown; closing
+/// or dropping a job (or the process exiting) fires the guarantee. A
 /// Windows failure to create or configure the job yields an inert handle whose
 /// `assign` is a no-op — panes still spawn, the guarantee is simply unavailable
 /// (R1), never a refused pane.
 pub struct SessionJob {
+    /// The job handle; null once [`close`](SessionJob::close)d. Atomic so the
+    /// process-wide session job can be shared and closed exactly once.
     #[cfg(not(unix))]
-    raw: *mut core::ffi::c_void,
+    raw: std::sync::atomic::AtomicPtr<core::ffi::c_void>,
 }
 
+/// The process-wide session job; see [`SessionJob::session`].
+static SESSION_JOB: std::sync::OnceLock<SessionJob> = std::sync::OnceLock::new();
+
 impl SessionJob {
+    /// This atrium's session job, created on first use. Process-wide so a pane
+    /// can be enrolled at the moment it is spawned — including a fleet's panes,
+    /// which spawn before the run loop starts — rather than on a later tick,
+    /// when anything it had already started would be outside the job for good.
+    /// The run loop [`close`](SessionJob::close)s it at teardown.
+    pub fn session() -> &'static SessionJob {
+        SESSION_JOB.get_or_init(SessionJob::create)
+    }
+
+    /// Close the job now, firing kill-on-close for everything still in it
+    /// (Windows); later calls, and [`assign`](SessionJob::assign) after it, do
+    /// nothing. A no-op on unix.
+    pub fn close(&self) {
+        #[cfg(not(unix))]
+        sys::close_job(
+            self.raw
+                .swap(std::ptr::null_mut(), std::sync::atomic::Ordering::SeqCst),
+        );
+    }
+
+    #[cfg(not(unix))]
+    fn handle(&self) -> *mut core::ffi::c_void {
+        self.raw.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Create the container: a kill-on-close Job Object on Windows, nothing on
     /// unix (where Linux's capped cgroup is the session-wide
     /// [`crate::cgroup::session`], taken before the first pane spawns).
@@ -596,7 +639,7 @@ impl SessionJob {
         #[cfg(not(unix))]
         {
             SessionJob {
-                raw: sys::create_job(),
+                raw: std::sync::atomic::AtomicPtr::new(sys::create_job()),
             }
         }
     }
@@ -623,7 +666,7 @@ impl SessionJob {
         }
         #[cfg(not(unix))]
         {
-            sys::assign_to_job(self.raw, pid)
+            sys::assign_to_job(self.handle(), pid)
         }
     }
 
@@ -638,7 +681,7 @@ impl SessionJob {
         #[cfg(not(unix))]
         {
             sys::set_job_memory_limit(
-                self.raw,
+                self.handle(),
                 bytes.map(|b| usize::try_from(b).unwrap_or(usize::MAX)),
             )
         }
@@ -655,7 +698,7 @@ impl SessionJob {
         }
         #[cfg(not(unix))]
         {
-            sys::terminate_member(self.raw, pid, accept)
+            sys::terminate_member(self.handle(), pid, accept)
         }
     }
 
@@ -668,7 +711,7 @@ impl SessionJob {
         }
         #[cfg(not(unix))]
         {
-            sys::job_pids(self.raw)
+            sys::job_pids(self.handle())
         }
     }
 }
@@ -706,7 +749,7 @@ impl Drop for SessionJob {
         // Closing atrium's last handle fires KILL_ON_JOB_CLOSE. On a normal return
         // this is the clean path; on TerminateProcess the kernel closes it for us
         // — either way no pane tree is left behind.
-        sys::close_job(self.raw);
+        self.close();
     }
 }
 
@@ -1289,6 +1332,42 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(gone, "kill-on-close must terminate the assigned process");
+    }
+
+    /// A pane is enrolled at spawn and again by the older enrollment sites, so a
+    /// second assign to the same job must be a success, and `close` must fire
+    /// kill-on-close without waiting for a drop (the session job is static).
+    #[cfg(not(unix))]
+    #[test]
+    fn reassigning_is_harmless_and_close_fires_kill_on_close() {
+        let mut child = std::process::Command::new("ping")
+            .args(["-n", "601", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = child.id();
+        let job = SessionJob::create();
+        let first = job.assign(pid);
+        let again = job.assign(pid);
+        job.close();
+        let after_close = job.assign(pid);
+        let mut gone = false;
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(first, "assign failed (runner inside a non-nesting job?)");
+        assert!(again, "re-assigning a member must succeed");
+        assert!(!after_close, "a closed job takes nobody");
+        assert!(gone, "close must fire kill-on-close");
+        assert!(std::ptr::eq(SessionJob::session(), SessionJob::session()));
     }
 
     /// The build pool's refill trusts this list to see every build in the

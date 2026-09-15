@@ -103,8 +103,9 @@ impl SafetyNet {
             .collect();
         if cur != self.registered {
             // Assign any newly-appeared pane to the session job so its whole
-            // tree is torn down with atrium (no-op on unix). Only the new pids,
-            // so a process is never re-assigned.
+            // tree is torn down with atrium. A backstop now: `spawn_pane_full`
+            // enrolls every pane before it runs, and re-assigning a member is a
+            // no-op success.
             for pid in cur.iter().filter(|p| !self.registered.contains(p)) {
                 session_job.assign(*pid);
             }
