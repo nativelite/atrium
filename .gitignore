@@ -10,3 +10,6 @@
 # Python bytecode from dev.py — a build artifact, never checked in.
 __pycache__/
 *.pyc
+
+# Crash dumps from git-bash / MSYS tools run in this tree.
+*.stackdump

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-09-15
+
+Performance numbers below come from one-off harnesses run on the founder's
+Windows machine (an atrium release build in a pty); they are not yet checked-in
+benchmarks. The first harness polled with 1 ms sleeps, which inflated its
+latency figures; the event-driven numbers were taken with a harness that
+timestamps output where it arrives.
+
 ### Added
 - **Fleet preflight warnings are one loud block.** Every warning the fleet
   banner raises (flags it ignores, deny rules that can't bind, the build pool
