@@ -726,6 +726,18 @@ impl ExeIds {
 /// process calling itself atrium, e.g. an atrium run as root — still fails
 /// closed. A same-uid unreadable hop stays "cannot tell": an agent could have
 /// made it. Pure, so the decision is tested on every platform.
+///
+/// Why an agent can't turn this into "no ceiling" (reviewed adversarially):
+/// - It can make its OWN processes look foreign (`prctl(PR_SET_DUMPABLE, 0)`
+///   makes `/proc/<pid>` root-owned) or forge their `comm` with a symlink name.
+///   That only ever gets hops skipped that were never the atrium, and the walk
+///   carries on upward to the real one.
+/// - The real enforcing atrium is resolved by the primary identity check, not
+///   by this: `execve` resets the dumpable bit for a non-setuid binary, so its
+///   `/proc/<pid>/exe` stays readable to its own uid.
+/// - If that check ever failed for the real atrium anyway, its `comm` really is
+///   `atrium`, and nothing lets an agent rename another process — so this
+///   returns "cannot tell", never "not atrium".
 #[cfg_attr(not(unix), allow(dead_code))]
 fn unreadable_hop(foreign_owner: bool, comm: Option<&str>) -> Option<bool> {
     if !foreign_owner {
@@ -738,9 +750,10 @@ fn unreadable_hop(foreign_owner: bool, comm: Option<&str>) -> Option<bool> {
 }
 
 /// Whether `pid` belongs to a different uid than this process, and its kernel
-/// `comm` name. Linux reads both from `/proc`; elsewhere there is nothing to add
-/// (macOS `proc_pidpath` resolves any pid, so its images don't go unreadable
-/// this way), which leaves the hop at "cannot tell".
+/// `comm` name. Linux reads both from `/proc`. Elsewhere this adds nothing and
+/// the hop stays "cannot tell" — on macOS that is untested: if `proc_pidpath`
+/// can't resolve another user's process, macOS still ends such walks in
+/// `Unknown` (fail-closed, but the Linux fix doesn't reach it yet).
 #[cfg(target_os = "linux")]
 fn owner_and_name(pid: u32) -> (bool, Option<String>) {
     use std::os::unix::fs::MetadataExt;

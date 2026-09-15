@@ -226,25 +226,95 @@ pub fn soft_pressure(cap: Cap, panes_used: u64, mem_total: u64, mem_available: u
     }
 }
 
+/// After stopping a build, how long before the guard may stop another: long
+/// enough to see whether the first kill relieved anything. Without it, pressure
+/// the session isn't causing (a browser holding the machine in its reserve) had
+/// the guard kill the session's next build every 3 s, indefinitely.
+pub const KILL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Under machine-wide pressure, a build smaller than this isn't stopped:
+/// freeing it can't move the machine out of its reserve, so killing it only
+/// breaks the agent's work. A pane over its own fixed cap has no such floor.
+pub const MIN_MACHINE_VICTIM: u64 = 256 * MIB;
+
+/// Whether the guard may stop a build of `victim_bytes` now. `machine_driven`
+/// is pressure from the machine's reserve rather than from the panes exceeding
+/// their own fixed cap; `since_last_kill` is the time since the guard last
+/// stopped something.
+pub fn may_kill(
+    victim_bytes: u64,
+    machine_driven: bool,
+    since_last_kill: Option<std::time::Duration>,
+) -> bool {
+    if since_last_kill.is_some_and(|d| d < KILL_COOLDOWN) {
+        return false;
+    }
+    !machine_driven || victim_bytes >= MIN_MACHINE_VICTIM
+}
+
 /// The `oom_score_adj` a build process gets on Linux, so that if the kernel's
 /// OOM killer does fire it takes a build before atrium, the terminal or the
 /// desktop. Raising the score is allowed without privilege; lowering is not.
 pub const BUILD_OOM_SCORE_ADJ: i32 = 800;
 
-/// `(session id, start time, rss pages, comm)` from a Linux `/proc/<pid>/stat`
-/// line. `comm` sits in parentheses and may itself contain spaces and `)`, so
-/// fields are counted from the LAST `)`. Pure, so it is tested everywhere.
+/// One `/proc/<pid>/stat` line, parsed.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_stat(text: &str) -> Option<(u32, u64, u64, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stat {
+    ppid: u32,
+    session: u32,
+    start: u64,
+    rss_pages: u64,
+    comm: String,
+}
+
+/// A Linux `/proc/<pid>/stat` line. `comm` sits in parentheses and may itself
+/// contain spaces and `)`, so fields are counted from the LAST `)`. Pure, so it
+/// is tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat(text: &str) -> Option<Stat> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let comm = text.get(open + 1..close)?.to_string();
     let f: Vec<&str> = text[close + 1..].split_whitespace().collect();
     // `f[0]` is field 3 (state), so field N of proc(5) is `f[N - 3]`.
-    let session = f.get(3)?.parse().ok()?; // field 6
-    let start = f.get(19)?.parse().ok()?; // field 22
-    let rss_pages = f.get(21)?.parse().ok()?; // field 24
-    Some((session, start, rss_pages, comm))
+    Some(Stat {
+        ppid: f.get(1)?.parse().ok()?,       // field 4
+        session: f.get(3)?.parse().ok()?,    // field 6
+        start: f.get(19)?.parse().ok()?,     // field 22
+        rss_pages: f.get(21)?.parse().ok()?, // field 24
+        comm,
+    })
+}
+
+/// The pids that belong to `panes`: every process in a pane's session (a pane
+/// leads its own session), plus every descendant of one by parent link — so a
+/// child that called `setsid()` still counts. A daemon that double-forks away
+/// to init leaves both trails; that residual is the same one `reap` documents.
+/// `table` is `pid -> (ppid, session)`. Pure, so it is tested everywhere.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn pane_members(table: &[(u32, (u32, u32))], panes: &[u32]) -> Vec<u32> {
+    let mut members: std::collections::HashSet<u32> = table
+        .iter()
+        .filter(|(pid, (_, session))| panes.contains(session) || panes.contains(pid))
+        .map(|(pid, _)| *pid)
+        .collect();
+    // Grow by parent links until nothing new joins; each pass adds at least one
+    // generation, so this ends within the tree's depth.
+    loop {
+        let before = members.len();
+        for (pid, (ppid, _)) in table {
+            if members.contains(ppid) {
+                members.insert(*pid);
+            }
+        }
+        if members.len() == before {
+            break;
+        }
+    }
+    let mut out: Vec<u32> = members.into_iter().collect();
+    out.sort_unstable();
+    out
 }
 
 /// The cap a fleet with `memory_mb` would run under, before it is recorded.
@@ -284,6 +354,8 @@ pub struct Guard {
     applied: Option<Option<u64>>,
     /// Pressure with nothing to stop has been reported this streak.
     stuck_reported: bool,
+    /// When the guard last stopped a build, for [`KILL_COOLDOWN`].
+    last_kill: Option<std::time::Instant>,
 }
 
 impl Guard {
@@ -327,8 +399,9 @@ impl Guard {
             self.stuck_reported = false;
             return None;
         }
+        let over_own_cap = matches!(cap, Cap::Fixed(bytes) if under_pressure(used, bytes));
         let why = match cap {
-            Cap::Fixed(bytes) if under_pressure(used, bytes) => format!(
+            Cap::Fixed(bytes) if over_own_cap => format!(
                 "panes at {} of their {} cap",
                 show_bytes(used),
                 show_bytes(bytes)
@@ -339,8 +412,28 @@ impl Guard {
                 show_bytes(total)
             ),
         };
-        match victim(&procs) {
-            Some(v) if unix::kill_bound(v.pid, v.start) => {
+        self.relieve(victim(&procs), !over_own_cap, &why, |v| {
+            unix::kill_bound(v.pid, v.start)
+        })
+    }
+
+    /// Stop `candidate` if [`may_kill`] allows it, or report — once per
+    /// streak — that nothing in the session is worth stopping. Silent during the
+    /// cooldown after a kill, while its effect shows up.
+    fn relieve(
+        &mut self,
+        candidate: Option<&Member>,
+        machine_driven: bool,
+        why: &str,
+        kill: impl FnOnce(&Member) -> bool,
+    ) -> Option<String> {
+        let since = self.last_kill.map(|t| t.elapsed());
+        if since.is_some_and(|d| d < KILL_COOLDOWN) {
+            return None;
+        }
+        match candidate {
+            Some(v) if may_kill(v.private, machine_driven, since) && kill(v) => {
+                self.last_kill = Some(std::time::Instant::now());
                 self.stuck_reported = false;
                 Some(format!(
                     "memory guard: stopped {} (pid {}, {}) — {why}",
@@ -351,7 +444,9 @@ impl Guard {
             }
             _ if !self.stuck_reported => {
                 self.stuck_reported = true;
-                Some(format!("memory guard: {why} and no build to stop"))
+                Some(format!(
+                    "memory guard: {why}, and nothing in the session is worth stopping"
+                ))
             }
             _ => None,
         }
@@ -384,33 +479,21 @@ impl Guard {
             self.stuck_reported = false;
             return None;
         }
+        // The panes' own fixed cap is binding (not the machine's reserve) when the
+        // limit IS that cap.
+        let over_own_cap = matches!(cap, Cap::Fixed(bytes) if limit >= bytes);
+        let why = format!(
+            "panes at {} of their {} limit",
+            show_bytes(used),
+            show_bytes(limit)
+        );
         // The kill re-checks membership and the build image through the handle it
         // kills with, so a victim that exited and had its pid recycled is safe.
-        match victim(&members) {
-            // Same predicate the victim was chosen by: a narrower one here would
-            // pick a linker and then refuse to stop it.
-            Some(v) if job.terminate_member(v.pid, &is_victim_image) => {
-                self.stuck_reported = false;
-                Some(format!(
-                    "memory guard: stopped {} (pid {}, {}) — panes at {} of their {} limit",
-                    image_file(&v.image),
-                    v.pid,
-                    show_bytes(v.private),
-                    show_bytes(used),
-                    show_bytes(limit)
-                ))
-            }
-            _ if !self.stuck_reported => {
-                self.stuck_reported = true;
-                Some(format!(
-                    "memory guard: panes at {} of their {} limit and no build to stop — \
-                     agents may start failing allocations",
-                    show_bytes(used),
-                    show_bytes(limit)
-                ))
-            }
-            _ => None,
-        }
+        // Same predicate the victim was chosen by: a narrower one here would pick
+        // a linker and then refuse to stop it.
+        self.relieve(victim(&members), !over_own_cap, &why, |v| {
+            job.terminate_member(v.pid, &is_victim_image)
+        })
     }
 }
 
@@ -449,14 +532,14 @@ mod unix {
     #[allow(unused_imports)]
     use core::ffi::{c_long, c_void};
 
-    /// Linux: every process whose session is one of the panes'.
+    /// Linux: every process belonging to the panes ([`super::pane_members`]).
     #[cfg(target_os = "linux")]
     pub fn pane_processes(panes: &[u32]) -> Option<Vec<Member>> {
         if panes.is_empty() {
             return Some(Vec::new());
         }
         let page = page_size();
-        let mut out = Vec::new();
+        let mut stats = Vec::new();
         for entry in std::fs::read_dir("/proc").ok()?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -469,19 +552,27 @@ mod unix {
             let Ok(text) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
                 continue;
             };
-            let Some((session, start, rss_pages, comm)) = super::parse_stat(&text) else {
-                continue;
-            };
-            if panes.contains(&session) {
-                out.push(Member {
-                    pid,
-                    private: rss_pages.saturating_mul(page),
-                    image: comm,
-                    start,
-                });
+            if let Some(stat) = super::parse_stat(&text) {
+                stats.push((pid, stat));
             }
         }
-        Some(out)
+        let table: Vec<(u32, (u32, u32))> = stats
+            .iter()
+            .map(|(pid, s)| (*pid, (s.ppid, s.session)))
+            .collect();
+        let members = super::pane_members(&table, panes);
+        Some(
+            stats
+                .into_iter()
+                .filter(|(pid, _)| members.binary_search(pid).is_ok())
+                .map(|(pid, s)| Member {
+                    pid,
+                    private: s.rss_pages.saturating_mul(page),
+                    image: s.comm,
+                    start: s.start,
+                })
+                .collect(),
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -623,13 +714,23 @@ mod unix {
         if n <= 0 {
             return None;
         }
-        let mut out = Vec::new();
+        // First pass: parent and session for every process, so a descendant that
+        // left its pane's session is still attributed by parent link.
+        let mut table: Vec<(u32, (u32, u32))> = Vec::new();
         for &pid in &pids[..(n as usize).min(pids.len())] {
             // SAFETY: a read-only query on a pid.
             let sid = unsafe { getsid(pid) };
-            if sid < 0 || !panes.contains(&(sid as u32)) {
+            let Some(ppid) = crate::orphan::parent_pid(pid as u32) else {
                 continue;
+            };
+            if sid >= 0 {
+                table.push((pid as u32, (ppid, sid as u32)));
             }
+        }
+        let members = super::pane_members(&table, panes);
+        let mut out = Vec::new();
+        for &pid in &members {
+            let pid = pid as i32;
             // SAFETY: all-integer struct, so zeroed is valid; the call writes at
             // most `size` bytes and a short write is rejected below.
             let mut info: ProcTaskInfo = unsafe { core::mem::zeroed() };
@@ -969,6 +1070,55 @@ mod tests {
         assert_eq!(status.and_then(|s| s.signal()), Some(9));
     }
 
+    /// Linux, live: a build that `setsid`s itself out of the pane's session is
+    /// still found, by parent link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_setsid_build_inside_a_pane_is_still_found() {
+        use std::os::unix::process::CommandExt;
+        let dir =
+            std::env::temp_dir().join(format!("atrium-memguard-setsid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("rustc");
+        std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+        let mut pane = std::process::Command::new("/bin/sh");
+        pane.args(["-c", &format!("setsid '{}' 30 & wait", fake.display())]);
+        // SAFETY: setsid is async-signal-safe and touches no Rust state.
+        unsafe {
+            pane.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                if setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut pane = pane.spawn().expect("spawn pane");
+        let pane_pid = pane.id();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let procs = unix::pane_processes(&[pane_pid]).expect("scan");
+        let build = procs.iter().find(|m| m.image == "rustc").cloned();
+        if let Some(b) = &build {
+            let _ = unix::kill_bound(b.pid, b.start);
+        }
+        let _ = pane.kill();
+        let _ = pane.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+        let build = build.expect("the setsid'd build must still be attributed to the pane");
+        let own_session = std::fs::read_to_string(format!("/proc/{}/stat", build.pid))
+            .ok()
+            .and_then(|t| parse_stat(&t))
+            .map(|s| s.session);
+        assert_ne!(
+            own_session,
+            Some(pane_pid),
+            "it really left the pane's session"
+        );
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unix_memory_reads_a_plausible_budget() {
@@ -977,6 +1127,44 @@ mod tests {
             total > GIB / 4 && available <= total,
             "{total} / {available}"
         );
+    }
+
+    /// Review: outside pressure made the guard kill the session's next build
+    /// every tick. A kill now waits out a cooldown, and machine-wide pressure
+    /// doesn't stop a build too small to relieve it.
+    #[test]
+    fn the_guard_neither_thrashes_nor_kills_what_cannot_help() {
+        use std::time::Duration;
+        let big = 2 * GIB;
+        let small = 50 * MIB;
+        // Machine-wide pressure: only a build big enough to matter.
+        assert!(may_kill(big, true, None));
+        assert!(!may_kill(small, true, None));
+        // The panes over their own cap: any build, however small.
+        assert!(may_kill(small, false, None));
+        // Within the cooldown nothing is stopped, whatever the cause.
+        assert!(!may_kill(big, true, Some(Duration::from_secs(5))));
+        assert!(!may_kill(small, false, Some(Duration::from_secs(29))));
+        assert!(may_kill(big, true, Some(KILL_COOLDOWN)));
+    }
+
+    /// Review: a descendant that calls setsid() left the pane's session and
+    /// became invisible. Parent links keep it attributed to its pane.
+    #[test]
+    fn a_resessioned_descendant_still_belongs_to_its_pane() {
+        // pid -> (ppid, session). Pane 100 leads session 100.
+        let table = [
+            (100, (1, 100)),   // the pane
+            (101, (100, 100)), // an agent in it
+            (102, (101, 102)), // setsid() build wrapper: its own session now
+            (103, (102, 102)), // the build under it
+            (200, (1, 200)),   // an unrelated session
+            (201, (200, 200)),
+        ];
+        let mut got = pane_members(&table, &[100]);
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 101, 102, 103]);
+        assert!(pane_members(&table, &[999]).is_empty());
     }
 
     #[test]
@@ -1013,13 +1201,20 @@ mod tests {
         // Real shape of /proc/<pid>/stat: pid (comm) state ppid pgrp session ...
         let mut fields: Vec<String> = (3..=52).map(|n| n.to_string()).collect();
         fields[0] = "S".into(); // field 3
+        fields[1] = "77".into(); // field 4: ppid
         fields[3] = "4242".into(); // field 6: session
         fields[19] = "987654".into(); // field 22: starttime
         fields[21] = "2560".into(); // field 24: rss pages
         let line = format!("1234 (evil) (rustc x) {}", fields.join(" "));
         assert_eq!(
             parse_stat(&line),
-            Some((4242, 987654, 2560, "evil) (rustc x".to_string()))
+            Some(Stat {
+                ppid: 77,
+                session: 4242,
+                start: 987654,
+                rss_pages: 2560,
+                comm: "evil) (rustc x".to_string(),
+            })
         );
         assert_eq!(parse_stat("garbage"), None);
     }

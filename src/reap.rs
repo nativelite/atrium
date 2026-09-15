@@ -73,8 +73,14 @@ mod sys {
     }
 
     pub fn pid_alive(pid: u32) -> bool {
+        // A pid above i32::MAX would cast negative, and a negative `kill` target
+        // is a process GROUP — answering a different question entirely. No
+        // kernel hands out such a pid, so it is simply not alive.
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
         // SAFETY: signal 0 sends nothing; this is a liveness probe.
-        pid != 0 && unsafe { kill(pid as i32, 0) == 0 }
+        unsafe { kill(pid as i32, 0) == 0 }
     }
 
     extern "C" {

@@ -735,9 +735,12 @@ mod tests {
     #[test]
     fn a_dead_sessions_fifo_is_swept_and_a_live_one_kept() {
         let dir = std::env::temp_dir();
+        // A pid that is positive as an i32 but above every kernel's pid_max
+        // (Linux 2^22, macOS 99999), so `kill(pid, 0)` really asks "is there such
+        // a process". `u32::MAX - 7` cast to -8, which probes process GROUP 8.
         let dead = dir.join(format!(
             "atrium-build-{}-00ff00ff00ff00ff.fifo",
-            u32::MAX - 7
+            999_999_937u32
         ));
         let live = dir.join(format!(
             "atrium-build-{}-00ff00ff00ff00fe.fifo",

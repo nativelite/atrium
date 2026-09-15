@@ -825,6 +825,13 @@ pub fn start_token(_pid: u32) -> Option<u64> {
     None
 }
 
+/// The parent pid of `pid`, or `None` if it can't be read. Same source as
+/// [`start_token`] (`proc_pidinfo` on macOS, `/proc/<pid>/stat` elsewhere).
+#[cfg(unix)]
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    proc_ids(pid).map(|(ppid, _, _)| ppid)
+}
+
 #[cfg(not(unix))]
 fn proc_ids(_pid: u32) -> Option<(u32, u32, u64)> {
     None
