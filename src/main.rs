@@ -144,6 +144,10 @@ const SYNC_END: &[u8] = b"\x1b[?2026l";
 /// the pane has no more data, so this cap only matters on a genuine flood.
 const DRAIN_READS_PER_TICK: usize = 64;
 
+/// How long exit waits for the terminal to take atrium's last output (the
+/// screen restore) before leaving anyway.
+const SCREEN_FINISH: Duration = Duration::from_secs(3);
+
 /// Draw the animated startup splash for a passthrough pane that has not painted
 /// yet — a centered `a t r i u m` wordmark and a spinner, so the agent's boot reads
 /// as *loading*, not a hang. Written straight to the terminal and wrapped in
@@ -963,8 +967,14 @@ fn run(
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
     set_trust_mode(trust);
-    let mut out = std::io::stdout();
+    // The terminal as a queue: a terminal that stops reading must not stop the
+    // loop — keys, pane draining, ctl and the safety net all run on. See
+    // `atrium::screen`; the view is repainted whole once it catches up.
+    let mut out = atrium::screen::Screen::stdout();
     let (mut rows, mut cols) = term.size().unwrap_or((24, 80));
+    // Resizes are read from a watcher thread: on Windows the size query itself
+    // blocks while the terminal isn't reading (see `SizeWatch`).
+    let size_watch = atrium::screen::SizeWatch::start((rows, cols));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
     // passthrough stream can never push the bar away.
     let _ = write!(out, "\x1b[?1049h\x1b[2J\x1b[H\x1b[1;{}r", rows - 1);
@@ -1043,6 +1053,7 @@ fn run(
         Ok(w) => windows.push(w),
         Err(e) => {
             cleanup_screen(&mut out);
+            out.finish(SCREEN_FINISH);
             eprintln!("atrium: cannot start {:?}: {e}", command[0]);
             return ExitCode::FAILURE;
         }
@@ -1427,7 +1438,7 @@ fn run(
         // 5. resize propagation
         if last_size_check.elapsed() >= Duration::from_millis(150) {
             last_size_check = Instant::now();
-            if let Ok((r, c)) = term.size() {
+            if let Some((r, c)) = size_watch.latest() {
                 // Windows Terminal's ConPTY reports a few rows FEWER once atrium is
                 // in the alternate screen buffer (a persistent reservation), and
                 // adopting it makes atrium redraw short — leaving a strip of stale
@@ -1561,6 +1572,24 @@ fn run(
             adopt_sessions(&mut windows, &world);
         }
 
+        // 5d. The terminal fell behind, output was discarded, and it has now
+        //     caught up: what it shows is stale, so repaint the whole view from
+        //     the emulators — the scroll region, the focused passthrough pane,
+        //     and (via reset + force_repaint) the tiled frame, any overlay and
+        //     the bar. The mouse-off assertion may have been discarded too.
+        if out.take_resync() {
+            let _ = write!(out, "\x1b[1;{}r\x1b[2J\x1b[H", rows - 1);
+            if !views.any() && !windows[active].tiled() {
+                let fp = windows[active].tree.focus();
+                if windows[active].pane(fp).is_some_and(|p| p.painted) {
+                    repaint_focused(&mut windows[active], rows, cols, &mut out);
+                }
+            }
+            outer_mouse_off = false;
+            renderer.reset();
+            force_repaint = true;
+        }
+
         // 6-7. paint the active window and the bar as one synchronized frame.
         renderer.paint(
             &mut windows,
@@ -1579,6 +1608,8 @@ fn run(
             &mut out,
         );
         force_repaint = false;
+        // Hand anything a phase wrote without flushing to the terminal this tick.
+        let _ = out.flush();
     }
 
     let dbg = std::env::var_os("ATRIUM_DEBUG").is_some();
@@ -1663,6 +1694,9 @@ fn run(
         eprint!("[atrium-dbg killed]\r\n");
     }
     cleanup_screen(&mut out);
+    // Deliver the restore before the process exits and takes the writer thread
+    // with it — bounded, so a terminal that never reads can't hold atrium open.
+    out.finish(SCREEN_FINISH);
     if dbg {
         eprint!("[atrium-dbg cleaned]\r\n");
     }

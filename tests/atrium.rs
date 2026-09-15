@@ -655,6 +655,129 @@ fn a_plain_start_shows_the_logo_before_the_shell() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
+/// **A terminal that stops reading freezes nothing but its own view.**
+///
+/// The test stops reading atrium's screen while a pane floods output, so every
+/// frame atrium writes backs up. atrium must keep draining the pane (the flood
+/// finishes and the shell writes a file after it), and once the terminal reads
+/// again the screen must come back and stay live.
+///
+/// Unix also types a command blind while nothing is read: keys are independent
+/// of output there. Windows can't be asked that: the console host that stopped
+/// delivering output stops delivering input too (measured: atrium's loop kept
+/// ticking, no key arrived until the terminal read again).
+#[test]
+fn a_terminal_that_stops_reading_freezes_nothing_but_the_view() {
+    let dir = std::env::temp_dir().join(format!("atrium-unread-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let flooded = dir.join("flooded.txt");
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
+    let prompt: &[u8] = if cfg!(windows) { b"Microsoft" } else { b"$ " };
+    let out = read_until(&mut p, prompt, Duration::from_secs(15));
+    assert!(
+        contains(&out, prompt),
+        "no shell: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A flood that records when it is done, typed while the terminal still
+    // reads; then the terminal stops reading entirely.
+    let fpath = flooded.display().to_string();
+    let (flood, last_line) = if cfg!(windows) {
+        (
+            format!(
+                "(for /L %i in (1,1,10000) do @echo flood-line-%i) & echo done> \"{fpath}\"\r\n"
+            ),
+            "flood-line-10000",
+        )
+    } else {
+        (
+            format!(
+                "i=1; while [ $i -le 200000 ]; do echo flood-line-$i; i=$((i+1)); done; \
+                 echo done > '{fpath}'\r\n"
+            ),
+            "flood-line-200000",
+        )
+    };
+    p.write(flood.as_bytes()).unwrap();
+    let done_within = |path: &std::path::Path, secs: u64| {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if std::fs::read_to_string(path)
+                .is_ok_and(|t| t.contains("done") || t.contains("alive"))
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    };
+    let drained = done_within(&flooded, 90);
+
+    #[cfg(unix)]
+    let keys = {
+        let alive = dir.join("alive.txt");
+        p.write(format!("echo alive > '{}'\r\n", alive.display()).as_bytes())
+            .unwrap();
+        done_within(&alive, 30)
+    };
+
+    // Read again: the screen has to come back, and stay live.
+    let mut buf = [0u8; 8192];
+    let mut resumed = Vec::new();
+    let settle = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settle {
+        if let Ok(Some(n)) = p.read_timeout(&mut buf, Duration::from_millis(100)) {
+            resumed.extend_from_slice(&buf[..n]);
+        }
+    }
+    // Written so the typed line itself can't satisfy the match.
+    let live: &[u8] = if cfg!(windows) {
+        b"echo resync^-ok-7\r\n"
+    } else {
+        b"m=resync; echo \"$m-ok-7\"\r\n"
+    };
+    p.write(live).unwrap();
+    let back = read_until(&mut p, b"resync-ok-7", Duration::from_secs(20));
+    p.write(b"\x01q").unwrap();
+    let code = wait_exit(&mut p, 30);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        drained,
+        "the pane's flood never finished while the screen was unread: atrium stopped draining it"
+    );
+    #[cfg(unix)]
+    assert!(
+        keys,
+        "a command typed while the screen was unread never ran: atrium stopped taking keys"
+    );
+    assert!(
+        contains(&resumed, last_line.as_bytes()),
+        "the screen did not come back with the pane's current content: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(
+            &resumed[resumed.len().saturating_sub(3000)..]
+        ))
+    );
+    assert!(
+        contains(&back, b"resync-ok-7"),
+        "the screen is not live after resuming: {:?}",
+        String::from_utf8_lossy(&back)
+    );
+    assert_eq!(code, 0);
+}
+
 /// Interactive session: keystrokes reach the hosted shell through atrium,
 /// its response comes back, the bar is painted, and Ctrl+A q quits.
 #[test]

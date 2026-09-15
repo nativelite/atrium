@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still launches. `ctl spawn` still refuses past the cap at runtime.
 
 ### Fixed
+- **A terminal that stops reading no longer freezes atrium.** atrium wrote
+  every frame straight to the terminal from its run loop, and asked the
+  terminal's size from it too. When the terminal stopped reading (a wedged or
+  suspended terminal, a console with a QuickEdit selection held), both
+  blocked, and so did everything else: pane output stopped being drained (so
+  the panes blocked on their own output), keys stopped reaching the panes, and
+  ctl went unanswered. Output now goes through a queue written on its own
+  thread, and the size is polled on another. If the terminal falls 256 KiB
+  behind, output is discarded rather than replayed stale, and the whole view is
+  repainted from the panes' emulators once the terminal catches up. Linux and
+  macOS keep taking keys throughout. Windows can't: the console host that stops
+  delivering output stops delivering keys too, so keys resume when the terminal
+  does. Needs `nativelite-rawterm` with `rawterm::size`.
 - **The startup logo shows on a plain `atrium`.** The hosted shell prints its
   prompt within milliseconds, and the splash used to hand off on that first
   output, so the logo was never drawn, or was wiped ~20 ms later. The logo now
