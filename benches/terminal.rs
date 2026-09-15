@@ -15,12 +15,14 @@
 //! - Flood: a pane prints a deterministic, agent-style log file (coloured test
 //!   output); time from launch until every pane exits, as MB/s. The pane blocks
 //!   when atrium falls behind, so this is atrium's end-to-end consumption rate.
+//! - Feed: the same log fed straight into one `vterm::Term`, in process: the
+//!   emulator's own cost, separated from ptys, threads and the loop.
 //!
 //! Knobs (environment):
 //! - `ATRIUM_BENCH_SAMPLES` (key echoes per scenario, default 100)
 //! - `ATRIUM_BENCH_IDLE_S` (idle window, default 10)
 //! - `ATRIUM_BENCH_FLOOD_MB` (per pane, default 16)
-//! - `ATRIUM_BENCH_ONLY` (`latency`, `idle` or `flood`)
+//! - `ATRIUM_BENCH_ONLY` (`latency`, `idle`, `feed` or `flood`)
 
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
@@ -83,6 +85,28 @@ fn main() {
                 Some(pct) => println!("| {label} | {pct:.2} |"),
                 None => println!("| {label} | unavailable on this platform |"),
             }
+        }
+        println!();
+    }
+    if wants("feed") {
+        println!("## Emulator feed ({flood_mb} MB into one vterm::Term, in process)\n");
+        println!("| grid | seconds | MB/s |");
+        println!("| --- | --- | --- |");
+        let file = flood_file(flood_mb);
+        let bytes = std::fs::read(&file).expect("read flood file");
+        let _ = std::fs::remove_file(&file);
+        for (rows, cols) in [(24usize, 80usize), (40, 160), (60, 240)] {
+            let mut term = vterm::Term::new(rows, cols);
+            let start = Instant::now();
+            // Chunked the way a pane reader delivers output.
+            for chunk in bytes.chunks(8192) {
+                term.feed(chunk);
+            }
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "| {rows}x{cols} | {secs:.2} | {:.1} |",
+                flood_mb as f64 / secs
+            );
         }
         println!();
     }
