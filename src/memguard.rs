@@ -35,6 +35,11 @@ pub const ENV_MEMORY_MB: &str = "ATRIUM_MEMORY_MB";
 pub const PRESSURE_PERCENT: u64 = 90;
 /// The smallest reserve kept free for the rest of the machine.
 const MIN_RESERVE: u64 = 2 * GIB;
+/// The lowest limit ever set. Without a floor, an empty job on a machine
+/// already inside its reserve computes a limit of 0, and the next pane can't
+/// commit a byte. A fixed floor (not headroom over current use) leaves room to
+/// start panes without letting a busy session creep upward tick by tick.
+const MIN_LIMIT: u64 = GIB;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
@@ -81,12 +86,46 @@ pub fn reserve(commit_limit: u64) -> u64 {
 /// The job memory limit to set, or `None` for no limit. `job_used` is the panes'
 /// committed memory now; `commit_limit` / `commit_available` are the machine's.
 pub fn job_limit(cap: Cap, job_used: u64, commit_limit: u64, commit_available: u64) -> Option<u64> {
-    let dynamic = job_used.saturating_add(commit_available.saturating_sub(reserve(commit_limit)));
+    // The floor is on the dynamic term only: it stops the machine-derived limit
+    // collapsing to 0, while an operator's explicit cap is honoured as given.
+    let dynamic = job_used
+        .saturating_add(commit_available.saturating_sub(reserve(commit_limit)))
+        .max(MIN_LIMIT);
     match cap {
         Cap::Off => None,
         Cap::Dynamic => Some(dynamic),
         Cap::Fixed(bytes) => Some(bytes.min(dynamic)),
     }
+}
+
+/// Whether a process may be stopped to relieve pressure: anything a build runs
+/// — cargo and its compilers ([`crate::buildpool::is_build_image`]) plus the
+/// linkers and C/C++ compilers they drive, since the link step is often the
+/// single largest process in a build. Never an agent, a shell or a tool.
+pub fn is_victim_image(name: &str) -> bool {
+    if crate::buildpool::is_build_image(name) {
+        return true;
+    }
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let lower = file.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    matches!(
+        stem,
+        "link"
+            | "lld-link"
+            | "rust-lld"
+            | "ld"
+            | "ld.lld"
+            | "ld64.lld"
+            | "mold"
+            | "cl"
+            | "cc"
+            | "c++"
+            | "gcc"
+            | "g++"
+            | "clang"
+            | "clang++"
+    )
 }
 
 /// Whether `used` has reached [`PRESSURE_PERCENT`] of `limit`.
@@ -104,12 +143,13 @@ pub struct Member {
     pub image: String,
 }
 
-/// The process to stop under pressure: the largest build process. `None` when
-/// no build is running — agents and shells are never chosen.
+/// The process to stop under pressure: the largest build process
+/// ([`is_victim_image`]). `None` when no build is running — agents and shells
+/// are never chosen.
 pub fn victim(members: &[Member]) -> Option<&Member> {
     members
         .iter()
-        .filter(|m| crate::buildpool::is_build_image(&m.image))
+        .filter(|m| is_victim_image(&m.image))
         .max_by_key(|m| m.private)
 }
 
@@ -206,7 +246,9 @@ impl Guard {
         // The kill re-checks membership and the build image through the handle it
         // kills with, so a victim that exited and had its pid recycled is safe.
         match victim(&members) {
-            Some(v) if job.terminate_member(v.pid, &crate::buildpool::is_build_image) => {
+            // Same predicate the victim was chosen by: a narrower one here would
+            // pick a linker and then refuse to stop it.
+            Some(v) if job.terminate_member(v.pid, &is_victim_image) => {
                 self.stuck_reported = false;
                 Some(format!(
                     "memory guard: stopped {} (pid {}, {}) — panes at {} of their {} limit",
@@ -289,6 +331,77 @@ mod tests {
             job_limit(Cap::Dynamic, 3 * GIB, 69 * GIB, GIB),
             Some(3 * GIB)
         );
+    }
+
+    /// Review #1: an empty job on a machine already inside its reserve used to
+    /// compute a limit of 0, so the next pane couldn't commit a byte. The floor
+    /// keeps room to start panes without letting a busy session creep upward.
+    #[test]
+    fn the_limit_never_collapses_below_the_floor() {
+        assert_eq!(job_limit(Cap::Dynamic, 0, 69 * GIB, GIB), Some(MIN_LIMIT));
+        // A fixed cap on a machine inside its reserve is bounded by the floored
+        // dynamic limit, not by 0.
+        assert_eq!(
+            job_limit(Cap::Fixed(8 * GIB), 0, 69 * GIB, GIB),
+            Some(MIN_LIMIT)
+        );
+        // An operator's explicit cap below the floor is honoured as given.
+        assert_eq!(
+            job_limit(Cap::Fixed(64 * MIB), 0, 69 * GIB, 50 * GIB),
+            Some(64 * MIB)
+        );
+        // Above the floor, pressure still pins the limit to what's in use: no
+        // per-tick headroom for a busy session to grow into.
+        assert_eq!(
+            job_limit(Cap::Dynamic, 20 * GIB, 69 * GIB, GIB),
+            Some(20 * GIB)
+        );
+        assert!(!under_pressure(0, MIN_LIMIT));
+    }
+
+    /// Review #2: the link step is often the largest process in a build, and a
+    /// guard that can't pick it does nothing exactly when a link OOMs.
+    #[test]
+    fn linkers_and_c_compilers_can_be_the_victim() {
+        for image in [
+            r"C:\VS\link.exe",
+            "lld-link.exe",
+            "rust-lld",
+            "ld",
+            "ld.lld",
+            "mold",
+            "cl.exe",
+            "cc",
+            "gcc",
+            "g++",
+            "clang",
+            "clang++.exe",
+            "rustc.exe",
+        ] {
+            assert!(is_victim_image(image), "{image}");
+        }
+        for image in [
+            "claude.exe",
+            "node",
+            "powershell.exe",
+            "cmd.exe",
+            "linker-notes",
+        ] {
+            assert!(!is_victim_image(image), "{image}");
+        }
+        let members = vec![
+            Member {
+                pid: 1,
+                private: 3 * GIB,
+                image: r"C:\rust\rustc.exe".into(),
+            },
+            Member {
+                pid: 2,
+                private: 6 * GIB,
+                image: r"C:\VS\link.exe".into(),
+            },
+        ];
+        assert_eq!(victim(&members).map(|v| v.pid), Some(2));
     }
 
     #[test]
