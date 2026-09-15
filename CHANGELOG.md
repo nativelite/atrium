@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-09-15
+
 ### Added
 - **One shared compile pool per session.** Every pane now gets
   `CARGO_MAKEFLAGS` pointing at a jobserver atrium owns, so all the agents'
@@ -18,8 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The fleet banner states the budget. An agent's `-j` or `CARGO_BUILD_JOBS`
   can't get past the pool. A session inside another atrium's pane shares the
   outer pool, and tokens lost when a build is killed are restored once no
-  build is running. Windows uses a named semaphore; unix uses a FIFO, which
-  is compiled but not yet run on a unix host.
+  build is running. Windows uses a named semaphore and unix a FIFO; cargo was
+  measured obeying both (a pool of N allows N + 1 jobs per cargo).
 - **A memory guard for everything the panes run (Windows).** atrium puts a
   commit limit on the session Job Object every pane runs in; atrium itself is
   not in the job, so it keeps running when the panes hit the limit. The
@@ -27,12 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commit, minus a reserve, recomputed every 3 seconds, so a session can never
   be what exhausts the machine. A fleet's `memory_mb` or `ATRIUM_MEMORY_MB`
   sets a fixed ceiling (`0`/`off` disables it). At 90% the guard stops the
-  largest build process, never an agent, and raises it on the bus and the bar.
+  largest build process (a compiler, linker or build script, never an agent),
+  raises it on the bus and the bar, and then waits 30 seconds before stopping
+  another. Under machine-wide pressure a build under 256 MiB isn't stopped,
+  since it can't relieve the machine; a pane over its own fixed cap has no
+  such floor.
   The kill checks job membership and the image through the same handle it
   terminates with, so a recycled pid is never hit.
 - **A soft memory guard on Linux and macOS.** Unix has no Job Object, so the
-  guard watches instead of capping. It finds each pane's processes by session,
-  and when available memory drops into the reserve or the panes reach a fixed
+  guard watches instead of capping. It finds each pane's processes by session
+  and by parent link (so a child that called `setsid()` still counts), and
+  when available memory drops into the reserve or the panes reach a fixed
   `memory_mb`, it stops the largest build with a kill bound to the process's
   start time (a pidfd on Linux). On Linux every build also gets a raised
   `oom_score_adj`, so the kernel's OOM killer takes a build before atrium or the
@@ -82,7 +89,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on an open dialog never drains its queue. Each target now holds at most 32.
   Past that, `ctl send` returns an error telling the sender to check `ctl
   status`, and a bus `--to` wake is skipped (the message stays on the bus).
-- **Transcript tailing is bounded more tightly** (agsess): an endless line can't
+- **Transcript tailing is bounded more tightly** (`nativelite-agsess` 0.2.1): an endless line can't
   grow a session's buffer, and the largest single read is 4 MiB instead of
   16 MiB. That 16 MiB read was the allocation that aborted atrium when a
   fleet's parallel builds exhausted system memory.
@@ -1222,7 +1229,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.32.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.33.0...HEAD
+[0.33.0]: https://github.com/nativelite/atrium/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/nativelite/atrium/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/nativelite/atrium/compare/v0.30.3...v0.31.0
 [0.3.0]: https://github.com/nativelite/atrium/compare/v0.2.1...v0.3.0
