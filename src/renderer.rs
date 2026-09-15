@@ -19,6 +19,45 @@ use atrium::select::Selection;
 /// already up for seconds. A pane that exits during the hold ends it at once.
 pub(crate) const SPLASH_MIN: Duration = Duration::from_millis(1200);
 
+/// How long a pane must be quiet before the bar is repaired (see
+/// [`bar_refresh_due`]). Comfortably longer than the console host's ~16 ms
+/// frame, and short enough that a damaged bar is fixed before you notice.
+const BAR_QUIET: Duration = Duration::from_millis(150);
+/// The least time between two repairs.
+const BAR_REFRESH: Duration = Duration::from_millis(500);
+
+/// Whether to repaint the bar with bytes **identical** to what is already on
+/// screen — a repair, not a change. A changed bar always paints at once; the
+/// caller compares the bytes first.
+///
+/// Every write atrium makes opens a ~16 ms frame window in the Windows console
+/// host, and a key that echoes inside that window waits for the window to close.
+/// So a no-op repaint is not free: it is a 16 ms keystroke for whoever types
+/// next. Measured with a relay (a pty inside a pty, no atrium) that echoed keys
+/// at p99 0.17 ms while silent: repainting a bar on a 500 ms timer with nothing
+/// to say took it to p99 8.7 ms, and on a 20 ms timer to a p50 of 12 ms. That
+/// was the whole of atrium's Windows-only ~16 ms echo outliers.
+///
+/// The repair is worth one write only after a pane has actually printed
+/// something *and then gone quiet* for [`BAR_QUIET`]:
+/// - Nothing printed ⇒ nothing can have damaged the bar. Idle ⇒ silent.
+/// - Still printing ⇒ wait. The bar would only be damaged again, the host is
+///   busy anyway, and this is exactly when a keystroke is waiting on a frame.
+/// - The command prompt owns the bar row while it is open, so never then.
+///
+/// The damage this repairs is narrow by construction: the pane is a row shorter
+/// than the screen and runs under a scroll region, so its output cannot push the
+/// bar away, and a full-screen erase (`2J`/`3J`), which ignores the region, is
+/// already caught by the drain and forces a repaint.
+pub(crate) fn bar_refresh_due(
+    no_prompt: bool,
+    output_since_bar: bool,
+    since_output: Duration,
+    since_bar: Duration,
+) -> bool {
+    no_prompt && output_since_bar && since_output >= BAR_QUIET && since_bar >= BAR_REFRESH
+}
+
 /// What the paint remembers between ticks.
 pub(crate) struct Renderer {
     /// Animation clock for the per-pane loading spinner (advances ~8 frames/sec).
@@ -38,6 +77,12 @@ pub(crate) struct Renderer {
     last_tiled_spin: usize,
     last_bar: String,
     last_bar_paint: Instant,
+    /// Whether a pane has written anything since the bar was last painted — the
+    /// only case where the bar can have been clobbered. See
+    /// [`bar_refresh_due`].
+    output_since_bar: bool,
+    /// When a pane last wrote, so the repair waits for it to go quiet.
+    last_pane_output: Instant,
     /// The previous composited master, kept per-frame so tiled mode diffs. Reset
     /// to None (full repaint) on mode/layout/window changes.
     prev_master: Option<ansi::Screen>,
@@ -65,6 +110,8 @@ impl Renderer {
             last_tiled_spin: usize::MAX,
             last_bar: String::new(),
             last_bar_paint: Instant::now(),
+            output_since_bar: false,
+            last_pane_output: Instant::now(),
             prev_master: None,
             tiled_buf: None,
             last_view: (usize::MAX, false, usize::MAX, false, false, false, 0, 0),
@@ -108,6 +155,7 @@ impl Renderer {
         flash: &mut Option<(String, Instant)>,
         mut force_repaint: bool,
         tiled_dirty: bool,
+        pane_output: bool,
         rows: u16,
         cols: u16,
         out: &mut impl std::io::Write,
@@ -296,18 +344,24 @@ impl Renderer {
             bar_paint(&infos, rows, cols as usize, note)
         };
         let mut bar_appended = false;
+        if pane_output {
+            self.output_since_bar = true;
+            self.last_pane_output = Instant::now();
+        }
         if force_repaint
             || splash_drawn
             || painted != self.last_bar
-            // The 500ms periodic refresh keeps the status bar's activity markers
-            // live, but while the command prompt is open it would reflash the
-            // prompt row twice a second — skip it there (the prompt repaints on
-            // keystroke via `painted != last_bar`).
-            || (prompt.is_none() && self.last_bar_paint.elapsed() >= Duration::from_millis(500))
+            || bar_refresh_due(
+                prompt.is_none(),
+                self.output_since_bar,
+                self.last_pane_output.elapsed(),
+                self.last_bar_paint.elapsed(),
+            )
         {
             frame.extend_from_slice(painted.as_bytes());
             self.last_bar = painted;
             self.last_bar_paint = Instant::now();
+            self.output_since_bar = false;
             bar_appended = true;
         }
         // The bar leaves the cursor parked on the bar row. Move it back to the
@@ -338,6 +392,66 @@ impl Renderer {
             let _ = out.write_all(&frame);
             let _ = out.write_all(SYNC_END);
             let _ = out.flush();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // (no_prompt, output_since_bar, ms since output, ms since the bar, want, why).
+    #[test]
+    fn the_bar_is_repaired_only_after_a_pane_printed_and_went_quiet() {
+        let cases: &[(bool, bool, u64, u64, bool, &str)] = &[
+            (true, true, 150, 500, true, "printed, then quiet: repair it"),
+            (true, true, 900, 900, true, "long quiet: repair it"),
+            (
+                true,
+                true,
+                20,
+                900,
+                false,
+                "still printing: the bar would only be damaged again, and a \
+                 keystroke is waiting on the console host's frame",
+            ),
+            (
+                true,
+                true,
+                500,
+                499,
+                false,
+                "repaired recently enough; don't write twice",
+            ),
+            (
+                true,
+                false,
+                5_000,
+                5_000,
+                false,
+                "idle: nothing printed, so nothing can have damaged the bar — \
+                 and an idle write costs the next keystroke ~16 ms on Windows",
+            ),
+            (
+                false,
+                true,
+                5_000,
+                5_000,
+                false,
+                "the command prompt owns the bar row; a repair would reflash it",
+            ),
+        ];
+        for &(no_prompt, output, out_ms, bar_ms, want, why) in cases {
+            assert_eq!(
+                bar_refresh_due(
+                    no_prompt,
+                    output,
+                    Duration::from_millis(out_ms),
+                    Duration::from_millis(bar_ms)
+                ),
+                want,
+                "{why}"
+            );
         }
     }
 }

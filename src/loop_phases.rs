@@ -49,6 +49,9 @@ pub(crate) struct ActiveDrain {
     /// Some pane's emulator changed (collected after all draining, resetting
     /// every pane's flag).
     pub(crate) tiled_dirty: bool,
+    /// Any pane in the active window produced bytes this tick. The bar's timed
+    /// refresh needs this: see [`crate::renderer::bar_refresh_due`].
+    pub(crate) pane_output: bool,
 }
 
 /// Phase 2 of the loop: drain every pane in the active window `w` (all panes are
@@ -64,6 +67,7 @@ pub(crate) fn drain_active_window(
     let tiled = w.tiled();
     let focus = w.tree.focus();
     let mut force_repaint = false;
+    let mut pane_output = false;
     for pane in w.panes.iter_mut() {
         // Drain each active pane *fully* before we composite, so a big data
         // burst (a large `ctl send`, a wall of tool output) is a whole frame
@@ -76,6 +80,7 @@ pub(crate) fn drain_active_window(
         for _ in 0..DRAIN_READS_PER_TICK {
             match pane_read(pane, buf) {
                 Some(n) if n > 0 => {
+                    pane_output = true;
                     // Always feed the emulator so a later switch/split/zoom
                     // renders the current screen without a repaint nudge.
                     pane.term.feed(&buf[..n]);
@@ -149,6 +154,7 @@ pub(crate) fn drain_active_window(
     ActiveDrain {
         force_repaint,
         tiled_dirty,
+        pane_output,
     }
 }
 

@@ -16,6 +16,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - ~16 ms key-echo outliers that occur only on Windows
   - output-flood throughput about 9x below `cat` on Linux
 
+  Both are fixed below. `ATRIUM_BENCH_KEY_GAP_MS` sets the pause between key
+  samples (default 30 ms), because on Windows that pause decides whether the
+  console host's frame cadence dominates the result.
+
+### Fixed
+- **The ~16 ms key-echo stalls on Windows are gone.** Every write atrium makes
+  opens a ~16 ms frame window in the Windows console host, and a key that echoes
+  inside one waits for the window to close — so a repaint that changes nothing
+  costs the next keystroke a frame. atrium was repainting an unchanged status bar
+  twice a second, even sitting idle. Now:
+  - an idle atrium writes **nothing at all** (measured: 18 writes in 3 s → 0),
+  - the bar is repaired only after a pane has printed *and then gone quiet*, and
+  - frames that queue up together (the passthrough drain, then the composite and
+    bar) go out as **one** write instead of one each.
+
+  Measured on Windows with keys 120 ms apart, which is about as fast as a person
+  types: p99 16.1 ms → 1.5 ms, max 16.6 → 1.8 ms, and no stalls at all in 120
+  keys (one pane); eight tiled panes p99 2.4 ms. Typing faster than 30 ms per key
+  still hits the console's own cadence — nothing atrium writes can avoid that,
+  and a bare shell behaves the same way. Linux was never affected and is
+  unchanged.
+
 ### Changed
 - **Output floods run about 4x faster.** The bench pinned the cost on the
   emulator, so the work went into `nativelite-ansi`: a region scroll is now a

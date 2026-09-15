@@ -22,7 +22,15 @@
 //! - `ATRIUM_BENCH_SAMPLES` (key echoes per scenario, default 100)
 //! - `ATRIUM_BENCH_IDLE_S` (idle window, default 10)
 //! - `ATRIUM_BENCH_FLOOD_MB` (per pane, default 16)
+//! - `ATRIUM_BENCH_KEY_GAP_MS` (pause between key samples, default 30)
 //! - `ATRIUM_BENCH_ONLY` (`latency`, `idle`, `feed` or `flood`)
+//!
+//! The key gap matters on Windows, and 30 ms is deliberately hostile: every
+//! write to the console host opens a ~16 ms frame window, and a key that echoes
+//! inside one waits for it to close. At 30 ms between keys — faster than anyone
+//! types — a terminal is never out of its own last frame, so the p90 is the
+//! console's cadence rather than atrium's. Run it at 120 ms for what a person
+//! actually feels.
 
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
@@ -262,9 +270,10 @@ const SETTLE: Duration = Duration::from_secs(4);
 fn key_echo(prog: &str, args: &[String], samples: usize) -> Option<Stats> {
     let mut s = Session::start(prog, args)?;
     s.drain(SETTLE);
+    let gap = Duration::from_millis(env_num("ATRIUM_BENCH_KEY_GAP_MS", 30) as u64);
     let mut lat = Vec::with_capacity(samples);
     for _ in 0..samples {
-        s.drain(Duration::from_millis(30));
+        s.drain(gap);
         let sent = Instant::now();
         s.pty.write(b"z").ok()?;
         let mut seen = Vec::new();

@@ -1606,6 +1606,7 @@ fn run(
             &mut flash,
             force_repaint,
             tiled_dirty,
+            drained.pane_output,
             rows,
             cols,
             &mut out,

@@ -9,7 +9,14 @@ local gate stays fast. Knobs:
 - `ATRIUM_BENCH_SAMPLES` (default 100)
 - `ATRIUM_BENCH_IDLE_S` (default 10)
 - `ATRIUM_BENCH_FLOOD_MB` (default 16)
+- `ATRIUM_BENCH_KEY_GAP_MS` (default 30)
 - `ATRIUM_BENCH_ONLY` (`latency`, `idle`, `feed` or `flood`)
+
+On Windows the key gap decides what the latency numbers measure. Every write to
+the console host opens a ~16 ms frame window, and a key that echoes inside one
+waits for it to close. At the default 30 ms — faster than anyone types — a
+terminal is never clear of its own last frame, so the p90 is the console's
+cadence, not atrium's. Use 120 ms for what a person feels.
 
 ## What `terminal` measures
 
@@ -55,8 +62,7 @@ percentage differences as noise until repeated.
 
 What the baseline shows:
 - **Windows ~16 ms outliers** (p99 with 1 pane, p90 with 8) don't occur on
-  Linux. They come from the Windows console path, not from atrium's loop; under
-  investigation.
+  Linux. Cause found and fixed — see below.
 - **Flood throughput is atrium's bottleneck.** On Linux a pane's output goes
   through atrium about 9x slower than `cat` alone (10.6 vs 99.5 MB/s). With 8
   panes that's about 1.6 MB/s per pane. Fixed since — see below.
@@ -75,6 +81,32 @@ numbers (WSL, same machine):
 | feed, 60x240 | 5.3 | 18.8 | 63.8 MB/s |
 | flood, 1 pane | 10.6 | — | 39-51 MB/s |
 | flood, 8 panes | 12.9 | — | 47.0 MB/s total |
+
+### The Windows ~16 ms echo stalls (unreleased)
+
+They were atrium's own writes. The console host turns each write into a ~16 ms
+frame, and a key echoing inside that frame waits for it. A probe (a pty inside a
+pty, no atrium — a relay that only copies bytes) pinned it down:
+
+| relay behaviour | echo p50 | p99 | max | keys ≥ 8 ms |
+| --- | --- | --- | --- | --- |
+| silent unless echoing | 0.06 | 0.17 | 0.29 | 0 / 150 |
+| repaints a bar every 100 ms | 0.09 | 8.66 | 13.12 | 3 / 150 |
+| repaints a bar every 20 ms | 12.12 | 14.14 | 14.93 | 136 / 150 |
+
+The hop count made no difference; a *periodic write with nothing to say* made all
+of it. atrium was repainting an unchanged bar twice a second. Fixed by writing
+nothing while idle, repairing the bar only after a pane printed and went quiet,
+and coalescing frames queued together into one write. Windows, keys 120 ms apart:
+
+| scenario | p50 ms | p90 ms | p99 ms | max ms |
+| --- | --- | --- | --- | --- |
+| bare cmd | 0.12 | 0.25 | 0.56 | 0.74 |
+| atrium, 1 pane | 0.34 | 0.54 | 1.58 | 1.75 |
+| atrium, 8 tiled panes | 0.80 | 1.74 | 2.38 | 4.10 |
+
+At the default 30 ms gap the stalls still show, for both atrium and a bare
+relay: below about one frame per key, the console host's cadence is the floor.
 
 Feed cost no longer grows with the grid. The flood figure is the range over
 five runs on a busy machine; `cat` measured 85-160 MB/s over the same runs, so

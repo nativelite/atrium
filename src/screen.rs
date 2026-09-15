@@ -78,10 +78,23 @@ impl Screen {
                 let Some(mut sink) = taken.lock().ok().and_then(|mut s| s.take()) else {
                     return;
                 };
-                for chunk in rx {
-                    let _ = sink.write_all(&chunk);
+                // `while let` rather than `for`, so the loop can also take
+                // whatever else is queued (below) without consuming `rx`.
+                while let Ok(chunk) = rx.recv() {
+                    // Take everything already queued and write it once. A tick
+                    // can queue several chunks (the passthrough drain, then the
+                    // composite and bar), and on Windows *every* write to the
+                    // console host opens a ~16 ms frame window in which a key
+                    // echo waits — so the write count, not just the byte count,
+                    // is latency. This never waits for more: it takes only what
+                    // is already there.
+                    let mut batch = chunk;
+                    while let Ok(more) = rx.try_recv() {
+                        batch.extend_from_slice(&more);
+                    }
+                    let _ = sink.write_all(&batch);
                     let _ = sink.flush();
-                    written.fetch_sub(chunk.len(), Ordering::SeqCst);
+                    written.fetch_sub(batch.len(), Ordering::SeqCst);
                 }
                 let _ = done_tx.send(());
             });
@@ -348,6 +361,86 @@ mod tests {
         assert!(before
             .split_terminator(' ')
             .all(|w| w == "frame" || w.len() == 4));
+    }
+
+    /// A sink that keeps each write separate, and blocks in the first one until
+    /// the test lets go — so the test controls what is queued behind it.
+    #[derive(Clone)]
+    struct Batches {
+        open: Arc<(Mutex<bool>, Condvar)>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        blocked: Arc<Mutex<bool>>,
+    }
+
+    impl Batches {
+        fn new() -> Batches {
+            Batches {
+                open: Arc::new((Mutex::new(false), Condvar::new())),
+                writes: Arc::new(Mutex::new(Vec::new())),
+                blocked: Arc::new(Mutex::new(false)),
+            }
+        }
+        fn open(&self) {
+            *self.open.0.lock().unwrap() = true;
+            self.open.1.notify_all();
+        }
+        fn writes(&self) -> Vec<Vec<u8>> {
+            self.writes.lock().unwrap().clone()
+        }
+        fn is_blocked(&self) -> bool {
+            *self.blocked.lock().unwrap()
+        }
+    }
+
+    impl Write for Batches {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            let mut open = self.open.0.lock().unwrap();
+            *self.blocked.lock().unwrap() = true;
+            while !*open {
+                open = self.open.1.wait(open).unwrap();
+            }
+            *self.blocked.lock().unwrap() = false;
+            self.writes.lock().unwrap().push(b.to_vec());
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Frames that piled up while the terminal was busy go out as one write, not
+    /// one write each: on Windows every write to the console host costs the next
+    /// keystroke up to a frame (~16 ms).
+    #[test]
+    fn frames_queued_together_are_written_together() {
+        let sink = Batches::new();
+        let mut s = Screen::new(sink.clone(), DEFAULT_LIMIT);
+        write!(s, "first").unwrap();
+        s.flush().unwrap();
+        assert!(
+            wait_for(|| sink.is_blocked()),
+            "the writer should be inside the first write"
+        );
+        // Both queue up behind the write in progress.
+        write!(s, "second").unwrap();
+        s.flush().unwrap();
+        write!(s, "third").unwrap();
+        s.flush().unwrap();
+        // The blocked write still counts: its bytes are subtracted when it
+        // returns, not when it starts.
+        assert!(
+            wait_for(|| s.backlog() == b"firstsecondthird".len()),
+            "both frames are queued behind the write in progress"
+        );
+
+        sink.open();
+        assert!(wait_for(|| s.backlog() == 0), "the writer drains");
+        s.finish(Duration::from_secs(5));
+        assert_eq!(
+            sink.writes(),
+            vec![b"first".to_vec(), b"secondthird".to_vec()],
+            "the two queued frames are one write"
+        );
     }
 
     #[test]
