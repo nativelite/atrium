@@ -182,6 +182,20 @@ impl SafetyNet {
                 }
             }
             for alert in alerts {
+                // A statement about atrium itself (a platform limitation) is
+                // kept on record and in the bus feed as an FYI, but never counted
+                // as a decision: it's true, and nothing the operator can act on.
+                if alert.is_informational() {
+                    ctl_audit.record(None, alert.kind, &alert.detail, true, "");
+                    let _ = bus.publish(
+                        "warden",
+                        atrium::bus::Kind::Fyi,
+                        None,
+                        &[("msg".to_string(), alert.detail.clone())],
+                        agsess::sessions::now_ms(),
+                    );
+                    continue;
+                }
                 ctl_audit.record(None, alert.kind, &alert.detail, false, "");
                 // A decision, not an FYI: these are exactly the events that
                 // should stop the operator rather than scroll past them.

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Windows sessions no longer open with "1 decision needs you".** The warden
+  can't detect nested atrium sessions on Windows, and said so once per session
+  as a decision, so the bar's decision count read as an error to act on. It's
+  now informational: kept in the audit log and posted to the bus as an FYI,
+  never counted as a decision. Real warden alerts still are.
+
 ## [0.34.0] - 2026-09-15
 
 Performance numbers below come from one-off harnesses run on the founder's

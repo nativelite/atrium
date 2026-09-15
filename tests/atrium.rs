@@ -778,6 +778,44 @@ fn a_terminal_that_stops_reading_freezes_nothing_but_the_view() {
     assert_eq!(code, 0);
 }
 
+/// **A platform limitation is information, not a decision** (Windows).
+///
+/// The warden can't detect nested sessions on Windows. It says so once. That note
+/// used to be raised as a decision, so every Windows session opened with
+/// "1 decision needs you" on the bar — which read as an error the operator had to
+/// act on, and trained them to ignore the one signal meant to stop them. It is
+/// still recorded (the audit log keeps it), just not counted as a decision.
+#[cfg(windows)]
+#[test]
+fn a_platform_limitation_is_not_counted_as_a_decision() {
+    let audit = std::env::temp_dir().join(format!("atrium-info-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&audit);
+    let env = [("ATRIUM_CTL_AUDIT".to_string(), audit.display().to_string())];
+    let mut p = pty::Pty::spawn_with_env(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--allow-ctl", "cmd", "/Q"],
+        24,
+        80,
+        &env,
+    )
+    .unwrap();
+    // The warden runs on a 3 s cadence; give it two passes.
+    let out = read_until(&mut p, b"decision", Duration::from_secs(8));
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let recorded = std::fs::read_to_string(&audit).unwrap_or_default();
+    let _ = std::fs::remove_file(&audit);
+    assert!(
+        !contains(&out, b"decision"),
+        "the bar counted a platform limitation as a decision: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(&out[out.len().saturating_sub(600)..]))
+    );
+    assert!(
+        recorded.contains("warden-descent-unsupported"),
+        "the limitation must still be recorded: {recorded}"
+    );
+}
+
 /// Interactive session: keystrokes reach the hosted shell through atrium,
 /// its response comes back, the bar is painted, and Ctrl+A q quits.
 #[test]

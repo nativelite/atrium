@@ -129,6 +129,18 @@ pub struct Alert {
     pub detail: String,
 }
 
+impl Alert {
+    /// Whether this is information about atrium itself rather than something
+    /// that happened. The one such alert today states a platform limitation
+    /// (no nested-session detection on Windows): true, worth recording, but
+    /// nothing the operator can decide. Raised as a decision it opened every
+    /// Windows session with "1 decision needs you", which read as an error and
+    /// taught people to ignore the count that is meant to stop them.
+    pub fn is_informational(&self) -> bool {
+        self.kind == "warden-descent-unsupported"
+    }
+}
+
 /// What an ancestry walk could establish. Four states, because collapsing the
 /// last two into "no ancestor" is how the ceiling came to fail open: a `ps` that
 /// could not be run returned an empty table, an empty table meant "no atrium
@@ -902,6 +914,26 @@ fn pane_session_ids(pane_pids: &[u32]) -> HashSet<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the platform-limitation note is informational; every alert about
+    /// something that happened stays a decision.
+    #[test]
+    fn only_a_platform_limitation_is_informational() {
+        let alert = |kind| Alert {
+            kind,
+            detail: String::new(),
+        };
+        assert!(alert("warden-descent-unsupported").is_informational());
+        for kind in [
+            "warden-binary-changed",
+            "warden-registry-tampered",
+            "warden-nested-unaccounted",
+            "warden-nested-atrium",
+            "warden-descent-unknown",
+        ] {
+            assert!(!alert(kind).is_informational(), "{kind}");
+        }
+    }
 
     #[test]
     fn digest_notices_any_change() {
