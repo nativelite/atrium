@@ -9,7 +9,7 @@ local gate stays fast. Knobs:
 - `ATRIUM_BENCH_SAMPLES` (default 100)
 - `ATRIUM_BENCH_IDLE_S` (default 10)
 - `ATRIUM_BENCH_FLOOD_MB` (default 16)
-- `ATRIUM_BENCH_ONLY` (`latency`, `idle` or `flood`)
+- `ATRIUM_BENCH_ONLY` (`latency`, `idle`, `feed` or `flood`)
 
 ## What `terminal` measures
 
@@ -19,6 +19,9 @@ local gate stays fast. Knobs:
   read a bare shell at 1.6 ms that was really 0.1 ms.
 - **Key echo:** time from writing a key to that key echoing back.
 - **Idle CPU:** the process's own CPU time over a quiet window, as % of one core.
+- **Emulator feed:** the same log fed straight into one `vterm::Term`, in
+  process, with no pty or rendering. It isolates the emulator's share of the
+  flood cost, and it's where the flood bottleneck turned out to live.
 - **Flood:** a pane prints a deterministic, coloured, agent-style log. Time from
   launch until every pane exits. The pane blocks when atrium falls behind, so on
   Linux/macOS this is atrium's end-to-end consumption rate.
@@ -56,4 +59,24 @@ What the baseline shows:
   investigation.
 - **Flood throughput is atrium's bottleneck.** On Linux a pane's output goes
   through atrium about 9x slower than `cat` alone (10.6 vs 99.5 MB/s). With 8
-  panes that's about 1.6 MB/s per pane.
+  panes that's about 1.6 MB/s per pane. Fixed since — see below.
+
+## Since the baseline: the emulator (unreleased)
+
+The flood bottleneck was the emulator's scrolling, not atrium's loop. Two
+changes in `nativelite-ansi` — a block move for a region scroll, then a row
+ring so scrolling the whole screen only advances an origin — moved the Linux
+numbers (WSL, same machine):
+
+| measurement | 0.34.0 | block move | row ring |
+| --- | --- | --- | --- |
+| feed, 24x80 | 16.1 | 53.5 | 70.2 MB/s |
+| feed, 40x160 | 11.0 | 27.4 | 66.0 MB/s |
+| feed, 60x240 | 5.3 | 18.8 | 63.8 MB/s |
+| flood, 1 pane | 10.6 | — | 39-51 MB/s |
+| flood, 8 panes | 12.9 | — | 47.0 MB/s total |
+
+Feed cost no longer grows with the grid. The flood figure is the range over
+five runs on a busy machine; `cat` measured 85-160 MB/s over the same runs, so
+treat the remaining gap as roughly 3x, not a precise ratio. Key echo (p50 0.30-0.44
+ms, p99 0.59-0.88 ms) and idle CPU (0.6-0.8%) are unchanged.

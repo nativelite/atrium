@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - ~16 ms key-echo outliers that occur only on Windows
   - output-flood throughput about 9x below `cat` on Linux
 
+### Changed
+- **Output floods run about 4x faster.** The bench pinned the cost on the
+  emulator, so the work went into `nativelite-ansi`: a region scroll is now a
+  block move, and scrolling the whole screen — what happens on nearly every
+  line of output — only advances a row ring's origin, so its cost no longer
+  grows with the grid. Feeding 16 MB into one `vterm::Term` at 40x160 went from
+  11.0 to 66.0 MB/s, and a pane flooding 16 MB through atrium on Linux went
+  from 10.6 to 39-51 MB/s (8 panes: 12.9 to 47.0 MB/s total). Key echo and idle
+  CPU are unchanged. **This release needs `nativelite-ansi` and
+  `nativelite-vterm` published first.**
+
 ### Fixed
 - **Windows sessions no longer open with "1 decision needs you".** The warden
   can't detect nested atrium sessions on Windows, and said so once per session
