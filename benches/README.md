@@ -108,6 +108,21 @@ and coalescing frames queued together into one write. Windows, keys 120 ms apart
 At the default 30 ms gap the stalls still show, for both atrium and a bare
 relay: below about one frame per key, the console host's cadence is the floor.
 
+### Where the flood gap went (unreleased)
+
+A second emulator change — blitting runs of plain ASCII instead of writing cell
+by cell (`nativelite-vterm`, unreleased) — took the feed to **173 MB/s** at
+40x160 and atrium's flood to **73.7-76.6 MB/s** against 135-139 MB/s for `cat`:
+a 1.8x gap, from 9x at the 0.34.0 baseline.
+
+That remaining gap is now explained, and it is not overhead. atrium does
+everything `cat` does *and* runs the bytes through the emulator, one after the
+other: 1/173 + 1/137 predicts 76 MB/s, which is what it measures. Going faster
+means making the emulator cheaper (parsing is 81% of it — the tokens allocate a
+`String` per text run and two `Vec`s per CSI) or overlapping the emulator with
+the write instead of doing them in series. Neither is a small change, and
+nothing in the pipeline is being wasted today.
+
 Feed cost no longer grows with the grid. The flood figure is the range over
 five runs on a busy machine; `cat` measured 85-160 MB/s over the same runs, so
 treat the remaining gap as roughly 3x, not a precise ratio. Key echo (p50 0.30-0.44
