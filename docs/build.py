@@ -236,19 +236,51 @@ def page_html(slug, title, body):
 """.format(title=esc(title), desc=esc(desc), nav=docnav(slug), body=body)
 
 
+def render(here, slug):
+    """The HTML `<slug>.md` should produce, without writing anything."""
+    with open(os.path.join(here, slug + ".md"), encoding="utf-8") as f:
+        md = f.read()
+    m = re.search(r"^#\s+(.*)$", md, re.M)
+    title = m.group(1).strip() if m else slug
+    return page_html(slug, title, convert(md))
+
+
+def check(here):
+    """Report pages whose `.html` no longer matches its `.md`, and write none.
+
+    The gate calls this. `fleets.html` was once stale for a whole release —
+    `fleets.md` grew the entire resource budget (build_jobs, deny, memory_mb)
+    in 0.33.0 and nobody re-ran this script, so the published page did not
+    have it. Markdown is the source of truth; this makes forgetting fail.
+    """
+    stale = []
+    for slug, _ in PAGES:
+        dst = os.path.join(here, slug + ".html")
+        try:
+            with open(dst, encoding="utf-8", newline="") as f:
+                # Read raw, then normalize: git may hand back CRLF on Windows.
+                have = f.read().replace("\r\n", "\n")
+        except FileNotFoundError:
+            stale.append(slug + ".html (missing)")
+            continue
+        if have != render(here, slug):
+            stale.append(slug + ".html")
+    if stale:
+        print("STALE docs (run `python docs/build.py`): " + ", ".join(stale))
+        return 1
+    print("docs OK: %d pages match their markdown." % len(PAGES))
+    return 0
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
+    if "--check" in sys.argv[1:]:
+        return check(here)
     built = []
     for slug, _ in PAGES:
-        src = os.path.join(here, slug + ".md")
-        with open(src, encoding="utf-8") as f:
-            md = f.read()
-        m = re.search(r"^#\s+(.*)$", md, re.M)
-        title = m.group(1).strip() if m else slug
-        body = convert(md)
         dst = os.path.join(here, slug + ".html")
         with open(dst, "w", encoding="utf-8", newline="\n") as f:
-            f.write(page_html(slug, title, body))
+            f.write(render(here, slug))
         built.append(slug + ".html")
     print("built %d pages: %s" % (len(built), ", ".join(built)))
 

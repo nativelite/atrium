@@ -2,7 +2,8 @@
 """Local dev runner for atrium — stdlib Python driving cargo, no task runner.
 
 The same `check` gate as every nativelite package, so the muscle memory is
-identical across languages. Here `check` is the zero-dependency guard, then
+identical across languages. Here `check` is the zero-dependency guard, then the
+drift check (generated docs and the marketplace's copy of the skills), then
 `cargo fmt --check`, then `cargo test` (unit + integration + doctests). Invoke it
 however your platform
 spells Python — `python` is Windows-only, macOS/Linux ship `python3`, and the
@@ -13,6 +14,7 @@ shebang + exec bit make `./dev.py` work everywhere:
   ./dev.py build      # cargo build --release
   ./dev.py fmt        # cargo fmt --check
   ./dev.py guard      # zero-dependency guard
+  ./dev.py drift      # docs/*.html match docs/*.md; skills match the plugin's copy
 
 Test runs are bounded. `cargo test` has no per-test timeout and this project has
 no CI to kill a stuck job, so a test that deadlocks used to wedge the machine
@@ -43,6 +45,15 @@ WINDOWS = os.name == "nt"
 #: Skipped gracefully if the sibling isn't present (e.g. a vendored checkout that
 #: only ships atrium).
 ABUS_MANIFEST = ROOT.parent / "abus" / "Cargo.toml"
+
+#: The Claude Code skills that teach a hosted agent to use `ctl` and fleets.
+#: `skills/` here is the **source of truth**; the marketplace plugin ships a
+#: copy, and nothing but the gate compares them. They diverged once already:
+#: `atrium-fleet` lived only in the marketplace for five plugin versions while
+#: this repo's README promised a hand-copy path, so anyone following the docs
+#: ran fleets with a skill half the size of the real one.
+SKILLS = ROOT / "skills"
+MARKETPLACE_SKILLS = ROOT.parent / "marketplace" / "atrium" / "skills"
 
 #: Wall-clock budget for one `cargo test` invocation. Generous on purpose: this
 #: is a backstop against a deadlock, not a performance assertion (the suite runs
@@ -203,12 +214,71 @@ def guard() -> int:
     return run(PY, "tools/dep_guard.py")
 
 
+def _skills_drift() -> int:
+    """Check that the marketplace's copy of the skills matches this repo's.
+
+    `skills/` here is the source of truth; the marketplace plugin is a
+    distribution copy (`nativelite/playbooks/release.md`). Skipped when the
+    sibling checkout isn't there, exactly like the abus fold-in above.
+    """
+    if not MARKETPLACE_SKILLS.is_dir():
+        print(f"skills: no marketplace checkout at {MARKETPLACE_SKILLS}, skipping")
+        return 0
+
+    def tree(root: Path) -> dict[str, str]:
+        # Text compared with newlines normalized: the two repos are checked out
+        # separately and git may hand one of them CRLF.
+        return {
+            str(p.relative_to(root)).replace("\\", "/"): p.read_text(
+                encoding="utf-8"
+            ).replace("\r\n", "\n")
+            for p in sorted(root.rglob("*"))
+            if p.is_file()
+        }
+
+    ours, theirs = tree(SKILLS), tree(MARKETPLACE_SKILLS)
+    missing = sorted(set(ours) - set(theirs))
+    extra = sorted(set(theirs) - set(ours))
+    changed = sorted(f for f in set(ours) & set(theirs) if ours[f] != theirs[f])
+    if not (missing or extra or changed):
+        print(f"skills OK: {len(ours)} files match the marketplace copy.")
+        return 0
+    print("SKILLS DRIFT between skills/ and the marketplace plugin:")
+    for f in missing:
+        print(f"  only here:        {f}")
+    for f in extra:
+        print(f"  only marketplace: {f}")
+    for f in changed:
+        print(f"  differs:          {f}")
+    print(f"  fix: copy skills/ over {MARKETPLACE_SKILLS} and bump plugin.json")
+    return 1
+
+
+def drift() -> int:
+    """The two hand-synced copies nothing else checks.
+
+    Both drifted unnoticed: `atrium-fleet` shipped only in the marketplace
+    while the README promised a hand-copy path from this repo, and
+    `fleets.html` sat a whole release behind `fleets.md`. Neither is code, so
+    no test would ever have caught them.
+    """
+    return run(PY, "docs/build.py", "--check") or _skills_drift()
+
+
 def check() -> int:
-    # guard (cheap) → fmt (cheap, fail fast on style drift) → test (expensive).
-    return guard() or fmt() or test()
+    # guard (cheap) → drift (cheap) → fmt (cheap, fail fast on style drift) →
+    # test (expensive).
+    return guard() or drift() or fmt() or test()
 
 
-COMMANDS = {"test": test, "build": build, "fmt": fmt, "guard": guard, "check": check}
+COMMANDS = {
+    "test": test,
+    "build": build,
+    "fmt": fmt,
+    "guard": guard,
+    "drift": drift,
+    "check": check,
+}
 
 
 def main(argv: list[str]) -> int:
