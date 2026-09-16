@@ -612,6 +612,8 @@ pub(crate) fn spawn_pane_full(
         mouse_wanted: false,
         argv: command.to_vec(),
         worktree: None,
+        deny: deny.to_vec(),
+        mode,
     })
 }
 

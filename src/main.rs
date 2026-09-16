@@ -394,6 +394,15 @@ pub(crate) struct Pane {
     pub(crate) argv: Vec<String>,
     /// The git worktree this pane runs in, if any.
     pub(crate) worktree: Option<String>,
+    /// This pane's own deny entries (its fleet agent's `deny`). Kept on the pane
+    /// because `argv` does not carry them — `--disallowedTools` is built at spawn
+    /// — so a snapshot has something to record and `atrium recover` something to
+    /// re-apply. Empty for a pane with no per-agent rules.
+    pub(crate) deny: Vec<String>,
+    /// The effective trust posture this pane was spawned at, which may sit below
+    /// the session ceiling (a fleet agent's `trust`, a de-escalated ctl worker).
+    /// Recorded so recovery restores the pane's own posture, not the ceiling.
+    pub(crate) mode: atrium::ctl::TrustMode,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -698,6 +707,11 @@ fn confirm_skip_permissions() -> bool {
 /// from the inline closure so the field mapping is directly unit-testable
 /// without a real PTY — if `worktree` (or any other field) is accidentally
 /// dropped, the test at `capture_pane_fields_propagates_worktree` fails.
+// The field list is the point: this is the one place a live `Pane` becomes a
+// `PaneCapture`, and naming every field here is what makes a dropped one a
+// compile error rather than a silently thinner snapshot. A bag struct would just
+// be `PaneCapture` again.
+#[allow(clippy::too_many_arguments)]
 fn capture_pane_fields(
     id: usize,
     role: Option<String>,
@@ -706,6 +720,11 @@ fn capture_pane_fields(
     identity: Option<String>,
     session_id: Option<String>,
     worktree: Option<String>,
+    deny: Vec<String>,
+    can_spawn: bool,
+    depth: usize,
+    parent_pane: Option<usize>,
+    mode: atrium::ctl::TrustMode,
 ) -> atrium::session::PaneCapture {
     atrium::session::PaneCapture {
         id,
@@ -715,6 +734,11 @@ fn capture_pane_fields(
         identity,
         session_id,
         worktree,
+        deny,
+        can_spawn,
+        depth,
+        parent_pane,
+        mode: Some(mode),
     }
 }
 
@@ -759,6 +783,16 @@ fn snapshot_if_changed(
         Some(w) => w,
         None => return Ok(()),
     };
+    // A pane's `parent` is an `AgentId`, minted per process and re-minted on
+    // recovery — storing one would name a *different* pane in the recovered
+    // session. Resolve it to the parent's pane id, which is stable inside the
+    // snapshot. A parent in another window, or one that has already exited,
+    // resolves to `None`; the pane's restored `depth` still holds the recursion
+    // guard, which is what `--max-depth` actually checks.
+    let parent_pane = |parent: Option<atrium::ctl::AgentId>| -> Option<usize> {
+        let parent = parent?;
+        w.panes.iter().find(|p| p.agent_id == parent).map(|p| p.id)
+    };
     let snap = atrium::session::capture(
         w.tree.ids(),
         w.tree.focus(),
@@ -773,9 +807,15 @@ fn snapshot_if_changed(
                     p.identity.clone(),
                     p.session_id.clone(),
                     p.worktree.clone(), // set by spawn_worker_* via sp.worktree
+                    p.deny.clone(),
+                    p.can_spawn,
+                    p.depth,
+                    parent_pane(p.parent),
+                    p.mode,
                 )
             })
             .collect(),
+        atrium::session::policy(),
     );
     if last.as_ref() == Some(&snap) {
         return Ok(());
@@ -783,6 +823,116 @@ fn snapshot_if_changed(
     atrium::session::save(path, &snap)?;
     *last = Some(snap);
     Ok(())
+}
+
+/// Drop repeats, keeping first-seen order. Small-n by construction (a deny list),
+/// so the quadratic scan is cheaper than the allocation a set would need.
+fn dedup_preserving_order(v: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(v.len());
+    for e in v {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+/// Was one of `names` typed on the recover command line (bare or `=`-glued)?
+///
+/// `ctl::parse_flags` returns a value for every flag, defaulted, so it cannot say
+/// whether the operator *chose* one. Recovery needs that distinction: an explicit
+/// flag must win over the snapshot, while an absent one must defer to it rather
+/// than silently overwriting the recorded session with a default.
+fn flag_typed(args: &[String], names: &[&str]) -> bool {
+    args.iter().any(|a| {
+        names.contains(&a.as_str())
+            || names
+                .iter()
+                .any(|n| a.starts_with(&format!("{n}=")) && n.starts_with("--"))
+    })
+}
+
+/// The trust ceiling a recovery runs at: an explicitly typed flag wins, else the
+/// posture the snapshot recorded, else the parsed default. The result is still
+/// capped to any enclosing session by `cap_trust_to_ancestor` at the call site —
+/// a snapshot is data on disk and must never be a way to climb.
+fn recovered_trust(
+    typed: bool,
+    parsed: atrium::ctl::TrustMode,
+    recorded: Option<atrium::ctl::TrustMode>,
+) -> atrium::ctl::TrustMode {
+    if typed {
+        return parsed;
+    }
+    recorded.unwrap_or(parsed)
+}
+
+/// One pane's posture on recovery: what it ran at before, capped to the session
+/// ceiling. A pane that sat below the ceiling (a fleet agent's own `trust`, a
+/// de-escalated worker) comes back where it was instead of being promoted to the
+/// ceiling, and a snapshot naming a *higher* posture is capped, not obeyed.
+fn recovered_pane_mode(
+    recorded: Option<atrium::ctl::TrustMode>,
+    ceiling: atrium::ctl::TrustMode,
+) -> atrium::ctl::TrustMode {
+    effective_mode(recorded, ceiling).0
+}
+
+/// A one-line, human-readable account of what a recovery is about to restore —
+/// or, for a pre-policy snapshot, what it cannot.
+///
+/// `policy` is the **effective** policy (what will actually be installed), not
+/// the raw record: a trust mode the ancestor cap lowered must read as lowered.
+/// `trust_from_snapshot` marks the posture as coming from the file rather than
+/// the command line, because that is the one value a recovery can raise above
+/// the flags the operator typed — and the snapshot is a file in a shared temp
+/// directory. Printed *before* the skip confirmation, so it informs the only
+/// prompt the operator gets.
+fn recovery_notice(
+    panes: usize,
+    policy: Option<&atrium::session::PolicyRecord>,
+    trust_from_snapshot: bool,
+) -> String {
+    let mut parts = vec![format!("{panes} pane(s)")];
+    match policy {
+        Some(p) => {
+            if let Some(t) = p.trust {
+                let source = if trust_from_snapshot {
+                    " (from the snapshot)"
+                } else {
+                    ""
+                };
+                parts.push(format!("trust {}{source}", t.policy_label()));
+            }
+            if p.allow_ctl {
+                // An unlimited guard is stored clamped to `i64::MAX` (see
+                // `session::num`); printing that as a 19-digit number reads as
+                // corruption rather than as "no limit".
+                let depth = if p.max_depth > 1_000_000 {
+                    "unlimited".to_string()
+                } else {
+                    p.max_depth.to_string()
+                };
+                parts.push(format!("ctl on (max depth {depth})"));
+            }
+            if !p.deny.is_empty() {
+                parts.push(format!("{} session deny rule(s)", p.deny.len()));
+            }
+            if let Some(j) = p.build_jobs {
+                parts.push(format!("build pool {j}"));
+            }
+            if let Some(mb) = p.memory_mb {
+                parts.push(format!("memory cap {mb} MB"));
+            }
+            format!("atrium recover: restoring {}", parts.join(", "))
+        }
+        None => format!(
+            "atrium recover: restoring {} — this snapshot predates the policy block, so the \
+             session's deny rules, compile pool and memory cap are NOT restored; \
+             pass them on the command line if the session had them",
+            parts.join(", ")
+        ),
+    }
 }
 
 /// `atrium recover` — load the most recent session snapshot and relaunch every
@@ -821,12 +971,75 @@ fn recover_cmd(args: &[String]) -> ExitCode {
         eprintln!("atrium recover: snapshot has no panes — nothing to recover");
         return ExitCode::SUCCESS;
     }
+    // The session policy the snapshot recorded. Everything below prefers an
+    // explicitly typed flag and falls back to this, so `atrium recover` on its own
+    // rebuilds the session that was running rather than a default-flagged
+    // lookalike — which is what it used to do, silently, with the fleet's guards
+    // off (its deny list, compile pool and memory ceiling all live in process
+    // globals installed at `fleet up`, not in any pane's argv).
+    let policy = snap.policy.clone();
+    let trust_typed = flag_typed(args, &["--trust", "--skip-permissions"]);
+    let trust = recovered_trust(trust_typed, trust, policy.as_ref().and_then(|p| p.trust));
+    let allow_ctl = allow_ctl || policy.as_ref().is_some_and(|p| p.allow_ctl);
+    let max_depth = if flag_typed(args, &["--max-depth"]) {
+        max_depth
+    } else {
+        policy.as_ref().map_or(max_depth, |p| p.max_depth)
+    };
     let trust = cap_trust_to_ancestor(trust);
+    // The policy as it will actually be installed: the snapshot's guards, but the
+    // trust/ctl/depth values this call settled on. Recorded verbatim below so the
+    // recovered session's own snapshots carry it forward unchanged — reading it
+    // back off the live globals would lose a `build_jobs` that was inherited
+    // rather than re-created, one recovery generation at a time.
+    let applied = policy.as_ref().map(|p| atrium::session::PolicyRecord {
+        deny: p.deny.clone(),
+        build_jobs: p.build_jobs,
+        memory_mb: p.memory_mb,
+        trust: Some(trust),
+        allow_ctl,
+        max_depth,
+    });
+    // Before the confirmation, not after: this line is what the operator needs in
+    // order to answer it. A snapshot lives in a shared temp directory and is the
+    // one input here that can raise the posture above the typed flags, so what it
+    // asks for has to be visible at the moment there is still a choice.
+    eprintln!(
+        "{}",
+        recovery_notice(snap.panes.len(), applied.as_ref(), !trust_typed)
+    );
     if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
         eprintln!("atrium recover: aborted.");
         return ExitCode::SUCCESS;
     }
     set_trust_mode(trust);
+    if let Some(applied) = applied {
+        atrium::session::set_policy(applied);
+    }
+    // Re-install the session guards BEFORE any pane spawns, in the same order
+    // `fleet up` does: the deny list and memory ceiling are read at each spawn,
+    // and the compile pool must exist before the first agent inherits it.
+    if let Some(p) = &policy {
+        if !p.deny.is_empty() {
+            atrium::trust::set_fleet_deny(p.deny.clone());
+        }
+        if let Some(mb) = p.memory_mb {
+            atrium::memguard::set_fleet_mb(mb);
+        }
+        // Guarded the way `fleet up` guards it: `planned_size` is `None` when the
+        // pool is disabled or already inherited from an enclosing session, and
+        // neither is a failure worth warning about.
+        if let Some(jobs) = p.build_jobs {
+            if atrium::buildpool::planned_size(Some(jobs)).is_some()
+                && atrium::buildpool::init(Some(jobs)).is_none()
+            {
+                eprintln!(
+                    "atrium recover: warning: could not rebuild the build pool — agents' \
+                     builds will run unpooled"
+                );
+            }
+        }
+    }
     let mut flash: Option<(String, Instant)> = None;
     let ctl_listener = if allow_ctl {
         bind_ctl(&mut flash)
@@ -852,10 +1065,16 @@ fn recover_cmd(args: &[String]) -> ExitCode {
                 id: record.id,
                 identity: record.identity.as_deref(),
                 cwd: record.cwd.as_deref(),
-                mode: trust_mode(),
+                // The pane's own posture, capped to the ceiling — not the ceiling
+                // itself, which would promote every de-escalated pane.
+                mode: recovered_pane_mode(record.mode, trust_mode()),
                 extra_env: &[],
                 extra_norms: None,
-                deny: &[],
+                // The agent's own deny rules. `argv` never carried them: the
+                // `--disallowedTools` flags are built here, at spawn, from the
+                // roster — so a recovery that replayed argv alone handed every
+                // pane back the commands its fleet entry had taken away.
+                deny: &record.deny,
             },
             cell_rows,
             cols,
@@ -864,6 +1083,13 @@ fn recover_cmd(args: &[String]) -> ExitCode {
             Ok(mut pane) => {
                 pane.role = record.role.clone();
                 pane.worktree = record.worktree.clone();
+                // Capability and spawn-depth, from the snapshot. `spawn_pane_full`
+                // defaults to the human-pane behaviour (`can_spawn: true`, depth
+                // 0); leaving those defaults gave every recovered fleet agent the
+                // right to create teammates that its roster had withheld, and
+                // restarted the `--max-depth` guard at zero for deep workers.
+                pane.can_spawn = record.can_spawn;
+                pane.depth = record.depth;
                 panes.push(pane);
             }
             Err(e) => {
@@ -875,7 +1101,30 @@ fn recover_cmd(args: &[String]) -> ExitCode {
             }
         }
     }
-    let max_id = snap.layout.ids.iter().copied().max().unwrap_or(0);
+    // Re-point each worker at its parent. Agent ids were re-minted by the spawns
+    // above, so the snapshot's stored PANE ids are mapped to the new agent ids
+    // here, once every pane exists. `panes` is index-aligned with `snap.panes`:
+    // the loop pushes one per record and aborts on the first failure.
+    let new_ids: Vec<(usize, atrium::ctl::AgentId)> =
+        panes.iter().map(|p| (p.id, p.agent_id)).collect();
+    for (pane, record) in panes.iter_mut().zip(snap.panes.iter()) {
+        if let Some(parent_pane) = record.parent_pane {
+            pane.parent = new_ids
+                .iter()
+                .find(|(id, _)| *id == parent_pane)
+                .map(|(_, agent)| *agent);
+        }
+    }
+    // Both id sets, not just the layout's: a pane record carrying an id above
+    // every layout id would otherwise collide with the next `Ctrl+A c`.
+    let max_id = snap
+        .layout
+        .ids
+        .iter()
+        .chain(snap.panes.iter().map(|p| &p.id))
+        .copied()
+        .max()
+        .unwrap_or(0);
     let mut tree = Tree::grid_from_ids(&snap.layout.ids);
     tree.focus_pane(snap.layout.focus);
     let window = Window {
@@ -977,6 +1226,22 @@ fn run(
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
     set_trust_mode(trust);
+    // Record the session policy for the snapshot writer. This is the one place
+    // every launch path meets — a plain launch, `fleet up`, and `recover` all
+    // arrive here — and the fleet path has already installed its deny list, pool
+    // and memory ceiling by now, so reading them here captures the effective
+    // session rather than the command line's half of it.
+    atrium::session::set_policy(atrium::session::PolicyRecord {
+        // Deduped: `session_deny()` is `ATRIUM_DENY` + the fleet's rules, and a
+        // recovery re-installs the merged list as the fleet's — so without this
+        // the env entries are re-appended once per recovery generation.
+        deny: dedup_preserving_order(atrium::trust::session_deny()),
+        build_jobs: atrium::buildpool::session_size(),
+        memory_mb: atrium::memguard::fleet_mb(),
+        trust: Some(trust),
+        allow_ctl,
+        max_depth,
+    });
     // The terminal as a queue: a terminal that stops reading must not stop the
     // loop — keys, pane draining, ctl and the safety net all run on. See
     // `atrium::screen`; the view is repainted whole once it catches up.
@@ -2124,7 +2389,7 @@ mod tests {
     fn an_unauthenticated_caller_is_never_the_operator() {
         assert!(!privilege_for(None, None));
         // Even if a pane were somehow associated, no token means no authority.
-        assert!(!privilege_for(None, Some(None)));
+        assert!(!privilege_for(None, Some((None, 0))));
     }
 
     /// The child is launched with the paths that were DISCLOSED, not with the
@@ -2268,8 +2533,28 @@ mod tests {
     /// separate, still-open question — see review finding #1's remainder.)
     #[test]
     fn a_root_pane_is_the_operator_and_a_worker_is_not() {
-        assert!(privilege_for(Some(AgentId(1)), Some(None)));
-        assert!(!privilege_for(Some(AgentId(2)), Some(Some(AgentId(1)))));
+        assert!(privilege_for(Some(AgentId(1)), Some((None, 0))));
+        assert!(!privilege_for(
+            Some(AgentId(2)),
+            Some((Some(AgentId(1)), 1))
+        ));
+    }
+
+    /// A worker whose parent link is GONE is still a worker.
+    ///
+    /// `atrium recover` resolves each worker's parent through the pane that
+    /// spawned it, so a parent that had already exited resolves to `None`. With
+    /// the gate keyed on the parent alone, that promoted the worker to operator
+    /// across a recovery — session-wide `send`/`kill`/`respawn` and the right to
+    /// delegate any identity in the vault. Depth is recorded independently and
+    /// survives, so requiring both is what closes it.
+    #[test]
+    fn a_worker_that_lost_its_parent_link_is_not_promoted_to_operator() {
+        assert!(
+            !privilege_for(Some(AgentId(3)), Some((None, 1))),
+            "depth > 0 is a worker no matter what happened to its parent link"
+        );
+        assert!(!privilege_for(Some(AgentId(4)), Some((None, 7))));
     }
 
     use super::*;
@@ -2611,6 +2896,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    use atrium::ctl::TrustMode;
+
     // --- resume_argv --------------------------------------------------------
 
     fn pane_record(argv: Vec<String>, session_id: Option<String>) -> atrium::session::PaneRecord {
@@ -2622,6 +2909,11 @@ mod tests {
             identity: None,
             session_id,
             worktree: None,
+            deny: Vec::new(),
+            can_spawn: true,
+            depth: 0,
+            parent_pane: None,
+            mode: None,
         }
     }
 
@@ -2740,6 +3032,11 @@ mod tests {
             None,
             Some("sess-fix".to_string()),
             Some("fix".to_string()),
+            vec!["git push".to_string()],
+            false,
+            1,
+            Some(0),
+            TrustMode::Edits,
         );
         assert_eq!(
             cap.worktree.as_deref(),
@@ -2747,11 +3044,202 @@ mod tests {
             "worktree must flow through capture_pane_fields unchanged"
         );
         // None must propagate too — a non-worktree pane must not invent a name.
-        let cap_none =
-            super::capture_pane_fields(8, None, vec!["bash".to_string()], None, None, None, None);
+        let cap_none = super::capture_pane_fields(
+            8,
+            None,
+            vec!["bash".to_string()],
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            true,
+            0,
+            None,
+            TrustMode::Off,
+        );
         assert!(
             cap_none.worktree.is_none(),
             "non-worktree pane must have None"
+        );
+    }
+
+    // --- recovery restores the session policy, not just the layout ---------
+
+    /// Every capability field must survive the one mapping from a live `Pane` to
+    /// a `PaneCapture`. Dropping one here is exactly how the deny list and the
+    /// `can_spawn` bit went missing from recovery: the pane held them, the
+    /// snapshot never saw them.
+    #[test]
+    fn capture_pane_fields_propagates_the_capability_fields() {
+        let cap = super::capture_pane_fields(
+            2,
+            Some("builder".to_string()),
+            vec!["claude".to_string()],
+            None,
+            None,
+            None,
+            None,
+            vec!["cargo test --workspace".to_string()],
+            false,
+            3,
+            Some(1),
+            TrustMode::Plan,
+        );
+        assert_eq!(cap.deny, vec!["cargo test --workspace".to_string()]);
+        assert!(
+            !cap.can_spawn,
+            "the roster withheld it; so must the snapshot"
+        );
+        assert_eq!(cap.depth, 3);
+        assert_eq!(cap.parent_pane, Some(1));
+        assert_eq!(cap.mode, Some(TrustMode::Plan));
+    }
+
+    #[test]
+    fn flag_typed_sees_bare_and_glued_forms_only() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(super::flag_typed(
+            &a(&["--trust", "automode"]),
+            &["--trust"]
+        ));
+        assert!(super::flag_typed(&a(&["--max-depth=3"]), &["--max-depth"]));
+        assert!(super::flag_typed(
+            &a(&["--skip-permissions"]),
+            &["--trust", "--skip-permissions"]
+        ));
+        assert!(
+            !super::flag_typed(&a(&["--allow-ctl"]), &["--trust"]),
+            "an unrelated flag is not a trust choice"
+        );
+        assert!(
+            !super::flag_typed(&a(&[]), &["--trust"]),
+            "recovering with no flags defers to the snapshot"
+        );
+    }
+
+    /// The precedence rule: what the operator typed wins, what the snapshot
+    /// recorded fills the gap, and only then the parser's default. Without the
+    /// middle step a bare `atrium recover` silently downgraded an `automode`
+    /// fleet to the default posture.
+    #[test]
+    fn recovered_trust_prefers_the_typed_flag_then_the_snapshot() {
+        assert_eq!(
+            super::recovered_trust(true, TrustMode::Plan, Some(TrustMode::Auto)),
+            TrustMode::Plan,
+            "a typed flag wins over the snapshot"
+        );
+        assert_eq!(
+            super::recovered_trust(false, TrustMode::Off, Some(TrustMode::Auto)),
+            TrustMode::Auto,
+            "no flag: the recorded posture"
+        );
+        assert_eq!(
+            super::recovered_trust(false, TrustMode::Off, None),
+            TrustMode::Off,
+            "no flag and no record: the parsed default"
+        );
+    }
+
+    /// A pane comes back where it was, and a snapshot can never promote one: the
+    /// ceiling is applied to the recorded posture, not replaced by it.
+    #[test]
+    fn recovered_pane_mode_restores_below_the_ceiling_and_caps_above_it() {
+        assert_eq!(
+            super::recovered_pane_mode(Some(TrustMode::Edits), TrustMode::Auto),
+            TrustMode::Edits,
+            "a de-escalated pane must not be promoted to the ceiling"
+        );
+        assert_eq!(
+            super::recovered_pane_mode(Some(TrustMode::Skip), TrustMode::Plan),
+            TrustMode::Plan,
+            "a snapshot must never climb above the session ceiling"
+        );
+        assert_eq!(
+            super::recovered_pane_mode(None, TrustMode::Auto),
+            TrustMode::Auto,
+            "an unrecorded posture falls back to the ceiling"
+        );
+    }
+
+    /// A pre-policy snapshot must SAY that the guards are not coming back. The
+    /// silent version of this is the bug: a recovered fleet that looks identical
+    /// and runs with its deny list, compile pool and memory cap gone.
+    #[test]
+    fn recovery_notice_names_the_guards_or_warns_they_are_missing() {
+        let policy = atrium::session::PolicyRecord {
+            deny: vec!["git push".to_string()],
+            build_jobs: Some(10),
+            memory_mb: Some(32768),
+            trust: Some(TrustMode::Auto),
+            allow_ctl: true,
+            max_depth: 6,
+        };
+        let full = super::recovery_notice(4, Some(&policy), false);
+        for expected in [
+            "4 pane(s)",
+            "trust automode",
+            "ctl on (max depth 6)",
+            "1 session deny rule(s)",
+            "build pool 10",
+            "memory cap 32768 MB",
+        ] {
+            assert!(
+                full.contains(expected),
+                "{full:?} must mention {expected:?}"
+            );
+        }
+        let legacy = super::recovery_notice(4, None, true);
+        assert!(
+            legacy.contains("NOT restored"),
+            "a v1 snapshot must warn, not pretend: {legacy:?}"
+        );
+    }
+
+    /// The posture is the one value a recovery can raise above the flags the
+    /// operator typed, and the snapshot lives in a shared temp directory — so
+    /// when it comes from the file, the line that precedes the confirmation
+    /// prompt has to say so.
+    #[test]
+    fn recovery_notice_marks_a_posture_that_came_from_the_file() {
+        let policy = atrium::session::PolicyRecord {
+            deny: Vec::new(),
+            build_jobs: None,
+            memory_mb: None,
+            trust: Some(TrustMode::Auto),
+            allow_ctl: true,
+            max_depth: usize::MAX,
+        };
+        let from_file = super::recovery_notice(1, Some(&policy), true);
+        assert!(
+            from_file.contains("trust automode (from the snapshot)"),
+            "{from_file:?}"
+        );
+        assert!(
+            from_file.contains("max depth unlimited"),
+            "an unlimited guard must read as unlimited, not as a 19-digit number: {from_file:?}"
+        );
+        let typed = super::recovery_notice(1, Some(&policy), false);
+        assert!(
+            typed.contains("trust automode") && !typed.contains("from the snapshot"),
+            "a posture the operator typed is not attributed to the file: {typed:?}"
+        );
+    }
+
+    /// A recovery re-installs the merged deny list as the fleet's, and `run()`
+    /// re-reads `ATRIUM_DENY` on top of it. Without the dedupe the recorded list
+    /// grows by the env entries once per recovery generation.
+    #[test]
+    fn a_recorded_deny_list_does_not_grow_across_recoveries() {
+        let merged = vec![
+            "git push".to_string(),
+            "cargo bench".to_string(),
+            "git push".to_string(),
+        ];
+        assert_eq!(
+            super::dedup_preserving_order(merged),
+            vec!["git push".to_string(), "cargo bench".to_string()],
+            "repeats collapse, first-seen order survives"
         );
     }
 }

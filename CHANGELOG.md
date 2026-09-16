@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`atrium recover` restores the session's policy, not just its layout.** A
+  recovered session used to come back with its guards off: the fleet's `deny`
+  rules, the compile pool and the memory ceiling are installed once at `fleet up`
+  and live in process globals, so replaying each pane's `argv` restored none of
+  them. Recovering a fleet meant re-typing `ATRIUM_DENY`, `ATRIUM_BUILD_JOBS` and
+  `ATRIUM_MEMORY_MB` by hand — and knowing to.
+
+  Worse, it was a capability escalation. `spawn_pane_full` builds every pane with
+  `can_spawn: true` (the right default for a pane the human opened), and recovery
+  kept that default, so every recovered fleet agent could `ctl spawn` teammates
+  its roster had deliberately withheld. Per-agent `deny` entries were not
+  captured at all, de-escalated panes came back at the session ceiling, and the
+  `--max-depth` guard restarted from depth 0 for workers that were deeper.
+
+  The session snapshot is now **version 2**: it carries a `policy` block (session
+  deny, `build_jobs`, `memory_mb`, trust, `allow_ctl`, `max_depth`) and, per
+  pane, its own `deny`, `can_spawn`, `depth`, parent and trust posture. `atrium
+  recover` re-installs the guards before the first pane spawns and gives each
+  pane back its own posture and capability. A flag you type still wins over the
+  snapshot; a flag you omit now defers to it instead of silently overriding it
+  with a default.
+
+  The snapshot is an input with authority, so its failure directions were chosen
+  deliberately: a pane's recorded posture is capped to the session ceiling and an
+  unreadable one fails closed to `default`; a corrupt `deny` list or policy block
+  fails the load rather than reading as "no guards"; a duplicate pane id or a
+  schema from a newer atrium is refused. The session *ceiling* does come from the
+  snapshot when no `--trust` is typed, so recovery now prints the posture — marked
+  `(from the snapshot)` — before the confirmation prompt rather than after it.
+  The parent link is stored as a **pane id** rather than an `AgentId`, because
+  agent ids are re-minted on recovery and a stored one would name a different
+  pane.
+
+- **A recovered worker whose parent had exited came back as the operator.**
+  `caller_privileged` keyed on "no parent" alone, while its own doc comment
+  described a root pane as *parent `None`, depth 0*. A worker's parent link is
+  lost whenever the parent pane exited before the snapshot, so on recovery that
+  worker was classified as the human: session-wide `ctl send`/`kill`/`respawn`
+  outside its own subtree, the right to delegate any identity in the vault, and
+  the full audit trail. `privilege_for` now requires both conditions. Found by
+  adversarial review of the recovery change above.
+
+  v1 snapshots still load — the panes and their transcripts come back — and
+  recovery now prints what it restored, or states plainly that a pre-v2 snapshot
+  has no guards to restore rather than looking identical to one that does.
+
 ## [0.35.1] - 2026-09-15
 
 ### Changed

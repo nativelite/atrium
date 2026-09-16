@@ -179,6 +179,14 @@ pub fn init(fleet_jobs: Option<usize>) -> Option<&'static BuildPool> {
         .as_ref()
 }
 
+/// The size of the pool this session created, if any. Reads the cell — it never
+/// creates one — so a session snapshot can record the compile budget in force
+/// and `atrium recover` can rebuild the same pool instead of coming back
+/// unpooled (which is how a recovered fleet used to run its builds).
+pub fn session_size() -> Option<usize> {
+    SESSION.get().and_then(|p| p.as_ref()).map(|p| p.size())
+}
+
 /// Whether this process already sits inside an atrium session's pool (its
 /// `CARGO_MAKEFLAGS` names a jobserver), in which case it creates none.
 pub fn inherited() -> bool {

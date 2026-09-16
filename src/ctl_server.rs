@@ -104,10 +104,10 @@ pub(crate) fn caller_privileged(windows: &[Window], caller: Option<AgentId>) -> 
     // gate had no tests at all: when its two `None` arms were flipped from
     // `true` to `false` — a security fix — nothing in the suite changed, which is
     // precisely the problem.
-    let pane_parent = caller
+    let pane_root = caller
         .and_then(|id| pane_by_agent(windows, id))
-        .map(|p| p.parent);
-    privilege_for(caller, pane_parent)
+        .map(|p| (p.parent, p.depth));
+    privilege_for(caller, pane_root)
 }
 
 /// Resolve a spawn's permission mode against the session policy.
@@ -153,9 +153,23 @@ pub(crate) fn effective_mode(
 ///
 /// `pane_parent` says what the caller's capability token resolved to:
 /// - `None` — no such live pane (a stale or forged token), or no caller at all
-/// - `Some(None)` — a live pane with no parent: a root pane the human opened
-/// - `Some(Some(_))` — a live pane spawned by another: a worker
-pub(crate) fn privilege_for(caller: Option<AgentId>, pane_parent: Option<Option<AgentId>>) -> bool {
+/// - `Some((None, 0))` — a live root pane the human opened
+/// - `Some((Some(_), _))` — a live pane spawned by another: a worker
+/// - `Some((None, d))` with `d > 0` — a worker that has *lost* its parent link
+///
+/// That last case is why the depth is part of the decision and not just the
+/// parent. A worker's parent link can go missing: `atrium recover` resolves each
+/// worker's parent through the pane that spawned it, and a parent which had
+/// already exited (so it is no longer in the window) resolves to `None`. Keying
+/// the gate on the parent alone then promoted that worker to **operator** on the
+/// next recovery — handing it session-wide `send`/`kill`/`respawn` and the right
+/// to delegate any identity in the vault. Depth is recorded independently, so
+/// requiring both closes it. The doc above has described a root as "parent ==
+/// None, depth 0" since this gate was written; this is the code catching up.
+pub(crate) fn privilege_for(
+    caller: Option<AgentId>,
+    pane_root: Option<(Option<AgentId>, usize)>,
+) -> bool {
     match caller {
         // No authenticated caller is NOT the operator. This arm used to return
         // `true`, which inverted the gate: holding no credential granted strictly
@@ -164,8 +178,8 @@ pub(crate) fn privilege_for(caller: Option<AgentId>, pane_parent: Option<Option<
         // self-reported, so `None` means exactly "unauthenticated" and must be
         // the least trusted state, not the most.
         None => false,
-        Some(_) => match pane_parent {
-            Some(parent) => parent.is_none(),
+        Some(_) => match pane_root {
+            Some((parent, depth)) => parent.is_none() && depth == 0,
             // A token resolving to no live pane is stale or forged, not the
             // operator. Same inversion as above.
             None => false,

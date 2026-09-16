@@ -381,6 +381,13 @@ pub fn set_fleet_mb(mb: u64) {
     let _ = FLEET_MB.set(mb);
 }
 
+/// The fleet ceiling recorded for this session, if any. A session snapshot
+/// carries it so `atrium recover` re-applies the same cap rather than coming
+/// back with the memory guard off.
+pub fn fleet_mb() -> Option<u64> {
+    FLEET_MB.get().copied()
+}
+
 /// This session's cap, from the environment and the fleet file.
 pub fn session_cap() -> Cap {
     if !supported() {
