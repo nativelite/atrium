@@ -67,7 +67,7 @@ Requires a recent stable Rust toolchain. Windows is the reference platform
 
 ### Set up the coordination skills
 
-The control plane and fleets rely on two Claude Code skills that teach a hosted
+The control plane and fleets rely on three Claude Code skills that teach a hosted
 `claude` how to use `atrium ctl`. **Without them, an agent does not know the
 control plane exists**, so install them before running `--allow-ctl` sessions or
 `atrium fleet up`. The easiest way is the nativelite marketplace:
@@ -80,8 +80,8 @@ control plane exists**, so install them before running `--allow-ctl` sessions or
 Or copy the skill folders by hand from this repo's [`skills/`](skills/):
 
 ```bash
-cp -r skills/atrium-delegate skills/atrium-coordinate ~/.claude/skills/
-# Windows: copy skills\atrium-delegate and skills\atrium-coordinate
+cp -r skills/atrium-delegate skills/atrium-coordinate skills/atrium-fleet ~/.claude/skills/
+# Windows: copy the three folders under skills\
 #          into %USERPROFILE%\.claude\skills\
 ```
 
@@ -89,6 +89,9 @@ cp -r skills/atrium-delegate skills/atrium-coordinate ~/.claude/skills/
   work when it genuinely pays, and does small or dependent work inline.
 - **`atrium-coordinate`**: casts an agent as a coordinator that splits a task
   across a team, delegates every part, monitors, collects, and reaps.
+- **`atrium-fleet`**: designs, configures and runs a saved `atrium.fleet.json` —
+  the instruction layer for `atrium fleet up`, including what the resource
+  budget and the preflight warnings mean.
 
 Plain single-pane use (`atrium claude`) needs neither.
 
@@ -255,9 +258,10 @@ risky.
 This is the deepest part of atrium. The full command reference, the board/bus
 semantics, the trust ladder, and the **7-point security model** live in
 [docs/control-plane.md](docs/control-plane.md) and
-[docs/trust-and-security.md](docs/trust-and-security.md). Two Claude Code skills,
-[`atrium-delegate`](skills/atrium-delegate) and
-[`atrium-coordinate`](skills/atrium-coordinate), teach an agent to actually use
+[docs/trust-and-security.md](docs/trust-and-security.md). Three Claude Code
+skills, [`atrium-delegate`](skills/atrium-delegate),
+[`atrium-coordinate`](skills/atrium-coordinate) and
+[`atrium-fleet`](skills/atrium-fleet), teach an agent to actually use
 `ctl`. **Install them first** (see [Set up the coordination
 skills](#set-up-the-coordination-skills)), or a hosted agent will not know the
 control plane exists.

@@ -123,12 +123,16 @@ atrium ctl audit
 
 The multiplier: many workers, coordinated by a few of them, driven by one human, and every level is a pane you can watch, redirect, zoom into (`Ctrl+A z`), or kill. `ctl` is the small verb layer; the panes, tiling, identity injection, and `agsess` status it stands on already existed.
 
-## Delegation skills: atrium-delegate and atrium-coordinate
+## Delegation skills: atrium-delegate, atrium-coordinate and atrium-fleet
 
-`ctl` is the mechanism; two Claude Code skills (in `skills/`) are the instruction layer that makes an agent *use* it. Copy the directories into `~/.claude/skills/` and any atrium-hosted claude picks them up. They exist because the trigger is **who decides to delegate**:
+`ctl` is the mechanism; three Claude Code skills (in `skills/`) are the instruction layer that makes an agent *use* it. Copy the directories into `~/.claude/skills/` and any atrium-hosted claude picks them up. The first two exist because the trigger is **who decides to delegate**:
 
 - **`atrium-delegate`** (ambient / discretionary): the agent *may* hand off an independent, substantial part when it genuinely pays, and does small or dependent work inline. On its own a capable agent usually judges it can do the work itself (which is correct), so this fires rarely by design. Its real value is discoverability: without it, an agent does not know `atrium ctl` exists at all.
 - **`atrium-coordinate`** (directed): for when you *want* fan-out. It casts the agent as a coordinator that splits the work, delegates **every** part, monitors, collects, and reaps, instead of implementing inline. This is the reliable lever: on a task where the ambient skill chose inline every time, coordinate mode fanned out every time.
+
+The third covers the saved-fleet path rather than ad-hoc delegation:
+
+- **`atrium-fleet`**: designing, configuring and running an `atrium.fleet.json` — the file's full schema, what the resource budget actually costs (compiling is the scarce resource), what atrium enforces, and how to read the `PREFLIGHT` block.
 
 Drop a spawned lead straight into coordinate mode by telling it to coordinate:
 
