@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "atrium"
-version = "0.35.0"
+version = "0.35.1"
 dependencies = [
  "nativelite-abus",
  "nativelite-agsess",
@@ -64,7 +64,7 @@ version = "0.1.0"
 
 [[package]]
 name = "nativelite-vterm"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "nativelite-ansi",
  "nativelite-uwidth",

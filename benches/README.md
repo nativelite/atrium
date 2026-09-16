@@ -108,10 +108,10 @@ and coalescing frames queued together into one write. Windows, keys 120 ms apart
 At the default 30 ms gap the stalls still show, for both atrium and a bare
 relay: below about one frame per key, the console host's cadence is the floor.
 
-### Where the flood gap went (unreleased)
+### Where the flood gap went (0.35.1)
 
 A second emulator change — blitting runs of plain ASCII instead of writing cell
-by cell (`nativelite-vterm`, unreleased) — took the feed to **173 MB/s** at
+by cell (`nativelite-vterm` 0.5.2) — took the feed to **173 MB/s** at
 40x160 and atrium's flood to **73.7-76.6 MB/s** against 135-139 MB/s for `cat`:
 a 1.8x gap, from 9x at the 0.34.0 baseline.
 

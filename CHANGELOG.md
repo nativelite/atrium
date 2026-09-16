@@ -7,17 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.1] - 2026-09-15
+
 ### Changed
 - **Output floods run about 1.5x faster again**, from an emulator change in
-  `nativelite-vterm` (unreleased): a run of plain ASCII is blitted into the
-  screen instead of written cell by cell. On Linux a pane flooding 16 MB went
-  from 39-51 to 73.7-76.6 MB/s, against 135-139 MB/s for `cat` — a 1.8x gap,
-  from 9x at the 0.34.0 baseline.
+  `nativelite-vterm` 0.5.2: a run of plain ASCII is blitted into the screen
+  instead of written cell by cell. On Linux a pane flooding 16 MB went from
+  39-51 to 73.7-76.6 MB/s, against 135-139 MB/s for `cat` — a 1.8x gap, from 9x
+  at the 0.34.0 baseline.
 
   That gap is now explained rather than merely smaller: atrium does everything
   `cat` does *and* feeds the emulator, in series, and the two costs together
-  predict exactly the measured rate. See `benches/README.md`. **Releasing this
-  needs `nativelite-vterm` published first.**
+  predict exactly the measured rate. See `benches/README.md`. The emulator is no
+  longer what limits a flood, so this is where the throughput work stops until
+  something demands more.
 
 ## [0.35.0] - 2026-09-15
 
