@@ -139,6 +139,108 @@ pub fn session_file(root: &Path, project_id: &str, pid: u32, started_ms: u64) ->
     project_dir(root, project_id).join(format!("{pid}-{started_ms}.json"))
 }
 
+/// A session's sidecar file — its bus or board, saved beside the snapshot as
+/// `<pid>-<ms>.<kind>.json` so a resume brings back subscriptions, unread events
+/// and board state.
+pub fn sidecar(snapshot: &Path, kind: &str) -> PathBuf {
+    snapshot.with_extension(format!("{kind}.json"))
+}
+
+/// Is this store file a sidecar rather than a snapshot? Sidecars share the
+/// `.json` extension, so the listing must skip them or every bus file would be
+/// reported as an unreadable snapshot.
+pub fn is_sidecar(path: &Path) -> bool {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|stem| stem.contains('.'))
+}
+
+/// The snapshot this process is resuming, recorded once the operator has
+/// confirmed, so the run loop can seed the new session's bus and board from the
+/// old session's sidecars.
+static RESUME_SOURCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the snapshot being resumed. First call wins.
+pub fn set_resume_source(path: &Path) {
+    let _ = RESUME_SOURCE.set(path.to_path_buf());
+}
+
+/// The snapshot being resumed, if this process is a resume.
+pub fn resume_source() -> Option<&'static Path> {
+    RESUME_SOURCE.get().map(PathBuf::as_path)
+}
+
+/// Seed a new sidecar from the resumed session's, if there is one and the new
+/// file does not exist yet. Best-effort: a missing old sidecar simply starts
+/// empty, as a new session would.
+///
+/// Only a source inside the store seeds anything. `atrium recover --snapshot`
+/// accepts a file from anywhere — on unix, the shared `/tmp` — and a `.bus.json`
+/// that happens to sit beside it there is not this operator's.
+pub fn seed_sidecar(new_snapshot: &Path, kind: &str) {
+    let Some(source) = resume_source() else {
+        return;
+    };
+    let in_store = state_root().is_some_and(|root| is_in_store(source, &root));
+    if !in_store {
+        return;
+    }
+    let (from, to) = (sidecar(source, kind), sidecar(new_snapshot, kind));
+    if from.is_file() && !to.exists() {
+        if let Some(dir) = to.parent() {
+            let _ = ensure_private_dir(dir);
+        }
+        let _ = std::fs::copy(&from, &to);
+    }
+}
+
+/// Writes a session's bus and board off the run loop, in order, owner-only.
+///
+/// A deferred bus or board hands its serialized state out at most once per
+/// snapshot interval; writing half a megabyte on the loop thread would stall a key
+/// echo by milliseconds. One thread and one channel keep the writes ordered, so an
+/// older state can never land after a newer one. Best-effort, as bus persistence
+/// always was: a failed write is retried when the state next changes.
+pub struct SidecarWriter {
+    tx: Option<std::sync::mpsc::Sender<(PathBuf, String)>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SidecarWriter {
+    /// Start the writer thread.
+    pub fn start() -> SidecarWriter {
+        let (tx, rx) = std::sync::mpsc::channel::<(PathBuf, String)>();
+        let handle = std::thread::spawn(move || {
+            for (path, contents) in rx {
+                if let Some(dir) = path.parent() {
+                    let _ = ensure_private_dir(dir);
+                }
+                let _ = write_private(&path, &contents);
+            }
+        });
+        SidecarWriter {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    /// Queue one write.
+    pub fn submit(&self, write: (PathBuf, String)) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(write);
+        }
+    }
+
+    /// Finish every queued write and stop the thread — the last state a deliberate
+    /// exit leaves must be on disk before the process ends.
+    pub fn finish(mut self) {
+        self.tx = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// The writer pid a store file name claims (`<pid>-<ms>.json`), if it has one.
 pub fn pid_from_name(path: &Path) -> Option<u32> {
     path.file_stem()?.to_str()?.split('-').next()?.parse().ok()
@@ -287,7 +389,7 @@ pub fn list(dir: &Path, project_id: &str, now_ms: u64) -> Listing {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|e| e.to_str()) != Some("json") || is_sidecar(&path) {
             continue;
         }
         match crate::session::load(&path) {
@@ -393,8 +495,16 @@ pub fn mark_closed(path: &Path) -> Result<(), String> {
 /// [`mark_closed`] — a snapshot passed from elsewhere (a v1 file in the temp
 /// directory) is read, never modified.
 pub fn is_in_store(path: &Path, root: &Path) -> bool {
+    // Canonicalize the directory, not the file: a file that does not exist (yet,
+    // or any more) cannot be canonicalized, and the raw fallback lacks the verbatim
+    // prefix Windows puts on a canonical root, so the prefix test would fail for
+    // a path that is plainly inside the store.
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(path).starts_with(canon(root))
+    let full = match (path.parent(), path.file_name()) {
+        (Some(dir), Some(name)) => canon(dir).join(name),
+        _ => canon(path),
+    };
+    full.starts_with(canon(root))
 }
 
 #[cfg(test)]
@@ -442,6 +552,9 @@ mod tests {
                 depth: 0,
                 parent_pane: None,
                 mode: None,
+                kickoff: false,
+                norms: None,
+                context_env: Vec::new(),
             })
             .collect();
         s
@@ -677,6 +790,56 @@ mod tests {
     }
 
     #[test]
+    fn sidecars_sit_beside_their_snapshot_and_are_not_listed_as_sessions() {
+        let snap = Path::new("/s/p/42-7.json");
+        assert_eq!(sidecar(snap, "bus"), PathBuf::from("/s/p/42-7.bus.json"));
+        assert!(is_sidecar(&sidecar(snap, "board")));
+        assert!(!is_sidecar(snap));
+
+        let dir = std::env::temp_dir().join(format!("atrium_store_side_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let mut s = capture(vec![0], 0, Vec::new(), None);
+        s.meta = meta(42, 1, false);
+        crate::session::save(&dir.join("42-7.json"), &s).unwrap();
+        std::fs::write(dir.join("42-7.bus.json"), b"{\"events\":[]}").unwrap();
+        let listing = list(&dir, "p", 2);
+        assert_eq!(listing.sessions.len(), 1);
+        assert!(
+            listing.unreadable.is_empty() && listing.suspect.is_empty(),
+            "a bus file is not a broken snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resumed session starts its bus and board from the old session's files,
+    /// and never overwrites a sidecar that already exists. This is the only test
+    /// in the process that sets the resume source (a first-call-wins global).
+    #[test]
+    fn a_resume_seeds_the_new_sessions_sidecars_from_the_old_ones() {
+        // Inside the store: a source anywhere else never seeds (see `seed_sidecar`).
+        let dir = state_root()
+            .expect("the test suite sets a state dir")
+            .join(format!("atrium_store_seed_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        let old = dir.join("1-1.json");
+        let new = dir.join("2-2.json");
+        std::fs::write(sidecar(&old, "bus"), b"old bus").unwrap();
+        std::fs::write(sidecar(&new, "board"), b"already here").unwrap();
+        set_resume_source(&old);
+        seed_sidecar(&new, "bus");
+        seed_sidecar(&new, "board");
+        assert_eq!(std::fs::read(sidecar(&new, "bus")).unwrap(), b"old bus");
+        assert_eq!(
+            std::fs::read(sidecar(&new, "board")).unwrap(),
+            b"already here",
+            "an existing sidecar is never overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_store_file_name_carries_its_writer_pid() {
         assert_eq!(
             pid_from_name(Path::new("/s/p/4242-1757990000000.json")),
@@ -738,6 +901,10 @@ mod tests {
             &std::env::temp_dir().join("elsewhere.json"),
             &root
         ));
+        assert!(
+            is_in_store(&root.join("p").join("not-written-yet.json"), &root),
+            "a file that does not exist yet is still inside the store"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

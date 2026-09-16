@@ -614,6 +614,10 @@ pub(crate) fn spawn_pane_full(
         worktree: None,
         deny: deny.to_vec(),
         mode,
+        // The fleet launcher marks a kickoff after spawn; nothing else has one.
+        kickoff: false,
+        norms: extra_norms.map(str::to_string),
+        context_env: atrium::context::restorable_env(extra_env),
     })
 }
 

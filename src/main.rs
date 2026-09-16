@@ -403,6 +403,15 @@ pub(crate) struct Pane {
     /// the session ceiling (a fleet agent's `trust`, a de-escalated ctl worker).
     /// Recorded so recovery restores the pane's own posture, not the ceiling.
     pub(crate) mode: atrium::ctl::TrustMode,
+    /// The last element of `argv` is this fleet agent's kickoff prompt. Set by
+    /// the fleet launcher; a resume drops it so a mid-task agent is not told to
+    /// start over.
+    pub(crate) kickoff: bool,
+    /// The worktree instructions folded into this pane's system prompt at spawn,
+    /// kept so a resume can fold them in again (`argv` never carried them).
+    pub(crate) norms: Option<String>,
+    /// The fleet context-store variables this pane was given, for the same reason.
+    pub(crate) context_env: Vec<(String, String)>,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are
@@ -731,6 +740,9 @@ fn capture_pane_fields(
     depth: usize,
     parent_pane: Option<usize>,
     mode: atrium::ctl::TrustMode,
+    kickoff: bool,
+    norms: Option<String>,
+    context_env: Vec<(String, String)>,
 ) -> atrium::session::PaneCapture {
     atrium::session::PaneCapture {
         id,
@@ -745,6 +757,9 @@ fn capture_pane_fields(
         depth,
         parent_pane,
         mode: Some(mode),
+        kickoff,
+        norms,
+        context_env,
     }
 }
 
@@ -827,6 +842,9 @@ fn snapshot_if_changed(
                     p.depth,
                     parent_pane(p.parent),
                     p.mode,
+                    p.kickoff,
+                    p.norms.clone(),
+                    p.context_env.clone(),
                 )
             })
             .collect(),
@@ -993,6 +1011,18 @@ fn recovery_notice(
         if !record.deny.is_empty() {
             facts.push(format!("{} own deny rule(s)", record.deny.len()));
         }
+        // Shown, not just named: both come from the file and both reach the agent.
+        if let Some(norms) = &record.norms {
+            let flat = atrium::fleet::sanitize(&norms.replace(['\n', '\r'], " "));
+            let preview: String = flat.chars().take(60).collect();
+            facts.push(format!(
+                "worktree instructions \"{preview}…\" ({} chars)",
+                norms.chars().count()
+            ));
+        }
+        for (name, value) in &record.context_env {
+            facts.push(format!("{name}={}", atrium::fleet::sanitize(value)));
+        }
         lines.push(format!("      {}", facts.join(" · ")));
         let (_, dropped) = atrium::ctl::sanitize_spawn_argv(&record.argv);
         if !dropped.is_empty() {
@@ -1149,6 +1179,7 @@ fn recover_cmd(args: &[String]) -> ExitCode {
     }
     let plan = plan_resume(
         &snap,
+        Some(&path),
         allow_ctl,
         max_depth,
         trust,
@@ -1181,12 +1212,45 @@ struct ResumePlan {
     notice: String,
 }
 
+/// What a resume's bus and board will bring back, for the consent notice. Their
+/// contents are as writable by hosted agents as the snapshot, and agents act on
+/// bus messages, so the operator is told they are coming rather than finding out.
+/// `None` when the source has neither (or is outside the store, which never seeds).
+fn sidecar_summary(source: &std::path::Path) -> Option<String> {
+    let root = atrium::session_store::state_root()?;
+    if !atrium::session_store::is_in_store(source, &root) {
+        return None;
+    }
+    let bus_path = atrium::session_store::sidecar(source, "bus");
+    let board_path = atrium::session_store::sidecar(source, "board");
+    let mut parts = Vec::new();
+    if bus_path.is_file() {
+        let bus = atrium::bus::Bus::with_file(bus_path);
+        parts.push(format!(
+            "bus: {} event(s), {} open decision(s)",
+            bus.tail(atrium::bus::RING_CAP).len(),
+            bus.pending_decisions().len()
+        ));
+    }
+    if board_path.is_file() {
+        let board = atrium::board::Board::with_file(board_path);
+        parts.push(format!("board: {} entr(ies)", board.list().len()));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "  restoring the team's {} — written by the session's agents; treat as such",
+            parts.join(", ")
+        )
+    })
+}
+
 /// Settle a resume's posture. A typed flag wins; an omitted one defers to the
 /// snapshot instead of overwriting it with a default. The trust ceiling is still
 /// capped to any enclosing atrium session — a snapshot is data on disk and must
 /// never be a way to climb above one.
 fn plan_resume(
     snap: &atrium::session::Snapshot,
+    source: Option<&std::path::Path>,
     allow_ctl: bool,
     max_depth: usize,
     trust: atrium::ctl::TrustMode,
@@ -1209,8 +1273,13 @@ fn plan_resume(
         trust: Some(trust),
         allow_ctl,
         max_depth,
+        topics: p.topics.clone(),
     });
-    let notice = recovery_notice(&snap.panes, applied.as_ref(), !trust_typed, trust);
+    let mut notice = recovery_notice(&snap.panes, applied.as_ref(), !trust_typed, trust);
+    if let Some(line) = source.and_then(sidecar_summary) {
+        notice.push('\n');
+        notice.push_str(&line);
+    }
     ResumePlan {
         trust,
         allow_ctl,
@@ -1309,6 +1378,7 @@ fn offer_resume(
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let plan = plan_resume(
         &found.snapshot,
+        Some(&found.path),
         allow_ctl,
         max_depth,
         trust,
@@ -1468,8 +1538,21 @@ fn resume_session(
         }
     }
     set_trust_mode(trust);
+    let topics = applied.as_ref().and_then(|p| p.topics.clone());
     if let Some(applied) = applied {
         atrium::session::set_policy(applied);
+    }
+    // The run loop opens this session's bus and board beside its new snapshot;
+    // this is what lets it start them from the old session's instead of empty.
+    if let Some(src) = source {
+        atrium::session_store::set_resume_source(src);
+        // Copied now, not when the run loop opens them: until this session writes
+        // its first snapshot, another atrium starting in the project could prune
+        // the source and its bus and board would silently start empty.
+        if let Some((_, file, _)) = session_location() {
+            atrium::session_store::seed_sidecar(file, "bus");
+            atrium::session_store::seed_sidecar(file, "board");
+        }
     }
     // Re-install the session guards BEFORE any pane spawns, in the same order
     // `fleet up` does: the deny list and memory ceiling are read at each spawn,
@@ -1523,8 +1606,11 @@ fn resume_session(
                 // The pane's own posture, capped to the ceiling — not the ceiling
                 // itself, which would promote every de-escalated pane.
                 mode: recovered_pane_mode(record.mode, trust_mode()),
-                extra_env: &[],
-                extra_norms: None,
+                // What the original spawn folded in beyond argv: the worktree
+                // instructions, and the context-store variables (allowlisted on
+                // read, so a snapshot cannot hand a pane any other environment).
+                extra_env: &record.context_env,
+                extra_norms: record.norms.as_deref(),
                 // The agent's own deny rules. `argv` never carried them: the
                 // `--disallowedTools` flags are built here, at spawn, from the
                 // roster — so a recovery that replayed argv alone handed every
@@ -1546,6 +1632,9 @@ fn resume_session(
                 if pane.session_id.is_none() {
                     pane.session_id = record.session_id.clone();
                 }
+                // The kickoff was dropped from this pane's command iff it resumed a
+                // transcript; a pane that started fresh still carries it.
+                pane.kickoff = record.kickoff && !kickoff_dropped(record);
                 // Capability and spawn-depth, from the snapshot. `spawn_pane_full`
                 // defaults to the human-pane behaviour (`can_spawn: true`, depth
                 // 0); leaving those defaults gave every recovered fleet agent the
@@ -1606,7 +1695,9 @@ fn resume_session(
         max_depth,
         trust,
         ctl_listener,
-        None,
+        // A fleet's declared topics keep the bus strict after a resume, as `fleet
+        // up` made it.
+        topics,
     )
 }
 
@@ -1618,7 +1709,19 @@ fn resume_argv(record: &atrium::session::PaneRecord) -> Vec<String> {
     // is atrium's to set, from the policy the operator just confirmed — so the
     // governed permission flags never ride along, exactly as `fleet up` and
     // `ctl spawn` strip them from what they launch.
-    let (mut argv, _) = atrium::ctl::sanitize_spawn_argv(&record.argv);
+    // A kickoff is replayed only when the agent starts fresh. Resuming a
+    // transcript, the agent is mid-task; its opening instructions arriving again
+    // as a new turn is how resumed fleet agents re-read CLAUDE.md and went back to
+    // step one.
+    //
+    // Only for claude, where a `--resume` is appended below. Another vendor's pane
+    // may carry a session id atrium adopted, but nothing here resumes it: that pane
+    // starts a new session, and its kickoff is exactly what it needs.
+    let saved: &[String] = match record.argv.split_last() {
+        Some((_, rest)) if kickoff_dropped(record) => rest,
+        _ => &record.argv,
+    };
+    let (mut argv, _) = atrium::ctl::sanitize_spawn_argv(saved);
     if argv.is_empty() {
         return argv;
     }
@@ -1633,6 +1736,19 @@ fn resume_argv(record: &atrium::session::PaneRecord) -> Vec<String> {
         argv.push(id.clone());
     }
     argv
+}
+
+/// Does a resume leave this pane's kickoff out? Only when the pane has one and a
+/// claude transcript will actually be resumed. Shared by `resume_argv` (which
+/// drops it) and the resume spawn (which records whether the new command still
+/// carries it), so the two can never disagree.
+fn kickoff_dropped(record: &atrium::session::PaneRecord) -> bool {
+    record.kickoff
+        && record.session_id.is_some()
+        && record
+            .argv
+            .first()
+            .is_some_and(|c| atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)))
 }
 
 /// Remove every session-selecting argument — `--continue`/`-c`, and
@@ -1755,6 +1871,7 @@ fn run(
         trust: Some(trust),
         allow_ctl,
         max_depth,
+        topics: canonical_topics.clone(),
     });
     // The terminal as a queue: a terminal that stops reading must not stop the
     // loop — keys, pane draining, ctl and the safety net all run on. See
@@ -1892,16 +2009,34 @@ fn run(
     // The shared board (coordination layer): source-of-truth team state, in-memory
     // unless ATRIUM_BOARD names a snapshot file. Part of the ctl surface, so it is
     // already gated by `--allow-ctl`.
+    //
+    // Without an explicit file, a session with a place in the store keeps its board
+    // and bus there, beside its snapshot, so a resume brings back the team's
+    // subscriptions, unread events and board — which lived only in this process
+    // before, and died with it. A resume starts from the resumed session's copies.
+    let sidecar_of = |kind: &str| {
+        session_location().map(|(_, file, _)| atrium::session_store::sidecar(file, kind))
+    };
     let mut board = match std::env::var_os(atrium::board::ENV_BOARD) {
         Some(p) if !p.is_empty() => atrium::board::Board::with_file(std::path::PathBuf::from(p)),
-        _ => atrium::board::Board::new(),
+        _ => match sidecar_of("board") {
+            Some(path) => atrium::board::Board::with_file_deferred(path),
+            None => atrium::board::Board::new(),
+        },
     };
     // The shared pub/sub bus (coordination layer part 2): the team's event stream,
     // in-memory unless ATRIUM_BUS names a snapshot file. Same ctl gating as the board.
     let mut bus = match std::env::var_os(atrium::bus::ENV_BUS) {
         Some(p) if !p.is_empty() => atrium::bus::Bus::with_file(std::path::PathBuf::from(p)),
-        _ => atrium::bus::Bus::new(),
+        _ => match sidecar_of("bus") {
+            Some(path) => atrium::bus::Bus::with_file_deferred(path),
+            None => atrium::bus::Bus::new(),
+        },
     };
+    // Sidecar writes leave the loop: a deferred bus and board hand their state out
+    // at most once per snapshot interval, and this thread writes it.
+    let sidecar_writer = atrium::session_store::SidecarWriter::start();
+    let mut last_sidecar_flush = Instant::now();
     // A fleet that declared a topic vocabulary switches the bus to strict
     // admission; without one it stays soft-gated. Set before any pane is spawned,
     // so the very first publish is already governed by the right policy.
@@ -1963,6 +2098,15 @@ fn run(
         // and (unix) the orphan watchdog.
         if safety_net.tick(&windows, session_job, &mut ctl_audit, &mut bus, &mut flash) {
             force_repaint = true;
+        }
+        if last_sidecar_flush.elapsed() >= SNAPSHOT_INTERVAL {
+            last_sidecar_flush = Instant::now();
+            for write in [bus.take_pending_write(), board.take_pending_write()]
+                .into_iter()
+                .flatten()
+            {
+                sidecar_writer.submit(write);
+            }
         }
         // 1. wait for a key or pane output — woken the moment either arrives —
         //    or at most a tick, for the loop's timed work. Then keystrokes ->
@@ -2496,6 +2640,15 @@ fn run(
     // A deliberate exit: mark the snapshot closed so the next launch in this
     // project does not offer to resume what the operator chose to end. After the
     // screen is restored, so a failure is readable.
+    // Whatever the bus and board changed since the last flush, then wait for the
+    // writer: a resume should find the team as it was when the session ended.
+    for write in [bus.take_pending_write(), board.take_pending_write()]
+        .into_iter()
+        .flatten()
+    {
+        sidecar_writer.submit(write);
+    }
+    sidecar_writer.finish();
     let settled = if deliberate_exit {
         safety_net.settle_session()
     } else {
@@ -3451,6 +3604,9 @@ mod tests {
             depth: 0,
             parent_pane: None,
             mode: None,
+            kickoff: false,
+            norms: None,
+            context_env: Vec::new(),
         }
     }
 
@@ -3549,6 +3705,67 @@ mod tests {
         );
         assert!(notice.contains("may spawn teammates") && notice.contains("cannot spawn"));
         assert!(notice.contains("1 own deny rule(s)"));
+    }
+
+    /// A kickoff is the agent's opening instructions. Resuming a transcript the
+    /// agent is mid-task, so the kickoff is left out; starting fresh (nothing to
+    /// resume) it is exactly what the agent needs, so it stays.
+    #[test]
+    fn a_kickoff_is_replayed_only_when_the_agent_starts_fresh() {
+        let argv = vec![
+            "claude".into(),
+            "--model".into(),
+            "opus".into(),
+            "Start by reading CLAUDE.md".into(),
+        ];
+        let mut resumed = pane_record(argv.clone(), Some("t-1".into()));
+        resumed.kickoff = true;
+        assert_eq!(
+            super::resume_argv(&resumed),
+            vec!["claude", "--model", "opus", "--resume", "t-1"]
+        );
+        let mut fresh = pane_record(argv.clone(), None);
+        fresh.kickoff = true;
+        assert_eq!(
+            super::resume_argv(&fresh),
+            argv,
+            "no transcript: keep the kickoff"
+        );
+        // Another vendor's pane can carry an adopted session id, but nothing
+        // resumes it — it starts a new session and needs its kickoff.
+        let mut codex = pane_record(
+            vec!["codex".into(), "Start by reading AGENTS.md".into()],
+            Some("adopted".into()),
+        );
+        codex.kickoff = true;
+        assert_eq!(
+            super::resume_argv(&codex),
+            vec!["codex", "Start by reading AGENTS.md"],
+            "a non-claude pane keeps its kickoff"
+        );
+        let not_a_kickoff = pane_record(argv, Some("t-2".into()));
+        assert!(
+            super::resume_argv(&not_a_kickoff).contains(&"Start by reading CLAUDE.md".to_string()),
+            "only a pane marked as having a kickoff loses its last argument"
+        );
+    }
+
+    /// The consent notice names the parts of a resume the command line does not
+    /// show: worktree instructions and the context store.
+    #[test]
+    fn the_resume_notice_names_worktree_instructions_and_the_context_store() {
+        let mut p = pane_record(vec!["claude".into()], None);
+        p.norms = Some("stay in the worktree".into());
+        p.context_env = vec![("CONTEXT_MODE_DIR".into(), "/ctx".into())];
+        let notice = super::recovery_notice(&[p], None, false, TrustMode::Edits);
+        assert!(
+            notice.contains("worktree instructions \"stay in the worktree"),
+            "the instructions are previewed, not just named: {notice}"
+        );
+        assert!(
+            notice.contains("CONTEXT_MODE_DIR=/ctx"),
+            "the context store path is shown: {notice}"
+        );
     }
 
     /// A pane that was itself resumed carries `--resume <id>` in its argv; the next
@@ -3687,6 +3904,9 @@ mod tests {
             1,
             Some(0),
             TrustMode::Edits,
+            false,
+            None,
+            Vec::new(),
         );
         assert_eq!(
             cap.worktree.as_deref(),
@@ -3707,6 +3927,9 @@ mod tests {
             0,
             None,
             TrustMode::Off,
+            false,
+            None,
+            Vec::new(),
         );
         assert!(
             cap_none.worktree.is_none(),
@@ -3735,6 +3958,9 @@ mod tests {
             3,
             Some(1),
             TrustMode::Plan,
+            false,
+            None,
+            Vec::new(),
         );
         assert_eq!(cap.deny, vec!["cargo test --workspace".to_string()]);
         assert!(
@@ -3824,6 +4050,7 @@ mod tests {
             trust: Some(TrustMode::Auto),
             allow_ctl: true,
             max_depth: 6,
+            topics: None,
         };
         let full = super::recovery_notice(&notice_panes(4), Some(&policy), false, TrustMode::Auto);
         for expected in [
@@ -3859,6 +4086,7 @@ mod tests {
             trust: Some(TrustMode::Auto),
             allow_ctl: true,
             max_depth: usize::MAX,
+            topics: None,
         };
         let from_file =
             super::recovery_notice(&notice_panes(1), Some(&policy), true, TrustMode::Auto);

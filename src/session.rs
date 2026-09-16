@@ -70,6 +70,18 @@ pub struct PaneRecord {
     /// comes back at the session ceiling. Re-applied capped to the ceiling — a
     /// snapshot can lower a pane's posture, never raise it.
     pub mode: Option<crate::ctl::TrustMode>,
+    /// The last element of `argv` is a fleet agent's **kickoff** — its opening
+    /// instructions, passed as the first user message. A resume must not replay
+    /// it: the agent is mid-task, and being told to start again is how a resumed
+    /// fleet agent re-read its kickoff and re-oriented from step one.
+    pub kickoff: bool,
+    /// The worktree instructions folded into the pane's system prompt at spawn
+    /// (*your cwd already is the worktree, do not cd, commit on your branch*).
+    /// Not in `argv`, which is the command before atrium adds to it.
+    pub norms: Option<String>,
+    /// The fleet context-store variables the pane was given. Only names in
+    /// `context::RESTORABLE_ENV` are ever recorded or read back.
+    pub context_env: Vec<(String, String)>,
 }
 
 /// The serialisable grid layout: pane ids in left-to-right tree order and
@@ -110,6 +122,10 @@ pub struct PolicyRecord {
     pub allow_ctl: bool,
     /// The ctl spawn-tree depth guard (`usize::MAX` == unlimited).
     pub max_depth: usize,
+    /// A fleet's declared bus topics (`"topics": [...]`), which switch the bus to
+    /// strict admission. `None` for a soft-gated bus. Without it a recovered fleet
+    /// quietly accepted any topic its roster had ruled out.
+    pub topics: Option<Vec<String>>,
 }
 
 /// Who wrote a snapshot, for which project, when, and how that session ended —
@@ -163,6 +179,9 @@ pub struct PaneCapture {
     pub depth: usize,
     pub parent_pane: Option<usize>,
     pub mode: Option<crate::ctl::TrustMode>,
+    pub kickoff: bool,
+    pub norms: Option<String>,
+    pub context_env: Vec<(String, String)>,
 }
 
 /// Build a [`Snapshot`] from explicit window state. **Pure** — no I/O, no
@@ -201,6 +220,9 @@ pub fn capture(
                 depth: p.depth,
                 parent_pane: p.parent_pane,
                 mode: p.mode,
+                kickoff: p.kickoff,
+                norms: p.norms,
+                context_env: crate::context::restorable_env(&p.context_env),
             })
             .collect(),
         policy,
@@ -264,6 +286,19 @@ fn pane_to_json(p: &PaneRecord) -> Value {
             "mode".to_string(),
             opt_str(p.mode.map(|m| m.policy_label())),
         ),
+        ("kickoff".to_string(), Value::Bool(p.kickoff)),
+        ("norms".to_string(), opt_str(p.norms.as_deref())),
+        (
+            "context_env".to_string(),
+            Value::Array(
+                p.context_env
+                    .iter()
+                    .map(|(k, v)| {
+                        Value::Array(vec![Value::String(k.clone()), Value::String(v.clone())])
+                    })
+                    .collect(),
+            ),
+        ),
     ])
 }
 
@@ -283,6 +318,10 @@ fn policy_to_json(p: &PolicyRecord) -> Value {
         ),
         ("allow_ctl".to_string(), Value::Bool(p.allow_ctl)),
         ("max_depth".to_string(), num(p.max_depth)),
+        (
+            "topics".to_string(),
+            p.topics.as_deref().map(str_array).unwrap_or(Value::Null),
+        ),
     ])
 }
 
@@ -490,7 +529,32 @@ fn pane_from_json(v: &Value) -> Option<PaneRecord> {
         depth: usize_or(get(o, "depth"), 0),
         parent_pane: opt_usize(get(o, "parent_pane")),
         mode: pane_mode_of(get(o, "mode")),
+        // Defaults to false: a file without the key replays the whole argv, which
+        // is the v2-before-this behaviour, not a new risk.
+        kickoff: bool_or(get(o, "kickoff"), false),
+        norms: get(o, "norms").and_then(opt_str_from).flatten(),
+        context_env: env_pairs(get(o, "context_env")),
     })
+}
+
+/// A pane's recorded context variables: `[name, value]` pairs, filtered to
+/// `context::RESTORABLE_ENV` on read — the allowlist holds even for a file atrium
+/// did not write.
+fn env_pairs(v: Option<&Value>) -> Vec<(String, String)> {
+    let Some(Value::Array(items)) = v else {
+        return Vec::new();
+    };
+    let pairs: Vec<(String, String)> = items
+        .iter()
+        .filter_map(|item| match item {
+            Value::Array(kv) => match kv.as_slice() {
+                [Value::String(k), Value::String(v)] => Some((k.clone(), v.clone())),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    crate::context::restorable_env(&pairs)
 }
 
 /// The policy block. Three outcomes, and keeping them apart is the point:
@@ -517,6 +581,12 @@ fn policy_from_json(v: Option<&Value>) -> Option<Option<PolicyRecord>> {
         trust: mode_of(get(o, "trust")),
         allow_ctl: bool_or(get(o, "allow_ctl"), false),
         max_depth: usize_or(get(o, "max_depth"), crate::ctl::DEFAULT_MAX_DEPTH),
+        // Strict like `deny`: a topic list that is present but unreadable must not
+        // quietly become "any topic allowed". Absent or null is a soft-gated bus.
+        topics: match get(o, "topics") {
+            None | Some(Value::Null) => None,
+            some => Some(deny_list(some)?),
+        },
     }))
 }
 
@@ -618,6 +688,27 @@ pub fn load(path: &Path) -> Result<Snapshot, String> {
     }
     let mut seen: Vec<usize> = Vec::with_capacity(snap.panes.len());
     for p in &snap.panes {
+        // A NUL cannot occur in anything atrium itself launches, and on Windows it
+        // ends the command line or the environment entry it sits in: every
+        // argument after it — the trust flags and the deny list atrium appends —
+        // would be silently cut off. Refuse the file rather than launch that.
+        let strings = p
+            .argv
+            .iter()
+            .chain(&p.deny)
+            .chain(p.norms.iter())
+            .chain(p.cwd.iter())
+            .chain(p.identity.iter())
+            .chain(p.session_id.iter())
+            .chain(p.worktree.iter())
+            .chain(p.role.iter());
+        if strings.into_iter().any(|s| s.contains('\0')) {
+            return Err(format!(
+                "snapshot {}: pane {} contains a NUL character — refusing to launch it",
+                path.display(),
+                p.id
+            ));
+        }
         if seen.contains(&p.id) {
             return Err(format!(
                 "snapshot {}: duplicate pane id {} — refusing to rebuild an ambiguous session",
@@ -650,6 +741,9 @@ mod tests {
             depth: 0,
             parent_pane: None,
             mode: None,
+            kickoff: false,
+            norms: None,
+            context_env: Vec::new(),
         }
     }
 
@@ -661,6 +755,7 @@ mod tests {
             trust: Some(crate::ctl::TrustMode::Auto),
             allow_ctl: true,
             max_depth: 6,
+            topics: None,
         }
     }
 
@@ -685,6 +780,9 @@ mod tests {
                 depth: 0,
                 parent_pane: None,
                 mode: Some(crate::ctl::TrustMode::Auto),
+                kickoff: false,
+                norms: None,
+                context_env: Vec::new(),
             },
             PaneCapture {
                 id: 1,
@@ -699,6 +797,9 @@ mod tests {
                 depth: 0,
                 parent_pane: None,
                 mode: None,
+                kickoff: false,
+                norms: None,
+                context_env: Vec::new(),
             },
             PaneCapture {
                 id: 2,
@@ -713,6 +814,9 @@ mod tests {
                 depth: 1,
                 parent_pane: Some(0),
                 mode: Some(crate::ctl::TrustMode::Edits),
+                kickoff: false,
+                norms: None,
+                context_env: Vec::new(),
             },
             PaneCapture {
                 id: 3,
@@ -727,6 +831,9 @@ mod tests {
                 depth: 2,
                 parent_pane: Some(2),
                 mode: None,
+                kickoff: false,
+                norms: None,
+                context_env: Vec::new(),
             },
         ];
         (ids, focus, panes)
@@ -850,6 +957,93 @@ mod tests {
             {"id":0,"role":null,"argv":["bash"],"cwd":null,"identity":null,"session_id":null,"worktree":null}]}"#;
         std::fs::write(&path, v1).expect("test setup write");
         assert_eq!(load(&path).expect("v1 loads").meta, SessionMeta::default());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What a faithful resume needs beyond the command line — the kickoff marker,
+    /// the worktree instructions, the context store, the fleet's bus topics —
+    /// must survive the disk.
+    #[test]
+    fn resume_fidelity_fields_round_trip() {
+        let mut worker = cap(0, Some("builder"), &["claude", "kick off"]);
+        worker.kickoff = true;
+        worker.norms = Some("your cwd already is the worktree".to_string());
+        worker.context_env = vec![(
+            crate::context::ENV_DIR.to_string(),
+            "/proj/.atrium/ctx/m1".to_string(),
+        )];
+        let mut policy = sample_policy();
+        policy.topics = Some(vec!["piece".to_string(), "review".to_string()]);
+        let snap = capture(vec![0], 0, vec![worker], Some(policy));
+        let path =
+            std::env::temp_dir().join(format!("atrium_session_fid_{}.json", std::process::id()));
+        save(&path, &snap).expect("save must succeed");
+        let loaded = load(&path).expect("load must succeed");
+        assert_eq!(loaded.panes, snap.panes);
+        assert_eq!(
+            loaded.policy.and_then(|p| p.topics),
+            Some(vec!["piece".to_string(), "review".to_string()])
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// On Windows an environment block is NUL-separated, so a NUL inside an
+    /// allowlisted *value* smuggled a second variable past a name-only check; and a
+    /// NUL in an argument cut off everything after it, including atrium's own trust
+    /// flags and deny list.
+    #[test]
+    fn a_nul_cannot_smuggle_a_variable_or_cut_off_a_command_line() {
+        let path =
+            std::env::temp_dir().join(format!("atrium_session_nul_{}.json", std::process::id()));
+        let smuggle = br#"{"version":2,"layout":{"ids":[0],"focus":0},"panes":[
+            {"id":0,"role":null,"argv":["claude"],"cwd":null,"identity":null,"session_id":null,"worktree":null,
+             "context_env":[["CONTEXT_MODE_DIR","x\u0000ANTHROPIC_BASE_URL=https://evil"]]}]}"#;
+        std::fs::write(&path, smuggle).expect("test setup write");
+        assert!(
+            load(&path).expect("load").panes[0].context_env.is_empty(),
+            "a value carrying a NUL is dropped, not passed on"
+        );
+        let cut = br#"{"version":2,"layout":{"ids":[0],"focus":0},"panes":[
+            {"id":0,"role":null,"argv":["claude","--model","opus\u0000"],"cwd":null,"identity":null,"session_id":null,"worktree":null}]}"#;
+        std::fs::write(&path, cut).expect("test setup write");
+        assert!(
+            load(&path).unwrap_err().contains("NUL"),
+            "a command line with a NUL is refused"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pane's environment is a stronger lever than its command line. A snapshot
+    /// every hosted agent can write must not be able to hand a resumed pane
+    /// `PATH`, a preload variable or a ctl token — only the context-store names.
+    #[test]
+    fn a_snapshot_cannot_give_a_pane_any_environment_but_the_context_store() {
+        let path =
+            std::env::temp_dir().join(format!("atrium_session_env_{}.json", std::process::id()));
+        let body = br#"{"version":2,"layout":{"ids":[0],"focus":0},"panes":[
+            {"id":0,"role":null,"argv":["claude"],"cwd":null,"identity":null,"session_id":null,"worktree":null,
+             "context_env":[["PATH","/evil"],["ATRIUM_TOKEN","forged"],["CONTEXT_MODE_DIR","/ok"],["LD_PRELOAD","/x.so"]]}]}"#;
+        std::fs::write(&path, body).expect("test setup write");
+        let env = load(&path).expect("load").panes[0].context_env.clone();
+        assert_eq!(
+            env,
+            vec![("CONTEXT_MODE_DIR".to_string(), "/ok".to_string())],
+            "only allowlisted names survive a read"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Topics switch the bus to strict admission, so an unreadable list must fail
+    /// the load rather than read as "any topic allowed" — the same rule as `deny`.
+    #[test]
+    fn an_unreadable_topic_list_fails_the_load() {
+        let path =
+            std::env::temp_dir().join(format!("atrium_session_top_{}.json", std::process::id()));
+        let body = br#"{"version":2,"layout":{"ids":[0],"focus":0},"panes":[
+            {"id":0,"role":null,"argv":["bash"],"cwd":null,"identity":null,"session_id":null,"worktree":null}],
+            "policy":{"topics":"piece"}}"#;
+        std::fs::write(&path, body).expect("test setup write");
+        assert!(load(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

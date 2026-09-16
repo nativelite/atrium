@@ -120,6 +120,30 @@ impl ContextCfg {
 pub const ENV_DIR: &str = "CONTEXT_MODE_DIR";
 /// The session-partition variable for [`Provider::ContextMode`].
 pub const ENV_SESSION_SUFFIX: &str = "CONTEXT_MODE_SESSION_SUFFIX";
+
+/// The environment variables a session snapshot may record for a pane and a
+/// resume may hand back: exactly the ones [`context_env`] emits.
+///
+/// An allowlist, applied when a snapshot is captured **and** when one is read.
+/// A snapshot is a file every hosted agent can write, and a pane's environment is
+/// a stronger lever than its command line — `PATH`, a preload variable, or
+/// `ATRIUM_TOKEN` would reach the child before any flag is parsed. Only these
+/// names are ever restored, whatever the file says.
+pub const RESTORABLE_ENV: &[&str] = &[ENV_DIR, ENV_SESSION_SUFFIX];
+
+/// Keep only the pairs whose name is in [`RESTORABLE_ENV`].
+///
+/// A pair whose name **or value** contains a control character is dropped too.
+/// Checking the name alone is not enough: on Windows the child's environment is a
+/// block of NUL-terminated entries, so a value `x\0ANTHROPIC_BASE_URL=…` passed
+/// the name check and arrived as a second, unlisted variable.
+pub fn restorable_env(pairs: &[(String, String)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter(|(k, v)| RESTORABLE_ENV.contains(&k.as_str()) && !v.chars().any(char::is_control))
+        .cloned()
+        .collect()
+}
 /// The shared session suffix used for [`Share::Full`] — every agent lands in the
 /// same session named this.
 pub const FULL_SESSION_SUFFIX: &str = "fleet";

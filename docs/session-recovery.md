@@ -99,6 +99,25 @@ Each snapshot is a point-in-time image of the live session. It records:
     re-minted on recovery, so a stored agent id would name a different pane.
   - **mode** — the trust posture this pane actually ran at, which may sit below
     the session ceiling (a fleet agent's own `trust`, a de-escalated ctl worker).
+  - **kickoff** — whether the last element of argv is a fleet agent's kickoff
+    prompt. A pane that resumes its transcript is launched *without* it: the agent
+    is mid-task, and receiving its opening instructions again sent resumed agents
+    back to step one. A pane with nothing to resume starts fresh and keeps it.
+  - **worktree instructions** — the norms atrium folds into a worktree agent's
+    system prompt (*your cwd already is the worktree, do not `cd`, commit on your
+    branch*). They are not in argv, so they are recorded separately and folded in
+    again on resume.
+  - **context store** — the `CONTEXT_MODE_DIR` / `CONTEXT_MODE_SESSION_SUFFIX`
+    variables a fleet's `context` block gives each agent. These two names are the
+    *only* environment a snapshot can record or restore; any other name in the
+    file is dropped when it is read, because a pane's environment (`PATH`, a
+    preload variable, a ctl token) is a stronger lever than its command line. A
+    value containing a control character is dropped too: on Windows the
+    environment is a NUL-separated block, so a NUL inside an allowed value would
+    otherwise smuggle in a second variable. A NUL anywhere in a pane's command,
+    instructions or paths refuses the whole snapshot — on Windows it would cut
+    off everything after it, including the trust flags and deny list atrium
+    appends.
 
 These are the live fields tracked on each `Pane` throughout the session
 (`src/main.rs`); the snapshot serialises them to disk.
@@ -118,6 +137,18 @@ restores none of them.
 - **trust** — the session trust ceiling every pane is capped to.
 - **allow\_ctl** / **max\_depth** — whether the control plane was bound, and the
   spawn-depth guard.
+- **topics** — a fleet's declared bus topics, which put the bus in strict
+  admission. Without them a resumed fleet accepted any topic its roster ruled out.
+  An unreadable list fails the load, like `deny`.
+
+Beside the snapshot, each session also keeps its **bus** and **board** — the
+team's subscriptions, events and board entries, which used to live only in the
+atrium process and died with it. A resume starts from the resumed session's
+copies, so agents come back subscribed and with unread events waiting. They are
+written off the run loop by a background writer, owner-only, at most once per
+snapshot interval (5 s) and once more on exit, so a crash can lose up to the last
+few seconds of bus activity; on load, the bus is held to its live ring and
+message-size caps.
 
 **A snapshot is an input with authority, and every agent atrium hosts can write
 it.** Be precise about what it can and cannot do:
@@ -179,18 +210,28 @@ container — not something a file can provide.
 
 ## What recovery does not restore
 
-- **Worktree norms.** A fleet's worktree agents are launched with behavioural
-  norms folded into their system prompt (*your cwd already is the worktree, do
-  not `cd`, commit on your current branch*). Recovery restores the worktree and
-  the cwd but not those norms.
-- **Fleet context environment.** `CONTEXT_MODE_DIR` and the session suffix a
-  fleet's `context` block injects are not re-injected.
 - **Panes in other windows.** Only the first window is snapshotted, so a worker
   created by `ctl spawn` *without* `--here` — which opens its own window — is not
   recorded and does not come back.
-- **The kickoff prompt is re-delivered.** A fleet agent's kickoff lives in its
-  argv, so a recovered agent receives its opening instructions again on top of
-  the resumed transcript.
+- **A ctl worker's task prompt.** A fleet kickoff is known and left out on
+  resume; a task passed to `ctl spawn -- claude "<task>"` is just the last
+  argument of an arbitrary command, indistinguishable from any other, so a resumed
+  worker receives it again.
+- **Status for a pane resumed by hand.** A pane you launched yourself with
+  `claude --resume <id>` has no session id atrium injected, so it shows no agent
+  status and its snapshot records none. Recovery still replays its command, so it
+  resumes; it just is not recognised as the same agent by the second-copy check.
+- **A bus or board given explicitly.** With `ATRIUM_BUS` / `ATRIUM_BOARD` set,
+  that file is used as before — written on every change — and is not copied
+  into the store.
+- **The last seconds of bus activity before a crash.** See above.
+
+The bus and board files are as writable by hosted agents as the snapshot. What
+they carry is messages, not permissions — but agents act on messages, and a
+message's sender is just a field in the file. The confirmation says how many
+events, open decisions and board entries a resume brings back; treat them the way
+you would treat a bus the agents wrote while you were away, because that is what
+it is.
 
 
 ## Where the snapshot lives
@@ -229,6 +270,10 @@ atrium 0.35.1 and earlier kept snapshots in the temp directory as
 a directory every session and test run writes to is how the wrong session used to
 get restored — but when a project has nothing saved, `atrium recover` names the
 newest one whose atrium is no longer running, for `--snapshot`.
+
+A session's bus and board sit beside its snapshot as `<pid>-<started ms>.bus.json`
+and `.board.json`, and are pruned with it. An atrium nested in another atrium's
+pane has no place in the store, so its bus and board stay in memory, as before.
 
 The format is a single JSON line, versioned (`version: 2`); do not hard-code the
 path in scripts.

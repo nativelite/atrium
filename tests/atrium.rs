@@ -3329,6 +3329,9 @@ fn a_crashed_session_is_offered_on_launch_and_declining_closes_it() {
             depth: 0,
             parent_pane: None,
             mode: None,
+            kickoff: false,
+            norms: None,
+            context_env: Vec::new(),
         }],
         None,
     );
@@ -3382,6 +3385,68 @@ fn a_crashed_session_is_offered_on_launch_and_declining_closes_it() {
     assert!(
         atrium::session::load(&planted).unwrap().meta.clean,
         "declining must mark the crashed session closed"
+    );
+    let _ = std::fs::remove_dir_all(project.parent().unwrap());
+}
+
+/// The team's bus lives beside the session's snapshot, so what a resume brings
+/// back includes subscriptions and unread events — before, they lived only in the
+/// atrium process and died with it.
+#[test]
+fn a_sessions_bus_is_saved_beside_its_snapshot() {
+    let (project, state) = scratch("bus");
+    let (shell, flag): (&str, &str) = if cfg!(windows) {
+        ("cmd", "/Q")
+    } else {
+        ("sh", "-i")
+    };
+    let env = vec![(
+        "ATRIUM_STATE_DIR".to_string(),
+        state.to_string_lossy().into_owned(),
+    )];
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--allow-ctl", shell, flag],
+        24,
+        120,
+        &env,
+        Some(&project.to_string_lossy()),
+    )
+    .unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    let pid = p.pid();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl bus sub resume-probe-topic\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(
+        &mut p,
+        b"subscribed: resume-probe-topic",
+        Duration::from_secs(20),
+    );
+    assert!(
+        contains(&out, b"subscribed: resume-probe-topic"),
+        "no bus subscribe reply: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    wait_exit(&mut p, 15);
+    let dir =
+        atrium::session_store::project_dir(&state, &atrium::session_store::project_id(&project));
+    let snapshot = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|path| {
+            !atrium::session_store::is_sidecar(path)
+                && atrium::session_store::pid_from_name(path) == Some(pid)
+        })
+        .expect("the session wrote a snapshot");
+    let bus = std::fs::read_to_string(atrium::session_store::sidecar(&snapshot, "bus"))
+        .expect("the bus is saved beside the snapshot");
+    assert!(
+        bus.contains("resume-probe-topic"),
+        "the subscription must be in the saved bus: {bus}"
     );
     let _ = std::fs::remove_dir_all(project.parent().unwrap());
 }

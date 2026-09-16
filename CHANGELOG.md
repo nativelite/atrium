@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   why); files inconsistent with where they sit — another project, a mismatched
   pid, a future heartbeat — are listed as suspect and never offered.
 
+- **A resumed session is the session that was running, not just its layout.**
+  A fleet agent resuming its transcript is no longer handed its kickoff prompt
+  again (it went back to step one). Worktree agents get their worktree
+  instructions back, context-store agents their `CONTEXT_MODE_*` variables —
+  and only those: every other environment name in a snapshot is dropped on read.
+  A fleet's declared bus topics are restored, so the bus stays strict. The bus and
+  board are now kept beside the session's snapshot, so agents come back
+  subscribed, with unread events and the board as they left them; a resume starts
+  from the resumed session's copies. They are written by a background writer at
+  most once per snapshot interval, using `nativelite-abus`'s new deferred
+  persistence, so a busy bus costs the run loop nothing. The confirmation shows the
+  context-store path, a preview of the worktree instructions, and how many bus
+  events, open decisions and board entries will come back. A control character in
+  a restored environment value is dropped, and a NUL anywhere in a pane's command
+  or instructions refuses the snapshot — on Windows either would otherwise smuggle
+  a variable or cut off atrium's own trust flags and deny list.
+
 ### Changed
 - **Session snapshots moved to a per-user state directory, per project.**
   `%LOCALAPPDATA%\atrium\sessions` on Windows, `$XDG_STATE_HOME/atrium/sessions`
@@ -86,6 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent ids are re-minted on recovery and a stored one would name a different
   pane.
 
+- **`ctl respawn` lifted a pane's own limits.** A respawned pane was relaunched
+  at the session ceiling with no deny rules of its own, so respawning a restricted
+  fleet agent quietly removed its restrictions. It now keeps its own posture and
+  deny rules, and what its snapshot records (command, worktree instructions,
+  context variables) describes the process actually running.
 - **A recovered worker whose parent had exited came back as the operator.**
   `caller_privileged` keyed on "no parent" alone, while its own doc comment
   described a root pane as *parent `None`, depth 0*. A worker's parent link is

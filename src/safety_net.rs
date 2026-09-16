@@ -57,6 +57,43 @@ pub(crate) struct SafetyNet {
 
 /// Delete a project's oldest sessions beyond `KEEP_PER_PROJECT`, never a running
 /// one. Best-effort: a file that will not delete is left for the next start.
+/// This session's place in the store — its project directory, snapshot file and
+/// project id — decided once per process. `None` for an atrium nested in another
+/// atrium's pane, or one whose working directory is gone.
+///
+/// Memoized because two callers must agree on it exactly: the safety net writes
+/// the snapshot, and the run loop opens the bus and board as sidecars *beside*
+/// it — and the file name carries the start time, so computing it twice would
+/// name two different sessions.
+pub(crate) fn session_location() -> Option<&'static (std::path::PathBuf, std::path::PathBuf, String)>
+{
+    static LOCATION: std::sync::OnceLock<Option<(std::path::PathBuf, std::path::PathBuf, String)>> =
+        std::sync::OnceLock::new();
+    LOCATION
+        .get_or_init(|| {
+            if nested_in_atrium() {
+                return None;
+            }
+            let cwd = std::env::current_dir().ok()?;
+            let project = atrium::session_store::project_id(&cwd);
+            // No state directory (no LOCALAPPDATA / HOME at all) is rare enough
+            // that a private subdirectory of the temp dir is an acceptable home —
+            // the file is still owner-only there, it is just not where `recover`
+            // looks first.
+            let root = atrium::session_store::state_root()
+                .unwrap_or_else(|| std::env::temp_dir().join("atrium-state"));
+            let dir = atrium::session_store::project_dir(&root, &project);
+            let file = atrium::session_store::session_file(
+                &root,
+                &project,
+                std::process::id(),
+                atrium::session_store::now_ms(),
+            );
+            Some((dir, file, project))
+        })
+        .as_ref()
+}
+
 fn prune_sessions(dir: &std::path::Path, project: &str) {
     let now = atrium::session_store::now_ms();
     let stored = atrium::session_store::list(dir, project, now).sessions;
@@ -67,6 +104,13 @@ fn prune_sessions(dir: &std::path::Path, project: &str) {
         atrium::reap::pid_running,
     );
     for path in plan {
+        // A session's bus and board go with it; left behind they would be orphans
+        // no listing shows and nothing ever deletes.
+        for kind in ["bus", "board"] {
+            let _ = std::fs::remove_file(atrium::session_store::sidecar(&path, kind));
+            let _ = std::fs::remove_file(path.with_extension(format!("{kind}.tmp")));
+        }
+        let _ = std::fs::remove_file(path.with_extension("tmp"));
         let _ = std::fs::remove_file(path);
     }
 }
@@ -117,22 +161,13 @@ impl SafetyNet {
         // session would otherwise be filed — and pruned against, and offered —
         // as the operator's own. A working directory that no longer exists has no
         // project to file under at all; falling back to "." would pool every such
-        // session into one directory.
-        let cwd = std::env::current_dir().ok();
-        let project = cwd.as_deref().map(atrium::session_store::project_id);
-        // No state directory (no LOCALAPPDATA / HOME at all) is rare enough that a
-        // private subdirectory of the temp dir is an acceptable home — the file is
-        // still owner-only there, it is just not where `recover` looks first.
-        let root = atrium::session_store::state_root()
-            .unwrap_or_else(|| std::env::temp_dir().join("atrium-state"));
-        let keep = project.as_ref().filter(|_| !nested_in_atrium());
-        let store_dir = keep.map(|p| atrium::session_store::project_dir(&root, p));
-        if let (Some(dir), Some(p)) = (&store_dir, keep) {
-            prune_sessions(dir, p);
+        // session into one directory. Both cases are `session_location() == None`.
+        let location = session_location();
+        if let Some((dir, _, project)) = location {
+            prune_sessions(dir, project);
         }
-        let snapshot_path = keep.map(|p| {
-            atrium::session_store::session_file(&root, p, pid, atrium::session_store::now_ms())
-        });
+        let snapshot_path = location.map(|(_, file, _)| file.clone());
+        let keep = location.map(|(_, _, project)| project);
         let warden = atrium::warden::Warden::new(registry_path.clone());
         SafetyNet {
             snapshot_path,

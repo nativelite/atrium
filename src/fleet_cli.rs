@@ -1156,6 +1156,9 @@ pub(crate) fn spawn_fleet_window(
                 // human-pane behaviour (true); a fleet agent gets only what its
                 // entry declares.
                 pane.can_spawn = can_spawn;
+                // `fleet_launch` appends the kickoff as the last argument; a resume
+                // needs to know that to leave it out.
+                pane.kickoff = agent.kickoff.is_some();
                 panes.push(pane);
             }
             Err(e) => {

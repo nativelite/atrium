@@ -582,11 +582,17 @@ pub(crate) fn dispatch_ctl(
                 return deny;
             }
             // Capture the info we need before mutating the pane.
-            let (pane_slot_id, cmd, identity_name) = {
+            let (pane_slot_id, cmd, identity_name, deny, mode) = {
                 let Some(p) = pane_by_agent(windows, id) else {
                     return ctl::reply_err("respawn: target pane not found");
                 };
-                (p.id, vec![p.title.clone()], p.identity.clone())
+                (
+                    p.id,
+                    vec![p.title.clone()],
+                    p.identity.clone(),
+                    p.deny.clone(),
+                    p.mode,
+                )
             };
             // Build the new working directory. When worktree is named, create it
             // (idempotent) and use its dir; otherwise the new process inherits
@@ -603,10 +609,13 @@ pub(crate) fn dispatch_ctl(
                     id: pane_slot_id,
                     identity: identity_name.as_deref(),
                     cwd: new_cwd.as_deref(),
-                    mode: trust_mode(),
+                    // The pane's own posture and deny rules survive a respawn. They
+                    // used to be replaced by the session ceiling and no rules at all,
+                    // so respawning a restricted fleet agent quietly lifted its limits.
+                    mode: effective_mode(Some(mode), trust_mode()).0,
                     extra_env: &[],
                     extra_norms: norms.as_deref(),
-                    deny: &[],
+                    deny: &deny,
                 },
                 rows,
                 cols,
@@ -627,6 +636,14 @@ pub(crate) fn dispatch_ctl(
             p.session_id = new_pane.session_id.clone();
             p.launch_ms = new_pane.launch_ms;
             p.cwd = new_pane.cwd;
+            // What the snapshot records must describe the process now running: its
+            // command, its worktree instructions (or none, if respawned outside the
+            // worktree), no context variables and no kickoff.
+            p.argv = new_pane.argv;
+            p.norms = new_pane.norms;
+            p.context_env = new_pane.context_env;
+            p.kickoff = false;
+            p.mode = new_pane.mode;
             p.agent_id = new_pane.agent_id;
             p.token = new_pane.token;
             p.activity = false;
