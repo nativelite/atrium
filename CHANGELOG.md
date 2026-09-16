@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-09-15
+
+A measurement release. 0.34.0's performance numbers came from one-off
+harnesses; this one ships the benchmark as part of the repo, and then fixes the
+two things it found — both of which turned out to have a single, provable cause.
+
+Built on `nativelite-ansi` 0.3.1 and `nativelite-vterm` 0.5.1, where the
+scrolling work landed.
+
 ### Added
 - **A checked-in benchmark: `cargo bench --bench terminal`.** It measures key
   echo latency, idle CPU and output-flood throughput against the bare shell,
@@ -55,8 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   grows with the grid. Feeding 16 MB into one `vterm::Term` at 40x160 went from
   11.0 to 66.0 MB/s, and a pane flooding 16 MB through atrium on Linux went
   from 10.6 to 39-51 MB/s (8 panes: 12.9 to 47.0 MB/s total). Key echo and idle
-  CPU are unchanged. **This release needs `nativelite-ansi` and
-  `nativelite-vterm` published first.**
+  CPU are unchanged.
 
 ### Fixed
 - **Windows sessions no longer open with "1 decision needs you".** The warden

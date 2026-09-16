@@ -67,7 +67,7 @@ What the baseline shows:
   through atrium about 9x slower than `cat` alone (10.6 vs 99.5 MB/s). With 8
   panes that's about 1.6 MB/s per pane. Fixed since — see below.
 
-## Since the baseline: the emulator (unreleased)
+## Since the baseline: the emulator (0.35.0)
 
 The flood bottleneck was the emulator's scrolling, not atrium's loop. Two
 changes in `nativelite-ansi` — a block move for a region scroll, then a row
@@ -82,7 +82,7 @@ numbers (WSL, same machine):
 | flood, 1 pane | 10.6 | — | 39-51 MB/s |
 | flood, 8 panes | 12.9 | — | 47.0 MB/s total |
 
-### The Windows ~16 ms echo stalls (unreleased)
+### The Windows ~16 ms echo stalls (0.35.0)
 
 They were atrium's own writes. The console host turns each write into a ~16 ms
 frame, and a key echoing inside that frame waits for it. A probe (a pty inside a
