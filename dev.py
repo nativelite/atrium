@@ -52,6 +52,15 @@ TEST_TIMEOUT = int(os.environ.get("ATRIUM_TEST_TIMEOUT", "300"))
 #: The exit code `timeout(1)` uses, so a caller can tell a hang from a failure.
 TIMED_OUT = 124
 
+#: How many tests run at once. Each end-to-end test is a whole atrium — a pty, a
+#: shell, sometimes a fleet of them — so libtest's default of one thread per core
+#: oversubscribes the machine several times over, and a test that waits 15 s for
+#: a pane to answer can miss it. Measured on a 16-core machine: at the default,
+#: about one run in five failed, each time on a *different* test (the shape of a
+#: starved machine, not of a bad test); at half the cores, eight runs in a row
+#: passed, for about 4 s more. Not a performance knob — a correctness one.
+TEST_THREADS = os.environ.get("ATRIUM_TEST_THREADS") or str(max(2, (os.cpu_count() or 4) // 2))
+
 
 def _spawn(args: list[str], **kw) -> subprocess.Popen:
     """Start `args` in its own process group, so the whole tree can be killed.
@@ -111,7 +120,12 @@ def _name_the_hang(args: tuple[str, ...], timeout: int) -> None:
     afternoon. With `--test-threads=1` the name is printed *before* the test
     runs, so the last unterminated line is the test that never came back.
     """
-    serial = list(args) + ["--", "--test-threads=1"]
+    # Drop any libtest args the caller already passed (`--test-threads`), so the
+    # serial re-run is the only thing after the `--`.
+    cargo_args = list(args)
+    if "--" in cargo_args:
+        cargo_args = cargo_args[: cargo_args.index("--")]
+    serial = cargo_args + ["--", "--test-threads=1"]
     print(f"\n$ {' '.join(serial)}   # locating the hang")
     proc = _spawn(serial, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     seen = bytearray()
@@ -147,13 +161,19 @@ def _name_the_hang(args: tuple[str, ...], timeout: int) -> None:
 
 def test() -> int:
     print(f"# test budget: {TEST_TIMEOUT}s per invocation (ATRIUM_TEST_TIMEOUT)")
-    invocations = [("cargo", "test", "--all-targets"), ("cargo", "test", "--doc")]
+    print(f"# {TEST_THREADS} tests at once (ATRIUM_TEST_THREADS)")
+    # Only the binary targets need the cap (see TEST_THREADS); doctests are cheap.
+    threads = ("--", f"--test-threads={TEST_THREADS}")
+    invocations = [
+        ("cargo", "test", "--all-targets", *threads),
+        ("cargo", "test", "--doc"),
+    ]
     # Fold in the sibling abus crate so its coordination tests are part of the
     # gate, not a manual afterthought (see ABUS_MANIFEST).
     if ABUS_MANIFEST.exists():
         mp = ("--manifest-path", str(ABUS_MANIFEST))
         invocations += [
-            ("cargo", "test", *mp, "--all-targets"),
+            ("cargo", "test", *mp, "--all-targets", *threads),
             ("cargo", "test", *mp, "--doc"),
         ]
     for args in invocations:

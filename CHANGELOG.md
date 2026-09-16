@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   console host's frame cadence dominates the result.
 
 ### Fixed
+- **The local gate is no longer flaky on Linux.** `dev.py check` now runs the
+  binary targets with `--test-threads` at half the machine's cores
+  (`ATRIUM_TEST_THREADS` overrides). Each end-to-end test is a whole atrium — a
+  pty, a shell, sometimes a fleet — so one test thread per core oversubscribes
+  the machine several times over, and a test waiting 15 s for a pane can miss
+  it. Measured on a 16-core machine: about one run in five failed, each time on
+  a *different* test; at half the cores, eight runs in a row passed, for about
+  4 s more. It was not the filesystem — the failure rate was the same on WSL's
+  ext4 as on a Windows drive over 9p (2/11 vs 2/6).
 - **The ~16 ms key-echo stalls on Windows are gone.** Every write atrium makes
   opens a ~16 ms frame window in the Windows console host, and a key that echoes
   inside one waits for the window to close — so a repaint that changes nothing
