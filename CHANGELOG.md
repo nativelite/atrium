@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A crashed session is offered back when you start atrium again.** Run
+  `atrium` or `atrium fleet up` in a project whose last session did not exit
+  cleanly and atrium shows what it would restore — panes, trust, deny rules,
+  budgets, and for every pane the command it will run, its mode, its spawn right
+  and its own deny rules — and asks once. Enter resumes; `n` starts fresh and
+  stops asking about that session. The prompt is both the resume and the
+  approval, so a permission flag saved in a command is never replayed, and every
+  string from the file is stripped of control characters. Quitting, or every pane
+  exiting, marks the session closed; a crash, a kill, a closed window or a
+  shutdown does not — on unix too, where a termination signal runs the same
+  teardown a quit does. Never offered from inside an atrium pane or without a
+  terminal, and end-of-input is a no.
+- **`atrium recover --list` and `--snapshot <path>`.** List a project's saved
+  sessions (running / crashed / closed, age, panes, roles, trust), or restore a
+  specific file — including one an older atrium left in the temp directory.
+  `atrium recover` now asks before resuming (`ATRIUM_YES` does not answer it),
+  needs a terminal before it changes anything, and refuses to start a second copy
+  of agents that are already running — a live atrium, or transcripts another
+  running session has already resumed. A resumed pane keeps its transcript id, so
+  its agent status binds and a later recovery can resume it again.
+- **The warden watches the session snapshot.** A write to atrium's own snapshot
+  that it did not make — an edit, a deletion, a re-creation — is raised as a
+  decision and the file is rewritten from memory at once. Other files in the
+  project's store are not watched (see *Who can write the file* in the docs for
+  why); files inconsistent with where they sit — another project, a mismatched
+  pid, a future heartbeat — are listed as suspect and never offered.
+
+### Changed
+- **Session snapshots moved to a per-user state directory, per project.**
+  `%LOCALAPPDATA%\atrium\sessions` on Windows, `$XDG_STATE_HOME/atrium/sessions`
+  (else `~/.local/state/…`) on unix; one directory per project, one file per
+  session, owner-only on unix. They used to be `atrium-session-<pid>.json` in the
+  shared temp directory, where recovery took the newest file — so any other
+  session, including every e2e test run, could become the one restored. The test
+  suite now uses its own store (`.cargo/config.toml`). Each file carries a
+  heartbeat, so a session counts as running only while its pid is alive *and* it
+  is still being written — a reboot handing the old pid to another process no
+  longer makes a crash look alive.
+
+  This keeps other users out, not your own agents: everything atrium hosts runs
+  as you, and no file permission separates a user from their own processes. The
+  defenses for that are the tamper tripwire and the confirmation above — see
+  *Who can write the file* in `docs/session-recovery.md`.
+
 ### Fixed
 - **`atrium recover` restores the session's policy, not just its layout.** A
   recovered session used to come back with its guards off: the fleet's `deny`

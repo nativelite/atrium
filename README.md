@@ -293,7 +293,7 @@ control plane exists.
 | `atrium [flags] [cmd...]` | start a session hosting `cmd` (default: your shell) |
 | `atrium fleet up <name>` / `ls` / `clean <name>` | bring up a saved roster / list rosters / reclaim a fleet's clean, merged worktrees |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
-| `atrium recover` | rehydrate the most recent session snapshot ([session recovery](docs/session-recovery.md)) |
+| `atrium recover [--list \| --snapshot <path>]` | restore this project's last session — also offered automatically when a launch finds one that crashed ([session recovery](docs/session-recovery.md)) |
 | `atrium reap` / `--reap-orphans` | clean up orphaned pane groups ([reaping](docs/reaping.md)) |
 | `atrium --stdin-probe` | print the hex of what your terminal sends (diagnostics) |
 | `atrium --version` | print the version |

@@ -160,6 +160,21 @@ pub enum Ancestry {
     Unsupported,
 }
 
+/// The alert kind for a session snapshot atrium did not write. Named so the safety
+/// net can answer it (rewrite the file) without matching on a string literal twice.
+pub const SNAPSHOT_CHANGED: &str = "warden-snapshot-changed";
+
+/// A file's digest: `Ok(Some)` for its content, `Ok(None)` when it does not
+/// exist, `Err` for any other read failure — which is transient as far as a
+/// tripwire can tell, and must not be reported as a deletion.
+fn read_digest(path: &Path) -> Result<Option<u64>, ()> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(digest(&bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
 /// A cheap content digest.
 ///
 /// FNV-1a over the bytes: not a cryptographic hash, and deliberately not
@@ -187,6 +202,14 @@ pub struct Warden {
     exe_digest: Option<u64>,
     registry: PathBuf,
     registry_digest: Option<u64>,
+    /// The session snapshot, once atrium has written one. It decides the trust
+    /// posture, deny rules and spawn capabilities of a *recovered* session, and it
+    /// is writable by every agent atrium hosts (they run as the same user) — so a
+    /// write atrium did not make is reported, the same tripwire the registry has.
+    snapshot: Option<PathBuf>,
+    /// The digest atrium last wrote, or `None` once the file is known to be gone.
+    /// A deletion is a state to compare against, not a reason to stop looking.
+    snapshot_digest: Option<u64>,
     /// Session registries present when we started, plus our own, plus every one
     /// we have since reached a definite verdict on. Anything not in here is a
     /// session we have not judged yet. Only the unix descent check reads it.
@@ -216,6 +239,8 @@ impl Warden {
             exe_digest,
             registry_digest: digest_file(&registry),
             registry,
+            snapshot: None,
+            snapshot_digest: None,
             known_sessions,
             unknown_reported: HashSet::new(),
             unsupported_reported: false,
@@ -296,8 +321,60 @@ impl Warden {
             }
         }
 
+        if let Some(alert) = self.check_snapshot() {
+            out.push(alert);
+        }
+
         out.extend(self.check_descendants(pane_pids));
         out
+    }
+
+    /// Called after every snapshot write atrium makes: starts watching `path` and
+    /// moves the baseline to what was just written, so only a write atrium did
+    /// not make is reported.
+    pub fn snapshot_written(&mut self, path: &Path) {
+        self.snapshot_digest = digest_file(path);
+        self.snapshot = Some(path.to_path_buf());
+    }
+
+    /// Compare the snapshot against the last write atrium made. A change or a
+    /// deletion is an alert of kind [`SNAPSHOT_CHANGED`]; the caller answers it by
+    /// rewriting the file from memory, which is authoritative while atrium runs.
+    ///
+    /// This narrows the window rather than closing it: a write in the last check
+    /// interval before atrium dies is never seen. On Windows the Job Object
+    /// kills every pane with atrium, so no hosted agent outlives it to write
+    /// afterwards; on unix an orphaned one can, which is why a resume is still
+    /// shown to the operator and confirmed.
+    fn check_snapshot(&mut self) -> Option<Alert> {
+        let path = self.snapshot.as_ref()?;
+        // A transient read failure (a scanner holding the file open, a sharing
+        // violation on Windows) is not a deletion: skip this tick rather than
+        // report tampering that did not happen.
+        let now = match read_digest(path) {
+            Ok(d) => d,
+            Err(()) => return None,
+        };
+        if now == self.snapshot_digest {
+            return None;
+        }
+        let what = match (self.snapshot_digest, now) {
+            (Some(_), Some(_)) => "changed",
+            (Some(_), None) => "deleted",
+            _ => "re-created",
+        };
+        // Report once per event: the baseline follows the file until atrium's
+        // rewrite resets it through `snapshot_written`.
+        self.snapshot_digest = now;
+        Some(Alert {
+            kind: SNAPSHOT_CHANGED,
+            detail: format!(
+                "the session snapshot was {what} by something other than this atrium ({}); \
+                 rewriting it from memory. A recovery applies that file's commands, trust \
+                 posture, deny rules and spawn capabilities",
+                path.display()
+            ),
+        })
     }
 
     /// Called after atrium rewrites its own registry, so a legitimate write is not
@@ -972,6 +1049,63 @@ mod tests {
                 .iter()
                 .all(|a| a.kind != "warden-registry-changed"),
             "the same change was reported twice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A session snapshot decides a recovered session's authority and every hosted
+    /// agent can write it. atrium's own writes must stay silent; anyone else's —
+    /// an edit or a deletion — is reported, once.
+    #[test]
+    fn a_snapshot_atrium_did_not_write_is_reported_once() {
+        let dir = std::env::temp_dir().join(format!("atrium-warden-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = dir.join("registry");
+        std::fs::write(
+            &reg, "1
+",
+        )
+        .unwrap();
+        let snap = dir.join("1.json");
+        let mut w = Warden::new(reg);
+        let changed = |alerts: &[Alert]| alerts.iter().any(|a| a.kind == SNAPSHOT_CHANGED);
+
+        // Nothing watched until atrium writes one.
+        std::fs::write(&snap, "{\"trust\":\"accept\"}").unwrap();
+        assert!(
+            !changed(&w.check(&[])),
+            "an unwatched file is not ours to judge"
+        );
+
+        w.snapshot_written(&snap);
+        assert!(!changed(&w.check(&[])), "atrium's own write must not alert");
+
+        std::fs::write(&snap, "{\"trust\":\"skip\"}").unwrap();
+        assert!(
+            changed(&w.check(&[])),
+            "a write atrium did not make must alert"
+        );
+        assert!(
+            !changed(&w.check(&[])),
+            "the same change was reported twice"
+        );
+
+        // atrium answers by rewriting; that write resets the baseline.
+        std::fs::write(&snap, "{\"trust\":\"accept\"}").unwrap();
+        w.snapshot_written(&snap);
+        assert!(!changed(&w.check(&[])));
+
+        std::fs::remove_file(&snap).unwrap();
+        assert!(
+            changed(&w.check(&[])),
+            "deleting the snapshot must alert too"
+        );
+        // A deletion must not end the watch: re-creating the file is the next
+        // step of the same attack.
+        std::fs::write(&snap, "{\"trust\":\"skip\"}").unwrap();
+        assert!(
+            changed(&w.check(&[])),
+            "a file re-created after a deletion must alert"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

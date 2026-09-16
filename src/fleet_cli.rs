@@ -405,6 +405,11 @@ pub(crate) fn fleet_up(
     max_depth: usize,
     trust: atrium::ctl::TrustMode,
 ) -> ExitCode {
+    // A crashed fleet in this project is offered back before a fresh one is
+    // started over it — the same one prompt a plain launch gives.
+    if let Some(code) = crate::offer_resume(allow_ctl, max_depth, trust) {
+        return code;
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let located = match atrium::fleet::discover(&cwd) {
         Ok(l) => l,

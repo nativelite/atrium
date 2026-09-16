@@ -1,0 +1,13 @@
+# Environment for processes cargo runs from this repo — test binaries, the atrium
+# sessions the e2e tests spawn through them, and `cargo run`. So a `cargo run`
+# session also keeps its snapshots under target/ and makes no resume offer; an
+# installed atrium (`cargo install` runs nothing) sees none of this.
+
+[env]
+# e2e tests start real atrium sessions, and each one saves a real session
+# snapshot. Without this they land in the operator's own state directory, where
+# they become the "newest session" a real `atrium recover` would restore.
+ATRIUM_STATE_DIR = { value = "target/test-state", relative = true }
+# A test session is killed at the end of its test, which to the store looks
+# exactly like a crash — the next test would be offered to resume it.
+ATRIUM_RESUME_OFFER = "0"

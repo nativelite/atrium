@@ -112,6 +112,28 @@ pub struct PolicyRecord {
     pub max_depth: usize,
 }
 
+/// Who wrote a snapshot, for which project, when, and how that session ended —
+/// what decides whether a launch should offer to resume it.
+///
+/// All of it is optional on read: a v1 snapshot, or one passed explicitly with
+/// `atrium recover --snapshot`, simply has no meta and is never auto-offered.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionMeta {
+    /// The project directory the session was launched in (canonical form, see
+    /// `session_store::project_id`). Resuming is offered only in that project.
+    pub project: Option<String>,
+    /// The pid of the atrium that wrote the file.
+    pub pid: Option<u32>,
+    /// When the file was last written, epoch ms. A running atrium rewrites it on a
+    /// heartbeat even when nothing changed, so a stale timestamp means the writer
+    /// is gone — which, unlike the pid alone, survives a reboot reusing that pid.
+    pub saved_at_ms: Option<u64>,
+    /// The session ended on purpose (a normal quit), or was already resumed or
+    /// dismissed. A clean session is never offered, though `atrium recover` can
+    /// still restore it explicitly.
+    pub clean: bool,
+}
+
 /// A versioned snapshot of a window's grid and pane roster. Designed to also
 /// serve as the future daemon's persistent state model (ROADMAP Phase 2).
 #[derive(Debug, Clone, PartialEq)]
@@ -121,6 +143,8 @@ pub struct Snapshot {
     pub panes: Vec<PaneRecord>,
     /// The session policy to re-apply on recovery; `None` on a v1 snapshot.
     pub policy: Option<PolicyRecord>,
+    /// Ownership and lifecycle; empty on a v1 snapshot.
+    pub meta: SessionMeta,
 }
 
 /// Input for one pane in a [`capture`] call — a plain data struct so the
@@ -180,6 +204,7 @@ pub fn capture(
             })
             .collect(),
         policy,
+        meta: SessionMeta::default(),
     }
 }
 
@@ -291,6 +316,26 @@ fn snapshot_to_json(s: &Snapshot) -> Value {
             "policy".to_string(),
             s.policy.as_ref().map(policy_to_json).unwrap_or(Value::Null),
         ),
+        ("meta".to_string(), meta_to_json(&s.meta)),
+    ])
+}
+
+fn meta_to_json(m: &SessionMeta) -> Value {
+    Value::Object(vec![
+        ("project".to_string(), opt_str(m.project.as_deref())),
+        (
+            "pid".to_string(),
+            m.pid
+                .map(|p| Value::Number(Number::Int(p as i64)))
+                .unwrap_or(Value::Null),
+        ),
+        (
+            "saved_at_ms".to_string(),
+            m.saved_at_ms
+                .map(|t| Value::Number(Number::Int(t.min(i64::MAX as u64) as i64)))
+                .unwrap_or(Value::Null),
+        ),
+        ("clean".to_string(), Value::Bool(m.clean)),
     ])
 }
 
@@ -505,7 +550,23 @@ fn snapshot_from_json(v: &Value) -> Option<Snapshot> {
         layout: LayoutRecord { ids, focus },
         panes,
         policy: policy_from_json(get(o, "policy"))?,
+        meta: meta_from_json(get(o, "meta")),
     })
+}
+
+/// The meta block, tolerantly. Every failure direction here is safe: a missing
+/// project or a stale/absent timestamp only makes a session *less* likely to be
+/// offered, and nothing in the meta grants authority.
+fn meta_from_json(v: Option<&Value>) -> SessionMeta {
+    let Some(o) = v.and_then(obj_of) else {
+        return SessionMeta::default();
+    };
+    SessionMeta {
+        project: get(o, "project").and_then(opt_str_from).flatten(),
+        pid: opt_u64(get(o, "pid")).and_then(|p| u32::try_from(p).ok()),
+        saved_at_ms: opt_u64(get(o, "saved_at_ms")),
+        clean: bool_or(get(o, "clean"), false),
+    }
 }
 
 // ---- I/O -----------------------------------------------------------------
@@ -513,11 +574,12 @@ fn snapshot_from_json(v: &Value) -> Option<Snapshot> {
 /// Write `snap` to `path` **atomically**: serialises to a sibling `.tmp` file
 /// then renames over `path`. A crash mid-write leaves the previous snapshot
 /// intact — matching the atomic-write pattern in `reap::write_registry`.
+///
+/// Written owner-only on unix (`0600`, see [`crate::session_store::write_private`]):
+/// the file decides how much authority a recovered session gets.
 pub fn save(path: &Path, snap: &Snapshot) -> std::io::Result<()> {
     let body = format!("{}\n", snapshot_to_json(snap));
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &body)?;
-    std::fs::rename(&tmp, path)
+    crate::session_store::write_private(path, &body)
 }
 
 /// Load a snapshot from `path`. Returns a clear `Err` for a missing,
@@ -764,6 +826,30 @@ mod tests {
         assert_eq!(pol.trust, Some(crate::ctl::TrustMode::Auto));
         assert!(pol.allow_ctl);
         assert_eq!(pol.max_depth, 6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The meta block decides whether a launch offers to resume, so it must
+    /// survive the disk exactly; and a v1 file must read as "no meta" rather than
+    /// fail.
+    #[test]
+    fn meta_round_trips_and_is_empty_on_v1() {
+        let (ids, focus, panes) = sample_panes();
+        let mut snap = capture(ids, focus, panes, Some(sample_policy()));
+        snap.meta = SessionMeta {
+            project: Some("d:\\projects\\rationale".to_string()),
+            pid: Some(62996),
+            saved_at_ms: Some(1_757_990_000_000),
+            clean: false,
+        };
+        let path =
+            std::env::temp_dir().join(format!("atrium_session_meta_{}.json", std::process::id()));
+        save(&path, &snap).expect("save must succeed");
+        assert_eq!(load(&path).expect("load").meta, snap.meta);
+        let v1 = br#"{"version":1,"layout":{"ids":[0],"focus":0},"panes":[
+            {"id":0,"role":null,"argv":["bash"],"cwd":null,"identity":null,"session_id":null,"worktree":null}]}"#;
+        std::fs::write(&path, v1).expect("test setup write");
+        assert_eq!(load(&path).expect("v1 loads").meta, SessionMeta::default());
         let _ = std::fs::remove_file(&path);
     }
 

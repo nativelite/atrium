@@ -12,8 +12,16 @@ pub(crate) struct SafetyNet {
     /// The crash registry: the pane process groups a watchdog should kill if
     /// this process dies without running any teardown at all.
     registry_path: std::path::PathBuf,
-    snapshot_path: std::path::PathBuf,
+    /// This session's file in the per-user store (`session_store`).
+    /// `None` when this atrium keeps no snapshot: it runs inside another
+    /// atrium's pane (see `nested_in_atrium`), or its working directory is gone
+    /// and there is no project to file it under.
+    snapshot_path: Option<std::path::PathBuf>,
+    /// The project and pid stamped into every snapshot.
+    snapshot_meta: atrium::session::SessionMeta,
     last_snapshot: Option<atrium::session::Snapshot>,
+    /// Wall-clock ms of the last snapshot write, for the heartbeat.
+    last_snapshot_write_ms: u64,
     last_snapshot_check: Instant,
     /// The warden: tripwires, not gates. atrium cannot stop an agent that can run
     /// commands from launching an unconstrained one (it could run claude directly
@@ -47,15 +55,97 @@ pub(crate) struct SafetyNet {
     watchdog_retry_at: Option<Instant>,
 }
 
+/// Delete a project's oldest sessions beyond `KEEP_PER_PROJECT`, never a running
+/// one. Best-effort: a file that will not delete is left for the next start.
+fn prune_sessions(dir: &std::path::Path, project: &str) {
+    let now = atrium::session_store::now_ms();
+    let stored = atrium::session_store::list(dir, project, now).sessions;
+    let plan = atrium::session_store::prune_plan(
+        &stored,
+        atrium::session_store::KEEP_PER_PROJECT,
+        atrium::session_store::now_ms(),
+        atrium::reap::pid_running,
+    );
+    for path in plan {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+impl SafetyNet {
+    /// Write the snapshot if it changed or the heartbeat is due, move the warden's
+    /// baseline to a write that landed, and surface a failure once per streak.
+    fn write_snapshot(&mut self, windows: &[Window], flash: &mut Option<(String, Instant)>) {
+        let Some(path) = self.snapshot_path.clone() else {
+            return;
+        };
+        let saved = snapshot_if_changed(
+            windows,
+            &path,
+            &mut self.last_snapshot,
+            &mut self.last_snapshot_write_ms,
+            &self.snapshot_meta,
+        );
+        if let Some(true) =
+            surface_once(&mut self.snapshot_failing, saved, "session snapshot", flash)
+        {
+            self.warden.snapshot_written(&path);
+        }
+    }
+
+    /// Mark this session's snapshot clean on a deliberate exit, so the next
+    /// launch in this project does not offer to resume a session the operator
+    /// chose to end. `atrium recover` can still restore it explicitly. Returns an
+    /// error for the caller to print; a crash never reaches here, which is exactly
+    /// what leaves a crashed session offerable.
+    pub(crate) fn settle_session(&self) -> std::io::Result<()> {
+        let (Some(path), Some(last)) = (&self.snapshot_path, &self.last_snapshot) else {
+            return Ok(());
+        };
+        let mut closed = last.clone();
+        closed.meta.clean = true;
+        closed.meta.saved_at_ms = Some(atrium::session_store::now_ms());
+        atrium::session::save(path, &closed)
+    }
+}
+
 impl SafetyNet {
     pub(crate) fn new() -> SafetyNet {
         let registry_path = atrium::reap::registry_path(std::process::id());
+        let pid = std::process::id();
+        // An atrium inside another atrium's pane keeps no snapshot. An agent in a
+        // fleet's main tree shares the operator's working directory, so its
+        // session would otherwise be filed — and pruned against, and offered —
+        // as the operator's own. A working directory that no longer exists has no
+        // project to file under at all; falling back to "." would pool every such
+        // session into one directory.
+        let cwd = std::env::current_dir().ok();
+        let project = cwd.as_deref().map(atrium::session_store::project_id);
+        // No state directory (no LOCALAPPDATA / HOME at all) is rare enough that a
+        // private subdirectory of the temp dir is an acceptable home — the file is
+        // still owner-only there, it is just not where `recover` looks first.
+        let root = atrium::session_store::state_root()
+            .unwrap_or_else(|| std::env::temp_dir().join("atrium-state"));
+        let keep = project.as_ref().filter(|_| !nested_in_atrium());
+        let store_dir = keep.map(|p| atrium::session_store::project_dir(&root, p));
+        if let (Some(dir), Some(p)) = (&store_dir, keep) {
+            prune_sessions(dir, p);
+        }
+        let snapshot_path = keep.map(|p| {
+            atrium::session_store::session_file(&root, p, pid, atrium::session_store::now_ms())
+        });
+        let warden = atrium::warden::Warden::new(registry_path.clone());
         SafetyNet {
-            snapshot_path: atrium::reap::registry_dir()
-                .join(format!("atrium-session-{}.json", std::process::id())),
+            snapshot_path,
+            snapshot_meta: atrium::session::SessionMeta {
+                project: keep.cloned(),
+                pid: Some(pid),
+                saved_at_ms: None,
+                clean: false,
+            },
             last_snapshot: None,
+            last_snapshot_write_ms: 0,
             last_snapshot_check: Instant::now(),
-            warden: atrium::warden::Warden::new(registry_path.clone()),
+            warden,
             last_warden_check: Instant::now(),
             upkeep: Upkeep::start(atrium::reap::SessionJob::session()),
             cap_notice_raised: false,
@@ -116,8 +206,7 @@ impl SafetyNet {
             self.registered = cur;
             self.registry_dirty = true;
             self.registry_retry_at = None;
-            let saved = snapshot_if_changed(windows, &self.snapshot_path, &mut self.last_snapshot);
-            surface_once(&mut self.snapshot_failing, saved, "session snapshot", flash);
+            self.write_snapshot(windows, flash);
             self.last_snapshot_check = Instant::now();
         }
         // Persist it. A failed write is neither dropped nor recorded as done
@@ -161,8 +250,7 @@ impl SafetyNet {
         }
         if self.last_snapshot_check.elapsed() >= SNAPSHOT_INTERVAL {
             self.last_snapshot_check = Instant::now();
-            let saved = snapshot_if_changed(windows, &self.snapshot_path, &mut self.last_snapshot);
-            surface_once(&mut self.snapshot_failing, saved, "session snapshot", flash);
+            self.write_snapshot(windows, flash);
         }
         if self.last_warden_check.elapsed() >= WARDEN_INTERVAL {
             self.last_warden_check = Instant::now();
@@ -171,6 +259,19 @@ impl SafetyNet {
             // in a pane carries that session id even after a double-fork has
             // erased its parent link.
             let mut alerts = self.warden.check(&self.registered);
+            // A snapshot atrium did not write is answered, not just reported: the
+            // in-memory session is authoritative while atrium runs, so put it
+            // back now rather than leave a forged file for a recovery to apply.
+            if alerts
+                .iter()
+                .any(|a| a.kind == atrium::warden::SNAPSHOT_CHANGED)
+            {
+                // Force the write by making the heartbeat due, rather than by
+                // forgetting the last snapshot: if this rewrite fails, the clean-
+                // exit marking still has the real session to write back.
+                self.last_snapshot_write_ms = 0;
+                self.write_snapshot(windows, flash);
+            }
             // The ancestry cap fired before the bus existed; raise it once now.
             if let Some(note) = CAP_NOTICE.get() {
                 if !self.cap_notice_raised {

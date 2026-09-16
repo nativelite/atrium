@@ -7,10 +7,62 @@ identities, same agent commands, the same **session policy** (deny rules, trust
 postures, spawn capabilities, compile pool, memory ceiling) — and, for agents
 that support `--resume`, the same transcript.
 
-`atrium recover` takes no arguments. `--trust` and `--max-depth` override what
-the snapshot recorded for that one setting; everything you leave out comes back
-as it was. `--allow-ctl` only turns the control plane *on* — there is currently
-no flag that turns it off for a session whose snapshot recorded it on.
+## Picking up where you left off
+
+Start atrium the way you normally do — `atrium`, or `atrium fleet up <name>` — in
+the project whose session crashed. It notices, shows what it would restore, and
+asks once:
+
+```
+atrium: the last session in this project did not exit cleanly (saved 4m ago).
+atrium recover: restoring 2 pane(s), trust automode (from the snapshot), ctl on (max depth 6), 5 session deny rule(s), build pool 10, memory cap 32768 MB
+  [lead] claude --append-system-prompt <812 chars> --model opus <1403 chars> --resume ee8aef7c-…
+      mode automode · may spawn teammates
+  [builder] claude --append-system-prompt <1190 chars> --model opus <903 chars> --resume dee537d9-…
+      cwd D:\projects\.atrium-worktrees\m1\piece · mode automode · cannot spawn · 3 own deny rule(s)
+Resume it? [Y/n]
+```
+
+Enter resumes. `n` starts a fresh session and stops asking about that one — it is
+kept, and `atrium recover` can still restore it. That one prompt is both the
+resume and the approval, so it shows what the snapshot controls: the session's
+posture and guards, and for every pane the command it will run (flags as written,
+long prompts reduced to their length), its trust mode, whether it may spawn
+teammates, and its own deny rules. A permission flag saved in a command
+(`--dangerously-skip-permissions`, `--permission-mode`, `--allowedTools`) is
+never replayed — posture comes only from the policy you confirm — and is named as
+ignored. Every string from the file is stripped of control characters before it
+is printed.
+
+The offer is only made for a session that **did not end on purpose**. Quitting
+atrium, or every pane exiting, marks the snapshot closed. A crash, a kill, a
+closed terminal window, a lost SSH connection and a shutdown all leave it open —
+on unix a termination signal runs atrium's teardown but is still not a decision to
+end the session. The offer needs a terminal, is never made from inside an atrium
+pane (the pane marker, or process ancestry where the platform supports it — not
+yet Windows), and an answer of end-of-input is a no.
+
+### `atrium recover`
+
+The explicit form, for when you want to choose:
+
+| Command | What it does |
+| --- | --- |
+| `atrium recover` | restore this project's newest session that is not still running — crashed *or* closed — after the same confirmation |
+| `atrium recover --list` | list this project's saved sessions: state (`running` / `crashed` / `closed`), age, panes, roles, trust, file |
+| `atrium recover --snapshot <path>` | restore a specific snapshot file — including one an older atrium left in the temp directory |
+
+`--trust` and `--max-depth` override what the snapshot recorded for that one
+setting; everything you leave out comes back as it was. `--allow-ctl` only turns
+the control plane *on* — there is currently no flag that turns it off for a
+session whose snapshot recorded it on.
+
+Resuming needs a terminal and a person at it: `atrium recover` refuses to run
+without one, before it asks or changes anything, and `ATRIUM_YES` does not answer
+this confirmation. It also refuses to start a second copy of agents that are
+already running — a session whose atrium is still alive, or one whose agent
+transcripts another running session has already resumed. That second check is
+made again after you answer, in case another terminal resumed it meanwhile.
 
 ## What is captured
 
@@ -67,8 +119,8 @@ restores none of them.
 - **allow\_ctl** / **max\_depth** — whether the control plane was bound, and the
   spawn-depth guard.
 
-**A snapshot is an input with authority, and it is a file in a shared temp
-directory.** Be precise about what it can and cannot do:
+**A snapshot is an input with authority, and every agent atrium hosts can write
+it.** Be precise about what it can and cannot do:
 
 - A **pane's** recorded posture can only lower it: it is capped to the session
   ceiling, and a corrupt or unrecognised keyword fails closed to `default`
@@ -76,17 +128,54 @@ directory.** Be precise about what it can and cannot do:
 - A corrupt `deny` list, or a corrupt policy block, **fails the load** instead of
   reading as "this session had no guards".
 - The **session ceiling itself** comes from the snapshot when you pass no
-  `--trust`, so recovery can raise the posture above the flagless default — up to
-  whatever an enclosing atrium session caps it at. Recovery therefore prints the
+  `--trust`, so recovery can raise the posture above the flagless default. Inside
+  another atrium session it is capped to that session's posture where process
+  ancestry is available (not yet on Windows). Recovery therefore prints the
   posture, marked `(from the snapshot)` when it came from the file, *before* the
   `skip` confirmation, and `skip` still prompts. Read that line. If you do not
   trust the snapshot, pass `--trust` explicitly and it wins.
 
 Note that a snapshot has always carried each pane's **argv**, so a hostile one
 could already choose what gets launched; policy restoration widens what it
-controls rather than opening the door. Hardening the file itself (exclusive
-create, `0600`, refusing a snapshot whose pid never belonged to a dead atrium) is
-open work.
+controls rather than opening the door.
+
+### Who can write the file
+
+The store is owner-only on unix, which keeps *other users* out. It does not keep
+out your own agents: everything atrium hosts runs as you, and no file permission
+separates a user from their own processes. The honest defenses are therefore
+detection and consent, not integrity:
+
+- **Out of the way.** The file lives in your per-user state directory, not in
+  the project — the project root is exactly where a fleet's main-tree agents are
+  meant to write.
+- **Tamper tripwire, on its own file.** The warden digests every snapshot atrium
+  writes and checks it on its cadence. A write atrium did not make — an edit, a
+  deletion, a re-creation — is raised as a decision (audit log, bus, status bar),
+  and atrium immediately rewrites the file from memory, which is authoritative
+  while it runs. A write in the last check interval before atrium dies is not
+  seen. On Windows every pane dies with atrium (the Job Object), so no hosted
+  agent outlives it to write afterwards; on unix an orphaned one can.
+- **No tripwire on the rest of the store — on purpose.** A forged snapshot does
+  not need to touch atrium's own file: planting one beside it, or editing an old
+  crashed session, is what would get it offered. A watch for that was built and
+  removed. It is evaded by writing while no atrium runs, or by reusing the pid of
+  one that did; and it fired whenever an atrium in the same project died within a
+  few seconds of starting — an alert that is both easy to dodge and often wrong
+  teaches the operator to ignore the warden. The defenses for a planted file are
+  the ones below and the confirmation, which shows every pane's command.
+- **Inconsistent files are never candidates.** A file whose recorded project is
+  another one, whose recorded pid does not match its name, or whose heartbeat is
+  in the future is listed by `atrium recover --list` as *suspect* and is never
+  offered, restored by default, or counted toward the prune limit — a future
+  timestamp would otherwise make a planted file the newest session and push real
+  ones out.
+- **Consent.** Nothing is resumed without the confirmation above, and the line
+  it follows states the posture, the guards and whether the posture came from
+  the file.
+
+Real isolation is an OS boundary — a separate account per agent, or a
+container — not something a file can provide.
 
 ## What recovery does not restore
 
@@ -106,19 +195,43 @@ open work.
 
 ## Where the snapshot lives
 
-One file per session, in the same temp directory as the pane registry
-(`reap::registry_dir()` — `%TEMP%` on Windows, `/tmp` on Unix), named for the
-atrium process that wrote it:
+In a per-user state directory, one directory per project and one file per
+session:
 
 ```
-<tmp>/atrium-session-<pid>.json
+Windows  %LOCALAPPDATA%\atrium\sessions\<project>-<digest>\<pid>-<started ms>.json
+unix     $XDG_STATE_HOME/atrium/sessions/<project>-<digest>/<pid>-<started ms>.json
+         (~/.local/state/atrium/sessions/... when XDG_STATE_HOME is unset)
 ```
 
-`atrium recover` with no arguments picks the **most recently modified** one, so
-recover before starting another atrium session — a newer session writes a newer
-snapshot and would be chosen instead. The format is a single JSON line, versioned
-(`version: 2`); do not hard-code the path in scripts, it is an implementation
-detail that a future daemon may move.
+The start time is in the name so a reused pid never overwrites an older session.
+An atrium running inside another atrium's pane keeps no snapshot at all: an agent
+in a fleet's main tree shares the operator's working directory, and its session
+would otherwise be filed, pruned against and offered as the operator's.
+
+The project is the directory atrium was started in; `<project>` is its folder
+name and `<digest>` tells apart two folders with the same name. Two atriums in one
+project each keep their own file. Directories are `0700` and files `0600` on
+unix. A project keeps its five newest sessions; older ones are pruned when a new
+session starts, never one that is still running.
+
+Each file also records the atrium that wrote it and a **heartbeat**: a running
+atrium rewrites it every 15 seconds even when nothing changed. A session counts as
+running only while its pid is alive *and* its heartbeat is fresh — so a reboot that
+hands the old pid to another process does not make a crashed session look alive.
+
+`ATRIUM_STATE_DIR` overrides the location. The test suite uses it (with
+`ATRIUM_RESUME_OFFER=0`, which turns the launch-time offer off) so its sessions
+never mix with yours.
+
+atrium 0.35.1 and earlier kept snapshots in the temp directory as
+`atrium-session-<pid>.json`. Those are not scanned — picking the newest file from
+a directory every session and test run writes to is how the wrong session used to
+get restored — but when a project has nothing saved, `atrium recover` names the
+newest one whose atrium is no longer running, for `--snapshot`.
+
+The format is a single JSON line, versioned (`version: 2`); do not hard-code the
+path in scripts.
 
 ## How agents resume
 
@@ -174,8 +287,9 @@ at a clean prompt.
 
 ## Recovery flow after a host crash
 
-1. **atrium exits** — uncleanly (crash, power loss, kill) or cleanly (graceful
-   quit writes a final snapshot).
+1. **atrium exits** — uncleanly (crash, power loss, kill), leaving its snapshot
+   marked open, or cleanly (a graceful quit marks it closed, so it is not offered
+   on the next launch).
 2. **Hosted agents are terminated (Windows) or orphaned (Unix).**
    On Windows, atrium assigns every pane process to a Job Object with
    `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (`src/reap.rs`). When atrium's handle
@@ -184,9 +298,9 @@ at a clean prompt.
    `atrium recover` reconstructs the session from the snapshot.
    On Unix, agents may continue running under `init` until they exit naturally.
    The orphan reaper can reclaim stale processes; see [reaping](reaping.md).
-3. **Operator runs `atrium recover`** — no arguments required. atrium locates
-   the most recent snapshot for the current session, reads it, and re-opens the
-   session window.
+3. **Operator starts atrium in the project** — and confirms the resume offer,
+   or runs `atrium recover`. The confirmed snapshot is marked closed so it is not
+   offered again; the resumed session writes its own.
 4. **Policy is re-installed** — the session's deny rules, compile pool and
    memory ceiling go back in place *before* any pane spawns.
 5. **Layout is rebuilt** — the split tree is reconstructed and all panes are
@@ -202,7 +316,8 @@ at a clean prompt.
    so a lost link cannot promote it to the operator).
 
 `atrium recover` is safe to run even if the previous session exited cleanly: it
-opens a new session from the last snapshot rather than raising an error.
+opens a new session from that project's newest snapshot rather than raising an
+error.
 
 ## Relationship to `--session-id`
 

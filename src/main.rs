@@ -618,6 +618,12 @@ fn main() -> ExitCode {
     } else {
         rest
     };
+    // The last session in this project crashed: offer to pick it back up before
+    // starting a fresh one. Ahead of the skip confirmation, because a resume
+    // settles its own posture (and asks its own questions).
+    if let Some(code) = offer_resume(allow_ctl, max_depth, trust) {
+        return code;
+    }
     // `--skip-permissions` is full bypass — a conscious, dangerous choice. Make
     // the human confirm it once, in plain terms, *before* the TUI takes the
     // terminal (this reads stdin normally; the run loop takes raw mode after).
@@ -767,8 +773,15 @@ fn surface_once<T>(
     }
 }
 
-/// Write a session snapshot iff the window state has changed since the last write.
-/// Pure capture + equality check — no I/O when nothing changed.
+/// Write a session snapshot when the window state has changed since the last
+/// write, or when the heartbeat is due. Returns whether a write landed, so the
+/// caller can move the warden's baseline to it.
+///
+/// The heartbeat is what lets a later launch tell a running session from a dead
+/// one: a live atrium rewrites its file every `HEARTBEAT_MS` even when nothing
+/// changed, so a stale `saved_at_ms` means the writer is gone even if its pid has
+/// since been reused (see `session_store::liveness`). `last` holds the snapshot
+/// *without* the timestamp, so the change check still compares content.
 ///
 /// `last` advances only when the write lands, so a failed save is retried on the
 /// next check instead of being forgotten; the error is returned for the caller to
@@ -778,10 +791,12 @@ fn snapshot_if_changed(
     windows: &[Window],
     path: &std::path::Path,
     last: &mut Option<atrium::session::Snapshot>,
-) -> std::io::Result<()> {
+    last_write_ms: &mut u64,
+    meta: &atrium::session::SessionMeta,
+) -> std::io::Result<bool> {
     let w = match windows.first() {
         Some(w) => w,
-        None => return Ok(()),
+        None => return Ok(false),
     };
     // A pane's `parent` is an `AgentId`, minted per process and re-minted on
     // recovery — storing one would name a *different* pane in the recovered
@@ -817,12 +832,24 @@ fn snapshot_if_changed(
             .collect(),
         atrium::session::policy(),
     );
-    if last.as_ref() == Some(&snap) {
-        return Ok(());
+    let mut snap = snap;
+    snap.meta = meta.clone();
+    let now = atrium::session_store::now_ms();
+    let heartbeat_due = now.saturating_sub(*last_write_ms) >= atrium::session_store::HEARTBEAT_MS;
+    if last.as_ref() == Some(&snap) && !heartbeat_due {
+        return Ok(false);
     }
-    atrium::session::save(path, &snap)?;
+    // Re-created on every write rather than once at startup: a deleted directory
+    // (a cleanup, or tampering) must not turn into a silent stream of failures.
+    if let Some(dir) = path.parent() {
+        atrium::session_store::ensure_private_dir(dir)?;
+    }
+    let mut stamped = snap.clone();
+    stamped.meta.saved_at_ms = Some(now);
+    atrium::session::save(path, &stamped)?;
     *last = Some(snap);
-    Ok(())
+    *last_write_ms = now;
+    Ok(true)
 }
 
 /// Drop repeats, keeping first-seen order. Small-n by construction (a deny list),
@@ -889,12 +916,13 @@ fn recovered_pane_mode(
 /// directory. Printed *before* the skip confirmation, so it informs the only
 /// prompt the operator gets.
 fn recovery_notice(
-    panes: usize,
+    panes: &[atrium::session::PaneRecord],
     policy: Option<&atrium::session::PolicyRecord>,
     trust_from_snapshot: bool,
+    ceiling: atrium::ctl::TrustMode,
 ) -> String {
-    let mut parts = vec![format!("{panes} pane(s)")];
-    match policy {
+    let mut parts = vec![format!("{} pane(s)", panes.len())];
+    let head = match policy {
         Some(p) => {
             if let Some(t) = p.trust {
                 let source = if trust_from_snapshot {
@@ -932,14 +960,100 @@ fn recovery_notice(
              pass them on the command line if the session had them",
             parts.join(", ")
         ),
+    };
+    // Then every pane: what it will run and with what it is allowed to do. The
+    // summary line alone left out the part a hostile snapshot actually controls —
+    // the commands, and each pane's spawn right and deny rules — so the operator
+    // was approving a count. Every string is from the file, so every string is
+    // defanged before it reaches the terminal, as the fleet banner does.
+    let mut lines = vec![head];
+    for (n, record) in panes.iter().enumerate() {
+        let who = record
+            .role
+            .as_deref()
+            .map(atrium::fleet::sanitize)
+            .unwrap_or_else(|| format!("pane {}", n + 1));
+        lines.push(format!("  [{who}] {}", argv_summary(&resume_argv(record))));
+        let mut facts = Vec::new();
+        if let Some(cwd) = &record.cwd {
+            facts.push(format!("cwd {}", atrium::fleet::sanitize(cwd)));
+        }
+        if let Some(id) = &record.identity {
+            facts.push(format!("identity {}", atrium::fleet::sanitize(id)));
+        }
+        facts.push(format!(
+            "mode {}",
+            recovered_pane_mode(record.mode, ceiling).policy_label()
+        ));
+        facts.push(if record.can_spawn {
+            "may spawn teammates".to_string()
+        } else {
+            "cannot spawn".to_string()
+        });
+        if !record.deny.is_empty() {
+            facts.push(format!("{} own deny rule(s)", record.deny.len()));
+        }
+        lines.push(format!("      {}", facts.join(" · ")));
+        let (_, dropped) = atrium::ctl::sanitize_spawn_argv(&record.argv);
+        if !dropped.is_empty() {
+            lines.push(format!(
+                "      ignored from the saved command: {}",
+                dropped.join(", ")
+            ));
+        }
     }
+    lines.join("\n")
+}
+
+/// A pane's command for the consent notice: every flag as written, short values
+/// verbatim, and anything long or multi-word — a system prompt, a kickoff —
+/// reduced to its length. Defanged, since it comes from the snapshot file.
+fn argv_summary(argv: &[String]) -> String {
+    argv.iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let a = atrium::fleet::sanitize(a);
+            if i == 0 {
+                atrium::bind::command_stem(&a)
+            } else if a.starts_with('-') || (a.chars().count() <= 40 && !a.contains(' ')) {
+                a
+            } else {
+                format!("<{} chars>", a.chars().count())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `atrium recover` — load the most recent session snapshot and relaunch every
 /// pane with its session resumed. A missing snapshot prints a clear message
 /// and exits cleanly rather than panicking.
 fn recover_cmd(args: &[String]) -> ExitCode {
-    let (allow_ctl, max_depth, trust, rest) = match atrium::ctl::parse_flags(args) {
+    // recover's own flags first; everything else is the session flags `parse_flags`
+    // knows (`--trust`, `--allow-ctl`, `--max-depth`).
+    let mut list = false;
+    let mut explicit: Option<std::path::PathBuf> = None;
+    let mut flags: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list" => list = true,
+            "--snapshot" => match args.get(i + 1) {
+                Some(path) => {
+                    explicit = Some(path.into());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("atrium recover: --snapshot needs a path");
+                    return ExitCode::FAILURE;
+                }
+            },
+            a if a.starts_with("--snapshot=") => explicit = Some(a["--snapshot=".len()..].into()),
+            a => flags.push(a.to_string()),
+        }
+        i += 1;
+    }
+    let (allow_ctl, max_depth, trust, rest) = match atrium::ctl::parse_flags(&flags) {
         Ok(quad) => quad,
         Err(msg) => {
             eprintln!("atrium recover: {msg}");
@@ -950,49 +1064,145 @@ fn recover_cmd(args: &[String]) -> ExitCode {
         eprintln!("atrium recover: unexpected argument {:?}", rest[0]);
         return ExitCode::FAILURE;
     }
-    let snap_dir = atrium::reap::registry_dir();
-    let snap = match find_latest_snapshot(&snap_dir) {
+    let Ok(cwd) = std::env::current_dir() else {
+        eprintln!("atrium recover: the current directory no longer exists — cd into the project");
+        return ExitCode::FAILURE;
+    };
+    let project = atrium::session_store::project_id(&cwd);
+    let dir = atrium::session_store::state_root()
+        .map(|root| atrium::session_store::project_dir(&root, &project));
+    if list {
+        print_sessions(&project, dir.as_deref());
+        return ExitCode::SUCCESS;
+    }
+    // Before anything is chosen, asked or marked: a resume needs a terminal to
+    // run in, and its confirmation needs a person at one. Run from a script or an
+    // agent's shell, `recover` used to read end-of-input as consent, mark the
+    // operator's crashed session closed, and only then fail on the terminal.
+    {
+        use std::io::IsTerminal;
+        if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+            eprintln!("atrium recover: needs a terminal (to confirm the resume, and to run it)");
+            return ExitCode::FAILURE;
+        }
+    }
+    let now = atrium::session_store::now_ms();
+    let (path, snap) = match explicit {
         Some(path) => match atrium::session::load(&path) {
-            Ok(s) => s,
+            Ok(snap) => (path, snap),
             Err(e) => {
                 eprintln!("atrium recover: {e}");
                 return ExitCode::FAILURE;
             }
         },
         None => {
-            eprintln!(
-                "atrium recover: no snapshot found in {} — nothing to recover",
-                snap_dir.display()
-            );
-            return ExitCode::SUCCESS;
+            let stored = dir
+                .as_deref()
+                .map(|d| atrium::session_store::list(d, &project, now).sessions)
+                .unwrap_or_default();
+            match atrium::session_store::recoverable(&stored, now, atrium::reap::pid_running) {
+                Some(found) => (found.path.clone(), found.snapshot.clone()),
+                None => {
+                    eprintln!("atrium recover: no saved session for this project ({project})");
+                    // Snapshots used to live in the shared temp directory. Name the
+                    // newest one there rather than scan it: picking by mtime from a
+                    // directory every session and test writes to is exactly how the
+                    // wrong session used to get restored.
+                    if let Some(old) = find_latest_snapshot(
+                        &atrium::reap::registry_dir(),
+                        atrium::reap::pid_running,
+                    ) {
+                        eprintln!(
+                            "atrium recover: an older atrium kept snapshots in the temp directory; \
+                             the newest is {}\n  restore it with: atrium recover --snapshot \"{}\"",
+                            old.display(),
+                            old.display()
+                        );
+                    }
+                    return ExitCode::SUCCESS;
+                }
+            }
         }
     };
+    if atrium::session_store::liveness(&snap.meta, now, atrium::reap::pid_running)
+        == atrium::session_store::Liveness::Running
+    {
+        eprintln!(
+            "atrium recover: that session is still running (atrium pid {}); resuming it would \
+             start a second copy of the same agents on the same transcripts",
+            snap.meta
+                .pid
+                .map_or_else(|| "?".to_string(), |p| p.to_string())
+        );
+        return ExitCode::FAILURE;
+    }
     if snap.panes.is_empty() {
         eprintln!("atrium recover: snapshot has no panes — nothing to recover");
         return ExitCode::SUCCESS;
     }
-    // The session policy the snapshot recorded. Everything below prefers an
-    // explicitly typed flag and falls back to this, so `atrium recover` on its own
-    // rebuilds the session that was running rather than a default-flagged
-    // lookalike — which is what it used to do, silently, with the fleet's guards
-    // off (its deny list, compile pool and memory ceiling all live in process
-    // globals installed at `fleet up`, not in any pane's argv).
-    let policy = snap.policy.clone();
-    let trust_typed = flag_typed(args, &["--trust", "--skip-permissions"]);
-    let trust = recovered_trust(trust_typed, trust, policy.as_ref().and_then(|p| p.trust));
-    let allow_ctl = allow_ctl || policy.as_ref().is_some_and(|p| p.allow_ctl);
-    let max_depth = if flag_typed(args, &["--max-depth"]) {
+    if !snap.meta.clean && snap.meta.pid.is_some_and(atrium::reap::pid_running) {
+        eprintln!(
+            "atrium recover: its atrium (pid {}) still exists but stopped updating — it may be \
+             hung. Resuming starts a second copy of the same agents.",
+            snap.meta.pid.unwrap_or(0)
+        );
+    }
+    let plan = plan_resume(
+        &snap,
+        allow_ctl,
+        max_depth,
+        trust,
+        flag_typed(&flags, &["--trust", "--skip-permissions"]),
+        flag_typed(&flags, &["--max-depth"]),
+    );
+    // Before the confirmation, not after: this line is what the operator needs in
+    // order to answer it.
+    eprintln!("{}", plan.notice);
+    if !confirm_resume("atrium recover: resume this session?") {
+        eprintln!("atrium recover: not resumed.");
+        return ExitCode::SUCCESS;
+    }
+    resume_session(snap, plan, Some(&path))
+}
+
+/// What a resume will install, settled before anything is asked or spawned so the
+/// operator is shown exactly that.
+struct ResumePlan {
+    trust: atrium::ctl::TrustMode,
+    allow_ctl: bool,
+    max_depth: usize,
+    /// The policy as it will actually be installed: the snapshot's guards, with
+    /// the trust/ctl/depth values settled here. Recorded verbatim for the resumed
+    /// session, so its own snapshots carry it forward unchanged — reading it back
+    /// off the live globals would lose a `build_jobs` that was inherited rather
+    /// than re-created, one recovery generation at a time.
+    applied: Option<atrium::session::PolicyRecord>,
+    /// The one-line account shown before the confirmation.
+    notice: String,
+}
+
+/// Settle a resume's posture. A typed flag wins; an omitted one defers to the
+/// snapshot instead of overwriting it with a default. The trust ceiling is still
+/// capped to any enclosing atrium session — a snapshot is data on disk and must
+/// never be a way to climb above one.
+fn plan_resume(
+    snap: &atrium::session::Snapshot,
+    allow_ctl: bool,
+    max_depth: usize,
+    trust: atrium::ctl::TrustMode,
+    trust_typed: bool,
+    depth_typed: bool,
+) -> ResumePlan {
+    let policy = snap.policy.as_ref();
+    let trust = recovered_trust(trust_typed, trust, policy.and_then(|p| p.trust));
+    let allow_ctl = allow_ctl || policy.is_some_and(|p| p.allow_ctl);
+    let max_depth = if depth_typed {
         max_depth
     } else {
-        policy.as_ref().map_or(max_depth, |p| p.max_depth)
+        policy.map_or(max_depth, |p| p.max_depth)
     };
     let trust = cap_trust_to_ancestor(trust);
-    // The policy as it will actually be installed: the snapshot's guards, but the
-    // trust/ctl/depth values this call settled on. Recorded verbatim below so the
-    // recovered session's own snapshots carry it forward unchanged — reading it
-    // back off the live globals would lose a `build_jobs` that was inherited
-    // rather than re-created, one recovery generation at a time.
-    let applied = policy.as_ref().map(|p| atrium::session::PolicyRecord {
+    let applied = policy.map(|p| atrium::session::PolicyRecord {
         deny: p.deny.clone(),
         build_jobs: p.build_jobs,
         memory_mb: p.memory_mb,
@@ -1000,17 +1210,262 @@ fn recover_cmd(args: &[String]) -> ExitCode {
         allow_ctl,
         max_depth,
     });
-    // Before the confirmation, not after: this line is what the operator needs in
-    // order to answer it. A snapshot lives in a shared temp directory and is the
-    // one input here that can raise the posture above the typed flags, so what it
-    // asks for has to be visible at the moment there is still a choice.
-    eprintln!(
-        "{}",
-        recovery_notice(snap.panes.len(), applied.as_ref(), !trust_typed)
+    let notice = recovery_notice(&snap.panes, applied.as_ref(), !trust_typed, trust);
+    ResumePlan {
+        trust,
+        allow_ctl,
+        max_depth,
+        applied,
+        notice,
+    }
+}
+
+/// Read a `[Y/n]` answer: anything but an explicit no is yes. Pure, so the rule is
+/// testable without a terminal.
+fn resume_answer(line: &str) -> bool {
+    !matches!(line.trim().to_ascii_lowercase().as_str(), "n" | "no")
+}
+
+/// Ask the operator to confirm a resume. Always a real answer from a terminal:
+/// `ATRIUM_YES` is deliberately not honoured here. It exists so scripts can skip
+/// a fleet's banner, and an operator who keeps it set would otherwise have a
+/// crashed session's snapshot — its commands and posture — applied behind their
+/// back the next time they started a fleet.
+fn confirm_resume(question: &str) -> bool {
+    eprint!("{question} [Y/n] ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        // Zero bytes is end-of-input (Ctrl+D, Ctrl+Z, a closed pipe): nobody
+        // answered, and nobody answering is not consent. Enter is a line.
+        Ok(0) | Err(_) => false,
+        Ok(_) => resume_answer(&line),
+    }
+}
+
+/// Is this atrium running inside another atrium's pane? The pane marker, or —
+/// where the platform can tell — process ancestry. The marker alone is an
+/// environment variable an agent can unset; ancestry is the check it cannot, and
+/// is used wherever it exists (not on Windows yet, see `warden::atrium_ancestor`).
+/// Neither is a security boundary on its own: what they prevent is an agent that
+/// simply runs `atrium` having its session filed, pruned and offered as the
+/// operator's.
+fn nested_in_atrium() -> bool {
+    std::env::var_os(atrium::ctl::ENV_PANE).is_some()
+        || matches!(
+            atrium::warden::atrium_ancestor(),
+            atrium::warden::Ancestry::Atrium(_)
+        )
+}
+
+/// Should a launch offer to resume at all? Not when switched off
+/// (`ATRIUM_RESUME_OFFER=0`, which the test suite sets), not from inside an
+/// atrium pane (an agent launching atrium must not be handed the operator's
+/// crashed session), and not without a terminal to ask on.
+fn offer_enabled(offer_env: Option<&str>, in_pane: bool, interactive: bool) -> bool {
+    offer_env != Some("0") && !in_pane && interactive
+}
+
+/// A human-scale age: `42s`, `7m`, `3h`, `2d`.
+fn human_age(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// On launch in a project whose last session crashed, offer to resume it — one
+/// prompt that is both the resume and the approval. `Some(code)` when the launch
+/// became a resume; `None` to launch normally. Declining marks that session
+/// closed so it is not asked about again (`atrium recover` still has it).
+fn offer_resume(
+    allow_ctl: bool,
+    max_depth: usize,
+    trust: atrium::ctl::TrustMode,
+) -> Option<ExitCode> {
+    use std::io::IsTerminal;
+    let offer_env = std::env::var(atrium::session_store::ENV_RESUME_OFFER).ok();
+    if !offer_enabled(
+        offer_env.as_deref(),
+        nested_in_atrium(),
+        std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+    ) {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let project = atrium::session_store::project_id(&cwd);
+    let root = atrium::session_store::state_root()?;
+    let now = atrium::session_store::now_ms();
+    let stored = atrium::session_store::list(
+        &atrium::session_store::project_dir(&root, &project),
+        &project,
+        now,
+    )
+    .sessions;
+    let found = atrium::session_store::offer(&stored, now, atrium::reap::pid_running)?;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let plan = plan_resume(
+        &found.snapshot,
+        allow_ctl,
+        max_depth,
+        trust,
+        flag_typed(&argv, &["--trust", "--skip-permissions"]),
+        flag_typed(&argv, &["--max-depth"]),
     );
+    let meta = &found.snapshot.meta;
+    eprintln!(
+        "atrium: the last session in this project did not exit cleanly (saved {} ago).",
+        meta.saved_at_ms
+            .map_or_else(|| "?".to_string(), |t| human_age(now.saturating_sub(t)))
+    );
+    if meta.pid.is_some_and(atrium::reap::pid_running) {
+        eprintln!(
+            "atrium: its atrium (pid {}) still exists but stopped updating — it may be hung. \
+             Resuming starts a second copy of the same agents.",
+            meta.pid.unwrap_or(0)
+        );
+    }
+    eprintln!("{}", plan.notice);
+    if confirm_resume("Resume it?") {
+        return Some(resume_session(
+            found.snapshot.clone(),
+            plan,
+            Some(&found.path),
+        ));
+    }
+    if let Err(e) = atrium::session_store::mark_closed(&found.path) {
+        eprintln!("atrium: warning: {e}; this session may be offered again");
+    }
+    eprintln!("atrium: starting a new session (`atrium recover --list` still has that one).");
+    None
+}
+
+/// `atrium recover --list`: this project's saved sessions, newest first, with
+/// what each would restore — and any file that could not be read, since an
+/// unreadable snapshot may be a tampered one.
+fn print_sessions(project: &str, dir: Option<&std::path::Path>) {
+    let Some(dir) = dir else {
+        eprintln!(
+            "atrium recover: no state directory could be determined (set {})",
+            atrium::session_store::ENV_STATE_DIR
+        );
+        return;
+    };
+    let now = atrium::session_store::now_ms();
+    let listing = atrium::session_store::list(dir, project, now);
+    let (stored, bad) = (&listing.sessions, &listing.unreadable);
+    println!("sessions for {project}");
+    println!("  in {}", dir.display());
+    if stored.is_empty() && bad.is_empty() && listing.suspect.is_empty() {
+        println!("  (none)");
+    }
+    for s in stored {
+        let meta = &s.snapshot.meta;
+        let state = match atrium::session_store::liveness(meta, now, atrium::reap::pid_running) {
+            atrium::session_store::Liveness::Running => "running",
+            atrium::session_store::Liveness::Crashed => "crashed",
+            atrium::session_store::Liveness::Closed => "closed",
+        };
+        let age = meta
+            .saved_at_ms
+            .map_or_else(|| "?".to_string(), |t| human_age(now.saturating_sub(t)));
+        let trust = s
+            .snapshot
+            .policy
+            .as_ref()
+            .and_then(|p| p.trust)
+            .map_or("-", |t| t.policy_label());
+        let roles: Vec<&str> = s
+            .snapshot
+            .panes
+            .iter()
+            .filter_map(|p| p.role.as_deref())
+            .collect();
+        // Role strings come from the file: defanged, or an ESC in one could
+        // repaint this listing into something reassuring.
+        let roles: Vec<String> = roles.into_iter().map(atrium::fleet::sanitize).collect();
+        let roles = if roles.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", roles.join(", "))
+        };
+        println!(
+            "  {state:<8} {age:>4} ago  {} pane(s)  trust {trust}{roles}",
+            s.snapshot.panes.len()
+        );
+        println!("           {}", s.path.display());
+    }
+    for (path, e) in bad {
+        println!("  unreadable  {}: {e}", path.display());
+    }
+    for (path, why) in &listing.suspect {
+        println!(
+            "  suspect     {}: {why} — never offered; restore only with --snapshot, after \
+             reading it",
+            path.display()
+        );
+    }
+}
+
+/// Resume `snap` under `plan`: the skip confirmation, the session guards, every
+/// pane with its own posture and capability, then the run loop. `source` is the
+/// file it came from; a file in the store is marked closed once the operator has
+/// confirmed, so the next launch does not offer it again. If a pane then fails to
+/// start, the session is still reachable with a bare `atrium recover`, which also
+/// takes closed sessions.
+fn resume_session(
+    snap: atrium::session::Snapshot,
+    plan: ResumePlan,
+    source: Option<&std::path::Path>,
+) -> ExitCode {
+    let ResumePlan {
+        trust,
+        allow_ctl,
+        max_depth,
+        applied,
+        ..
+    } = plan;
+    let policy = snap.policy.clone();
     if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
         eprintln!("atrium recover: aborted.");
         return ExitCode::SUCCESS;
+    }
+    // Checked again here, after the prompts: the answer can take a while, and a
+    // second terminal offered the same crash may have resumed it meanwhile.
+    if let Some(src) = source {
+        if let (Ok(cwd), Some(root)) =
+            (std::env::current_dir(), atrium::session_store::state_root())
+        {
+            let project = atrium::session_store::project_id(&cwd);
+            let now = atrium::session_store::now_ms();
+            let stored = atrium::session_store::list(
+                &atrium::session_store::project_dir(&root, &project),
+                &project,
+                now,
+            )
+            .sessions;
+            let me = atrium::session_store::Stored {
+                path: src.to_path_buf(),
+                snapshot: snap.clone(),
+            };
+            if atrium::session_store::superseded(&stored, &me, now, atrium::reap::pid_running) {
+                eprintln!(
+                    "atrium recover: these agents are already running in another atrium \
+                     session — not starting a second copy"
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    if let (Some(src), Some(root)) = (source, atrium::session_store::state_root()) {
+        if atrium::session_store::is_in_store(src, &root) {
+            if let Err(e) = atrium::session_store::mark_closed(src) {
+                eprintln!("atrium recover: warning: {e}; this session may be offered again");
+            }
+        }
     }
     set_trust_mode(trust);
     if let Some(applied) = applied {
@@ -1083,6 +1538,14 @@ fn recover_cmd(args: &[String]) -> ExitCode {
             Ok(mut pane) => {
                 pane.role = record.role.clone();
                 pane.worktree = record.worktree.clone();
+                // The transcript id. `--resume <id>` is a user session argument,
+                // so the spawn path injects no id of its own and would leave the
+                // pane unbound: no agent status, and a snapshot with nothing to
+                // resume next time or to tell a second copy by. Resuming keeps
+                // writing the same transcript, so the recorded id stays right.
+                if pane.session_id.is_none() {
+                    pane.session_id = record.session_id.clone();
+                }
                 // Capability and spawn-depth, from the snapshot. `spawn_pane_full`
                 // defaults to the human-pane behaviour (`can_spawn: true`, depth
                 // 0); leaving those defaults gave every recovered fleet agent the
@@ -1151,7 +1614,11 @@ fn recover_cmd(args: &[String]) -> ExitCode {
 /// session id, strips `--continue` and appends `--resume <id>` so the agent
 /// resumes its conversation. Non-claude panes are relaunched verbatim.
 fn resume_argv(record: &atrium::session::PaneRecord) -> Vec<String> {
-    let mut argv = record.argv.clone();
+    // The saved command is data from a file every hosted agent can write. Posture
+    // is atrium's to set, from the policy the operator just confirmed — so the
+    // governed permission flags never ride along, exactly as `fleet up` and
+    // `ctl spawn` strip them from what they launch.
+    let (mut argv, _) = atrium::ctl::sanitize_spawn_argv(&record.argv);
     if argv.is_empty() {
         return argv;
     }
@@ -1159,22 +1626,69 @@ fn resume_argv(record: &atrium::session::PaneRecord) -> Vec<String> {
         return argv;
     }
     if let Some(id) = &record.session_id {
-        argv.retain(|a| a != "--continue");
+        // A pane that was itself resumed carries `--resume <id>` in its argv
+        // already; appending a second one is a malformed command line.
+        argv = strip_session_args(&argv);
         argv.push("--resume".to_string());
         argv.push(id.clone());
     }
     argv
 }
 
-/// Scan `dir` for `atrium-session-*.json` files and return the most recently
-/// modified one, or `None` if the directory is unreadable or empty.
-fn find_latest_snapshot(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Remove every session-selecting argument — `--continue`/`-c`, and
+/// `--resume`/`-r`/`--session-id` with their value, in either the separate or
+/// the `=` form — so exactly one `--resume` can be appended.
+fn strip_session_args(argv: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut i = 0;
+    while i < argv.len() {
+        let a = &argv[i];
+        let head = a.split('=').next().unwrap_or(a);
+        match head {
+            "--continue" | "-c" if i > 0 => i += 1,
+            "--resume" | "-r" | "--session-id" if i > 0 => {
+                i += if !a.contains('=') && i + 1 < argv.len() {
+                    2
+                } else {
+                    1
+                };
+            }
+            _ => {
+                out.push(a.clone());
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Scan `dir` — the temp directory older atriums saved snapshots to — for
+/// `atrium-session-<pid>.json` files and return the most recently modified one
+/// whose atrium is no longer `running`, or `None`.
+///
+/// Only used to *name* a legacy file for `atrium recover --snapshot`, never to pick
+/// one silently. Skipping live writers matters even for that: an older atrium that
+/// is still running keeps its snapshot the newest file there, and pointing the
+/// operator at their own running session as "the one to recover" is exactly
+/// backwards.
+fn find_latest_snapshot(
+    dir: &std::path::Path,
+    running: impl Fn(u32) -> bool,
+) -> Option<std::path::PathBuf> {
     let rd = std::fs::read_dir(dir).ok()?;
     let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
     for entry in rd.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if !name.starts_with("atrium-session-") || !name.ends_with(".json") {
+            continue;
+        }
+        let writer = name
+            .trim_start_matches("atrium-session-")
+            .trim_end_matches(".json")
+            .parse::<u32>()
+            .ok();
+        if writer.is_some_and(&running) {
             continue;
         }
         if let Ok(meta) = entry.metadata() {
@@ -1427,6 +1941,11 @@ fn run(
     // The read at the top can fail (terminal gone) *and* commands deep inside
     // `break 'outer`; a labeled `loop` expresses both. clippy's while-let
     // rewrite can't host the labeled break, so allow it here.
+    // Set only where the operator quit or every pane ended. A termination signal
+    // (SIGHUP from a closed window, SIGTERM from a shutdown) and a lost terminal
+    // leave through the same teardown but are NOT deliberate — the session was
+    // taken away, and the next launch should offer it back.
+    let mut deliberate_exit = false;
     #[allow(clippy::while_let_loop)]
     'outer: loop {
         // 0. a termination signal (SIGHUP from a closed terminal window, or a
@@ -1519,6 +2038,7 @@ fn run(
                 &mut flash,
             ) {
                 if outcome.apply(&mut renderer, &mut force_repaint) {
+                    deliberate_exit = true;
                     break 'outer;
                 }
                 continue;
@@ -1620,6 +2140,7 @@ fn run(
                     if std::env::var_os("ATRIUM_DEBUG").is_some() {
                         eprint!("[atrium-dbg quit-received]\r\n");
                     }
+                    deliberate_exit = true;
                     break 'outer;
                 }
             }
@@ -1695,6 +2216,8 @@ fn run(
                 .count();
             windows.retain(|w| !w.panes.is_empty());
             if windows.is_empty() {
+                // Every agent ended on its own: nothing crashed, nothing to resume.
+                deliberate_exit = true;
                 break;
             }
             active = active
@@ -1970,6 +2493,20 @@ fn run(
     // Deliver the restore before the process exits and takes the writer thread
     // with it — bounded, so a terminal that never reads can't hold atrium open.
     out.finish(SCREEN_FINISH);
+    // A deliberate exit: mark the snapshot closed so the next launch in this
+    // project does not offer to resume what the operator chose to end. After the
+    // screen is restored, so a failure is readable.
+    let settled = if deliberate_exit {
+        safety_net.settle_session()
+    } else {
+        Ok(())
+    };
+    if let Err(e) = settled {
+        eprintln!(
+            "atrium: warning: could not mark the session snapshot closed ({e}); the next \
+             launch here may offer to resume this session"
+        );
+    }
     if dbg {
         eprint!("[atrium-dbg cleaned]\r\n");
     }
@@ -2959,7 +3496,120 @@ mod tests {
         assert!(got.is_empty());
     }
 
+    fn notice_panes(n: usize) -> Vec<atrium::session::PaneRecord> {
+        (0..n)
+            .map(|_| pane_record(vec!["claude".into()], None))
+            .collect()
+    }
+
+    /// The consent line must show what a snapshot actually controls. Approving a
+    /// pane *count* let a planted file run any command with any spawn right; each
+    /// pane's command, posture, spawn right and own deny rules are now listed, a
+    /// governed flag the file tried to smuggle is named as ignored, and a role
+    /// carrying an escape sequence cannot repaint the prompt.
+    #[test]
+    fn the_resume_notice_lists_what_each_pane_will_run_and_may_do() {
+        let mut lead = pane_record(
+            vec![
+                "claude".into(),
+                "--allowedTools".into(),
+                "Bash(*)".into(),
+                "--model".into(),
+                "opus".into(),
+                "You are the lead of a long-running fleet.".into(),
+            ],
+            Some("t-lead".into()),
+        );
+        lead.role = Some("lead\u{1b}[2J".to_string());
+        lead.can_spawn = true;
+        lead.mode = Some(TrustMode::Skip);
+        let mut worker = pane_record(vec!["claude".into()], None);
+        worker.role = Some("builder".into());
+        worker.can_spawn = false;
+        worker.deny = vec!["git push".into()];
+        let notice = super::recovery_notice(&[lead, worker], None, false, TrustMode::Edits);
+        assert!(
+            !notice.contains('\u{1b}'),
+            "an ESC from the file reached the terminal"
+        );
+        assert!(notice.contains("--model opus"), "flags are shown: {notice}");
+        assert!(
+            !notice.contains("Bash(*)"),
+            "a governed flag is not part of what will run: {notice}"
+        );
+        assert!(notice.contains("ignored from the saved command: --allowedTools"));
+        assert!(
+            notice.contains("<41 chars>"),
+            "a prompt is reduced to its length"
+        );
+        assert!(notice.contains("--resume t-lead"));
+        assert!(
+            notice.contains("mode accept"),
+            "a recorded `skip` is shown capped to the ceiling: {notice}"
+        );
+        assert!(notice.contains("may spawn teammates") && notice.contains("cannot spawn"));
+        assert!(notice.contains("1 own deny rule(s)"));
+    }
+
+    /// A pane that was itself resumed carries `--resume <id>` in its argv; the next
+    /// resume must replace it, not append a second one.
+    #[test]
+    fn resuming_a_resumed_pane_keeps_exactly_one_session_argument() {
+        let r = pane_record(
+            vec![
+                "claude".into(),
+                "--model".into(),
+                "opus".into(),
+                "--resume".into(),
+                "old".into(),
+                "--session-id=older".into(),
+                "-c".into(),
+            ],
+            Some("current".into()),
+        );
+        assert_eq!(
+            super::resume_argv(&r),
+            vec!["claude", "--model", "opus", "--resume", "current"]
+        );
+    }
+
+    /// Governed permission flags in a saved command never reach the agent: the
+    /// posture comes from the policy the operator confirmed.
+    #[test]
+    fn a_saved_command_cannot_carry_its_own_permission_flags() {
+        let r = pane_record(
+            vec![
+                "claude".into(),
+                "--dangerously-skip-permissions".into(),
+                "--permission-mode".into(),
+                "bypassPermissions".into(),
+            ],
+            None,
+        );
+        assert_eq!(super::resume_argv(&r), vec!["claude"]);
+    }
+
     // --- find_latest_snapshot -----------------------------------------------
+
+    /// A legacy snapshot whose atrium is still running is someone's live session,
+    /// not a candidate to recover — even when it is the newest file there.
+    #[test]
+    fn find_latest_skips_a_snapshot_whose_atrium_is_still_running() {
+        let tmp =
+            std::env::temp_dir().join(format!("atrium_snap_live_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("atrium-session-100.json"), b"{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(tmp.join("atrium-session-200.json"), b"{}").unwrap();
+        let got = super::find_latest_snapshot(&tmp, |pid| pid == 200);
+        assert_eq!(
+            got.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())),
+            Some("atrium-session-100.json".to_string()),
+            "the running session (200) is newer but must be skipped"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn find_latest_picks_newest_json_and_ignores_others() {
@@ -2975,7 +3625,7 @@ mod tests {
         let b = tmp.join("atrium-session-200.json");
         std::fs::write(&a, b"{}").unwrap();
         std::fs::write(&b, b"{}").unwrap();
-        let result = super::find_latest_snapshot(&tmp);
+        let result = super::find_latest_snapshot(&tmp, |_| false);
         assert!(result.is_some(), "must find a snapshot");
         let got = result.unwrap();
         assert!(
@@ -2996,7 +3646,7 @@ mod tests {
     #[test]
     fn find_latest_unreadable_dir_returns_none() {
         let missing = std::path::PathBuf::from("/no/such/directory/atrium_test_xyz");
-        assert!(super::find_latest_snapshot(&missing).is_none());
+        assert!(super::find_latest_snapshot(&missing, |_| false).is_none());
     }
 
     #[test]
@@ -3007,7 +3657,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         std::fs::write(tmp.join("atrium-session-1.pids"), b"pids").unwrap();
         std::fs::write(tmp.join("unrelated.json"), b"{}").unwrap();
-        assert!(super::find_latest_snapshot(&tmp).is_none());
+        assert!(super::find_latest_snapshot(&tmp, |_| false).is_none());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -3175,7 +3825,7 @@ mod tests {
             allow_ctl: true,
             max_depth: 6,
         };
-        let full = super::recovery_notice(4, Some(&policy), false);
+        let full = super::recovery_notice(&notice_panes(4), Some(&policy), false, TrustMode::Auto);
         for expected in [
             "4 pane(s)",
             "trust automode",
@@ -3189,7 +3839,7 @@ mod tests {
                 "{full:?} must mention {expected:?}"
             );
         }
-        let legacy = super::recovery_notice(4, None, true);
+        let legacy = super::recovery_notice(&notice_panes(4), None, true, TrustMode::Off);
         assert!(
             legacy.contains("NOT restored"),
             "a v1 snapshot must warn, not pretend: {legacy:?}"
@@ -3210,7 +3860,8 @@ mod tests {
             allow_ctl: true,
             max_depth: usize::MAX,
         };
-        let from_file = super::recovery_notice(1, Some(&policy), true);
+        let from_file =
+            super::recovery_notice(&notice_panes(1), Some(&policy), true, TrustMode::Auto);
         assert!(
             from_file.contains("trust automode (from the snapshot)"),
             "{from_file:?}"
@@ -3219,11 +3870,52 @@ mod tests {
             from_file.contains("max depth unlimited"),
             "an unlimited guard must read as unlimited, not as a 19-digit number: {from_file:?}"
         );
-        let typed = super::recovery_notice(1, Some(&policy), false);
+        let typed = super::recovery_notice(&notice_panes(1), Some(&policy), false, TrustMode::Auto);
         assert!(
             typed.contains("trust automode") && !typed.contains("from the snapshot"),
             "a posture the operator typed is not attributed to the file: {typed:?}"
         );
+    }
+
+    /// Enter is yes; only an explicit no declines. A resume offer the operator
+    /// dismisses by reflex would otherwise be gone for good.
+    #[test]
+    fn a_resume_prompt_defaults_to_yes_and_only_no_declines() {
+        for yes in ["\n", "y\n", "Yes\r\n", "sure\n"] {
+            assert!(super::resume_answer(yes), "{yes:?} should resume");
+        }
+        for no in ["n\n", "N", " no \r\n", "NO"] {
+            assert!(!super::resume_answer(no), "{no:?} should decline");
+        }
+    }
+
+    /// The offer is for the operator at a terminal: never from inside a pane (an
+    /// agent launching atrium must not be handed the operator's crashed session),
+    /// never without a terminal, never when switched off.
+    #[test]
+    fn the_resume_offer_needs_an_operator_at_a_terminal() {
+        assert!(super::offer_enabled(None, false, true));
+        assert!(super::offer_enabled(Some("1"), false, true));
+        assert!(
+            !super::offer_enabled(Some("0"), false, true),
+            "switched off"
+        );
+        assert!(
+            !super::offer_enabled(None, true, true),
+            "inside an atrium pane"
+        );
+        assert!(
+            !super::offer_enabled(None, false, false),
+            "no terminal to ask on"
+        );
+    }
+
+    #[test]
+    fn ages_read_at_human_scale() {
+        assert_eq!(super::human_age(42_000), "42s");
+        assert_eq!(super::human_age(7 * 60_000), "7m");
+        assert_eq!(super::human_age(3 * 3_600_000), "3h");
+        assert_eq!(super::human_age(2 * 86_400_000), "2d");
     }
 
     /// A recovery re-installs the merged deny list as the fleet's, and `run()`
