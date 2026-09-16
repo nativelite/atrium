@@ -3087,3 +3087,86 @@ fn a_redirected_tmpdir_does_not_lift_the_ceiling() {
     let _ = wait_exit(&mut p, 15);
     let _ = std::fs::remove_dir_all(&decoy);
 }
+
+/// A fleet that declares a `context` block actually reaches its panes: the
+/// agent's *process* has `CONTEXT_MODE_DIR` and `CONTEXT_MODE_SESSION_SUFFIX`
+/// set, which is how the context-mode plugin is pointed at a shared store.
+///
+/// The unit tests cover the mapping (provider, share) → env pairs; this covers
+/// the rest of the chain — fleet parse → `context_env` → `PaneSpec.extra_env` →
+/// the pty's environment — which was otherwise only verified by reading it. A
+/// refactor that dropped `extra_env` on the way to the spawn would leave every
+/// unit test green and silently stop configuring the store.
+///
+/// `share: knowledge` is the interesting case: every agent shares one directory
+/// and gets its own session suffix, so the two panes must disagree on the
+/// suffix while agreeing on the dir.
+#[test]
+fn a_fleet_context_block_reaches_the_agent_process() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let td = std::env::temp_dir().join(format!("atrium-ctx-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    let cmd_json = {
+        let mut parts = vec![format!("{shell:?}")];
+        parts.extend(args.iter().map(|a| format!("{a:?}")));
+        parts.join(", ")
+    };
+    let fleet_json = format!(
+        r#"{{ "fleets": {{ "ctx": {{ "grid": "1x2",
+          "context": {{ "provider": "context-mode", "share": "knowledge" }},
+          "agents": [
+          {{ "name": "one", "cmd": [{cmd_json}] }},
+          {{ "name": "two", "cmd": [{cmd_json}] }}
+        ] }} }} }}"#
+    );
+    std::fs::write(td.join("atrium.fleet.json"), fleet_json).unwrap();
+
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["fleet", "up", "ctx"],
+        30,
+        140,
+        &hermetic_env(&td),
+        Some(&td.to_string_lossy()),
+    )
+    .unwrap();
+    read_until(&mut p, b"2:two", Duration::from_secs(20));
+
+    // Pane 1 prints its suffix. Marked either side so the echoed command line
+    // itself can't satisfy the assertion.
+    let echo: &[u8] = if cfg!(windows) {
+        b"echo ctx[%CONTEXT_MODE_SESSION_SUFFIX%]end\r\n"
+    } else {
+        b"echo \"ctx[$CONTEXT_MODE_SESSION_SUFFIX]end\"\r\n"
+    };
+    p.write(echo).unwrap();
+    let out = read_until(&mut p, b"ctx[one]end", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"ctx[one]end"),
+        "agent `one` did not get CONTEXT_MODE_SESSION_SUFFIX=one: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    // The shared directory is set too, and points inside the fleet's ctx root.
+    let echo_dir: &[u8] = if cfg!(windows) {
+        b"echo dir[%CONTEXT_MODE_DIR%]end\r\n"
+    } else {
+        b"echo \"dir[$CONTEXT_MODE_DIR]end\"\r\n"
+    };
+    p.write(echo_dir).unwrap();
+    let out = read_until(&mut p, b"]end", Duration::from_secs(15));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("dir[") && !text.contains("dir[]end"),
+        "CONTEXT_MODE_DIR is empty in the pane: {text}"
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_dir_all(&td);
+}
