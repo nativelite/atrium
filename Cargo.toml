@@ -1,6 +1,6 @@
 [package]
 name = "atrium"
-version = "0.35.1"
+version = "0.36.0"
 edition = "2021"
 rust-version = "1.70"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
@@ -11,7 +11,7 @@ categories = ["command-line-utilities"]
 
 # nativelite app rule: zero THIRD-PARTY dependencies; org crates only.
 [dependencies]
-abus = { package = "nativelite-abus", version = "0.2", path = "../abus" }
+abus = { package = "nativelite-abus", version = "0.2.1", path = "../abus" }
 pty = { package = "nativelite-pty", version = "0.4.1", path = "../pty-rs" }
 akey = { package = "nativelite-akey", version = "0.2", path = "../akey" }
 rawterm = { package = "nativelite-rawterm", version = "0.2.2", path = "../rawterm-rs" }

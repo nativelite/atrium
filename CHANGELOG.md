@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-09-17
+
 ### Added
+- **The atrium skills run long work as short sessions** (marketplace plugin
+  0.2.7). `atrium-coordinate` sizes every item by countable signals and splits
+  anything large before it is built. Each item gets one fresh teammate, which
+  leaves a checkpoint (a commit saying what, why and what is open, a board entry,
+  and a `rat` node where the repo uses rationale) and is then reaped. A fresh
+  reviewer checks each item, and a final reviewer checks the whole range. The lead
+  keeps its own context small and restarts itself from `PLAN.md` and the board
+  with `ctl respawn`. `atrium-delegate` and `atrium-fleet` follow the same rules.
 - **A crashed session is offered back when you start atrium again.** Run
   `atrium` or `atrium fleet up` in a project whose last session did not exit
   cleanly and atrium shows what it would restore — panes, trust, deny rules,
@@ -1520,7 +1530,11 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.36.0...HEAD
+[0.36.0]: https://github.com/nativelite/atrium/compare/v0.35.1...v0.36.0
+[0.35.1]: https://github.com/nativelite/atrium/compare/v0.35.0...v0.35.1
+[0.35.0]: https://github.com/nativelite/atrium/compare/v0.34.0...v0.35.0
+[0.34.0]: https://github.com/nativelite/atrium/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/nativelite/atrium/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/nativelite/atrium/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/nativelite/atrium/compare/v0.30.3...v0.31.0

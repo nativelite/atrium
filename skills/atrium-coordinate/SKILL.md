@@ -116,6 +116,9 @@ your context.
 
 ## Restarting yourself
 
+Needs atrium 0.36.0 or later (`atrium --version`). Earlier versions relaunch a
+bare command and show nothing in the restarted pane.
+
 Your starting point lives on disk: `PLAN.md` (items, sizes, order), the board
 (what is built, reviewed, open), `bus feed` (decisions waiting) and `git log`.
 Restart between phases, for example after a batch of items passes review, or
