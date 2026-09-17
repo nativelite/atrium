@@ -238,8 +238,9 @@ What `respawn` does:
 1. Sends the pane's current child a graceful stop and waits for it to exit.
 2. Creates the named worktree if it does not yet exist (same naming rules as
    `spawn --worktree`).
-3. Relaunches the same command — same argv, role, and identity — with its working
-   directory set to the worktree.
+3. Relaunches the same command — same argv, role, identity, mode, deny rules and
+   context store — as a new session, with its working directory set to the
+   worktree. (Without `--worktree`, the pane restarts in the directory it was in.)
 4. Re-injects the worktree behavioral norms into the fresh session.
 
 The pane id and role are preserved. Teammates that target `scout` by role keep

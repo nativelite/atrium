@@ -21,15 +21,120 @@ is not an `atrium ctl` pane is the wrong thing.
 
 ## Your loop
 
-1. **Split** the work into independent parts — ideally parts that can proceed in
-   parallel without waiting on each other.
-2. **Delegate each part** to its own teammate (see below). Delegate the part
-   rather than doing it yourself.
-3. **Monitor** with `atrium ctl status`; when a teammate reports idle, collect its
-   output (the files it changed).
-4. **Integrate and verify** the parts, resolve conflicts, and **reap every
-   teammate you spawned** (see "Finish cleanly"). Synthesis and cleanup are your
-   job.
+Work runs as many short sessions, not a few long ones. A session's context is
+paid for again on every turn, so an agent that carries three finished items into
+a fourth pays for all of them, and drifts. Each item gets a fresh session, leaves
+a checkpoint on disk, and is reviewed by another fresh session.
+
+1. **Plan.** Write `PLAN.md`: the items, each with its size, the files it owns,
+   and its done-signal. Commit it. It is your restart point as well as the plan.
+2. **Size** every item (below) before anyone builds it. Split every L.
+3. **Build** each item in its own fresh teammate: one item, one session.
+4. **Checkpoint.** The teammate commits and marks the board; you reap it.
+5. **Review** each item in a fresh session. A failure goes to a fresh fixer.
+6. **Final review** of the whole range, then the full gate once, then confirm
+   every teammate is reaped (see "Finish cleanly").
+
+## Size every item first
+
+Size by what you can count before starting, not by how hard it feels. Any one
+signal sets the size.
+
+| Size | Signals | How it runs |
+|------|---------|-------------|
+| **S** | one file, under ~50 changed lines, no new public surface (command, flag, API, file format), covered by existing tests | No session of its own: fold it into the brief of a related M item. Covered by the final review |
+| **M** | 2–5 files, or up to ~300 changed lines, or one new public surface with its tests | One fresh teammate, one checkpoint, one fresh review |
+| **L** | more than 5 files or ~300 lines, a new module, spans packages, or its brief does not fit one paragraph | Split into M items before anyone builds. Never hand an L to one session |
+
+Go **one size up** for permissions, auth or security; persisted formats or
+on-disk state; concurrency; and anything its own tests cannot exercise. Items
+like that always get their own review, even when small.
+
+Record the size and why on the board, so a wrong size shows:
+`atrium ctl board set <item> size=M why="3 files, new ctl verb"`. Tell every
+teammate: if the item turns out bigger than sized, stop, checkpoint what is done,
+and `bus pub <topic> --decision item=<item> msg="bigger than M: <why>"` so you can
+re-split it. Do not push on.
+
+## One item, one session
+
+Brief a fresh teammate with exactly one item. When it is done, reap it and spawn
+a new one for the next item. Never `send` a finished teammate a second item.
+
+## The checkpoint: what a finished item leaves
+
+Put this in every build brief. Done means all four:
+
+1. The project's gate is green, then **a commit** whose message says what
+   changed, why, and what was left open. The commit is the handoff: the next
+   session reads `git show <sha>`, never the old conversation. `git show` works
+   from any worktree of the repo.
+2. **The board:** `atrium ctl board set <item> status=DONE commit=<sha> review=pending open="<one line, or empty>"`.
+3. **Reasoning that must outlive the session** (a rejected approach, a hazard,
+   a known limit) goes where it survives. If the repo has `.rationale/`, record it
+   as a `rat` node anchored to the code:
+   `rat new <id> --kind rationale|hazard|limitation --at <path>:<line>`.
+   Otherwise, put it in the commit message.
+4. **Announce and stop:** `atrium ctl bus pub <topic> item=<item> status=done commit=<sha>`.
+
+Then reap it.
+
+## Review each item in a fresh session
+
+Spawn a reviewer that never saw the build. Brief it with the item's original
+brief, the commit sha, and this job: check the change against the brief, not
+against the builder's account of it. Read `git show <sha>` and run the tests the
+change touches. Where `.rationale/` exists, also read `rat context <changed files>`
+and run `rat check`. Do not edit anything. Finish with
+`board set <item> review=pass`, or `review=fail findings="<short>"` plus the full
+findings in a file named on the board.
+
+On a fail, spawn a **fresh fixer** with the original brief and the findings, then
+a fresh review. The builder's session is gone; keep it gone.
+
+## Final review
+
+Once every item has `review=pass`, spawn one fresh reviewer over the whole range
+(`git log --oneline <base>..HEAD`, `git diff <base>..HEAD`). It looks for what no
+single-item review can see: a contract one item changed and another relied on,
+duplicated helpers, inconsistent names, docs that cover only some of it. Then run
+the full gate once.
+
+## Keep your own context small: you are the long session
+
+Teammates come and go; you last the whole run, and everything you read stays in
+your context.
+
+- **Read roll-ups, not raw output:** `board list`, `bus feed`,
+  `git log --oneline`, `git show --stat <sha>`. Leave whole diffs and transcripts
+  to reviewers.
+- **Use context-mode when it is available** (its `ctx_batch_execute`,
+  `ctx_execute` and `ctx_search` tools). Run anything with long output through it
+  and keep only the answer.
+- **Keep nothing only in your head.** Anything you would need after a restart goes
+  on the board or into `PLAN.md` as soon as you decide it.
+
+## Restarting yourself
+
+Your starting point lives on disk: `PLAN.md` (items, sizes, order), the board
+(what is built, reviewed, open), `bus feed` (decisions waiting) and `git log`.
+Restart between phases, for example after a batch of items passes review, or
+whenever your context is heavy:
+
+1. `atrium ctl board set lead phase=<n> next="<items>" note="<anything not in PLAN.md>"`
+2. Make sure `PLAN.md` is current and committed.
+3. Queue your own first message, then respawn yourself (bash shown; in PowerShell
+   use `$env:ATRIUM_PANE`):
+
+       atrium ctl send $ATRIUM_PANE "You are the lead, restarted. Read PLAN.md, then atrium ctl board get lead, board list, bus feed. Continue from next."
+       atrium ctl respawn $ATRIUM_PANE
+
+Your process ends, and a new session starts in your pane with the same command,
+mode, deny rules and context store. Your teammates keep running and stay yours.
+The queued message is typed into the new session once it is idle, or after a
+short grace if it has no status yet. A fleet lead's kickoff runs again on restart,
+so a fleet lead whose kickoff already says "read PLAN.md and the board, continue
+from `board get lead`" can skip the `send`.
 
 ## How to delegate
 
@@ -56,8 +161,8 @@ do NOT return a value to you.
     atrium ctl status <role>     # one teammate
     atrium ctl kill <role>       # reap a teammate once you have collected its part
 
-Poll status until teammates are idle, then read the files they changed and
-integrate. Use `atrium ctl audit` to review what you delegated and how it resolved.
+Poll status or `bus feed` until teammates report done, then read their checkpoint
+(`board get <item>`, `git show --stat <sha>`) and integrate. Use `atrium ctl audit` to review what you delegated and how it resolved.
 
 ## The board — shared source of truth
 

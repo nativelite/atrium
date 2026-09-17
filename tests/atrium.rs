@@ -1806,6 +1806,154 @@ fn ctl_spawn_here_succeeds() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// `atrium ctl respawn` restarts the agent it was pointed at, arguments and all.
+/// It used to relaunch only the command's name, so `claude --model opus` came back
+/// as a bare `claude` — the wrong agent for a clean restart. The spawn log records
+/// the exact command each launch ran; the respawn's line must carry the worker's
+/// own argument, which the parent shell's command does not.
+#[test]
+fn ctl_respawn_keeps_the_panes_arguments() {
+    let log = std::env::temp_dir().join(format!(
+        "atrium-respawn-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (shell, flag, marker): (&str, &str, &str) = if cfg!(windows) {
+        ("cmd", "/Q", "/D")
+    } else {
+        ("sh", "-i", "-u")
+    };
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--allow-ctl", shell, flag],
+        24,
+        100,
+        &[
+            ("ATRIUM_CTL_ALLOW".to_string(), shell.to_string()),
+            (
+                "ATRIUM_SPAWN_LOG".to_string(),
+                log.to_string_lossy().into_owned(),
+            ),
+        ],
+        None,
+    )
+    .unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(
+        format!("\"{atrium}\" ctl spawn --here --role keeper -- {shell} {flag} {marker}\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"keeper\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "spawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl respawn keeper\r\n").as_bytes())
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let lines = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(str::to_string).collect();
+        if lines.len() >= 3 || std::time::Instant::now() > deadline {
+            break lines;
+        }
+        let _ = read_until(&mut p, b"\x00never", Duration::from_millis(200));
+    };
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    let _ = std::fs::remove_file(&log);
+    assert!(
+        lines.len() >= 3,
+        "expected launch, spawn and respawn in the spawn log, got {lines:?}"
+    );
+    let spawned = lines[1].split_whitespace().any(|a| a == marker);
+    let respawned = lines[2].split_whitespace().any(|a| a == marker);
+    assert!(spawned, "the spawn itself lost {marker}: {lines:?}");
+    assert!(
+        respawned,
+        "the respawn dropped the pane's arguments: {lines:?}"
+    );
+}
+
+/// A pane can restart itself: `ctl respawn` aimed at the caller's own pane id
+/// kills the process that asked and launches a new one in its place. This is how
+/// a lead clears its context mid-run, so the request must not wedge or take the
+/// session down when its sender disappears before the reply.
+#[test]
+fn a_pane_can_respawn_itself() {
+    let log = std::env::temp_dir().join(format!(
+        "atrium-self-respawn-{}-{}.log",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (shell, flag, own_id): (&str, &str, &str) = if cfg!(windows) {
+        ("cmd", "/Q", "%ATRIUM_PANE%")
+    } else {
+        ("sh", "-i", "$ATRIUM_PANE")
+    };
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--allow-ctl", shell, flag],
+        24,
+        100,
+        &[
+            ("ATRIUM_CTL_ALLOW".to_string(), shell.to_string()),
+            (
+                "ATRIUM_SPAWN_LOG".to_string(),
+                log.to_string_lossy().into_owned(),
+            ),
+        ],
+        None,
+    )
+    .unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl respawn {own_id}\r\n").as_bytes())
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let launches = loop {
+        let n = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        if n >= 2 || std::time::Instant::now() > deadline {
+            break n;
+        }
+        let _ = read_until(&mut p, b"\x00never", Duration::from_millis(200));
+    };
+    let _ = std::fs::remove_file(&log);
+    assert!(launches >= 2, "the pane did not restart itself");
+    // The new process is shown, not just started: what it prints reaches the
+    // screen. The typed command splits the word, so only its output can match.
+    let echo = if cfg!(windows) {
+        "echo re^spawned-shows\r\n"
+    } else {
+        "echo re''spawned-shows\r\n"
+    };
+    p.write(echo.as_bytes()).unwrap();
+    let out = read_until(&mut p, b"respawned-shows", Duration::from_secs(15));
+    let shown = contains(&out, b"respawned-shows");
+    p.write(b"\x01q").unwrap();
+    // Panics if atrium does not quit after a self-respawn.
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        shown,
+        "the restarted pane's output never reached the screen: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 // --- end to end: the ctl control channel (C3) -------------------------------
 
 /// `atrium ctl kill <role>` tears down the worker over the live channel: spawn a

@@ -76,6 +76,7 @@ compatible), and an empty `agents` list is rejected.
 | `build_jobs` | number | total compiler jobs **all** agents' cargo builds share (the session compile pool). Default one per core, bounded by RAM; `0` = off. See [Compiling is the scarce resource](#compiling-is-the-scarce-resource-required-for-any-fleet-that-builds) |
 | `memory_mb` | number | fixed ceiling on the memory everything the agents run may use. Default dynamic; `0` = off. Hard on Windows and on Linux under `systemd-run --user --scope -p Delegate=yes`; soft otherwise |
 | `deny` | array of strings | commands **no** claude agent in the session may run, including workers spawned later: claude rules (`"Bash(git push --force*)"`) or command prefixes (`"cargo test --workspace"`) |
+| `context` | object | shared context store: `{"provider": "context-mode", "share": "knowledge"}` (`share`: `knowledge` = shared index, private session memory; `full`; `none`). Stored per fleet under `.atrium/ctx/<fleet>/`, and kept by a pane across `ctl respawn` |
 
 ### Agent-level keys
 
@@ -131,7 +132,7 @@ Launch arg order per agent: `cmd… [--add-dir …] [--append-system-prompt prom
       "deny": ["cargo build --release", "cargo bench"],
       "agents": [
         { "name": "lead", "cmd": ["claude", "--model", "opus"],
-          "kickoff": "You lead. Read PLAN.md. Assign via board/bus, don't code. `atrium ctl bus sub build review`." },
+          "kickoff": "You lead. Read PLAN.md, then `atrium ctl board get lead`, `board list` and `bus feed`, and continue from there. Assign via board/bus, don't code. `atrium ctl bus sub build review`." },
         { "name": "api", "cmd": ["claude", "--model", "sonnet"], "worktree": "api",
           "deny": ["cargo test --workspace", "cargo build --workspace", "python dev.py check"],
           "prompt": "You own crates/api. Build and test only that crate: cargo test -p api.",
@@ -236,6 +237,25 @@ A fleet whose agents talk needs three things, or it silently no-ops:
 The runtime coordination commands (what your kickoffs tell agents to run):
 `atrium ctl board set/get/list`, `atrium ctl bus pub/sub/feed/resolve`. See the
 atrium-coordinate skill for the full board/bus playbook.
+
+## Long runs: short sessions
+
+A roster agent lives as long as the fleet, and so does everything in its context.
+For a run with more than a few items, keep the roster to the roles that must
+last, and let the lead spawn the rest one item at a time:
+
+- **Roster:** the lead (with `"can_spawn": true`), plus an integrator if branches
+  need merging. The lead spawns a fresh builder per item and a fresh reviewer per
+  item, and reaps each one at its checkpoint. atrium-coordinate has the sizing
+  table, the checkpoint and the review loop to put in the lead's instructions.
+- **The lead's kickoff is its restart point.** It runs again whenever the lead
+  is respawned, so write it to resume: read `PLAN.md`, `board get lead`,
+  `board list`, `bus feed`, and continue. A kickoff that says "start the plan"
+  starts the plan over.
+- **Give the fleet a `context` block** so the lead can push long output through
+  context-mode, and so its knowledge base survives a restart.
+- **Commit `PLAN.md`** before `fleet up`. Every fresh session, and every worktree,
+  starts from it.
 
 ## Compiling is the scarce resource (required for any fleet that builds)
 
@@ -400,7 +420,12 @@ Write rules as concrete commands an agent can follow, not as goals.
   (read-only doesn't collide). Grid `1xN`.
 - **Build team** — lead (main tree, delegates) + workers (each a worktree, disjoint
   files) + adversarial reviewer (main tree) + integrator (main tree, merges +
-  gates). `allow_ctl: true`, `--trust automode`. The shape shown above.
+  gates). `allow_ctl: true`, `--trust automode`. The shape shown above; for a
+  handful of items.
+- **Long build run** — roster of lead (`can_spawn: true`, restartable kickoff) +
+  integrator, a `context` block, a committed `PLAN.md`. The lead sizes the items,
+  then spawns a fresh builder and a fresh reviewer per item and a final reviewer
+  at the end. See [Long runs: short sessions](#long-runs-short-sessions).
 - **Tool-develops-itself (bootstrap loop)** — when the fleet edits the very tool
   it's running on, the running binary is **locked**: agents develop in worktrees →
   gate green → merge → the human reinstalls (`cargo install --path . --force` or
@@ -431,6 +456,10 @@ Write rules as concrete commands an agent can follow, not as goals.
   silently dropped; put it in the kickoff there.
 
 - Coordinating fleet but no `allow_ctl` → bus/board silently dead.
+- Lead kickoff written as "begin the plan" → a respawned lead starts over; write
+  it to resume from `PLAN.md` and the board.
+- Lead spawning per-item teammates without `"can_spawn": true` → every spawn is
+  refused (a fleet agent defaults to false).
 - `--trust automode` with a haiku agent → that agent can't run commands; add
   `"trust": "accept"` to it.
 - Flags after `up` → fleet doesn't launch through the fleet path.

@@ -24,6 +24,13 @@ it — delegation has real coordination overhead. Do NOT delegate parts that dep
 on each other, or small/quick work. (If you have been told to coordinate a team,
 use the atrium-coordinate skill instead — there, delegating is the job.)
 
+Size the part by what you can count. One file and under ~50 changed lines, with no
+new command, flag, API or file format, is small: do it yourself. Two to five
+files, up to ~300 lines, or one new public surface with its tests is worth one
+teammate. Anything bigger is several parts; split it before handing any of it
+off. Give each teammate **one** part, and never send a finished teammate another.
+A fresh teammate per part keeps every session small.
+
 ## How to delegate
 
     atrium ctl spawn --role <short-name> -- claude
@@ -34,6 +41,12 @@ your goal, or your work in progress. Every `send` must be fully self-contained:
 the goal, the exact file paths, the constraints, and how it will know it is done.
 Write a short paragraph, not "do the auth part".
 
+End every brief with the checkpoint, so the part's result survives its session:
+run the project's gate, then commit with a message saying what changed, why, and
+what is left open. Record reasoning that must outlive the session as a `rat` node
+if the repo has `.rationale/`, or in the commit message otherwise. Finish with
+`atrium ctl board set <part> status=DONE commit=<sha>`.
+
 ## Collect results, then reap
 
 Teammates leave artifacts on the shared filesystem (files, edits, commits) — they
@@ -42,8 +55,9 @@ do NOT return a value to you.
     atrium ctl status [<role>]   # which teammates are working vs idle
     atrium ctl kill <role>       # reap a teammate once you have collected its part
 
-When a teammate reports idle, read the files it changed to see its work, then
-reap it — don't leave a finished teammate running.
+When a teammate reports done, read its checkpoint (`board get <part>`,
+`git show <sha>`) and check the work against the brief, then reap it. Don't leave
+a finished teammate running.
 
 ## Full surface & discovery
 

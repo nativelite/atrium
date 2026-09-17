@@ -70,6 +70,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *Who can write the file* in `docs/session-recovery.md`.
 
 ### Fixed
+- **A respawned pane showed nothing.** Since 0.34.0 a pane's output is read by a
+  thread tied to its process; `ctl respawn` swapped in the new process but kept
+  the old reader, which went on reading the dead one, so nothing the restarted
+  program printed ever reached the screen. The reader now goes with the old
+  process.
+- **`ctl respawn` relaunched a different agent.** It started only the command's
+  name, so `claude --model opus` came back as a bare `claude` with no kickoff; it
+  also moved a worktree agent into atrium's own directory without its worktree
+  instructions, and dropped its context-store variables. A respawn now runs the
+  pane's own command, where it was, with its context store, as a new session: a
+  claude `--resume`, `--continue` or `--session-id` is dropped, so the restart
+  does not reopen the conversation it exists to leave. A pane can respawn itself.
+  The restarted pane's workers stay its workers (they named the old agent id as
+  their parent, so a lead below the root lost reach of its own team), and sends
+  still queued for it are delivered whole to the new process instead of dropped.
 - **`atrium recover` restores the session's policy, not just its layout.** A
   recovered session used to come back with its guards off: the fleet's `deny`
   rules, the compile pool and the memory ceiling are installed once at `fleet up`

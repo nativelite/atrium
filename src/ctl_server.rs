@@ -59,6 +59,31 @@ fn queue_send(pending: &mut Vec<PendingSend>, target: AgentId, text: String) -> 
     true
 }
 
+/// Point every parent link that names `old` at `new`. A respawn mints its pane a
+/// new agent id; its workers must follow, or they fall out of its subtree. Pure.
+pub(crate) fn repoint_parents<'a>(
+    links: impl Iterator<Item = &'a mut Option<AgentId>>,
+    old: AgentId,
+    new: AgentId,
+) {
+    for link in links.filter(|l| **l == Some(old)) {
+        *link = Some(new);
+    }
+}
+
+/// Hand the sends queued for a respawned pane's old id to its new one, each from
+/// its first byte: whatever part reached the killed process died with it. The
+/// wait restarts too, so a new process that has no status yet gets the same grace
+/// before delivery as a freshly spawned one, not a send already past it.
+fn retarget_sends(pending: &mut [PendingSend], old: AgentId, new: AgentId, now: Instant) {
+    for ps in pending.iter_mut().filter(|ps| ps.target == old) {
+        ps.target = new;
+        ps.written = 0;
+        ps.text_written_at = None;
+        ps.queued_at = now;
+    }
+}
+
 /// Find a hosted pane by its global agent id (immutable / mutable).
 pub(crate) fn pane_by_agent(windows: &[Window], id: AgentId) -> Option<&Pane> {
     windows
@@ -582,25 +607,34 @@ pub(crate) fn dispatch_ctl(
                 return deny;
             }
             // Capture the info we need before mutating the pane.
-            let (pane_slot_id, cmd, identity_name, deny, mode) = {
+            let (pane_slot_id, cmd, identity_name, deny, mode, context_env, place) = {
                 let Some(p) = pane_by_agent(windows, id) else {
                     return ctl::reply_err("respawn: target pane not found");
                 };
                 (
                     p.id,
-                    vec![p.title.clone()],
+                    respawn_argv(&p.argv, &p.title),
                     p.identity.clone(),
                     p.deny.clone(),
                     p.mode,
+                    p.context_env.clone(),
+                    (p.cwd.clone(), p.norms.clone(), p.worktree.clone()),
                 )
             };
-            // Build the new working directory. When worktree is named, create it
-            // (idempotent) and use its dir; otherwise the new process inherits
-            // atrium's own cwd, same as a plain spawn.
-            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let (new_cwd, norms) = match worktree_spawn_params(&cwd, rr.worktree.as_deref()) {
-                Ok(pair) => pair,
-                Err(e) => return ctl::reply_err(&format!("spawn failed: {e}")),
+            // Where the new process runs. A named worktree is created (idempotent)
+            // and used; otherwise the pane restarts where it was, with its own
+            // worktree instructions. It used to land in atrium's cwd with none, so
+            // restarting a worktree agent moved it onto the main tree.
+            let (new_cwd, norms, worktree) = match rr.worktree.as_deref() {
+                Some(name) => {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    match worktree_spawn_params(&cwd, Some(name)) {
+                        Ok((c, n)) => (c, n, Some(name.to_string())),
+                        Err(e) => return ctl::reply_err(&format!("spawn failed: {e}")),
+                    }
+                }
+                None => place,
             };
             let mut flash = None;
             let new_pane = match spawn_pane_full(
@@ -613,7 +647,9 @@ pub(crate) fn dispatch_ctl(
                     // used to be replaced by the session ceiling and no rules at all,
                     // so respawning a restricted fleet agent quietly lifted its limits.
                     mode: effective_mode(Some(mode), trust_mode()).0,
-                    extra_env: &[],
+                    // The pane's context store, so a restarted agent keeps its
+                    // knowledge base (a fresh session, not a fresh memory).
+                    extra_env: &context_env,
                     extra_norms: norms.as_deref(),
                     deny: &deny,
                 },
@@ -629,6 +665,11 @@ pub(crate) fn dispatch_ctl(
             // term, and session fields. Role/parent/depth/can_spawn are preserved.
             let p = pane_by_agent_mut(windows, id).unwrap();
             let _ = p.pty.kill();
+            // The old reader goes with the old child, and before its `Pty` drops
+            // (see `Pane::inbox`). Kept, it went on reading the dead pty, and since
+            // the loop only starts a reader for a pane with none, nothing the new
+            // process wrote was ever shown.
+            p.inbox = None;
             p.pty = new_pane.pty;
             p.term = new_pane.term;
             p.filter = new_pane.filter;
@@ -637,12 +678,14 @@ pub(crate) fn dispatch_ctl(
             p.launch_ms = new_pane.launch_ms;
             p.cwd = new_pane.cwd;
             // What the snapshot records must describe the process now running: its
-            // command, its worktree instructions (or none, if respawned outside the
-            // worktree), no context variables and no kickoff.
+            // command, where it runs, its worktree instructions and context
+            // variables. The kickoff is kept: a respawn starts a new session, and a
+            // fresh fleet agent needs its opening instructions (the same rule a
+            // recovery follows when it cannot resume a transcript).
             p.argv = new_pane.argv;
             p.norms = new_pane.norms;
             p.context_env = new_pane.context_env;
-            p.kickoff = false;
+            p.worktree = worktree;
             p.mode = new_pane.mode;
             p.agent_id = new_pane.agent_id;
             p.token = new_pane.token;
@@ -650,6 +693,15 @@ pub(crate) fn dispatch_ctl(
             p.painted = false;
             let new_id = p.agent_id;
             let role = p.role.clone();
+            repoint_parents(
+                windows
+                    .iter_mut()
+                    .flat_map(|w| w.panes.iter_mut())
+                    .map(|p| &mut p.parent),
+                id,
+                new_id,
+            );
+            retarget_sends(pending, id, new_id, Instant::now());
             ctl::reply_spawned(
                 new_id,
                 role.as_deref(),
@@ -898,6 +950,24 @@ pub(crate) fn reply_tree(
 
 /// Subtree-scope guard: `None` if the caller may act on `target`, else a ready
 /// JSON refusal. The operator (privileged) may act on anything.
+/// The command a `ctl respawn` relaunches: the pane's own recorded command, as a
+/// new session. The governed permission flags are stripped (the pane's `mode`
+/// sets its posture at spawn), and for claude every session-selecting argument
+/// goes too, so the spawn mints a fresh `--session-id` rather than resuming the
+/// conversation the restart exists to leave. Other programs keep their arguments
+/// verbatim: `-c` is a command string to a shell, not a session. A pane with no
+/// recorded command falls back to its title. Pure.
+pub(crate) fn respawn_argv(argv: &[String], title: &str) -> Vec<String> {
+    let (argv, _) = atrium::ctl::sanitize_spawn_argv(argv);
+    match argv.first() {
+        None => vec![title.to_string()],
+        Some(c) if atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)) => {
+            strip_session_args(&argv)
+        }
+        Some(_) => argv,
+    }
+}
+
 pub(crate) fn scope_denied(
     windows: &[Window],
     caller: Option<AgentId>,
@@ -1169,6 +1239,72 @@ pub(crate) fn flush_sends(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A respawn restarts the agent that was running — its model, its kickoff —
+    /// as a new session with no permission flags of its own.
+    #[test]
+    fn a_respawned_claude_keeps_its_arguments_but_not_its_session() {
+        let argv = args(&[
+            "claude",
+            "--model",
+            "opus",
+            "--resume",
+            "abc",
+            "--dangerously-skip-permissions",
+            "--session-id=def",
+            "-c",
+            "You lead. Read PLAN.md.",
+        ]);
+        assert_eq!(
+            respawn_argv(&argv, "claude"),
+            args(&["claude", "--model", "opus", "You lead. Read PLAN.md."])
+        );
+    }
+
+    #[test]
+    fn a_respawned_shell_keeps_a_dash_c_command() {
+        let argv = args(&["sh", "-c", "make watch"]);
+        assert_eq!(respawn_argv(&argv, "sh"), argv);
+    }
+
+    /// A respawn mints the pane a new agent id. Its workers name their parent by
+    /// id, so they must follow it, or a restarted lead below the root could no
+    /// longer steer the team it built.
+    #[test]
+    fn a_respawned_panes_workers_follow_it_to_its_new_id() {
+        let (old, new, other) = (AgentId(4), AgentId(9), AgentId(2));
+        let mut parents = vec![Some(old), Some(other), None, Some(old)];
+        repoint_parents(parents.iter_mut(), old, new);
+        assert_eq!(parents, vec![Some(new), Some(other), None, Some(new)]);
+    }
+
+    /// Sends queued for the old process go to the new one, from the start: a
+    /// fragment already written into the dead pty is not continued mid-text.
+    #[test]
+    fn sends_queued_for_a_respawned_pane_are_delivered_whole_to_its_new_process() {
+        let (old, new, other) = (AgentId(4), AgentId(9), AgentId(2));
+        let mut pending = Vec::new();
+        assert!(queue_send(&mut pending, old, "resume from PLAN.md".into()));
+        assert!(queue_send(&mut pending, other, "keep going".into()));
+        pending[0].written = 6;
+        pending[0].text_written_at = Some(Instant::now());
+        let later = pending[0].queued_at + SEND_UNBOUND_FALLBACK;
+        retarget_sends(&mut pending, old, new, later);
+        assert_eq!(pending[0].target, new);
+        assert_eq!(pending[0].queued_at, later);
+        assert_eq!(pending[0].written, 0);
+        assert!(pending[0].text_written_at.is_none());
+        assert_eq!(pending[1].target, other);
+    }
+
+    #[test]
+    fn a_pane_with_no_recorded_command_respawns_its_title() {
+        assert_eq!(respawn_argv(&[], "claude"), args(&["claude"]));
+    }
 
     #[test]
     fn a_target_that_never_takes_delivery_cannot_grow_the_queue_without_bound() {
