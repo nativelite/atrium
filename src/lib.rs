@@ -47,6 +47,7 @@ pub mod session;
 pub mod session_store;
 pub mod signals;
 pub mod spawn;
+pub mod templates;
 pub mod theme;
 pub mod tile;
 pub mod trust;

@@ -585,6 +585,95 @@ pub struct Located {
     pub global: bool,
 }
 
+/// The text of the object under `"fleets"."<name>"` in a fleet file, exactly
+/// as written (key order, spacing, comments-in-strings intact), or `None` when
+/// the file does not hold that fleet. `fleet init` copies a user's template
+/// with this rather than re-serializing the parsed value, so the project file
+/// reads as the template was written.
+pub fn fleet_object_text(text: &str, name: &str) -> Option<String> {
+    let root = json::parse(text).ok()?;
+    root.get("fleets")?.get(name)?;
+    // Walk to the value: find the key inside the "fleets" object at nesting
+    // depth 2, then take the balanced braces after it. A JSON scanner that
+    // respects strings, since a prompt may contain braces and quotes.
+    let bytes = text.as_bytes();
+    let key = format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""));
+    let mut depth = 0usize;
+    let mut i = 0;
+    let mut in_str = false;
+    let mut fleets_depth: Option<usize> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            match c {
+                b'\\' => i += 1,
+                b'"' => in_str = false,
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                // A key or a string value. At depth 1, "fleets" opens the map; at
+                // the map's depth, our name opens the object.
+                let end = str_end(bytes, i)?;
+                let lit = &text[i..=end];
+                let rest = text[end + 1..].trim_start();
+                if depth == 1 && lit == "\"fleets\"" && rest.starts_with(':') {
+                    fleets_depth = Some(2);
+                } else if fleets_depth == Some(depth) && lit == key && rest.starts_with(':') {
+                    let colon = end + 1 + (text[end + 1..].len() - rest.len());
+                    let open = text[colon + 1..].find('{')? + colon + 1;
+                    let close = balanced_close(bytes, open)?;
+                    return Some(text[open..=close].to_string());
+                }
+                i = end + 1;
+                continue;
+            }
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the closing quote of the string literal opening at `start`.
+fn str_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The index of the `}` balancing the `{` at `open`, string-aware.
+fn balanced_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = str_end(bytes, i)?,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Environment knob: the user-global fleet file's path, in full, when someone
 /// keeps it somewhere else (a synced dotfiles folder, say). Unset ⇒ the
 /// platform default under [`global_dir`].
@@ -2060,6 +2149,31 @@ mod tests {
     /// Serializes the tests that move `XDG_CONFIG_HOME`, since the environment
     /// is process-wide and the suite runs in parallel.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A user's template is copied as written: the object's text, braces and
+    /// quotes inside prompts included, not a re-serialization.
+    #[test]
+    fn a_fleets_object_text_is_extracted_verbatim() {
+        let file = r#"{
+  "fleets": {
+    "other": { "agents": [ { "name": "x", "cmd": ["claude"], "prompt": "has { braces } and \"quotes\"" } ] },
+    "mine":  {
+      "grid": "2x2",
+      "agents": [ { "name": "a", "cmd": ["claude"], "prompt": "say \"}\" not }" } ]
+    }
+  }
+}"#;
+        let got = fleet_object_text(file, "mine").unwrap();
+        assert!(got.starts_with("{\n      \"grid\": \"2x2\""), "{got}");
+        assert!(got.ends_with("]\n    }"), "{got}");
+        assert!(got.contains(r#""prompt": "say \"}\" not }""#), "{got}");
+        let other = fleet_object_text(file, "other").unwrap();
+        assert!(other.contains("has { braces }"), "{other}");
+        assert_eq!(fleet_object_text(file, "nope"), None);
+        // What was extracted is itself a valid fleet object.
+        let wrapped = format!("{{\"fleets\":{{\"mine\":{got}}}}}");
+        assert!(parse(&wrapped).is_ok());
+    }
 
     #[test]
     fn discover_missing_names_both_locations() {

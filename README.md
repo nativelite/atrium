@@ -295,6 +295,7 @@ control plane exists.
 | --- | --- |
 | `atrium [flags] [cmd...]` | start a session hosting `cmd` (default: your shell) |
 | `atrium fleet up <name>` / `ls` / `clean <name>` | bring up a saved roster / list rosters / reclaim a fleet's clean, merged worktrees |
+| `atrium fleet init <template> [--agents N]` / `ls --templates` | start a project's `atrium.fleet.json` from a built-in reference fleet (`solo`, `pair`, `crew`) or one of your own from the global `fleet.json` ([templates](docs/fleets.md#templates)) |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
 | `atrium config path` / `init [--at <path>]` | where the user-global config is read from / write a starter there (asks for the location on a first run; see [Config](#config)) |
 | `atrium recover [--list \| --snapshot <path>]` | restore this project's last session — also offered automatically when a launch finds one that crashed ([session recovery](docs/session-recovery.md)) |

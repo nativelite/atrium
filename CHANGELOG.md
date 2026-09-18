@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`atrium fleet init <template> [--agents N]` and three built-in reference
+  fleets.** `solo`, `pair` and `crew` are compiled into atrium: runnable
+  statements of how a fleet is meant to run — the lead plans and sizes items,
+  delegates one per fresh teammate and reaps it on checkpoint, reviews in
+  fresh sessions and restarts itself from `PLAN.md` and the board; builders
+  in their own worktrees. `init` writes `./atrium.fleet.json` from a built-in
+  or from one of your own fleets in the user-global `fleet.json` (yours wins
+  over a built-in of the same name, and `init` says so), copied as written;
+  it never overwrites. `--agents N` scales the builders. `atrium fleet ls
+  --templates` lists both sources. (#5)
 - **A user-global `config.json`** beside the global fleet file
   (`%APPDATA%\atrium\config.json` / `~/.config/atrium/config.json`): what an
   operator wants in force on this machine for every project, without exporting

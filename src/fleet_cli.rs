@@ -34,7 +34,42 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("ls") if args.get(1).map(String::as_str) == Some("--templates") => {
+            fleet_ls_templates()
+        }
         Some("ls") => fleet_ls(),
+        Some("init") => match args.get(1) {
+            Some(name) if !name.starts_with('-') => {
+                let mut builders = 1usize;
+                let mut i = 2;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--agents" => match args.get(i + 1).and_then(|n| n.parse::<usize>().ok()) {
+                            Some(n) if n >= 1 => {
+                                builders = n;
+                                i += 2;
+                            }
+                            _ => {
+                                eprintln!("atrium fleet init: --agents needs a whole number of at least 1");
+                                return ExitCode::FAILURE;
+                            }
+                        },
+                        other => {
+                            eprintln!("atrium fleet init: unexpected argument {other:?}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                fleet_init(name, builders)
+            }
+            _ => {
+                eprintln!(
+                    "atrium fleet init <name> [--agents N]: needs a template name \
+                     (try `atrium fleet ls --templates`)"
+                );
+                ExitCode::FAILURE
+            }
+        },
         Some("clean") => match args.get(1) {
             Some(name) if !name.starts_with('-') => fleet_clean(name),
             _ => {
@@ -45,11 +80,148 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
         _ => {
             eprintln!(
                 "usage: atrium fleet up <name> [--allow-ctl] [--trust <policy>] | \
-                 atrium fleet clean <name> | atrium fleet ls"
+                 atrium fleet init <template> [--agents N] | atrium fleet clean <name> | \
+                 atrium fleet ls [--templates]"
             );
             ExitCode::FAILURE
         }
     }
+}
+
+/// The user's own templates: every fleet in the global `fleet.json`, by name,
+/// with the text it was defined in. `None` when there is no global file; an
+/// unreadable one is an error, since a typo there must not silently hide a
+/// template behind a built-in of the same name.
+fn user_templates() -> Result<Option<(std::path::PathBuf, atrium::fleet::Fleets)>, String> {
+    let Some(path) = atrium::fleet::global_path() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let fleets = atrium::fleet::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some((path, fleets)))
+}
+
+/// `atrium fleet ls --templates`: the built-ins and the user's own, each
+/// source labelled, so `init <name>` has a menu.
+pub(crate) fn fleet_ls_templates() -> ExitCode {
+    println!("built-in:");
+    for (name, summary) in atrium::templates::NAMES
+        .iter()
+        .zip(atrium::templates::SUMMARIES)
+    {
+        println!("  {name:<12} {summary}");
+    }
+    match user_templates() {
+        Ok(Some((path, fleets))) => {
+            println!("yours ({}):", path.display());
+            let names = fleets.names();
+            if names.is_empty() {
+                println!("  (none)");
+            }
+            for name in names {
+                let f = fleets.get(name).unwrap();
+                let roster: Vec<&str> = f.agents.iter().map(|a| a.name.as_str()).collect();
+                let shadows = if atrium::templates::NAMES.contains(&name) {
+                    "  (shadows the built-in)"
+                } else {
+                    ""
+                };
+                println!("  {name:<12} {}{shadows}", roster.join(", "));
+            }
+        }
+        Ok(None) => {
+            let where_ = atrium::fleet::global_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the user-global fleet.json".to_string());
+            println!("yours: none — fleets in {where_} are templates too");
+        }
+        Err(e) => {
+            eprintln!("atrium fleet: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `atrium fleet init <name> [--agents N]`: write `./atrium.fleet.json` holding
+/// the named template — the user's own fleet of that name from the global
+/// `fleet.json` (which wins over a built-in, and says so), else a built-in.
+/// Copies, never links: the project file is self-contained and reviewable.
+/// Refuses to overwrite an existing file.
+pub(crate) fn fleet_init(name: &str, builders: usize) -> ExitCode {
+    let target = std::path::Path::new("atrium.fleet.json");
+    if target.exists() {
+        eprintln!(
+            "atrium fleet init: ./atrium.fleet.json already exists; edit it, or move it aside first"
+        );
+        return ExitCode::FAILURE;
+    }
+    let (text, source) = match user_templates() {
+        Err(e) => {
+            eprintln!("atrium fleet: {e}");
+            return ExitCode::FAILURE;
+        }
+        Ok(Some((path, fleets))) if fleets.get(name).is_some() => {
+            // The user's fleet, copied as the text they wrote it in: the file's
+            // object for that name, re-serialized from the parsed value would
+            // lose their key order and formatting.
+            let raw = std::fs::read_to_string(&path).unwrap_or_default();
+            match atrium::fleet::fleet_object_text(&raw, name) {
+                Some(object) => {
+                    if builders != 1 {
+                        eprintln!(
+                            "atrium fleet init: --agents applies to the built-ins; {name:?} is yours \
+                             and is copied as written"
+                        );
+                    }
+                    let shadow = if atrium::templates::NAMES.contains(&name) {
+                        format!(" (yours, shadowing the built-in {name:?})")
+                    } else {
+                        String::new()
+                    };
+                    (
+                        atrium::templates::fleet_file(name, &object),
+                        format!("{}{shadow}", path.display()),
+                    )
+                }
+                None => {
+                    eprintln!(
+                        "atrium fleet init: could not extract {name:?} from {}",
+                        path.display()
+                    );
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        Ok(_) => match atrium::templates::builtin(name, builders) {
+            Some(object) => (
+                atrium::templates::fleet_file(name, &object),
+                format!("built-in {name:?}"),
+            ),
+            None => {
+                eprintln!(
+                    "atrium fleet init: no template named {name:?} (try `atrium fleet ls --templates`)"
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    // Whatever the source, what lands must be a roster `fleet up` accepts.
+    if let Err(e) = atrium::fleet::parse(&text) {
+        eprintln!("atrium fleet init: the template does not parse as a fleet: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::write(target, &text) {
+        eprintln!("atrium fleet init: write {}: {e}", target.display());
+        return ExitCode::FAILURE;
+    }
+    println!("wrote ./atrium.fleet.json from {source}");
+    println!("next: review it, then `atrium fleet up {name}`");
+    ExitCode::SUCCESS
 }
 
 /// Is `rest` — the tokens left after atrium's own leading launch flags are

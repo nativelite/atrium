@@ -3781,3 +3781,107 @@ fn config_init_writes_the_starter_and_the_pointer_and_path_reports_it() {
     );
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `atrium fleet init` writes `./atrium.fleet.json` from a built-in, scales its
+/// builders with `--agents`, refuses to overwrite, and prefers the user's own
+/// fleet of the same name from the global `fleet.json` — saying so. The global
+/// file is a temp one, and every run happens in its own temp directory.
+#[test]
+fn fleet_init_writes_a_builtin_or_the_users_template_and_never_overwrites() {
+    let base = std::env::temp_dir().join(format!("atrium-fleet-init-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let global = base.join("global").join("fleet.json");
+    std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+    std::fs::write(
+        &global,
+        r#"{"fleets":{"crew":{"agents":[{"name":"only","cmd":["claude"],"prompt":"mine, not the built-in"}]},
+                     "mine":{"agents":[{"name":"m","cmd":["claude"]}]}}}"#,
+    )
+    .unwrap();
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+            .args(args)
+            .current_dir(dir)
+            .env("ATRIUM_FLEET", &global)
+            .env("ATRIUM_YES", "1")
+            .output()
+            .unwrap()
+    };
+    let text =
+        |dir: &std::path::Path| std::fs::read_to_string(dir.join("atrium.fleet.json")).unwrap();
+
+    // A built-in, scaled.
+    let d = base.join("pair");
+    let out = run(&d, &["fleet", "init", "pair", "--agents", "3"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = text(&d);
+    for name in ["builder-1", "builder-2", "builder-3", "reviewer"] {
+        assert!(
+            t.contains(&format!("\"name\": \"{name}\"")),
+            "{name} in {t}"
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("built-in \"pair\""),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // Never overwrite.
+    let out = run(&d, &["fleet", "init", "solo"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already exists"));
+    assert_eq!(text(&d), t, "the file is untouched");
+
+    // The user's fleet wins over the built-in of the same name, verbatim.
+    let d = base.join("crew");
+    let out = run(&d, &["fleet", "init", "crew"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = text(&d);
+    assert!(
+        t.contains("mine, not the built-in") && !t.contains("integrator"),
+        "{t}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("shadowing the built-in"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // A user's fleet with its own name; an unknown name is refused.
+    let d = base.join("mine");
+    let out = run(&d, &["fleet", "init", "mine"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text(&d).contains("\"name\":\"m\""),
+        "verbatim: {}",
+        text(&d)
+    );
+    let out = run(&base.join("nope"), &["fleet", "init", "nope"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no template named"));
+
+    // The menu names both sources and the shadow.
+    let out = run(&base.join("ls"), &["fleet", "ls", "--templates"]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("built-in:") && stdout.contains("solo") && stdout.contains("yours ("),
+        "{stdout}"
+    );
+    assert!(stdout.contains("(shadows the built-in)"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&base);
+}

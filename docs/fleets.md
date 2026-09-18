@@ -38,9 +38,28 @@ For a saved roster of named agents, each with its own identity, working dir, and
 Mass-spawn opens N copies of *one* command. A **fleet** brings up a squad of *different, named* agents, each already in-role with its own identity, working directory, extra context dirs, and instructions, from one command.
 
 ```bash
+atrium fleet init crew        # start this project's atrium.fleet.json from a template
 atrium fleet up review-crew   # bring up the whole squad, each on its identity
 atrium fleet ls               # list the fleet names in the file
 ```
+
+### Templates
+
+`atrium fleet init <name> [--agents N]` writes `./atrium.fleet.json` from a template, so a fleet starts from a known-good shape rather than a blank file. It copies, never links — the project file is self-contained and reviewable — and refuses to overwrite one that exists. `atrium fleet ls --templates` is the menu.
+
+Three **built-ins** are compiled into atrium, so they work on a fresh machine with no files anywhere:
+
+| Template | Roster | What it encodes |
+| --- | --- | --- |
+| `solo` | one claude, control plane on | a `PLAN.md` kept current, a checkpoint per item, a restart that picks up from disk |
+| `pair` | a builder and a reviewer | one item per builder session; a reviewer that checks the brief, not the builder's story |
+| `crew` | lead, builder, reviewer, integrator | the lead plans and sizes items, delegates one per fresh teammate, reaps on checkpoint, reviews in fresh sessions, restarts itself from `PLAN.md` and the board; builders in their own worktrees |
+
+They are runnable statements of the rules the `atrium-coordinate` skill spells out in prose — the prompts are the standing orders, the kickoffs the openings. `--agents N` scales the builders in `pair` and `crew` (`builder-1`…`builder-N`, each in its own worktree group). Read what `init` wrote before `fleet up`: the lead's kickoff asks the human for the initiative on the bus if there is no `PLAN.md`.
+
+**Your own templates** are the fleets in the user-global `fleet.json` (`atrium config path` shows where it is). `atrium fleet init <name>` copies one by name, as you wrote it; a fleet of yours with a built-in's name wins over the built-in, and `init` says so. That file is otherwise only a fallback for `fleet up`, so keeping your reusable rosters there costs nothing.
+
+Deferred, deliberately: `"extends": "<template>"` in a project fleet (inheritance with overrides). Copy-`init` first; if you find yourself re-running it to pick up template changes, that is the signal.
 
 ### Where the fleet file lives
 
