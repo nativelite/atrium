@@ -636,6 +636,24 @@ pub(crate) fn dispatch_ctl(
                 }
                 None => place,
             };
+            // The replacement is born at its tile's inner size, not the
+            // terminal's. Spawned at the terminal's size, its emulator was larger
+            // than the tile it is blitted into: the text was clipped on the right
+            // and the bottom rows — claude's input box — sat outside the copied
+            // rectangle until a manual terminal resize re-tiled the window.
+            let Some(wi) = windows
+                .iter()
+                .position(|w| w.panes.iter().any(|p| p.agent_id == id))
+            else {
+                return ctl::reply_err("respawn: target pane not found");
+            };
+            let (pane_rows, pane_cols) = pane_inner_size(
+                windows[wi].tiled(),
+                &windows[wi].tree,
+                pane_slot_id,
+                rows,
+                cols,
+            );
             let mut flash = None;
             let new_pane = match spawn_pane_full(
                 PaneSpec {
@@ -653,8 +671,8 @@ pub(crate) fn dispatch_ctl(
                     extra_norms: norms.as_deref(),
                     deny: &deny,
                 },
-                rows,
-                cols,
+                pane_rows,
+                pane_cols,
                 &mut flash,
             ) {
                 Ok(p) => p,
@@ -693,6 +711,9 @@ pub(crate) fn dispatch_ctl(
             p.painted = false;
             let new_id = p.agent_id;
             let role = p.role.clone();
+            // Re-tile the window so the new pane (and every sibling) holds its
+            // exact inner rect — the backstop `ctl spawn --here` already relies on.
+            resize_window(&mut windows[wi], rows, cols);
             repoint_parents(
                 windows
                     .iter_mut()

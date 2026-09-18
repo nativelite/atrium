@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.36.1] - 2026-09-17
+
+### Fixed
+- **A restarted pane was clipped to the top-left of its tile.** `ctl respawn`
+  (0.36.0) started the replacement at the terminal's size and never re-tiled,
+  so its screen was larger than the tile it is drawn into: text was cut off at
+  the tile's right edge and the bottom rows — claude's input box — were never
+  shown, until a manual terminal resize. In a 2×2 fleet every restarted
+  teammate lost its input box while the untouched lead kept its own. A respawn
+  now starts at its tile's inner size and re-tiles the window, as `ctl spawn
+  --here` already did.
+- **A pane that drew while its window was hidden showed the startup spinner.**
+  Only the active window's drain marked a pane painted, so a pane restarted in a
+  background tiled window came up at its prompt and was drawn as "starting…"
+  (spinner animating) when switched to, until it wrote again. Both drains now
+  apply the same rule. (unix; on Windows the switch's resize made ConPTY repaint.)
+- **An abandoned synchronized update froze a pane for good.** While an app is
+  inside a DEC 2026 update the emulator shows the frame from before it, and only
+  the app's own close or a resize ended that — an app that opened one and then
+  blocked never recovered. atrium now closes an update for its own emulator once
+  the pane has been byte-quiet for 250 ms; the silence term keeps a live redraw
+  whole, and it counts as no activity for `ctl` `idle_ms`.
+
 ## [0.36.0] - 2026-09-17
 
 ### Added
@@ -1530,7 +1553,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.36.1...HEAD
+[0.36.1]: https://github.com/nativelite/atrium/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/nativelite/atrium/compare/v0.35.1...v0.36.0
 [0.35.1]: https://github.com/nativelite/atrium/compare/v0.35.0...v0.35.1
 [0.35.0]: https://github.com/nativelite/atrium/compare/v0.34.0...v0.35.0

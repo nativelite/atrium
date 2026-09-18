@@ -130,6 +130,35 @@ pub(crate) fn split_focused(
     }
 }
 
+/// The inner (content) size a pane's child and emulator must have: its tile's
+/// rect minus the one-cell border on every side, or the whole area above the bar
+/// when the window is passthrough. The same arithmetic `resize_window` applies
+/// after the fact, for a spawn that must be right from its first frame — `ctl
+/// respawn` used to start the replacement at the terminal's size, so its screen
+/// was larger than the tile it is blitted into and its bottom rows (claude's
+/// input box) fell outside the copied rectangle until a terminal resize.
+pub(crate) fn pane_inner_size(
+    tiled: bool,
+    tree: &Tree,
+    pane_id: usize,
+    rows: u16,
+    cols: u16,
+) -> (u16, u16) {
+    if tiled {
+        if let Some((_, rect)) = tree
+            .rects(tiled_outer(rows, cols))
+            .into_iter()
+            .find(|(id, _)| *id == pane_id)
+        {
+            return (
+                rect.rows.saturating_sub(2).max(1) as u16,
+                rect.cols.saturating_sub(2).max(1) as u16,
+            );
+        }
+    }
+    (rows.saturating_sub(1).max(1), cols.max(1))
+}
+
 /// Recompute every pane's rect and push the size to its pty and emulator. In
 /// passthrough (single/zoomed) the focused pane owns the whole area; in tiled
 /// mode each pane gets its rect.
@@ -328,5 +357,31 @@ mod tests {
         for &(dirty, view, force, want, label) in cases {
             assert_eq!(needs_composite(dirty, view, force), want, "{label}");
         }
+    }
+
+    // A pane in a 2×2 grid gets a quarter tile's inner size, not the terminal's.
+    // RED-when-broken: returning the passthrough size for a tiled window (what
+    // `ctl respawn` did) fails every tiled row.
+    #[test]
+    fn pane_inner_size_is_the_tile_not_the_terminal() {
+        let tree = Tree::grid_from_ids(&[1, 2, 3, 4]);
+        for id in [1, 2, 3, 4] {
+            let (r, c) = pane_inner_size(true, &tree, id, 24, 100);
+            // Half of 23 rows / 100 cols, less a border on each side; the split
+            // rounding decides which half is the larger by one.
+            assert!(
+                (8..=10).contains(&r),
+                "pane {id}: rows {r} is not a quarter tile"
+            );
+            assert!(
+                (46..=48).contains(&c),
+                "pane {id}: cols {c} is not a quarter tile"
+            );
+        }
+        // Never zero, however small the terminal.
+        assert_eq!(pane_inner_size(true, &tree, 1, 3, 4), (1, 1));
+        // A passthrough window: the whole area above the bar.
+        assert_eq!(pane_inner_size(false, &tree, 1, 24, 100), (23, 100));
+        assert_eq!(pane_inner_size(false, &Tree::new(1), 1, 1, 1), (1, 1));
     }
 }

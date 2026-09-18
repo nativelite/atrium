@@ -1882,6 +1882,135 @@ fn ctl_respawn_keeps_the_panes_arguments() {
     );
 }
 
+/// A respawned pane is the size of its tile. `ctl respawn` used to start the
+/// replacement at the terminal's size, so its emulator was wider and taller than
+/// the tile it is drawn into: text was cut off at the tile's right edge and the
+/// bottom rows (claude's input box) were never shown, until a manual terminal
+/// resize re-tiled the window. The probe is the symptom itself: the restarted
+/// worker echoes a line wider than its tile. On a tile-sized emulator it wraps
+/// and the tail is visible; on a terminal-sized one it stays on one row and the
+/// tail lies beyond the tile's right edge, never drawn. The tail is spelled with
+/// the shell's own quoting so the typed command never contains it literally.
+#[test]
+fn ctl_respawn_sizes_the_pane_to_its_tile() {
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(
+        format!("\"{atrium}\" ctl spawn --here --role keeper -- {shell} {flag}\r\n").as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"keeper\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "spawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The replacement takes the next agent id after the worker's.
+    let visible = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
+    let worker: u32 = visible
+        .split("\"pane\":")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no pane id in the spawn reply: {visible:?}"));
+    let respawned = format!("\"pane\":{}", worker + 1);
+    // `--here` focuses the fresh worker (on the right); the lead on the left
+    // does the restarting, so it is the lead that must be typed into.
+    p.write(b"\x01h").unwrap();
+    p.write(format!("\"{atrium}\" ctl respawn keeper\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, respawned.as_bytes(), Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, respawned.as_bytes()),
+        "respawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Back to the worker's slot, now holding the restarted shell. 60 filler
+    // cells push the tail past a half-width tile's 48 columns but keep the
+    // echoed line inside the terminal's 100, so only a wrap can show it.
+    p.write(b"\x01l").unwrap();
+    let filler = "A".repeat(60);
+    let (typed, marker): (&str, &[u8]) = if cfg!(windows) {
+        ("WRAP^^TAIL9", b"WRAP^TAIL9") // cmd: ^^ escapes to a single ^
+    } else {
+        ("'WRAP\"\"TAIL9'", b"WRAPTAIL9") // sh: the quotes vanish on output
+    };
+    p.write(format!("echo {filler}{typed}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, marker, Duration::from_secs(20));
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        contains(&out, marker),
+        "the respawned pane is wider than its tile (the echoed line did not wrap): {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// A pane that draws everything while its window is in the background shows
+/// its content when that window is switched to — not the "starting…" spinner.
+/// Only the active window's drain used to mark a pane painted; a pane restarted
+/// in a background tiled window came up at its prompt, went quiet, and was
+/// drawn as still starting (spinner animating) until it wrote again. Layout:
+/// window 1 is the lead; window 2 holds two shells (tiled). The lead restarts
+/// one of them while window 2 is in the background, then switches over.
+///
+/// Fails before the fix on unix only: on Windows the switch's same-size pty
+/// resize makes ConPTY repaint the pane, and that fresh output marked it
+/// painted through the active drain. A shell on unix writes nothing for a
+/// same-size resize, so there the spinner stayed.
+#[test]
+fn a_pane_painted_in_the_background_shows_its_content_when_switched_to() {
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{atrium}\" ctl spawn --role alpha -- {shell} {flag}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20)); // window 2 opened
+    p.write(b"\x012").unwrap(); // watch window 2, focus on alpha
+    let _ = read_until(&mut p, b"\x00never", Duration::from_millis(1500));
+    p.write(format!("\"{atrium}\" ctl spawn --here --role beta -- {shell} {flag}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"beta\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "tiling window 2 failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    let visible = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
+    let beta: u32 = visible
+        .rsplit("\"pane\":")
+        .next()
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no pane id in the spawn reply: {visible:?}"));
+    // Let beta's shell paint its prompt, then leave window 2 in the background.
+    let _ = read_until(&mut p, b"\x00never", Duration::from_secs(2));
+    p.write(b"\x011").unwrap();
+    let _ = read_until(&mut p, b"\x00never", Duration::from_millis(1500));
+    // Restart beta from the lead: its new shell draws while window 2 is hidden.
+    let respawned = format!("\"pane\":{}", beta + 1);
+    p.write(format!("\"{atrium}\" ctl respawn beta\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, respawned.as_bytes(), Duration::from_secs(20));
+    assert!(
+        contains(&out, respawned.as_bytes()),
+        "respawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    let _ = read_until(&mut p, b"\x00never", Duration::from_secs(3));
+    // Switch over and watch: the spinner must not be drawn at any point.
+    p.write(b"\x012").unwrap();
+    let out = read_until(&mut p, b"starting", Duration::from_secs(4));
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        !contains(&out, b"starting"),
+        "a pane painted in the background is drawn as still starting: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
 /// A pane can restart itself: `ctl respawn` aimed at the caller's own pane id
 /// kills the process that asked and launches a new one in its place. This is how
 /// a lead clears its context mid-run, so the request must not wedge or take the

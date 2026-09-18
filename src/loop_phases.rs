@@ -93,14 +93,12 @@ pub(crate) fn drain_active_window(
                     if let Some(m) = sniff_mouse_mode(&buf[..n]) {
                         pane.mouse_wanted = m;
                     }
-                    // "painted" = the emulator now has *visible* content, not
-                    // merely that setup bytes arrived. The focused passthrough
-                    // pane is the one under the splash: it is handed off by
-                    // [`finish_splash`] instead, which also holds the logo up
-                    // for its minimum time.
+                    // The focused passthrough pane is the one under the splash:
+                    // it is handed off by [`finish_splash`] instead, which also
+                    // holds the logo up for its minimum time.
                     let under_splash = !tiled && pane.id == focus;
-                    if !under_splash && !pane.painted && !term_blank(&pane.term) {
-                        pane.painted = true;
+                    if !under_splash {
+                        note_painted(pane);
                     }
                     if under_splash {
                         if overlay_up {
@@ -139,6 +137,7 @@ pub(crate) fn drain_active_window(
                 None => break,
             }
         }
+        unstick_sync_frame(pane);
     }
     if !tiled {
         let _ = out.flush();
@@ -238,8 +237,55 @@ pub(crate) fn drain_background_windows(windows: &mut [Window], active: usize, bu
                     pane.mouse_wanted = m;
                 }
                 pane.activity = true;
+                // Same rule as the active drain. Without it a pane that did all
+                // its drawing while its window was in the background was never
+                // marked painted, so switching to that window showed the
+                // "starting…" spinner over real content (and kept the frame
+                // animating) until the pane happened to write again.
+                note_painted(pane);
             }
+            unstick_sync_frame(pane);
         }
+    }
+}
+
+/// Mark a pane painted once its emulator holds *visible* content — not merely
+/// once setup bytes arrived. One rule for both drains; a pane that has painted
+/// stays painted (a respawn resets the flag for the new process).
+pub(crate) fn note_painted(pane: &mut Pane) {
+    if !pane.painted && !term_blank(&pane.term) {
+        pane.painted = true;
+    }
+}
+
+/// How long a pane may sit inside a synchronized update (DEC mode 2026) with no
+/// bytes arriving before the host closes the update for it. Long enough that a
+/// working app is never cut mid-frame (a frame's bytes come in one burst); short
+/// enough that a stuck one is not a visible freeze.
+pub(crate) const SYNC_STUCK_AFTER: Duration = Duration::from_millis(250);
+
+/// Whether an open synchronized update has been abandoned: the pane is inside
+/// one and has been byte-quiet for longer than `limit`. Pure, so the rule is
+/// testable without a terminal. The silence term is what keeps this from
+/// cutting a live redraw in half.
+pub(crate) fn sync_frame_stuck(in_sync: bool, quiet_for: Duration, limit: Duration) -> bool {
+    in_sync && quiet_for > limit
+}
+
+/// Close an abandoned synchronized update on the host side. While the update is
+/// open the emulator serves the frame from *before* it, and only the app's own
+/// `?2026l` or a resize ends that — so an app that opened one and then blocked
+/// (on a query its pty never answers, say) froze its tile for good. Feeding the
+/// close to our emulator reveals what the app has drawn since; nothing is sent
+/// to the child. `last_activity` is read, never written: it is what ctl reports
+/// as `idle_ms`, and this is not activity.
+pub(crate) fn unstick_sync_frame(pane: &mut Pane) {
+    if sync_frame_stuck(
+        pane.term.in_sync(),
+        pane.last_activity.elapsed(),
+        SYNC_STUCK_AFTER,
+    ) {
+        pane.term.feed(b"\x1b[?2026l");
     }
 }
 
@@ -357,5 +403,59 @@ pub(crate) fn decision_note(bus: &atrium::bus::Bus, windows: &[Window]) -> Strin
         0 => String::new(),
         1 => "1 decision needs you \u{00b7} Ctrl+A b".to_string(),
         n => format!("{n} decisions need you \u{00b7} Ctrl+A b"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pane for the drain rules: a real (idle) shell, so the fields the rules
+    /// read exist, with its emulator driven directly by the test.
+    fn idle_pane() -> Pane {
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        let mut flash = None;
+        spawn_pane(
+            &[shell.to_string()],
+            5,
+            20,
+            1,
+            None,
+            atrium::ctl::TrustMode::Off,
+            &mut flash,
+        )
+        .expect("a shell to host the pane")
+    }
+
+    /// Feeding the close to the emulator reveals what the app drew inside the
+    /// abandoned update — but only once the pane has been quiet past the limit,
+    /// and without touching the activity clock ctl reports as `idle_ms`.
+    #[test]
+    fn an_abandoned_sync_update_is_closed_after_the_quiet_limit() {
+        let mut pane = idle_pane();
+        pane.term.feed(b"\x1b[?2026hX");
+        assert!(pane.term.in_sync(), "the update is open");
+        assert_ne!(pane.term.screen().cell(0, 0).ch, 'X', "the frame is held");
+
+        // Bytes just arrived: a live frame, left alone.
+        pane.last_activity = Instant::now();
+        unstick_sync_frame(&mut pane);
+        assert!(pane.term.in_sync(), "a live frame is not cut");
+
+        // Quiet past the limit: closed for the app, revealing the drawn cell.
+        let quiet_since = Instant::now() - SYNC_STUCK_AFTER - Duration::from_millis(50);
+        pane.last_activity = quiet_since;
+        unstick_sync_frame(&mut pane);
+        assert!(!pane.term.in_sync(), "the abandoned update is closed");
+        assert_eq!(
+            pane.term.screen().cell(0, 0).ch,
+            'X',
+            "the frame is revealed"
+        );
+        assert_eq!(
+            pane.last_activity, quiet_since,
+            "unsticking is not activity"
+        );
+        let _ = pane.pty.kill();
     }
 }
