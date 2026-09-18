@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **One shape of help, everywhere.** `atrium --help`, `atrium ctl --help`,
+  `fleet`, `config`, `recover` and `reap` each answer `--help` and `-h` on
+  stdout with exit 0 and no session (`ctl --help` used to fail for want of
+  `ATRIUM_CTL`; `recover --help` was an "unexpected argument"). Each text is
+  `usage:` lines, then one command per line with its flags and what it does,
+  grouped; the top level names the families and the session flags, and stops
+  at 100 columns. The ctl help now lists `respawn`, `unsub`, `--window`,
+  `--worktree`, `--json` and `--no-color`, which the parser always accepted.
 - **A bus event wakes the panes it addresses and the topic's subscribers.**
   The bus was pull only: a finished worker's `bus pub work status=done` sat
   unseen until the lead happened to run `bus feed`, and a `--to lead` from a

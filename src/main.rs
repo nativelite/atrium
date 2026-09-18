@@ -481,6 +481,10 @@ fn main() -> ExitCode {
     // `atrium reap` cleans up after sessions that are already gone — a crash, or a
     // session from before any of this existed.
     if args.first().map(String::as_str) == Some("reap") {
+        if args.get(1).is_some_and(|a| atrium::help::wants(a)) {
+            print!("{}", atrium::help::REAP);
+            return ExitCode::SUCCESS;
+        }
         let (sessions, watchdogs, orphans) = atrium::reap::reap_stale();
         // Never silent about a kill: name every process group collected, and say
         // which owner it was orphaned by. An operator who runs this after losing
@@ -582,29 +586,8 @@ fn main() -> ExitCode {
         println!("atrium {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    if rest.first().map(String::as_str) == Some("--help") {
-        eprintln!(
-            "usage: atrium [--identity <name>] [--reap-orphans] [--allow-ctl [--max-depth <N>]] [--trust [plan|accept|automode|skip] | --skip-permissions] [-n <N> | --grid <R>x<C>] [up <fleet> | command [args...]]\n\
-             \x20      up <fleet>: launch a saved fleet under the leading flags (alias for `atrium fleet up <fleet>`),\n\
-             \x20               e.g. `atrium --trust automode up context-build`. Put session flags BEFORE `up`.\n\
-             \x20      --reap-orphans: before starting, kill pane process groups whose atrium is gone (prints each\n\
-             \x20               one). Off by default; `atrium reap` does the same thing on its own.\n\
-             \x20      --trust <policy>: the session trust policy — the mode spawned agents run in, and the\n\
-             \x20               ceiling they are capped at (low→high: plan < accept < automode < skip):\n\
-             \x20               `plan` read-only plan mode; `accept` (bare --trust) auto-accept edits + a safe\n\
-             \x20               dev-command allowlist (build/test/run), anything else (curl, git push, rm outside\n\
-             \x20               the dir) still prompts, visibly; `automode` claude's auto mode (hands-off edits +\n\
-             \x20               commands with claude's guardrails); `skip` FULL bypass (--dangerously-skip-\n\
-             \x20               permissions, no gate — atrium confirms it at launch). All pre-accept claude's\n\
-             \x20               folder-trust dialog. Extend the accept allowlist with ATRIUM_TRUST_ALLOW=\"a,b\".\n\
-             \x20               The policy is a CEILING for every caller: `ctl spawn --mode …` may match\n\
-             \x20               it or de-escalate, never elevate. Raise it at launch, not mid-session.\n\
-             \x20      --skip-permissions: alias for --trust skip.\n\
-             \x20      --version, -V: print the version and exit.\n\
-             \x20      atrium ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...> | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
-             \x20      (ATRIUM_CTL_AUDIT=<file> mirrors the ctl audit log to JSONL)\n\
-             \x20      (mouse capture is OFF by default so text selection works; Ctrl+A m turns it on: click focuses a pane, wheel scrolls the hovered tile)"
-        );
+    if rest.first().is_some_and(|a| atrium::help::wants(a)) {
+        print!("{}", atrium::help::top());
         return ExitCode::SUCCESS;
     }
     if rest.first().map(String::as_str) == Some("--stdin-probe") {
@@ -1174,14 +1157,22 @@ fn config_cmd(args: &[String]) -> ExitCode {
                 }
             }
         }
+        Some(a) if atrium::help::wants(a) => {
+            print!("{}", atrium::help::CONFIG);
+            ExitCode::SUCCESS
+        }
         _ => {
-            eprintln!("usage: atrium config path | init [--at <path>]");
+            eprint!("{}", atrium::help::CONFIG);
             ExitCode::FAILURE
         }
     }
 }
 
 fn recover_cmd(args: &[String]) -> ExitCode {
+    if args.iter().any(|a| atrium::help::wants(a)) {
+        print!("{}", atrium::help::RECOVER);
+        return ExitCode::SUCCESS;
+    }
     // recover's own flags first; everything else is the session flags `parse_flags`
     // knows (`--trust`, `--allow-ctl`, `--max-depth`).
     let mut list = false;
@@ -1215,6 +1206,7 @@ fn recover_cmd(args: &[String]) -> ExitCode {
     };
     if !rest.is_empty() {
         eprintln!("atrium recover: unexpected argument {:?}", rest[0]);
+        eprint!("{}", atrium::help::RECOVER);
         return ExitCode::FAILURE;
     }
     let Ok(cwd) = std::env::current_dir() else {

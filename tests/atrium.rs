@@ -3980,3 +3980,47 @@ fn a_workers_to_wakes_the_pane_that_spawned_it() {
         String::from_utf8_lossy(&strip_csi_bytes(&out))
     );
 }
+
+/// Every family answers `--help` and `-h` on stdout with exit 0 and no
+/// session: `atrium ctl --help` used to fail before parsing because it
+/// demanded ATRIUM_CTL, `recover --help` was "unexpected argument", and the
+/// top-level help went to stderr.
+#[test]
+fn every_family_answers_help_on_stdout_without_a_session() {
+    for args in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["ctl", "--help"],
+        vec!["ctl", "-h"],
+        vec!["fleet", "--help"],
+        vec!["config", "-h"],
+        vec!["recover", "--help"],
+        vec!["reap", "--help"],
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+            .args(&args)
+            .env_remove("ATRIUM_CTL")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("usage:"), "{args:?}: {stdout}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote to stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // A bare `atrium ctl` is a usage error that still shows the commands.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+        .arg("ctl")
+        .env_remove("ATRIUM_CTL")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("respawn"));
+}

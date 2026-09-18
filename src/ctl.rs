@@ -1680,6 +1680,17 @@ pub fn reply_list(nodes: &[TreeNode]) -> Reply {
 /// `atrium ctl <cmd> …`: build a request from argv, send it to `ATRIUM_CTL`, print
 /// the reply. Exit code reflects the reply's `ok`.
 pub fn ctl_cmd(args: &[String]) -> ExitCode {
+    // Help needs no session: `atrium ctl --help` answers from anywhere, and a
+    // bare `atrium ctl` shows the same text as a usage error.
+    if args.iter().any(|a| crate::help::wants(a)) {
+        print!("{}", crate::help::CTL);
+        return ExitCode::SUCCESS;
+    }
+    if args.is_empty() {
+        eprintln!("atrium ctl: needs a command");
+        eprint!("{}", crate::help::CTL);
+        return ExitCode::FAILURE;
+    }
     let Some(address) = std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty()) else {
         eprintln!(
             "atrium ctl: not inside a ctl-enabled atrium session ({ENV_ADDRESS} unset).\n\
@@ -1707,13 +1718,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("atrium ctl: {msg}");
-            eprintln!(
-                "usage: atrium ctl spawn [--role R] [--identity X] [--here] [--mode plan|accept|automode|skip] -- <cmd...>\n\
-                 \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
-                 \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
-                 \x20      | board claim <key> [--ttl secs] | board release <key>\n\
-                 \x20      | bus pub <topic> [--decision] [--to <role|id>[,...]] [--new] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
-            );
+            eprint!("{}", crate::help::CTL);
             return ExitCode::FAILURE;
         }
     };

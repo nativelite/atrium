@@ -9,6 +9,10 @@ use std::time::Instant;
 /// separate from the hosted-program path — a fleet is atrium's own command, not a
 /// child to run.
 pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|a| atrium::help::wants(a)) {
+        print!("{}", atrium::help::FLEET);
+        return ExitCode::SUCCESS;
+    }
     match args.first().map(String::as_str) {
         Some("up") => match args.get(1) {
             Some(name) if !name.starts_with('-') => {
@@ -78,11 +82,7 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
             }
         },
         _ => {
-            eprintln!(
-                "usage: atrium fleet up <name> [--allow-ctl] [--trust <policy>] | \
-                 atrium fleet init <template> [--agents N] | atrium fleet clean <name> | \
-                 atrium fleet ls [--templates]"
-            );
+            eprint!("{}", atrium::help::FLEET);
             ExitCode::FAILURE
         }
     }

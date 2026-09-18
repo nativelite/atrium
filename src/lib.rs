@@ -32,6 +32,7 @@ pub mod events;
 pub use abus::{board, bus};
 pub mod filter;
 pub mod fleet;
+pub mod help;
 pub mod identity;
 pub mod input;
 pub mod ipc;
