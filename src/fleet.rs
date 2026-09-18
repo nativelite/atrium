@@ -137,6 +137,12 @@ pub struct Fleet {
     /// (`"cargo test --workspace"`). Added to `ATRIUM_DENY` and the built-in
     /// fail-safes ([`crate::trust::deny_args`]). Claude agents only.
     pub deny: Vec<String>,
+    /// Other commands that are claude — a second account's shim (`claude2`), a
+    /// wrapper, a renamed install — so their panes get every claude rule (trust
+    /// posture, deny list, `--session-id`, the ctl directive and worktree norms)
+    /// and `ctl spawn` accepts them. Added to `ATRIUM_CLAUDE_ALIASES` for the
+    /// whole session ([`crate::bind::set_claude_aliases`]).
+    pub claude_aliases: Vec<String>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -407,6 +413,11 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
     };
 
     let deny = deny_list(get("deny"), &format!("fleet {name:?}"))?;
+    let claude_aliases = str_list(
+        get("claude_aliases"),
+        "claude_aliases",
+        &format!("fleet {name:?}"),
+    )?;
 
     let agents_val =
         get("agents").ok_or_else(|| format!("fleet {name:?} has no \"agents\" array"))?;
@@ -434,16 +445,23 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         build_jobs,
         memory_mb,
         deny,
+        claude_aliases,
         agents,
     })
 }
 
 /// A `deny` list: an array of strings, or an error naming `whose` field.
 fn deny_list(v: Option<&json::Value>, whose: &str) -> Result<Vec<String>, String> {
+    str_list(v, "deny", whose)
+}
+
+/// An optional array-of-strings key; absent is empty, anything else is an error
+/// naming the key and its owner.
+fn str_list(v: Option<&json::Value>, key: &str, whose: &str) -> Result<Vec<String>, String> {
     let Some(v) = v else {
         return Ok(Vec::new());
     };
-    let err = || format!("{whose}: \"deny\" must be an array of strings");
+    let err = || format!("{whose}: {key:?} must be an array of strings");
     v.as_array()
         .ok_or_else(err)?
         .iter()
@@ -2127,6 +2145,7 @@ mod tests {
             build_jobs: None,
             memory_mb: None,
             deny: Vec::new(),
+            claude_aliases: Vec::new(),
             agents: vec![Agent {
                 name: name.to_string(),
                 cmd: vec![cmd.to_string()],
@@ -2394,6 +2413,7 @@ mod tests {
             build_jobs: None,
             memory_mb: None,
             deny: Vec::new(),
+            claude_aliases: Vec::new(),
             agents,
         };
         let anchor = Anchor {

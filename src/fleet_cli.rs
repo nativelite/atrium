@@ -448,6 +448,10 @@ pub(crate) fn fleet_up(
             return ExitCode::FAILURE;
         }
     };
+    // The fleet's `claude_aliases` are in force from here: the banner's
+    // non-claude warnings, every spawn and later ctl spawns all judge a
+    // command by them.
+    atrium::bind::set_claude_aliases(fleet.claude_aliases.clone());
 
     // Preflight: warn if context-mode plugin is missing — but ONLY when this
     // fleet actually opts in (provider == ContextMode). No-context fleets and
@@ -1313,6 +1317,7 @@ mod tests {
             build_jobs: None,
             memory_mb: None,
             deny: fleet_deny.iter().map(|s| s.to_string()).collect(),
+            claude_aliases: Vec::new(),
             agents: agents
                 .iter()
                 .map(|(name, cmd, deny)| atrium::fleet::Agent {

@@ -59,19 +59,45 @@ pub fn is_agent_stem(stem: &str) -> bool {
 /// so a non-claude agent — recognized as an agent by [`is_agent_stem`] — still
 /// launches with its own command untouched.
 pub fn is_claude_stem(stem: &str) -> bool {
-    CLAUDE_STEMS.contains(&stem) || is_claude_wrapper_stem(stem)
+    CLAUDE_STEMS.contains(&stem) || is_claude_alias(stem, &session_claude_aliases())
 }
 
-/// A numbered claude wrapper — `claude2`, `claude3` — is claude: the name a
-/// second account's shim gets (a `.cmd` or script that sets `CLAUDE_CONFIG_DIR`
-/// and runs `claude`). It used to fall outside every claude rule, so such a
-/// fleet launched with no trust posture, no deny list, no `--session-id` and
-/// no ctl directive or worktree norms, and `ctl spawn` refused it as not an
-/// agent — all silently. Only digits qualify: `claude-code-router` or
-/// `claudeflow` are other programs.
-fn is_claude_wrapper_stem(stem: &str) -> bool {
-    stem.strip_prefix("claude")
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+/// Environment knob (comma-separated) naming other commands that *are* claude:
+/// a second account's shim (`claude2`, a `.cmd` or script that sets
+/// `CLAUDE_CONFIG_DIR` and runs `claude`), a wrapper, a renamed install. Such a
+/// command used to fall outside every claude rule, so a fleet built on it
+/// launched with no trust posture, no deny list, no `--session-id` and no ctl
+/// directive or worktree norms, and `ctl spawn` refused it as not an agent —
+/// all silently. Naming is the operator's, so the list is explicit rather than
+/// a pattern. Entries are commands or stems (`claude2`, `claude2.cmd`, a full
+/// path) and match the pane's stem. A fleet's `claude_aliases` adds to it for
+/// the session.
+pub const ENV_CLAUDE_ALIASES: &str = "ATRIUM_CLAUDE_ALIASES";
+
+/// A fleet's `claude_aliases`, recorded once for the whole session so ctl-spawned
+/// workers and a recovery recognize the same commands as claude.
+static FLEET_CLAUDE_ALIASES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record a fleet's session-wide `claude_aliases`. First call wins.
+pub fn set_claude_aliases(aliases: Vec<String>) {
+    let _ = FLEET_CLAUDE_ALIASES.set(aliases);
+}
+
+/// The session's claude aliases: [`ENV_CLAUDE_ALIASES`], then the fleet's.
+pub fn session_claude_aliases() -> Vec<String> {
+    let mut v = crate::ctl::parse_allow_list(ENV_CLAUDE_ALIASES);
+    if let Some(fleet) = FLEET_CLAUDE_ALIASES.get() {
+        v.extend(fleet.iter().cloned());
+    }
+    v
+}
+
+/// Is `stem` one of `aliases`? Each alias is taken as a command and reduced to
+/// its stem the way a pane's command is, so an alias written as `claude2.cmd`
+/// or with a path matches the pane it names. Pure: the session rule with the
+/// list injected.
+pub fn is_claude_alias(stem: &str, aliases: &[String]) -> bool {
+    aliases.iter().any(|a| command_stem(a) == stem)
 }
 
 /// Extract a command's **stem** (basename without extension) in a way that is
@@ -319,32 +345,29 @@ mod tests {
         }
     }
 
-    /// A second account's shim is claude in every rule: the dialect (trust
-    /// flags, deny list, session id, system-prompt folds) and agent treatment
-    /// (`ctl spawn`, status chrome). Other `claude…` programs are not.
+    /// A command named in `claude_aliases` is claude in every rule: the dialect
+    /// (trust flags, deny list, session id, system-prompt folds) and agent
+    /// treatment (`ctl spawn`, status chrome). An alias may be written as a
+    /// bare stem, with an extension, or with a path; an unnamed `claude…`
+    /// program is not claude.
     #[test]
-    fn a_numbered_claude_wrapper_is_claude() {
-        for stem in ["claude2", "claude3", "claude10"] {
-            assert!(is_claude_stem(stem), "{stem} speaks the claude dialect");
-            assert!(is_agent_stem(stem), "{stem} is an agent");
-            assert!(
-                session_id_for(&cmd(&[stem, "--model", "opus"])).is_some(),
-                "{stem} binds"
-            );
+    fn a_named_alias_is_claude() {
+        let aliases: Vec<String> = ["claude2", "claude-work.cmd", r"C:\tools\cc.exe"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for stem in ["claude2", "claude-work", "cc"] {
+            assert!(is_claude_alias(stem, &aliases), "{stem} is an alias");
         }
-        for stem in [
-            "claude-code-router",
-            "claudeflow",
-            "claude_x",
-            "claude-2",
-            "2claude",
-        ] {
-            assert!(!is_claude_stem(stem), "{stem} is another program");
+        for stem in ["claude3", "claude-code-router", "claudeflow", "cmd"] {
+            assert!(!is_claude_alias(stem, &aliases), "{stem} is not named");
         }
+        assert!(!is_claude_alias("claude2", &[]), "no aliases: no match");
         // The stem rule applies after the path/extension are stripped.
-        assert!(is_claude_stem(&command_stem(
-            r"C:\Users\u\.local\bin\claude2.cmd"
-        )));
+        assert!(is_claude_alias(
+            &command_stem(r"C:\Users\u\.local\bin\claude2.cmd"),
+            &aliases
+        ));
     }
 
     #[test]

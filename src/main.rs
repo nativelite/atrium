@@ -1268,6 +1268,7 @@ fn plan_resume(
     let trust = cap_trust_to_ancestor(trust);
     let applied = policy.map(|p| atrium::session::PolicyRecord {
         deny: p.deny.clone(),
+        claude_aliases: p.claude_aliases.clone(),
         build_jobs: p.build_jobs,
         memory_mb: p.memory_mb,
         trust: Some(trust),
@@ -1560,6 +1561,11 @@ fn resume_session(
     if let Some(p) = &policy {
         if !p.deny.is_empty() {
             atrium::trust::set_fleet_deny(p.deny.clone());
+        }
+        // Before any spawn: the panes' commands are judged claude (or not) by
+        // the same aliases the session ran with.
+        if !p.claude_aliases.is_empty() {
+            atrium::bind::set_claude_aliases(p.claude_aliases.clone());
         }
         if let Some(mb) = p.memory_mb {
             atrium::memguard::set_fleet_mb(mb);
@@ -1926,6 +1932,7 @@ fn run(
         // recovery re-installs the merged list as the fleet's — so without this
         // the env entries are re-appended once per recovery generation.
         deny: dedup_preserving_order(atrium::trust::session_deny()),
+        claude_aliases: dedup_preserving_order(atrium::bind::session_claude_aliases()),
         build_jobs: atrium::buildpool::session_size(),
         memory_mb: atrium::memguard::fleet_mb(),
         trust: Some(trust),
@@ -4156,6 +4163,7 @@ mod tests {
     fn recovery_notice_names_the_guards_or_warns_they_are_missing() {
         let policy = atrium::session::PolicyRecord {
             deny: vec!["git push".to_string()],
+            claude_aliases: Vec::new(),
             build_jobs: Some(10),
             memory_mb: Some(32768),
             trust: Some(TrustMode::Auto),
@@ -4192,6 +4200,7 @@ mod tests {
     fn recovery_notice_marks_a_posture_that_came_from_the_file() {
         let policy = atrium::session::PolicyRecord {
             deny: Vec::new(),
+            claude_aliases: Vec::new(),
             build_jobs: None,
             memory_mb: None,
             trust: Some(TrustMode::Auto),

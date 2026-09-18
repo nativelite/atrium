@@ -276,6 +276,7 @@ control plane exists.
 | `ATRIUM_PANE` | the caller pane's agent id (set by atrium) |
 | `ATRIUM_BOARD` | file to persist the board across restarts (in-memory otherwise) |
 | `ATRIUM_BUS` | file to persist the bus across restarts |
+| `ATRIUM_CLAUDE_ALIASES` | other commands that are claude — a second account's shim, a wrapper, a renamed install (comma-separated); their panes get every claude rule and `ctl spawn` accepts them. A fleet's `claude_aliases` adds to it |
 | `ATRIUM_CTL_ALLOW` | extra command stems `ctl spawn` may launch (comma-separated) |
 | `ATRIUM_CTL_AUDIT` | mirror the ctl audit log to a JSONL file |
 | `ATRIUM_TRUST_ALLOW` | extra safe-command prefixes for `--trust accept` |

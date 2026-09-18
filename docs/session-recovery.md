@@ -131,6 +131,9 @@ restores none of them.
 
 - **deny** — the session-wide deny entries (`ATRIUM_DENY` plus the fleet's
   `deny`), re-installed before the first pane spawns.
+- **claude\_aliases** — the session's claude aliases (`ATRIUM_CLAUDE_ALIASES`
+  plus the fleet's `claude_aliases`), re-installed before the first pane
+  spawns so a fleet built on a shim is still claude.
 - **build\_jobs** — the compile pool size, rebuilt so recovered agents' builds
   are pooled rather than unbounded.
 - **memory\_mb** — the session memory ceiling for the guard.

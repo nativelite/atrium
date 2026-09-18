@@ -532,6 +532,7 @@ mod tests {
             build_jobs: None,
             memory_mb: None,
             deny: Vec::new(),
+            claude_aliases: Vec::new(),
             agents: agents
                 .iter()
                 .map(|(n, w)| Agent {

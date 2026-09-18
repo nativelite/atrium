@@ -352,7 +352,8 @@ impl SpawnDenied {
         match self {
             SpawnDenied::EmptyCommand => "spawn needs a command (e.g. `-- claude`)".to_string(),
             SpawnDenied::NotAllowed(stem) => format!(
-                "{stem:?} is not on the agent allowlist ({}); ctl spawns agents only",
+                "{stem:?} is not on the agent allowlist ({}); ctl spawns agents only \
+                 (a claude wrapper is named in `claude_aliases` / ATRIUM_CLAUDE_ALIASES)",
                 bind::AGENT_STEMS.join(", ")
             ),
             SpawnDenied::DepthExceeded { attempted, max } => {

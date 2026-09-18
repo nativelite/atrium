@@ -11,17 +11,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **A second account's claude ran with none of atrium's launch rules.** A
-  fleet whose command is a numbered wrapper — `claude2`, a shim that sets
+  fleet whose command is a shim — `claude2`, a script that sets
   `CLAUDE_CONFIG_DIR` and runs `claude` — was not recognized as claude, so its
   panes launched with no trust posture, no deny list, no `--session-id` (no
   status, nothing to resume), and neither the ctl directive nor their worktree
   instructions folded in; `ctl spawn` refused the command as not an agent. All
-  of it silently. `claude` followed by digits is now claude in every rule.
-  Other `claude…` names (`claude-code-router`, `claudeflow`) are still other
-  programs. With it, transcripts are read from `$CLAUDE_CONFIG_DIR/projects`
-  when that variable is set for atrium (nativelite-agsess 0.2.3); a wrapper
-  that sets the variable only for the agent still binds nothing, so set it for
-  the atrium process too.
+  of it silently. A fleet now names such commands in **`claude_aliases`**
+  (`ATRIUM_CLAUDE_ALIASES` operator-wide); they are claude in every rule, the
+  list is kept in the session snapshot so a recovery judges them the same way,
+  and the `ctl spawn` refusal says where to name one. With it, transcripts are
+  read from `$CLAUDE_CONFIG_DIR/projects` when that variable is set for atrium
+  (nativelite-agsess 0.2.3); a shim that sets it only for the agent still
+  binds nothing, so set it for the atrium process too.
 - **Recovery died on a reaped worktree, blaming the command.** A pane whose
   recorded directory no longer exists (a worktree the fleet removed after its
   item shipped) made `atrium recover` abort the whole session with

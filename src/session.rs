@@ -112,6 +112,9 @@ pub struct PolicyRecord {
     /// fail-safes and each pane's own rules are added on top at spawn, and
     /// `deny_args` dedupes, so re-supplying an entry is harmless.
     pub deny: Vec<String>,
+    /// The session's claude aliases (`ATRIUM_CLAUDE_ALIASES` plus the fleet's
+    /// `claude_aliases`), so a recovered fleet built on a shim is still claude.
+    pub claude_aliases: Vec<String>,
     /// The compile pool size (a fleet's `build_jobs`), if a pool was created.
     pub build_jobs: Option<usize>,
     /// The session memory ceiling in MB (a fleet's `memory_mb`), if one was set.
@@ -305,6 +308,7 @@ fn pane_to_json(p: &PaneRecord) -> Value {
 fn policy_to_json(p: &PolicyRecord) -> Value {
     Value::Object(vec![
         ("deny".to_string(), str_array(&p.deny)),
+        ("claude_aliases".to_string(), str_array(&p.claude_aliases)),
         ("build_jobs".to_string(), opt_num(p.build_jobs)),
         (
             "memory_mb".to_string(),
@@ -576,6 +580,7 @@ fn policy_from_json(v: Option<&Value>) -> Option<Option<PolicyRecord>> {
     let o = obj_of(v)?;
     Some(Some(PolicyRecord {
         deny: deny_list(get(o, "deny"))?,
+        claude_aliases: deny_list(get(o, "claude_aliases"))?,
         build_jobs: opt_usize(get(o, "build_jobs")),
         memory_mb: opt_u64(get(o, "memory_mb")),
         trust: mode_of(get(o, "trust")),
@@ -750,6 +755,7 @@ mod tests {
     fn sample_policy() -> PolicyRecord {
         PolicyRecord {
             deny: vec!["git push".to_string(), "cargo bench".to_string()],
+            claude_aliases: vec!["claude2".to_string()],
             build_jobs: Some(10),
             memory_mb: Some(32768),
             trust: Some(crate::ctl::TrustMode::Auto),
@@ -928,6 +934,7 @@ mod tests {
         let loaded = load(&path).expect("load must succeed");
         let pol = loaded.policy.expect("policy must survive the round trip");
         assert_eq!(pol.deny, sample_policy().deny);
+        assert_eq!(pol.claude_aliases, vec!["claude2".to_string()]);
         assert_eq!(pol.build_jobs, Some(10));
         assert_eq!(pol.memory_mb, Some(32768));
         assert_eq!(pol.trust, Some(crate::ctl::TrustMode::Auto));
