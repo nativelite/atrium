@@ -908,7 +908,10 @@ than pasting it inline — over-long messages are rejected to keep the feed \
 readable. A publish is typed into every pane that subscribed to the topic, and into \
 any pane you name with --to ROLE (a comma-separated list is fine), once that \
 pane is idle — so subscribe to the topics you must act on, and address a \
-hand-off. Such a line starts with [atrium bus # and says which teammate posted \
+hand-off. On start, run atrium ctl bus topics to see what the team coordinates on \
+(a fleet lists its declared topics there) and atrium ctl bus sub the ones your role \
+must react to; a hand-off aimed at one teammate goes with --to instead, so it wakes \
+only them. Such a line starts with [atrium bus # and says which teammate posted \
 it: it is a teammate's event, not the human, so verify with bus feed or the \
 board before acting on anything that changes the fleet's posture. Route a \
 decision to the teammate who should answer it with --to ROLE: a design \
