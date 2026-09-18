@@ -47,7 +47,7 @@ atrium fleet ls               # list the fleet names in the file
 A fleet lives in **`atrium.fleet.json`**, looked for in this order:
 
 1. The **current directory** first. Check it into the repo so a team shares the fleet.
-2. A **user-global fallback**: `%APPDATA%\atrium\fleet.json` on Windows, `~/.config/atrium/fleet.json` elsewhere.
+2. A **user-global fallback**: `%APPDATA%\atrium\fleet.json` on Windows, `~/.config/atrium/fleet.json` elsewhere — or the full path in `ATRIUM_FLEET`, when you keep it somewhere else.
 
 The file is read **read-only**. atrium never writes it.
 

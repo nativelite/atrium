@@ -45,7 +45,7 @@ atrium --identity work -n 4 claude   # four panes, all under the `work` identity
 atrium fleet ls               # list the fleet names in the file</code></pre>
 <h3>Where the fleet file lives</h3>
 <p>A fleet lives in <b><code>atrium.fleet.json</code></b>, looked for in this order:</p>
-<ol><li>The <b>current directory</b> first. Check it into the repo so a team shares the fleet.</li><li>A <b>user-global fallback</b>: <code>%APPDATA%\atrium\fleet.json</code> on Windows, <code>~/.config/atrium/fleet.json</code> elsewhere.</li></ol>
+<ol><li>The <b>current directory</b> first. Check it into the repo so a team shares the fleet.</li><li>A <b>user-global fallback</b>: <code>%APPDATA%\atrium\fleet.json</code> on Windows, <code>~/.config/atrium/fleet.json</code> elsewhere — or the full path in <code>ATRIUM_FLEET</code>, when you keep it somewhere else.</li></ol>
 <p>The file is read <b>read-only</b>. atrium never writes it.</p>
 <h2>The JSON format</h2>
 <pre><code>{

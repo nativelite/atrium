@@ -585,16 +585,40 @@ pub struct Located {
     pub global: bool,
 }
 
-/// The user-global fleet-file path (`%APPDATA%\atrium\fleet.json` on Windows,
-/// `~/.config/atrium/fleet.json` elsewhere), or `None` if the base dir is unset.
+/// Environment knob: the user-global fleet file's path, in full, when someone
+/// keeps it somewhere else (a synced dotfiles folder, say). Unset ⇒ the
+/// platform default under [`global_dir`].
+pub const ENV_FLEET: &str = "ATRIUM_FLEET";
+
+/// The user-global fleet-file path: [`ENV_FLEET`] when set, else
+/// `%APPDATA%\atrium\fleet.json` on Windows / `~/.config/atrium/fleet.json`
+/// elsewhere, or `None` if neither the variable nor the base dir is set.
 pub fn global_path() -> Option<PathBuf> {
+    global_file(ENV_FLEET, "fleet.json")
+}
+
+/// The platform's user-config directory for atrium: `%APPDATA%\atrium` on
+/// Windows, `$XDG_CONFIG_HOME/atrium` or `~/.config/atrium` elsewhere. Both
+/// user-global files (`fleet.json`, `config.json`) live here unless their own
+/// variable moves them.
+pub fn global_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let base = std::env::var_os("APPDATA").map(PathBuf::from);
     #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
-    base.map(|b| b.join("atrium").join("fleet.json"))
+    base.map(|b| b.join("atrium"))
+}
+
+/// A user-global file: the full path in `var` when set (empty counts as unset),
+/// else `name` under [`global_dir`]. Each file has its own variable, so moving
+/// one never moves the other.
+pub fn global_file(var: &str, name: &str) -> Option<PathBuf> {
+    match std::env::var_os(var).filter(|v| !v.is_empty()) {
+        Some(p) => Some(PathBuf::from(p)),
+        None => global_dir().map(|d| d.join(name)),
+    }
 }
 
 /// A human-readable rendering of the global path for error messages, even when

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
   Precedence, lowest to highest: the file, the fleet's key, the `ATRIUM_*`
   variable, a flag. Absent is fine; malformed is an error at launch. (#4)
+- **`ATRIUM_CONFIG` and `ATRIUM_FLEET`** name the full path of each user-global
+  file for anyone who keeps them somewhere else; a config path that is named
+  but missing is an error. Unset, both sit under `%APPDATA%\atrium` /
+  `~/.config/atrium` as before.
 
 ## [0.36.1] - 2026-09-17
 

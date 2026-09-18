@@ -106,10 +106,21 @@ impl GlobalConfig {
     }
 }
 
-/// The file's path (`%APPDATA%\atrium\config.json`, `~/.config/atrium/config.json`),
-/// or `None` when the base directory is unset. Beside [`crate::fleet::global_path`].
+/// Environment knob: the file's path, in full, when someone keeps it somewhere
+/// else. Unset ⇒ `config.json` under [`crate::fleet::global_dir`].
+pub const ENV_CONFIG: &str = "ATRIUM_CONFIG";
+
+/// The file's path: [`ENV_CONFIG`] when set, else `%APPDATA%\atrium\config.json`
+/// / `~/.config/atrium/config.json`, or `None` when neither is set. Beside the
+/// global fleet file by default; each moves on its own variable.
 pub fn global_path() -> Option<PathBuf> {
-    crate::fleet::global_path().map(|p| p.with_file_name("config.json"))
+    crate::fleet::global_file(ENV_CONFIG, "config.json")
+}
+
+/// Whether the path was named explicitly ([`ENV_CONFIG`]), in which case a
+/// missing file is an error rather than "no config".
+fn path_is_explicit() -> bool {
+    std::env::var_os(ENV_CONFIG).is_some_and(|v| !v.is_empty())
 }
 
 /// Parse the file's text. Every key is optional; a key of the wrong shape is an
@@ -257,16 +268,28 @@ fn home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Read the file if it exists. `Ok(None)` when there is none.
+/// Read the file if it exists. `Ok(None)` when there is none at the default
+/// place; a path named by [`ENV_CONFIG`] must exist (you asked for a file that
+/// is not there).
 pub fn load() -> Result<Option<GlobalConfig>, String> {
     let Some(path) = global_path() else {
         return Ok(None);
     };
-    match std::fs::read_to_string(&path) {
+    read(&path, path_is_explicit())
+}
+
+/// [`load`] over an explicit path. `explicit` says whether a missing file is an
+/// error (the path was named) or simply no config (the platform default).
+pub fn read(path: &Path, explicit: bool) -> Result<Option<GlobalConfig>, String> {
+    match std::fs::read_to_string(path) {
         Ok(text) => parse(&text)
             .map(Some)
             .map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "{}: named by {ENV_CONFIG} but not there",
+            path.display()
+        )),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
@@ -438,10 +461,38 @@ mod tests {
     }
 
     #[test]
-    fn the_file_sits_beside_the_global_fleet_file() {
+    fn the_file_sits_beside_the_global_fleet_file_by_default() {
+        if std::env::var_os(ENV_CONFIG).is_some()
+            || std::env::var_os(crate::fleet::ENV_FLEET).is_some()
+        {
+            return; // the developer moved one; the default is not observable here
+        }
         if let (Some(cfg), Some(fleet)) = (global_path(), crate::fleet::global_path()) {
             assert_eq!(cfg.parent(), fleet.parent());
             assert_eq!(cfg.file_name().unwrap(), "config.json");
         }
+    }
+
+    /// A missing file at the default place is no config; a missing file at a
+    /// path someone named is an error that says so. A present file reads.
+    #[test]
+    fn a_named_but_missing_file_is_an_error_a_default_one_is_none() {
+        let dir = std::env::temp_dir().join(format!("atrium-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("nope.json");
+        assert_eq!(read(&missing, false).unwrap(), None);
+        let err = read(&missing, true).unwrap_err();
+        assert!(
+            err.contains(ENV_CONFIG) && err.contains("nope.json"),
+            "{err}"
+        );
+        let present = dir.join("config.json");
+        std::fs::write(&present, r#"{"claude_aliases":["claude2"]}"#).unwrap();
+        assert_eq!(
+            read(&present, true).unwrap().unwrap().alias_names(),
+            vec!["claude2"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

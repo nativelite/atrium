@@ -276,6 +276,8 @@ control plane exists.
 | `ATRIUM_PANE` | the caller pane's agent id (set by atrium) |
 | `ATRIUM_BOARD` | file to persist the board across restarts (in-memory otherwise) |
 | `ATRIUM_BUS` | file to persist the bus across restarts |
+| `ATRIUM_CONFIG` | full path of the user-global `config.json`, when you keep it elsewhere (a named path must exist) |
+| `ATRIUM_FLEET` | full path of the user-global `fleet.json` fallback, when you keep it elsewhere |
 | `ATRIUM_CLAUDE_ALIASES` | other commands that are claude — a second account's shim, a wrapper, a renamed install (comma-separated); their panes get every claude rule and `ctl spawn` accepts them. A fleet's `claude_aliases` adds to it |
 | `ATRIUM_CTL_ALLOW` | extra command stems `ctl spawn` may launch (comma-separated) |
 | `ATRIUM_CTL_AUDIT` | mirror the ctl audit log to a JSONL file |
@@ -310,7 +312,9 @@ and only under `--trust`. See [docs/trust-and-security.md](docs/trust-and-securi
 A **user-global `config.json`** beside that fleet file (`%APPDATA%\atrium\config.json`
 / `~/.config/atrium/config.json`) holds what you want in force on this machine for
 every project, without exporting the same variables into every terminal. Absent is
-fine; malformed is an error at launch, never a silent default.
+fine; malformed is an error at launch, never a silent default. Keep either file
+wherever you organize things: `ATRIUM_CONFIG` and `ATRIUM_FLEET` name each one's
+full path.
 
 ```json
 {
