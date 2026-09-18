@@ -448,9 +448,11 @@ pub(crate) fn fleet_up(
             return ExitCode::FAILURE;
         }
     };
-    // The fleet's `claude_aliases` are in force from here: the banner's
-    // non-claude warnings, every spawn and later ctl spawns all judge a
-    // command by them.
+    // The global config's fleet defaults fill the keys this fleet left out
+    // (its own keys and the environment still win), then the fleet's
+    // `claude_aliases` are in force from here: the banner's non-claude
+    // warnings, every spawn and later ctl spawns all judge a command by them.
+    let fleet = atrium::config::get().apply_to_fleet(fleet);
     atrium::bind::set_claude_aliases(fleet.claude_aliases.clone());
 
     // Preflight: warn if context-mode plugin is missing — but ONLY when this

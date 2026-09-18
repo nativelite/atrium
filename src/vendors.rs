@@ -233,10 +233,28 @@ impl VendorWorlds {
     /// [`vendor_root`] is known. Always includes the ClaudeCode world (its root
     /// is always known), so this is a superset of today's single-world behavior.
     pub fn new() -> Self {
-        let worlds = SUPPORTED_VENDORS
+        Self::with_extra_claude_roots(crate::config::get().alias_transcript_roots())
+    }
+
+    /// The vendor worlds plus one claude world per extra root: the transcripts
+    /// of each `claude_aliases` entry that runs under its own config dir.
+    /// Without them a second account's panes never bound — their sessions were
+    /// looked for under the first account's projects. A root equal to the
+    /// default is not added twice.
+    pub fn with_extra_claude_roots(extra: Vec<PathBuf>) -> Self {
+        let mut worlds: Vec<World> = SUPPORTED_VENDORS
             .iter()
             .filter_map(|&vendor| vendor_root(vendor).map(|root| World::for_vendor(root, vendor)))
             .collect();
+        let default_claude = vendor_root(Vendor::ClaudeCode);
+        let mut seen: Vec<PathBuf> = Vec::new();
+        for root in extra {
+            if default_claude.as_ref() == Some(&root) || seen.contains(&root) {
+                continue;
+            }
+            worlds.push(World::for_vendor(root.clone(), Vendor::ClaudeCode));
+            seen.push(root);
+        }
         VendorWorlds { worlds }
     }
 
@@ -870,6 +888,42 @@ mod tests {
     /// A Gemini user line — no `cwd` field, so `session.cwd` stays `None`.
     const GEMINI_LINE: &str =
         r#"{"role":"user","parts":[{"text":"hello"}],"timestamp":"2026-01-01T00:00:01.000Z"}"#;
+
+    /// A second account's transcripts live under its own config dir. A world
+    /// for that root (from a `claude_aliases` entry's `config_dir`) binds a
+    /// session there by id; without it the same id is unknown. The default
+    /// root is never added twice.
+    #[test]
+    fn an_alias_config_dir_gives_its_sessions_a_world() {
+        let td = TempDir::new("alias-root");
+        let root = td.0.join("projects");
+        write_adopt_session(&root, "proj", "sess-2nd", &[&claude_user_with_cwd("/w")]);
+
+        let mut with = VendorWorlds::with_extra_claude_roots(vec![root.clone()]);
+        with.refresh();
+        assert!(
+            with.status_for(Some("sess-2nd")).is_some(),
+            "the alias root's session binds"
+        );
+
+        let mut without = VendorWorlds::with_extra_claude_roots(Vec::new());
+        without.refresh();
+        assert_eq!(without.status_for(Some("sess-2nd")), None);
+
+        let dup = VendorWorlds::with_extra_claude_roots(vec![
+            root.clone(),
+            root.clone(),
+            agsess::default_root(),
+        ]);
+        let base = VendorWorlds::with_extra_claude_roots(Vec::new())
+            .worlds
+            .len();
+        assert_eq!(
+            dup.worlds.len(),
+            base + 1,
+            "one world per distinct extra root"
+        );
+    }
 
     #[test]
     fn adopt_no_candidates_before_launch() {

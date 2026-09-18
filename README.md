@@ -307,6 +307,38 @@ elsewhere). atrium reads it **read-only** and never writes it. The one file atri
 *does* write is Claude Code's per-directory folder-trust bit in `~/.claude.json`,
 and only under `--trust`. See [docs/trust-and-security.md](docs/trust-and-security.md).
 
+A **user-global `config.json`** beside that fleet file (`%APPDATA%\atrium\config.json`
+/ `~/.config/atrium/config.json`) holds what you want in force on this machine for
+every project, without exporting the same variables into every terminal. Absent is
+fine; malformed is an error at launch, never a silent default.
+
+```json
+{
+  "claude_aliases": { "claude2": { "config_dir": "~/.claude-2" } },
+  "deny": ["Bash(git push --force*)"],
+  "ctl_allow": [],
+  "trust_allow": [],
+  "build_jobs": null,
+  "memory_mb": null,
+  "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
+}
+```
+
+- **`claude_aliases`** — other commands that are claude: a second account's shim,
+  a wrapper, a renamed install. A list of names, or a map whose entries may name
+  the **`config_dir`** that claude runs under; then atrium also reads that
+  account's transcripts (`<dir>/projects`, so its panes bind and recover) and
+  keeps its folder-trust bit in `<dir>/.claude.json`.
+- **`deny`**, **`ctl_allow`**, **`trust_allow`** — the same lists as `ATRIUM_DENY`,
+  `ATRIUM_CTL_ALLOW`, `ATRIUM_TRUST_ALLOW`; they merge with the variable and the
+  fleet's own.
+- **`build_jobs`**, **`memory_mb`** — defaults for fleets that set neither.
+- **`fleet_defaults`** — `trust`, `identity`, `allow_ctl`, `grid` for fleets that
+  leave them out.
+
+Precedence, lowest to highest: `config.json` → the project fleet's key → the
+`ATRIUM_*` variable → a command-line flag.
+
 ## Design and scope
 
 atrium is a **passthrough first**, an emulator only when it must tile. In

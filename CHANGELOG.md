@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A user-global `config.json`** beside the global fleet file
+  (`%APPDATA%\atrium\config.json` / `~/.config/atrium/config.json`): what an
+  operator wants in force on this machine for every project, without exporting
+  the same variables into every terminal. `claude_aliases` (a list, or a map
+  whose entries may name the `config_dir` that claude runs under — atrium then
+  reads that account's transcripts and keeps its folder trust there, so a
+  second account's panes bind, show status and recover), `deny`, `ctl_allow`,
+  `trust_allow` (merged with their variables and the fleet's), `build_jobs` and
+  `memory_mb` (defaults for fleets that set neither) and `fleet_defaults`
+  (`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
+  Precedence, lowest to highest: the file, the fleet's key, the `ATRIUM_*`
+  variable, a flag. Absent is fine; malformed is an error at launch. (#4)
+
 ## [0.36.1] - 2026-09-17
 
 ### Fixed

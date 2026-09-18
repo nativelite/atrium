@@ -640,9 +640,12 @@ pub const ENV_AUDIT: &str = "ATRIUM_CTL_AUDIT";
 /// session that did not ask for it. Empty/unset ⇒ agents-only (`{claude}`).
 pub const ENV_ALLOW: &str = "ATRIUM_CTL_ALLOW";
 
-/// Read [`ENV_ALLOW`] into the extra-allow list (trimmed, empties dropped).
+/// The extra-allow list: the global config's `ctl_allow`, then [`ENV_ALLOW`]
+/// (trimmed, empties dropped).
 pub fn extra_allow_from_env() -> Vec<String> {
-    parse_allow_list(ENV_ALLOW)
+    let mut v = crate::config::get().ctl_allow.clone();
+    v.extend(parse_allow_list(ENV_ALLOW));
+    v
 }
 
 /// Parse a comma-separated allowlist from an environment variable.

@@ -83,13 +83,21 @@ pub fn set_claude_aliases(aliases: Vec<String>) {
     let _ = FLEET_CLAUDE_ALIASES.set(aliases);
 }
 
-/// The session's claude aliases: [`ENV_CLAUDE_ALIASES`], then the fleet's.
+/// The session's claude aliases: the global config's, [`ENV_CLAUDE_ALIASES`],
+/// then the fleet's.
 pub fn session_claude_aliases() -> Vec<String> {
-    let mut v = crate::ctl::parse_allow_list(ENV_CLAUDE_ALIASES);
+    let mut v = crate::config::get().alias_names();
+    v.extend(crate::ctl::parse_allow_list(ENV_CLAUDE_ALIASES));
     if let Some(fleet) = FLEET_CLAUDE_ALIASES.get() {
         v.extend(fleet.iter().cloned());
     }
     v
+}
+
+/// The `CLAUDE_CONFIG_DIR` a claude alias runs under, when the global config
+/// names one — where that claude's transcripts and folder-trust map live.
+pub fn alias_config_dir(stem: &str) -> Option<&'static std::path::Path> {
+    crate::config::get().alias_config_dir(stem)
 }
 
 /// Is `stem` one of `aliases`? Each alias is taken as a command and reduced to

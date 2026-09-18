@@ -506,6 +506,16 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // The user-global config (`config.json`): aliases, session-wide lists and
+    // fleet defaults, in force for every launch path below. Not for the ctl
+    // client, which runs inside panes many times a session and needs none of
+    // it. A malformed file is an error here, never a silent default.
+    if args.first().map(String::as_str) != Some("ctl") {
+        if let Err(e) = atrium::config::install_from_disk() {
+            eprintln!("atrium: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // `atrium recover` rehydrates the most recent session snapshot — same dispatch
     // level as `fleet` and `ctl`, before flag parsing, so `recover` is never
     // mistaken for a hosted command.

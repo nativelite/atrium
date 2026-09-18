@@ -419,7 +419,9 @@ pub(crate) fn spawn_pane_full(
             .map(std::path::PathBuf::from)
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
-        if let Err(e) = atrium::trust::ensure_trusted(&dir) {
+        // An aliased claude with its own config dir keeps its trust map there.
+        let config_dir = atrium::bind::alias_config_dir(&title);
+        if let Err(e) = atrium::trust::ensure_trusted_in(config_dir, &dir) {
             *flash = Some((format!("folder-trust: {e}"), Instant::now()));
         }
     }

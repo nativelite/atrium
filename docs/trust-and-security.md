@@ -122,7 +122,8 @@ limits, each one unit-tested as a pure function:
    **agent allowlist** (default `{claude}`), so a confused agent can't
    `ctl spawn -- rm -rf`. Extend it per-session, set by the human who launches
    atrium, with **`ATRIUM_CTL_ALLOW`** (comma-separated stems, for example for
-   another agent CLI). It never weakens a session that didn't set it.
+   another agent CLI) or `ctl_allow` in the user-global `config.json`. It never
+   weakens a session that didn't set it.
 3. **No count cap; a depth guard.** A fleet designed for 32 runs 32; width is
    unlimited. Only *recursion* is bounded, by **`--max-depth`** (default 6, `0`
    removes it): a spawn past the ceiling is refused, so a self-spawning agent

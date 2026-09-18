@@ -95,8 +95,11 @@ pub fn extra_allow_from_env() -> Vec<String> {
     // Shares only the PARSING with `ctl::extra_allow_from_env`. The two read
     // different variables and gate different postures — this one widens claude's
     // own tool allowlist, that one the ctl spawn allowlist — so they must stay
-    // separate functions even though their bodies once looked identical.
-    crate::ctl::parse_allow_list(ENV_TRUST_ALLOW)
+    // separate functions even though their bodies once looked identical. The
+    // global config's `trust_allow` comes first, for the same posture.
+    let mut v = crate::config::get().trust_allow.clone();
+    v.extend(crate::ctl::parse_allow_list(ENV_TRUST_ALLOW));
+    v
 }
 
 /// Build the claude CLI args for the safe hands-off `--trust` posture:
@@ -197,9 +200,11 @@ pub fn parse_deny_env() -> Vec<String> {
     crate::ctl::parse_allow_list(ENV_DENY)
 }
 
-/// The session-wide deny entries: `ATRIUM_DENY`, then the fleet's `deny`.
+/// The session-wide deny entries: the global config's `deny`, `ATRIUM_DENY`,
+/// then the fleet's `deny`.
 pub fn session_deny() -> Vec<String> {
-    let mut v = parse_deny_env();
+    let mut v = crate::config::get().deny.clone();
+    v.extend(parse_deny_env());
     if let Some(fleet) = FLEET_DENY.get() {
         v.extend(fleet.iter().cloned());
     }
@@ -269,7 +274,17 @@ pub enum Outcome {
 /// problem — callers treat it as non-fatal (the spawn still proceeds; worst case
 /// the dialog appears), never a reason to abort a pane.
 pub fn ensure_trusted(dir: &Path) -> Result<Outcome, String> {
-    let path = config_path().ok_or_else(|| "no HOME to locate ~/.claude.json".to_string())?;
+    ensure_trusted_in(None, dir)
+}
+
+/// [`ensure_trusted`] for a claude that runs under its own config dir (a
+/// `claude_aliases` entry with `config_dir`): the map is `<dir>/.claude.json`.
+/// `None` is the process's own claude ([`ensure_trusted`]).
+pub fn ensure_trusted_in(config_dir: Option<&Path>, dir: &Path) -> Result<Outcome, String> {
+    let path = match config_dir {
+        Some(d) => d.join(".claude.json"),
+        None => config_path().ok_or_else(|| "no HOME to locate ~/.claude.json".to_string())?,
+    };
     ensure_trusted_at(&path, dir)
 }
 
