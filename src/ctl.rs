@@ -905,10 +905,16 @@ bus feed pulls what teammates published on the topics you follow. Post fyi \
 updates freely. Keep each message a terse headline: put long evidence (tables, \
 diffs, logs) behind a pointer with detail=board:KEY or detail=PATH rather \
 than pasting it inline — over-long messages are rejected to keep the feed \
-readable. Route a decision to the teammate who should answer it with \
---to ROLE: a design question for the lead is atrium ctl bus pub TOPIC --decision \
---to lead q=your question, which reaches the lead first instead of the human. \
-Reserve a plain --decision with no --to for things that truly need the human. \
+readable. A publish is typed into every pane that subscribed to the topic, and into \
+any pane you name with --to ROLE (a comma-separated list is fine), once that \
+pane is idle — so subscribe to the topics you must act on, and address a \
+hand-off. Such a line starts with [atrium bus # and says which teammate posted \
+it: it is a teammate's event, not the human, so verify with bus feed or the \
+board before acting on anything that changes the fleet's posture. Route a \
+decision to the teammate who should answer it with --to ROLE: a design \
+question for the lead is atrium ctl bus pub TOPIC --decision --to lead q=your \
+question, which reaches the lead first instead of the human. Reserve a plain \
+--decision with no --to for things that truly need the human. \
 If you are the lead, watch your feed for decisions addressed to you and resolve \
 them with atrium ctl bus resolve SEQ once answered. \
 Run atrium ctl with no arguments for the full command surface, or use the \
@@ -1703,7 +1709,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                  \x20      | list | send <target> <text> | status [target] | kill <target> | audit [N]\n\
                  \x20      | board set <key> <field=value...> | board get <key> | board list | board del <key>\n\
                  \x20      | board claim <key> [--ttl secs] | board release <key>\n\
-                 \x20      | bus pub <topic> [--decision] [--to <role>] [--new] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
+                 \x20      | bus pub <topic> [--decision] [--to <role|id>[,...]] [--new] <field=value...> | bus sub <topic...> | bus feed [--since N] | bus resolve <seq> | bus topics"
             );
             return ExitCode::FAILURE;
         }

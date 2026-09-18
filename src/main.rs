@@ -2933,7 +2933,7 @@ fn default_shell() -> String {
 mod tests {
     use super::{
         assemble_command, audit_outcome, combine_system_prompt, fold_system_prompt, pane_base_env,
-        privilege_for, routed_wake, sanitize_shim_arg, surface_once, worktree_spawn_params,
+        privilege_for, sanitize_shim_arg, surface_once, worktree_spawn_params,
     };
 
     // -- audit_outcome over the typed Reply (r10 B12) ------------------------
@@ -3151,41 +3151,6 @@ mod tests {
     fn fold_without_a_block_leaves_the_command_untouched() {
         let cmd = args(&["claude", "--append-system-prompt", "ROLE", "go"]);
         assert_eq!(fold_system_prompt(cmd.clone(), None), cmd);
-    }
-
-    fn wake_fields(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn routed_message_wakes_the_target_with_its_content() {
-        // The footgun this fixes: a `--to` message sat unseen on the bus and an
-        // idle target never acted on it. The wake must carry the content so the
-        // target does not have to be subscribed to the topic to receive it.
-        let f = wake_fields(&[("to", "lead"), ("msg", "ship it")]);
-        let (to, text) =
-            routed_wake(&f, "ctl-fixes", 42, atrium::bus::Kind::Fyi, "reviewer").unwrap();
-        assert_eq!(to, "lead");
-        assert!(text.contains("ship it"), "carries the content: {text}");
-        assert!(text.contains("reviewer"), "names the sender");
-        assert!(text.contains("ctl-fixes"), "names the topic");
-        assert!(text.contains("#42"), "carries the seq to resolve/reference");
-    }
-
-    #[test]
-    fn a_decision_question_is_the_body_when_no_msg() {
-        let f = wake_fields(&[("to", "lead"), ("q", "combined or split?")]);
-        let (_, text) = routed_wake(&f, "t", 1, atrium::bus::Kind::DecisionNeeded, "gate").unwrap();
-        assert!(text.contains("combined or split?"));
-    }
-
-    #[test]
-    fn an_unrouted_publish_wakes_nobody() {
-        let f = wake_fields(&[("msg", "broadcast")]);
-        assert!(routed_wake(&f, "t", 1, atrium::bus::Kind::Fyi, "lead").is_none());
     }
 
     /// **A pane must carry the session marker whether or not ctl is on.**

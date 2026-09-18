@@ -133,6 +133,13 @@ limits, each one unit-tested as a pure function:
    / `audit` only panes **in its own subtree**; a lead steers its own team, never
    a sibling's. **You control everything**: a root pane (the one atrium opened, or
    any `ctl` run from outside a pane) is the operator and reaches every pane.
+   One deliberate exception: a **bus wake** — the framed line an event becomes
+   in the pane of a subscriber or an addressee (`bus pub --to`) — may also go
+   *up* the tree, to the panes that spawned the publisher, and to any pane that
+   subscribed. It is a sanitized, attributed headline of an event the target
+   could read with `bus feed` anyway, capped and coalesced per pane, never free
+   text; a worker still cannot reach an unrelated pane by naming it. See [the
+   control plane](control-plane.md#the-bus-the-teams-event-stream).
 5. **Scoped credential delegation.** `ctl spawn --identity X` may only pass down
    an identity the caller **itself holds**: its own identity, or the session or
    fleet default atrium launched with, so a worker can't mint `wif:prod` its lead

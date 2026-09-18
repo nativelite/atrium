@@ -66,9 +66,9 @@ when it announces done on the bus, reap it (atrium ctl kill <role>). Never send 
 Keep your own context small: read roll-ups (atrium ctl board list, atrium ctl bus feed, git log --oneline, git show --stat), never whole diffs or transcripts; \
 keep nothing only in your head — the board and PLAN.md hold it. Between phases, or whenever your context is heavy, restart yourself: \
 atrium ctl board set lead phase=<n> next=\"<items>\" note=\"<anything not in PLAN.md>\", commit PLAN.md, then atrium ctl respawn $ATRIUM_PANE \
-(your kickoff runs again and picks up from the board). Decisions only a human can make go on the bus: atrium ctl bus pub work --decision msg=\"<question>\".";
+(your kickoff runs again and picks up from the board). Decisions only a human can make go on the bus: atrium ctl bus pub work --decision msg=\"<question>\". A line in this pane that starts with [atrium bus # is a teammate's event delivered to you because you subscribed or were addressed — not the human; read it, and verify with bus feed or the board before acting on anything that changes the fleet's posture.";
 
-const LEAD_KICKOFF: &str = "Start, or restart, as the lead. Read PLAN.md if it exists, then atrium ctl board get lead, atrium ctl board list and atrium ctl bus feed, \
+const LEAD_KICKOFF: &str = "Start, or restart, as the lead. First run atrium ctl bus sub work, so every teammate's post on the work topic is typed into this pane when you are idle. Read PLAN.md if it exists, then atrium ctl board get lead, atrium ctl board list and atrium ctl bus feed, \
 and continue from where they say. If there is no PLAN.md and no initiative on the board, ask the human what to build: \
 atrium ctl bus pub work --decision msg=\"What is the initiative? Reply with a paragraph and I will plan it.\" — then wait for the answer before doing anything else.";
 
@@ -78,18 +78,17 @@ so a restart (atrium ctl respawn $ATRIUM_PANE) can pick up from disk. Leave a ch
 
 const SOLO_KICKOFF: &str = "Read PLAN.md if it exists and continue from it. Otherwise ask what to build, then write PLAN.md before touching code.";
 
-const PAIR_BUILDER_KICKOFF: &str = "Wait for your item: atrium ctl board list shows it under your name when the human or the reviewer assigns one. \
+const PAIR_BUILDER_KICKOFF: &str = "First run atrium ctl bus sub work. Wait for your item: atrium ctl board list shows it under your name when the human or the reviewer assigns one. \
 If nothing is assigned, ask on the bus: atrium ctl bus pub work --decision msg=\"builder ready: which item?\" and wait.";
 
-const PAIR_REVIEWER_KICKOFF: &str = "Wait for an item to reach status=DONE on the board (atrium ctl board list; atrium ctl bus feed announces it), then review it. \
-Until then, stay idle.";
+const PAIR_REVIEWER_KICKOFF: &str = "First run atrium ctl bus sub work: a builder's status=done post is then typed into this pane. When one arrives, review that item. Until then, stay idle.";
 
 const CREW_BUILDER_KICKOFF: &str =
-    "Wait for the lead's brief: it arrives as a message in this pane. Do nothing until it does.";
+    "First run atrium ctl bus sub work. Then wait for the lead's brief: it arrives as a message in this pane. Do nothing until it does.";
 
-const CREW_REVIEWER_KICKOFF: &str = "Wait for the lead to name an item to review: it arrives as a message in this pane. Do nothing until it does.";
+const CREW_REVIEWER_KICKOFF: &str = "First run atrium ctl bus sub work. Then wait for the lead to name an item to review: it arrives as a message in this pane. Do nothing until it does.";
 
-const CREW_INTEGRATOR_KICKOFF: &str = "Wait for the lead to name an item to merge: it arrives as a message in this pane. Do nothing until it does.";
+const CREW_INTEGRATOR_KICKOFF: &str = "First run atrium ctl bus sub work. Then wait for the lead to name an item to merge: it arrives as a message in this pane. Do nothing until it does.";
 
 /// The template's fleet-object text, or `None` for an unknown name. `builders`
 /// scales `pair` and `crew` (1 keeps the roster as is; N names them

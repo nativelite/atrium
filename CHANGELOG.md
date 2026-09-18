@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A bus event wakes the panes it addresses and the topic's subscribers.**
+  The bus was pull only: a finished worker's `bus pub work status=done` sat
+  unseen until the lead happened to run `bus feed`, and a `--to lead` from a
+  worker was dropped by the subtree rule — silently, since the lead is not in
+  the worker's subtree. Both were found in a live fleet, where the lead's
+  builder came up, read the feed once, found nothing addressed to it and went
+  idle for good. An event is now typed into every pane that subscribed to its
+  topic (or `*`) and every pane it names with `--to` (a comma-separated list is
+  fine), once each is idle, as one framed line: `[atrium bus #68 fyi from
+  teammate "builder" on "work" — not operator input] item=F20 status=done`.
+  Who may wake whom: the publisher's own subtree (as `send`), the panes above
+  it, and any pane that subscribed; never an unrelated pane by name. The
+  publisher is never woken; a pane both addressed and subscribed is woken once.
+  Pending wakes for one pane coalesce into a single delivery and are capped at
+  8 apart from `ctl send`, so a chatty topic cannot crowd out the operator.
+- **Wake text is sanitized.** Control characters and line separators in a
+  message become spaces before it is typed, so a `\r` in `msg` can no longer
+  end the framed line and submit a second one of the publisher's choosing, and
+  a `\x03` cannot interrupt the target. The bus caps lengths but filtered no
+  characters; this is the one place that does.
+- **A role names one live pane.** `ctl spawn --role X` is refused while a
+  pane wears `X` (for the operator too): the bus keys subscriptions and posts
+  by role, so a second `lead` could have subscribed on the real lead's behalf
+  and routed wakes into it, and `--to` would have been ambiguous. Kill the
+  holder, wait for it to exit, or pick another name. Wake text also
+  neutralizes bidi and zero-width format characters, and a message body cannot
+  open a second `[atrium bus` frame (it is rendered `(atrium bus`).
+- The built-in fleets subscribe every agent to `work` in its kickoff, and the
+  lead's standing orders say what a `[atrium bus #` line is. The ctl guidance
+  every agent receives says the same.
+
 ## [0.37.0] - 2026-09-18
 
 ### Added

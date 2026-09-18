@@ -3885,3 +3885,98 @@ fn fleet_init_writes_a_builtin_or_the_users_template_and_never_overwrites() {
     assert!(stdout.contains("(shadows the built-in)"), "{stdout}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A plain `bus pub` on a topic the lead subscribed to is typed into the lead's
+/// pane — by a depth-1 worker, outside its own subtree. The bus used to be pull
+/// only: a finished worker's announcement sat unseen until the lead happened to
+/// run `bus feed`. The lead is a shell (unbound), so the wake lands after the
+/// unbound grace and is echoed by the shell, where the marker is read. The
+/// marker is spelled with the worker shell's quoting so the typed command's
+/// echo never contains it; only the delivered wake does.
+#[test]
+fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_subtree() {
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl bus --json sub work\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"subscribed\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "sub failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl spawn --here --role w -- {shell} {flag}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"w\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "spawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // `--here` focuses the worker: it publishes, unrouted, from depth 1.
+    let typed: &str = if cfg!(windows) {
+        "WAKE^^MARK1"
+    } else {
+        "'WAKE\"\"MARK1'"
+    };
+    p.write(format!("\"{atrium}\" ctl bus --json pub work --new msg={typed}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"seq\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "pub failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Back to the lead: the wake is typed there, framed and attributed.
+    p.write(b"\x01h").unwrap();
+    let out = read_until(&mut p, b"input]", Duration::from_secs(20));
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        contains(&out, b"teammate") && contains(&out, b"input]"),
+        "the subscriber was not woken: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(&out))
+    );
+}
+
+/// A worker's `--to` hand-off up to the pane that spawned it wakes that pane.
+/// The subtree rule used to drop it silently: the lead is not in the worker's
+/// subtree, so the most common hand-off of all never landed.
+#[test]
+fn a_workers_to_wakes_the_pane_that_spawned_it() {
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl spawn --here --role w -- {shell} {flag}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"w\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "spawn failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The lead is agent 0; the worker addresses it by id, nobody subscribed.
+    let typed: &str = if cfg!(windows) {
+        "WAKE^^MARK2"
+    } else {
+        "'WAKE\"\"MARK2'"
+    };
+    p.write(
+        format!("\"{atrium}\" ctl bus --json pub work --new --to 0 msg={typed}\r\n").as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"\"seq\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "pub failed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01h").unwrap();
+    let out = read_until(&mut p, b"input]", Duration::from_secs(20));
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        contains(&out, b"teammate") && contains(&out, b"input]"),
+        "the ancestor was not woken: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(&out))
+    );
+}
