@@ -79,6 +79,11 @@ pub const SUPPORTED_VENDORS: &[Vendor] = &[Vendor::ClaudeCode, Vendor::Codex];
 /// with the hyphen, not the display name). Recognising a stem does not imply a
 /// world is built for it — see [`SUPPORTED_VENDORS`].
 pub fn vendor_for_stem(stem: &str) -> Option<Vendor> {
+    // A numbered wrapper (`claude2`, a second account's shim) is claude here
+    // too, or its pane had no vendor: no status, no overview tag.
+    if crate::bind::is_claude_stem(stem) {
+        return Some(Vendor::ClaudeCode);
+    }
     match stem {
         "claude" => Some(Vendor::ClaudeCode),
         "gemini" => Some(Vendor::Gemini),
@@ -628,6 +633,7 @@ mod tests {
     #[test]
     fn claude_stem_and_root_are_wired() {
         assert_eq!(vendor_for_stem("claude"), Some(Vendor::ClaudeCode));
+        assert_eq!(vendor_for_stem("claude2"), Some(Vendor::ClaudeCode));
         assert_eq!(vendor_for_stem("definitely-not-an-agent"), None);
         assert_eq!(
             vendor_root(Vendor::ClaudeCode),

@@ -1597,12 +1597,16 @@ fn resume_session(
     let mut panes: Vec<Pane> = Vec::with_capacity(snap.panes.len());
     for record in &snap.panes {
         let argv = resume_argv(record);
+        let place = resume_place(record, |d| std::path::Path::new(d).is_dir());
+        if let Some(w) = &place.warning {
+            eprintln!("atrium recover: {w}");
+        }
         match spawn_pane_full(
             PaneSpec {
                 command: &argv,
                 id: record.id,
                 identity: record.identity.as_deref(),
-                cwd: record.cwd.as_deref(),
+                cwd: place.cwd.as_deref(),
                 // The pane's own posture, capped to the ceiling — not the ceiling
                 // itself, which would promote every de-escalated pane.
                 mode: recovered_pane_mode(record.mode, trust_mode()),
@@ -1610,7 +1614,7 @@ fn resume_session(
                 // instructions, and the context-store variables (allowlisted on
                 // read, so a snapshot cannot hand a pane any other environment).
                 extra_env: &record.context_env,
-                extra_norms: record.norms.as_deref(),
+                extra_norms: place.norms.as_deref(),
                 // The agent's own deny rules. `argv` never carried them: the
                 // `--disallowedTools` flags are built here, at spawn, from the
                 // roster — so a recovery that replayed argv alone handed every
@@ -1645,7 +1649,20 @@ fn resume_session(
                 panes.push(pane);
             }
             Err(e) => {
-                eprintln!("atrium recover: cannot start {:?}: {e}", argv[0]);
+                // Name the pane and where it was to start: the error alone
+                // blamed the command for a directory that was missing.
+                let (what, where_) = (
+                    pane_label(record),
+                    place
+                        .cwd
+                        .as_deref()
+                        .map(|d| format!(" in {d}"))
+                        .unwrap_or_default(),
+                );
+                eprintln!(
+                    "atrium recover: cannot start {what} ({:?}){where_}: {e}",
+                    argv[0]
+                );
                 for p in panes.iter_mut() {
                     let _ = p.pty.kill();
                 }
@@ -1699,6 +1716,49 @@ fn resume_session(
         // up` made it.
         topics,
     )
+}
+
+/// Where a recovered pane runs and which worktree instructions it keeps: its
+/// recorded directory and norms while that directory still exists. When it is
+/// gone — a worktree the fleet reaped after its item shipped — the pane starts
+/// in the project directory *without* the instructions, which would tell it it
+/// sits in a worktree it does not, and `warning` says so. Recovery used to hand
+/// the missing directory straight to the spawn and abort the whole session on
+/// its "file not found", blaming the command. Pure: `dir_exists` is injected.
+struct ResumePlace {
+    cwd: Option<String>,
+    norms: Option<String>,
+    warning: Option<String>,
+}
+
+fn resume_place(
+    record: &atrium::session::PaneRecord,
+    dir_exists: impl Fn(&str) -> bool,
+) -> ResumePlace {
+    match record.cwd.as_deref() {
+        Some(dir) if !dir_exists(dir) => ResumePlace {
+            cwd: None,
+            norms: None,
+            warning: Some(format!(
+                "{}: its directory {dir} is gone; starting in the project directory without its worktree instructions",
+                pane_label(record)
+            )),
+        },
+        _ => ResumePlace {
+            cwd: record.cwd.clone(),
+            norms: record.norms.clone(),
+            warning: None,
+        },
+    }
+}
+
+/// How a recovery message names a pane: its role, else its command.
+fn pane_label(record: &atrium::session::PaneRecord) -> String {
+    record
+        .role
+        .clone()
+        .or_else(|| record.argv.first().cloned())
+        .unwrap_or_else(|| format!("pane {}", record.id))
 }
 
 /// Build the recovery argv for one pane. For claude panes with a stored
@@ -3668,6 +3728,32 @@ mod tests {
         let got = super::resume_argv(&r);
         // no session_id → argv returned verbatim, --continue preserved
         assert_eq!(got, vec!["claude", "--continue"]);
+    }
+
+    /// A pane whose directory is gone starts in the project directory, loses
+    /// the worktree instructions that would now be false, and says so; one
+    /// whose directory exists keeps both, quietly.
+    #[test]
+    fn a_pane_whose_directory_is_gone_starts_in_the_project_without_its_norms() {
+        let mut r = pane_record(vec!["claude".into()], None);
+        r.role = Some("builder".into());
+        r.cwd = Some("/wt/piece".into());
+        r.norms = Some("You are in git worktree piece".into());
+        let gone = super::resume_place(&r, |_| false);
+        assert_eq!(gone.cwd, None);
+        assert_eq!(gone.norms, None);
+        let w = gone.warning.expect("the operator is told");
+        assert!(w.starts_with("builder: "), "{w}");
+        assert!(w.contains("/wt/piece is gone"), "{w}");
+        let kept = super::resume_place(&r, |_| true);
+        assert_eq!(kept.cwd.as_deref(), Some("/wt/piece"));
+        assert_eq!(kept.norms.as_deref(), Some("You are in git worktree piece"));
+        assert_eq!(kept.warning, None);
+        // No directory recorded: nothing to check, nothing to say.
+        r.cwd = None;
+        let none = super::resume_place(&r, |_| false);
+        assert_eq!(none.cwd, None);
+        assert_eq!(none.warning, None);
     }
 
     #[test]

@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.36.1] - 2026-09-17
 
 ### Fixed
+- **A second account's claude ran with none of atrium's launch rules.** A
+  fleet whose command is a numbered wrapper — `claude2`, a shim that sets
+  `CLAUDE_CONFIG_DIR` and runs `claude` — was not recognized as claude, so its
+  panes launched with no trust posture, no deny list, no `--session-id` (no
+  status, nothing to resume), and neither the ctl directive nor their worktree
+  instructions folded in; `ctl spawn` refused the command as not an agent. All
+  of it silently. `claude` followed by digits is now claude in every rule.
+  Other `claude…` names (`claude-code-router`, `claudeflow`) are still other
+  programs. With it, transcripts are read from `$CLAUDE_CONFIG_DIR/projects`
+  when that variable is set for atrium (nativelite-agsess 0.2.3); a wrapper
+  that sets the variable only for the agent still binds nothing, so set it for
+  the atrium process too.
+- **Recovery died on a reaped worktree, blaming the command.** A pane whose
+  recorded directory no longer exists (a worktree the fleet removed after its
+  item shipped) made `atrium recover` abort the whole session with
+  `cannot start "claude2": The system cannot find the file specified`. The pane
+  now starts in the project directory without its worktree instructions, and
+  the warning names the pane and the directory; a spawn that still fails names
+  the pane and where it was to start.
 - **A restarted pane was clipped to the top-left of its tile.** `ctl respawn`
   (0.36.0) started the replacement at the terminal's size and never re-tiled,
   so its screen was larger than the tile it is drawn into: text was cut off at

@@ -25,7 +25,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-agsess"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "nativelite-json",
 ]

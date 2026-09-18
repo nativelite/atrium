@@ -50,7 +50,7 @@ const USER_SESSION_ARGS: &[&str] = &["--session-id", "--resume", "-r", "--contin
 /// (its title, as atrium already derives it) is in [`AGENT_STEMS`]. Non-agent
 /// panes (shells, editors) are never bound and never get agent chrome.
 pub fn is_agent_stem(stem: &str) -> bool {
-    AGENT_STEMS.contains(&stem)
+    AGENT_STEMS.contains(&stem) || is_claude_stem(stem)
 }
 
 /// Does this stem speak Claude Code's CLI dialect? True only for a claude stem.
@@ -59,7 +59,19 @@ pub fn is_agent_stem(stem: &str) -> bool {
 /// so a non-claude agent — recognized as an agent by [`is_agent_stem`] — still
 /// launches with its own command untouched.
 pub fn is_claude_stem(stem: &str) -> bool {
-    CLAUDE_STEMS.contains(&stem)
+    CLAUDE_STEMS.contains(&stem) || is_claude_wrapper_stem(stem)
+}
+
+/// A numbered claude wrapper — `claude2`, `claude3` — is claude: the name a
+/// second account's shim gets (a `.cmd` or script that sets `CLAUDE_CONFIG_DIR`
+/// and runs `claude`). It used to fall outside every claude rule, so such a
+/// fleet launched with no trust posture, no deny list, no `--session-id` and
+/// no ctl directive or worktree norms, and `ctl spawn` refused it as not an
+/// agent — all silently. Only digits qualify: `claude-code-router` or
+/// `claudeflow` are other programs.
+fn is_claude_wrapper_stem(stem: &str) -> bool {
+    stem.strip_prefix("claude")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Extract a command's **stem** (basename without extension) in a way that is
@@ -305,6 +317,34 @@ mod tests {
         for stem in ["gemini", "codex", "aider", "cursor-agent", "cmd", "bash"] {
             assert!(!is_claude_stem(stem), "{stem} is not claude");
         }
+    }
+
+    /// A second account's shim is claude in every rule: the dialect (trust
+    /// flags, deny list, session id, system-prompt folds) and agent treatment
+    /// (`ctl spawn`, status chrome). Other `claude…` programs are not.
+    #[test]
+    fn a_numbered_claude_wrapper_is_claude() {
+        for stem in ["claude2", "claude3", "claude10"] {
+            assert!(is_claude_stem(stem), "{stem} speaks the claude dialect");
+            assert!(is_agent_stem(stem), "{stem} is an agent");
+            assert!(
+                session_id_for(&cmd(&[stem, "--model", "opus"])).is_some(),
+                "{stem} binds"
+            );
+        }
+        for stem in [
+            "claude-code-router",
+            "claudeflow",
+            "claude_x",
+            "claude-2",
+            "2claude",
+        ] {
+            assert!(!is_claude_stem(stem), "{stem} is another program");
+        }
+        // The stem rule applies after the path/extension are stripped.
+        assert!(is_claude_stem(&command_stem(
+            r"C:\Users\u\.local\bin\claude2.cmd"
+        )));
     }
 
     #[test]
