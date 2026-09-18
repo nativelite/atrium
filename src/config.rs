@@ -110,17 +110,194 @@ impl GlobalConfig {
 /// else. Unset ⇒ `config.json` under [`crate::fleet::global_dir`].
 pub const ENV_CONFIG: &str = "ATRIUM_CONFIG";
 
-/// The file's path: [`ENV_CONFIG`] when set, else `%APPDATA%\atrium\config.json`
-/// / `~/.config/atrium/config.json`, or `None` when neither is set. Beside the
-/// global fleet file by default; each moves on its own variable.
+/// The file's path, however it was resolved ([`resolve`]).
 pub fn global_path() -> Option<PathBuf> {
-    crate::fleet::global_file(ENV_CONFIG, "config.json")
+    resolve().path
 }
 
-/// Whether the path was named explicitly ([`ENV_CONFIG`]), in which case a
-/// missing file is an error rather than "no config".
-fn path_is_explicit() -> bool {
-    std::env::var_os(ENV_CONFIG).is_some_and(|v| !v.is_empty())
+/// The platform default: `config.json` under [`crate::fleet::global_dir`].
+pub fn default_path() -> Option<PathBuf> {
+    crate::fleet::global_dir().map(|d| d.join("config.json"))
+}
+
+/// The pointer atrium keeps at the platform place, naming where the config
+/// actually lives: one line, the full path. Written by first-run setup and
+/// `atrium config init`, so a config kept elsewhere is found on every later
+/// launch without a variable in every shell. Its presence is also the "asked
+/// once" marker: with it there, first-run setup never asks again. atrium's
+/// file, not the operator's — though it is plain text if they need it.
+pub fn pointer_path() -> Option<PathBuf> {
+    crate::fleet::global_dir().map(|d| d.join("config.path"))
+}
+
+/// How the config's path was decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// [`ENV_CONFIG`] named it.
+    Env,
+    /// The pointer file named it.
+    Pointer,
+    /// The platform default, nothing else said.
+    Default,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub path: Option<PathBuf>,
+    pub source: Source,
+}
+
+/// Where the config is read from: [`ENV_CONFIG`] first (explicit, for a script
+/// or a test), then the pointer, then the platform default.
+pub fn resolve() -> Resolved {
+    let pointer = pointer_path().and_then(|p| std::fs::read_to_string(p).ok());
+    resolve_from(
+        std::env::var_os(ENV_CONFIG).as_deref(),
+        pointer.as_deref(),
+        default_path(),
+    )
+}
+
+/// [`resolve`] over explicit inputs. An empty variable or a blank pointer
+/// counts as unset.
+pub fn resolve_from(
+    env: Option<&std::ffi::OsStr>,
+    pointer_text: Option<&str>,
+    default: Option<PathBuf>,
+) -> Resolved {
+    if let Some(p) = env.filter(|v| !v.is_empty()) {
+        return Resolved {
+            path: Some(PathBuf::from(p)),
+            source: Source::Env,
+        };
+    }
+    if let Some(line) = pointer_text.and_then(|t| t.lines().next()).map(str::trim) {
+        if !line.is_empty() {
+            return Resolved {
+                path: Some(PathBuf::from(line)),
+                source: Source::Pointer,
+            };
+        }
+    }
+    Resolved {
+        path: default,
+        source: Source::Default,
+    }
+}
+
+/// True when nothing has decided where the config lives and no default file
+/// exists: the state first-run setup asks in.
+pub fn needs_first_run() -> bool {
+    let r = resolve();
+    r.source == Source::Default && !r.path.as_deref().is_some_and(Path::is_file)
+}
+
+/// A starter file: every key present with its default, so it parses to the
+/// defaults and reads as documentation of what can be set.
+pub const STARTER: &str = r#"{
+  "claude_aliases": {},
+  "deny": [],
+  "ctl_allow": [],
+  "trust_allow": [],
+  "build_jobs": null,
+  "memory_mb": null,
+  "fleet_defaults": {
+    "trust": null,
+    "identity": null,
+    "allow_ctl": null,
+    "grid": null
+  }
+}
+"#;
+
+/// What `init` did.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Init {
+    pub config: PathBuf,
+    /// The pointer written, when the platform place exists to hold one.
+    pub pointer: Option<PathBuf>,
+}
+
+/// Write the starter config at `path` and point the platform place at it.
+/// Refuses to overwrite: an existing file is the operator's. The pointer is
+/// written even for the default path, so first-run setup asks exactly once.
+pub fn init_at(path: &Path) -> Result<Init, String> {
+    init_with_pointer(path, pointer_path().as_deref())
+}
+
+/// [`init_at`] with the pointer's location injected.
+pub fn init_with_pointer(path: &Path, pointer: Option<&Path>) -> Result<Init, String> {
+    if path.exists() {
+        return Err(format!(
+            "{} already exists; edit it, or remove it to start over",
+            path.display()
+        ));
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(path, STARTER).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let mut written = None;
+    if let Some(ptr) = pointer {
+        if let Some(dir) = ptr.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(ptr, format!("{}\n", path.display()))
+            .map_err(|e| format!("write {}: {e}", ptr.display()))?;
+        written = Some(ptr.to_path_buf());
+    }
+    Ok(Init {
+        config: path.to_path_buf(),
+        pointer: written,
+    })
+}
+
+/// The path a first-run answer means: Enter (or blanks) is the default; anything
+/// else is a path, `~` expanded, surrounding quotes dropped.
+pub fn answer_to_path(line: &str, default: &Path, home: Option<&Path>) -> PathBuf {
+    let t = line.trim().trim_matches('"').trim_matches('\'').trim();
+    if t.is_empty() {
+        default.to_path_buf()
+    } else {
+        expand_home(t, home)
+    }
+}
+
+/// Ask where the config should live and write it there. Only when a human is
+/// present (stdin is a terminal and `ATRIUM_YES` is unset) and nothing has
+/// decided yet ([`needs_first_run`]); a script or a test gets no question and
+/// no file. Errors are reported, not fatal: the launch goes on with defaults.
+pub fn first_run_setup() {
+    use std::io::IsTerminal;
+    if !needs_first_run()
+        || std::env::var_os("ATRIUM_YES").is_some()
+        || !std::io::stdin().is_terminal()
+    {
+        return;
+    }
+    let Some(default) = default_path() else {
+        return;
+    };
+    eprintln!("atrium: first run — a user-global config.json holds what you want in force for every project.");
+    eprint!(
+        "Global config file location (Enter for default: {}): ",
+        default.display()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut line = String::new();
+    if !matches!(std::io::stdin().read_line(&mut line), Ok(n) if n > 0) {
+        return; // end of input: nobody answered, ask again next time
+    }
+    let path = answer_to_path(&line, &default, home().as_deref());
+    match init_at(&path) {
+        Ok(done) => {
+            eprintln!("atrium: wrote {}", done.config.display());
+            if let Some(p) = done.pointer {
+                eprintln!("atrium: remembered it in {}", p.display());
+            }
+        }
+        Err(e) => eprintln!("atrium: config not written: {e}"),
+    }
 }
 
 /// Parse the file's text. Every key is optional; a key of the wrong shape is an
@@ -272,24 +449,34 @@ fn home() -> Option<PathBuf> {
 /// place; a path named by [`ENV_CONFIG`] must exist (you asked for a file that
 /// is not there).
 pub fn load() -> Result<Option<GlobalConfig>, String> {
-    let Some(path) = global_path() else {
+    let r = resolve();
+    let Some(path) = r.path else {
         return Ok(None);
     };
-    read(&path, path_is_explicit())
+    read(&path, r.source)
 }
 
-/// [`load`] over an explicit path. `explicit` says whether a missing file is an
-/// error (the path was named) or simply no config (the platform default).
-pub fn read(path: &Path, explicit: bool) -> Result<Option<GlobalConfig>, String> {
+/// [`load`] over an explicit path. A missing file is no config at the platform
+/// default, and an error naming what pointed there otherwise.
+pub fn read(path: &Path, source: Source) -> Result<Option<GlobalConfig>, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text)
             .map(Some)
             .map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !explicit => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "{}: named by {ENV_CONFIG} but not there",
-            path.display()
-        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match source {
+            Source::Default => Ok(None),
+            Source::Env => Err(format!(
+                "{}: named by {ENV_CONFIG} but not there",
+                path.display()
+            )),
+            Source::Pointer => Err(format!(
+                "{}: named by {} but not there (run `atrium config init`, or fix the pointer)",
+                path.display(),
+                pointer_path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "the config pointer".to_string())
+            )),
+        },
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
@@ -474,25 +661,121 @@ mod tests {
     }
 
     /// A missing file at the default place is no config; a missing file at a
-    /// path someone named is an error that says so. A present file reads.
+    /// path someone named is an error that says who named it. A present file
+    /// reads.
     #[test]
     fn a_named_but_missing_file_is_an_error_a_default_one_is_none() {
         let dir = std::env::temp_dir().join(format!("atrium-config-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let missing = dir.join("nope.json");
-        assert_eq!(read(&missing, false).unwrap(), None);
-        let err = read(&missing, true).unwrap_err();
+        assert_eq!(read(&missing, Source::Default).unwrap(), None);
+        let err = read(&missing, Source::Env).unwrap_err();
         assert!(
             err.contains(ENV_CONFIG) && err.contains("nope.json"),
+            "{err}"
+        );
+        let err = read(&missing, Source::Pointer).unwrap_err();
+        assert!(
+            err.contains("config init") && err.contains("nope.json"),
             "{err}"
         );
         let present = dir.join("config.json");
         std::fs::write(&present, r#"{"claude_aliases":["claude2"]}"#).unwrap();
         assert_eq!(
-            read(&present, true).unwrap().unwrap().alias_names(),
+            read(&present, Source::Pointer)
+                .unwrap()
+                .unwrap()
+                .alias_names(),
             vec!["claude2"]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The variable wins, then the pointer's first non-blank line, then the
+    /// default; an empty variable or a blank pointer is unset.
+    #[test]
+    fn resolution_is_env_then_pointer_then_default() {
+        use std::ffi::OsStr;
+        let default = Some(PathBuf::from("/cfg/config.json"));
+        let r = resolve_from(
+            Some(OsStr::new("/env/c.json")),
+            Some("/ptr/c.json\n"),
+            default.clone(),
+        );
+        assert_eq!(
+            r,
+            Resolved {
+                path: Some("/env/c.json".into()),
+                source: Source::Env
+            }
+        );
+        let r = resolve_from(
+            Some(OsStr::new("")),
+            Some("  /ptr/c.json  \n"),
+            default.clone(),
+        );
+        assert_eq!(
+            r,
+            Resolved {
+                path: Some("/ptr/c.json".into()),
+                source: Source::Pointer
+            }
+        );
+        let r = resolve_from(None, Some("\n"), default.clone());
+        assert_eq!(
+            r,
+            Resolved {
+                path: default.clone(),
+                source: Source::Default
+            }
+        );
+        let r = resolve_from(None, None, None);
+        assert_eq!(
+            r,
+            Resolved {
+                path: None,
+                source: Source::Default
+            }
+        );
+    }
+
+    /// `init` writes the starter (which parses to the defaults) and the pointer,
+    /// refuses to overwrite, and the pointer names the config's full path.
+    #[test]
+    fn init_writes_the_starter_and_the_pointer_once() {
+        assert_eq!(
+            parse_with_home(STARTER, home()).unwrap(),
+            GlobalConfig::default()
+        );
+        let dir = std::env::temp_dir().join(format!("atrium-config-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = dir.join("elsewhere").join("config.json");
+        let ptr = dir.join("platform").join("config.path");
+        let done = init_with_pointer(&cfg, Some(&ptr)).unwrap();
+        assert_eq!(done.config, cfg);
+        assert_eq!(done.pointer.as_deref(), Some(ptr.as_path()));
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), STARTER);
+        let pointed = std::fs::read_to_string(&ptr).unwrap();
+        assert_eq!(pointed.trim(), cfg.display().to_string());
+        let again = init_with_pointer(&cfg, Some(&ptr)).unwrap_err();
+        assert!(again.contains("already exists"), "{again}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_first_run_answer_is_the_default_or_a_path() {
+        let d = Path::new("/cfg/config.json");
+        let h = Path::new("/home/u");
+        assert_eq!(answer_to_path("", d, Some(h)), d);
+        assert_eq!(answer_to_path("  \n", d, Some(h)), d);
+        assert_eq!(
+            answer_to_path("~/dots/atrium.json\n", d, Some(h)),
+            h.join("dots/atrium.json")
+        );
+        assert_eq!(
+            answer_to_path("\"/x/y.json\"", d, Some(h)),
+            PathBuf::from("/x/y.json")
+        );
     }
 }

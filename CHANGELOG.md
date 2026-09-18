@@ -20,6 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
   Precedence, lowest to highest: the file, the fleet's key, the `ATRIUM_*`
   variable, a flag. Absent is fine; malformed is an error at launch. (#4)
+- **First-run setup and `atrium config`.** The first `fleet up` or `recover` on a
+  machine asks once where the user-global config should live (Enter takes the
+  default), writes a starter there and remembers the answer in `config.path`
+  beside the default — atrium's own pointer, so a config kept elsewhere is found
+  on every later launch and an upgrade never asks again. `atrium config init
+  [--at <path>]` does the same by hand; `atrium config path` shows where it
+  resolved and why. A script or a test (no terminal, or `ATRIUM_YES`) is never
+  asked and nothing is written.
 - **`ATRIUM_CONFIG` and `ATRIUM_FLEET`** name the full path of each user-global
   file for anyone who keeps them somewhere else; a config path that is named
   but missing is an error. Unset, both sit under `%APPDATA%\atrium` /
