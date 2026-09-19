@@ -7,48 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.37.0] - 2026-09-18
-
-### Added
-- **`atrium fleet init <template> [--agents N]` and three built-in reference
-  fleets.** `solo`, `pair` and `crew` are compiled into atrium: runnable
-  statements of how a fleet is meant to run — the lead plans and sizes items,
-  delegates one per fresh teammate and reaps it on checkpoint, reviews in
-  fresh sessions and restarts itself from `PLAN.md` and the board; builders
-  in their own worktrees. `init` writes `./atrium.fleet.json` from a built-in
-  or from one of your own fleets in the user-global `fleet.json` (yours wins
-  over a built-in of the same name, and `init` says so), copied as written;
-  it never overwrites. `--agents N` scales the builders. `atrium fleet ls
-  --templates` lists both sources. (#5)
-- **A user-global `config.json`** beside the global fleet file
-  (`%APPDATA%\atrium\config.json` / `~/.config/atrium/config.json`): what an
-  operator wants in force on this machine for every project, without exporting
-  the same variables into every terminal. `claude_aliases` (a list, or a map
-  whose entries may name the `config_dir` that claude runs under — atrium then
-  reads that account's transcripts and keeps its folder trust there, so a
-  second account's panes bind, show status and recover), `deny`, `ctl_allow`,
-  `trust_allow` (merged with their variables and the fleet's), `build_jobs` and
-  `memory_mb` (defaults for fleets that set neither) and `fleet_defaults`
-  (`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
-  Precedence, lowest to highest: the file, the fleet's key, the `ATRIUM_*`
-  variable, a flag. Absent is fine; malformed is an error at launch. (#4)
-- **First-run setup and `atrium config`.** The first `fleet up` or `recover` on a
-  machine asks once where the user-global config should live (Enter takes the
-  default), writes a starter there and remembers the answer in `config.path`
-  beside the default — atrium's own pointer, so a config kept elsewhere is found
-  on every later launch and an upgrade never asks again. `atrium config init
-  [--at <path>]` does the same by hand; `atrium config path` shows where it
-  resolved and why. A script or a test (no terminal, or `ATRIUM_YES`) is never
-  asked and nothing is written.
-- **`ATRIUM_CONFIG` and `ATRIUM_FLEET`** name the full path of each user-global
-  file for anyone who keeps them somewhere else; a config path that is named
-  but missing is an error. Unset, both sit under `%APPDATA%\atrium` /
-  `~/.config/atrium` as before.
-- **The atrium skills** (marketplace plugin 0.2.8): `atrium-coordinate` and
-  `atrium-delegate` subscribe first, address hand-offs with `--to`, and say
-  what a `[atrium bus #` line is; `atrium-fleet` starts a roster from
-  `atrium fleet init`, names the template library and `config.json`, and
-  puts a subscription in every kickoff.
+## [0.37.1] - 2026-09-18
 
 ### Changed
 - **One shape of help, everywhere.** `atrium --help`, `atrium ctl --help`,
@@ -89,6 +48,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The built-in fleets subscribe every agent to `work` in its kickoff, and the
   lead's standing orders say what a `[atrium bus #` line is. The ctl guidance
   every agent receives says the same.
+- **The atrium skills** (marketplace plugin 0.2.8): `atrium-coordinate` and
+  `atrium-delegate` subscribe first, address hand-offs with `--to`, and say
+  what a `[atrium bus #` line is; `atrium-fleet` starts a roster from
+  `atrium fleet init`, names the template library and `config.json`, and
+  puts a subscription in every kickoff.
+
+## [0.37.0] - 2026-09-18
+
+### Added
+- **`atrium fleet init <template> [--agents N]` and three built-in reference
+  fleets.** `solo`, `pair` and `crew` are compiled into atrium: runnable
+  statements of how a fleet is meant to run — the lead plans and sizes items,
+  delegates one per fresh teammate and reaps it on checkpoint, reviews in
+  fresh sessions and restarts itself from `PLAN.md` and the board; builders
+  in their own worktrees. `init` writes `./atrium.fleet.json` from a built-in
+  or from one of your own fleets in the user-global `fleet.json` (yours wins
+  over a built-in of the same name, and `init` says so), copied as written;
+  it never overwrites. `--agents N` scales the builders. `atrium fleet ls
+  --templates` lists both sources. (#5)
+- **A user-global `config.json`** beside the global fleet file
+  (`%APPDATA%\atrium\config.json` / `~/.config/atrium/config.json`): what an
+  operator wants in force on this machine for every project, without exporting
+  the same variables into every terminal. `claude_aliases` (a list, or a map
+  whose entries may name the `config_dir` that claude runs under — atrium then
+  reads that account's transcripts and keeps its folder trust there, so a
+  second account's panes bind, show status and recover), `deny`, `ctl_allow`,
+  `trust_allow` (merged with their variables and the fleet's), `build_jobs` and
+  `memory_mb` (defaults for fleets that set neither) and `fleet_defaults`
+  (`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
+  Precedence, lowest to highest: the file, the fleet's key, the `ATRIUM_*`
+  variable, a flag. Absent is fine; malformed is an error at launch. (#4)
+- **First-run setup and `atrium config`.** The first `fleet up` or `recover` on a
+  machine asks once where the user-global config should live (Enter takes the
+  default), writes a starter there and remembers the answer in `config.path`
+  beside the default — atrium's own pointer, so a config kept elsewhere is found
+  on every later launch and an upgrade never asks again. `atrium config init
+  [--at <path>]` does the same by hand; `atrium config path` shows where it
+  resolved and why. A script or a test (no terminal, or `ATRIUM_YES`) is never
+  asked and nothing is written.
+- **`ATRIUM_CONFIG` and `ATRIUM_FLEET`** name the full path of each user-global
+  file for anyone who keeps them somewhere else; a config path that is named
+  but missing is an error. Unset, both sit under `%APPDATA%\atrium` /
+  `~/.config/atrium` as before.
 
 ## [0.36.1] - 2026-09-17
 
@@ -1656,7 +1658,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.37.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.37.1...HEAD
+[0.37.1]: https://github.com/nativelite/atrium/compare/v0.37.0...v0.37.1
 [0.37.0]: https://github.com/nativelite/atrium/compare/v0.36.1...v0.37.0
 [0.36.1]: https://github.com/nativelite/atrium/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/nativelite/atrium/compare/v0.35.1...v0.36.0
