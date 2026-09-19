@@ -55,14 +55,18 @@ do NOT return a value to you.
     atrium ctl status [<role>]   # which teammates are working vs idle
     atrium ctl kill <role>       # reap a teammate once you have collected its part
 
-When a teammate reports done, read its checkpoint (`board get <part>`,
-`git show <sha>`) and check the work against the brief, then reap it. Don't leave
-a finished teammate running.
+Tell each teammate in its brief to post `atrium ctl bus pub <topic> --to <your
+role> msg=done commit=<sha>` when it finishes: that line is typed into your pane
+once you are idle (`[atrium bus #… from teammate "<role>" …]`), so you need not
+poll. Then read its checkpoint (`board get <part>`, `git show <sha>`) and check
+the work against the brief, then reap it. Don't leave a finished teammate
+running.
 
 ## Full surface & discovery
 
     atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl bus pub <topic> [--to <role>[,...]] <field=value...> | bus sub <topic...>
 
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles
 it beside you (vs a new window); `--mode` picks a teammate's permission mode

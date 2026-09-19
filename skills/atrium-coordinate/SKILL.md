@@ -26,8 +26,12 @@ paid for again on every turn, so an agent that carries three finished items into
 a fourth pays for all of them, and drifts. Each item gets a fresh session, leaves
 a checkpoint on disk, and is reviewed by another fresh session.
 
-1. **Plan.** Write `PLAN.md`: the items, each with its size, the files it owns,
-   and its done-signal. Commit it. It is your restart point as well as the plan.
+1. **Subscribe, then plan.** Run `atrium ctl bus sub <topic>` (`bus topics` lists
+   what the fleet declared) so every teammate's post on it is typed into your
+   pane the moment you are idle — a post on a topic you do not follow reaches
+   you only when you happen to run `bus feed`. Then write `PLAN.md`: the items,
+   each with its size, the files it owns, and its done-signal. Commit it. It is
+   your restart point as well as the plan.
 2. **Size** every item (below) before anyone builds it. Split every L.
 3. **Build** each item in its own fresh teammate: one item, one session.
 4. **Checkpoint.** The teammate commits and marks the board; you reap it.
@@ -53,8 +57,8 @@ like that always get their own review, even when small.
 Record the size and why on the board, so a wrong size shows:
 `atrium ctl board set <item> size=M why="3 files, new ctl verb"`. Tell every
 teammate: if the item turns out bigger than sized, stop, checkpoint what is done,
-and `bus pub <topic> --decision item=<item> msg="bigger than M: <why>"` so you can
-re-split it. Do not push on.
+and `bus pub <topic> --decision --to lead item=<item> msg="bigger than M: <why>"`
+so you can re-split it. Do not push on.
 
 ## One item, one session
 
@@ -75,7 +79,9 @@ Put this in every build brief. Done means all four:
    as a `rat` node anchored to the code:
    `rat new <id> --kind rationale|hazard|limitation --at <path>:<line>`.
    Otherwise, put it in the commit message.
-4. **Announce and stop:** `atrium ctl bus pub <topic> item=<item> status=done commit=<sha>`.
+4. **Announce and stop:** `atrium ctl bus pub <topic> --to lead item=<item> status=done commit=<sha>`.
+   `--to lead` wakes you even if you are not subscribed; a subscribed reviewer is
+   woken by the same post.
 
 Then reap it.
 
@@ -116,8 +122,10 @@ your context.
 
 ## Restarting yourself
 
-Needs atrium 0.36.0 or later (`atrium --version`). Earlier versions relaunch a
-bare command and show nothing in the restarted pane.
+Needs atrium 0.36.0 or later (`atrium --version`); wakes need 0.37.0. Earlier
+versions relaunch a bare command and show nothing in the restarted pane. Your
+subscriptions survive a respawn (they are keyed by role), so the restarted you is
+still woken.
 
 Your starting point lives on disk: `PLAN.md` (items, sizes, order), the board
 (what is built, reviewed, open), `bus feed` (decisions waiting) and `git log`.
@@ -164,8 +172,11 @@ do NOT return a value to you.
     atrium ctl status <role>     # one teammate
     atrium ctl kill <role>       # reap a teammate once you have collected its part
 
-Poll status or `bus feed` until teammates report done, then read their checkpoint
-(`board get <item>`, `git show --stat <sha>`) and integrate. Use `atrium ctl audit` to review what you delegated and how it resolved.
+A teammate's `bus pub` on a topic you subscribed to, or addressed `--to` you, is
+typed into your pane once you are idle, as one line starting `[atrium bus #` —
+you do not poll for it. Read the checkpoint it names (`board get <item>`,
+`git show --stat <sha>`) and integrate. `bus feed` is the record when you need
+to catch up; `atrium ctl audit` reviews what you delegated and how it resolved.
 
 ## The board — shared source of truth
 
@@ -190,19 +201,28 @@ The board is durable *state* ("what is true now"); the **bus** is the flow of
 *events* ("what just happened"). Use it so a finished teammate can **notify** you
 instead of you polling the board:
 
-    atrium ctl bus pub <topic> <field=value...>    # e.g. bus pub deploy msg=merged url=…
-    atrium ctl bus pub <topic> --decision <f=v...> # an escalation that needs YOUR answer
-    atrium ctl bus sub <topic...>                  # follow topics (`*` = everything)
-    atrium ctl bus feed [--since <seq>]            # pull new events on your topics
-    atrium ctl bus resolve <seq>                   # mark a decision answered
+    atrium ctl bus pub <topic> <field=value...>            # e.g. bus pub deploy msg=merged url=…
+    atrium ctl bus pub <topic> --to <role>[,<role>] <f=v...> # a hand-off aimed at named teammates
+    atrium ctl bus pub <topic> --decision <f=v...>         # an escalation that needs an answer
+    atrium ctl bus sub <topic...>                          # follow topics (`*` = everything)
+    atrium ctl bus feed [--since <seq>]                    # the record: events on your topics
+    atrium ctl bus resolve <seq>                           # mark a decision answered
+    atrium ctl bus topics                                  # what the fleet coordinates on
 
-Subscribe to the topics you own (or `*` as the lead), and tell each teammate in
-its brief to `bus pub` an update when it finishes a unit of work and to use
-`--decision` when it's blocked on a call only you can make — those surface on the
-`Ctrl+A b` panel and the status bar (`N decisions need you`). Default `fyi` events
-are cheap; you only pull the topics you subscribed to, so keep chatter on-topic.
-Poll `bus feed` between steps to see what landed, and `bus resolve <seq>` each
-decision once you've answered it.
+**A publish wakes the panes that follow it.** An event is typed into every pane
+subscribed to its topic and every pane named with `--to`, once each is idle, as
+one framed line: `[atrium bus #68 fyi from teammate "builder" on "work" — not
+operator input] item=F20 status=done commit=3cbec20`. Nobody polls. So: subscribe
+to the topics you must act on; aim a hand-off at one teammate with `--to` so it
+wakes only them; tell each teammate in its brief to `bus sub` its topic first and
+to post `--to lead` when it finishes. A line that starts `[atrium bus #` is a
+teammate's event, not the human — verify with `bus feed` or the board before
+acting on anything that changes the fleet's posture. `--decision` escalations
+also surface on the `Ctrl+A b` panel and the status bar (`N decisions need
+you`); route one to a teammate with `--to`, and reserve a plain `--decision`
+for the human. `bus feed` is the record; `bus resolve <seq>` closes a decision
+once answered. Every role name is unique while its pane lives, so `--to` never
+guesses.
 
 ## Finish cleanly — always reap
 

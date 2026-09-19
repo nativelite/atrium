@@ -34,10 +34,14 @@ want you to fan work out *right now* from inside a running pane → the runtime 
 2. **Propose a roster** in prose first: one line per agent (name, model, what it
    owns, whether it gets a worktree, **which build/test commands it may run**).
    Get a nod before writing JSON.
-3. **Write the instruction layers, then `atrium.fleet.json`** (schema below): the
-   committed `CLAUDE.md` with the fleet's shared rules and resource budget, a
-   per-agent `prompt`, and a short kickoff. Prefer explicit `model`/`worktree`
-   keys over stuffing flags into `cmd`.
+3. **Start from a template, then edit.** `atrium fleet init crew` (or `solo`,
+   `pair`, or one of the user's own from the global `fleet.json` — `atrium fleet
+   ls --templates` is the menu) writes `./atrium.fleet.json` with the roster,
+   prompts and kickoffs that encode the short-session loop below; `--agents N`
+   scales the builders. It never overwrites. Then write the instruction layers
+   (schema below): the committed `CLAUDE.md` with the fleet's shared rules and
+   resource budget, and edit the per-agent `prompt` and kickoff to the project.
+   Prefer explicit `model`/`worktree` keys over stuffing flags into `cmd`.
 4. **Explain the launch line and the settings you chose**, then let them run it.
 5. **Iterate.** Fleet files are cheap to edit and re-run; tune and relaunch.
 
@@ -53,7 +57,20 @@ merge):
 
 A cwd file **shadows** the global one — if both exist, only the cwd file is read.
 So a per-project fleet must live in that project's `atrium.fleet.json`. `atrium
-fleet ls` lists the fleets in whichever file was found.
+fleet ls` lists the fleets in whichever file was found. The global file is also
+the user's **template library**: `atrium fleet init <name>` copies a fleet from
+it into the project as written, and a fleet there named like a built-in wins
+over the built-in. `ATRIUM_FLEET` names the global file's full path for anyone
+who keeps it elsewhere.
+
+Beside it lives the user-global **`config.json`** (`atrium config path` shows
+where): `claude_aliases` (a second account's shim such as `claude2`, with the
+`config_dir` it runs under, so its panes bind and recover), session-wide `deny`,
+`ctl_allow`, `trust_allow`, `build_jobs`, `memory_mb`, and `fleet_defaults`
+(`trust`, `identity`, `allow_ctl`, `grid` for fleets that leave them out).
+Precedence, lowest to highest: config.json, the fleet's key, the `ATRIUM_*`
+variable, a flag. If a fleet's command is not plain `claude`, name it there or
+the pane gets none of atrium's launch rules.
 
 ## Schema
 
@@ -136,11 +153,11 @@ Launch arg order per agent: `cmd… [--add-dir …] [--append-system-prompt prom
         { "name": "api", "cmd": ["claude", "--model", "sonnet"], "worktree": "api",
           "deny": ["cargo test --workspace", "cargo build --workspace", "python dev.py check"],
           "prompt": "You own crates/api. Build and test only that crate: cargo test -p api.",
-          "kickoff": "You own crates/api in your own worktree (already placed — don't cd, commit on your branch). Implement per PLAN.md, `cargo test -p api` green, commit, then `atrium ctl bus pub build msg=api done`." },
+          "kickoff": "You own crates/api in your own worktree (already placed — don't cd, commit on your branch). Implement per PLAN.md, `cargo test -p api` green, commit, then `atrium ctl bus pub build --to lead msg=api done`." },
         { "name": "store", "cmd": ["claude", "--model", "sonnet"], "worktree": "store",
           "deny": ["cargo test --workspace", "cargo build --workspace", "python dev.py check"],
           "prompt": "You own crates/store. Build and test only that crate: cargo test -p store.",
-          "kickoff": "You own crates/store in your own worktree. … `atrium ctl bus pub build msg=store done`." },
+          "kickoff": "You own crates/store in your own worktree. … `atrium ctl bus pub build --to lead msg=store done`." },
         { "name": "reviewer", "cmd": ["claude", "--model", "opus"],
           "kickoff": "Adversarial reviewer in the main tree. Verify each branch against real behavior; block the integrator on the bus until issues are fixed. Don't rubber-stamp." },
         { "name": "integrator", "cmd": ["claude", "--model", "sonnet"],
@@ -154,6 +171,8 @@ Launch arg order per agent: `cmd… [--add-dir …] [--append-system-prompt prom
 ## Launch & manage
 
 ```
+atrium fleet init <template> [--agents N]          # start ./atrium.fleet.json from solo | pair | crew | yours
+atrium fleet ls --templates                         # the built-ins and the user's own templates
 atrium fleet up <name> [--allow-ctl] [--trust <policy>] [--max-depth N]
 atrium --trust automode [--allow-ctl] up <name>     # flags-first form (same thing)
 atrium fleet ls                                     # list fleets in the found file
@@ -232,11 +251,19 @@ A fleet whose agents talk needs three things, or it silently no-ops:
    but note **worktree** agents only see files committed at HEAD, so either commit
    the plan or inline it into each kickoff.
 3. Optional `"topics": [...]` to lock the bus vocabulary so the team doesn't
-   fragment into `review`/`reviews`/`review-gate`.
+   fragment into `review`/`reviews`/`review-gate` — and so `atrium ctl bus
+   topics` tells every agent what to subscribe to.
+4. **Subscriptions in every kickoff.** A publish is typed into the panes
+   subscribed to its topic and the panes it names with `--to`, once each is
+   idle; it reaches nobody else until they run `bus feed`. So each kickoff
+   starts with `atrium ctl bus sub <topic>` for the topics that role must react
+   to, and each "done" post goes `--to lead` (or whoever must act). Do not
+   subscribe every agent to everything: every post then wakes every idle
+   teammate, a turn each. Role names are unique while a pane lives.
 
 The runtime coordination commands (what your kickoffs tell agents to run):
-`atrium ctl board set/get/list`, `atrium ctl bus pub/sub/feed/resolve`. See the
-atrium-coordinate skill for the full board/bus playbook.
+`atrium ctl board set/get/list`, `atrium ctl bus pub/sub/feed/resolve/topics`.
+See the atrium-coordinate skill for the full board/bus playbook.
 
 ## Long runs: short sessions
 
@@ -404,7 +431,7 @@ A fleet section for the root `CLAUDE.md`, to adapt:
 - **No background build loops.** No watch mode or repeated rebuild loops, and
   never more than one build at a time.
 - **Done means green.** Run `<gate command>` and see it pass, commit on your
-  branch, then `atrium ctl bus pub <topic> msg=<what> done`.
+  branch, then `atrium ctl bus pub <topic> --to lead msg=<what> done`.
 - **When blocked, stop.** Post the blocker on the bus and wait; don't guess
   across another agent's files.
 ```
@@ -473,7 +500,8 @@ Write rules as concrete commands an agent can follow, not as goals.
 
 ## Discovery
 
-`atrium fleet ls` (fleets in scope), `atrium fleet up`/`clean` usage on bad args,
-and `atrium ctl` with no arguments (or `atrium --help`) for the authoritative,
-current command surface. When unsure of a flag or key, check those rather than
+`atrium fleet --help` (up, init, ls, clean), `atrium fleet ls --templates`,
+`atrium config --help`, and `atrium ctl --help` (or `atrium --help`) for the
+authoritative, current command surface — every family answers `--help` from
+anywhere. When unsure of a flag or key, check those rather than
 guessing — the surface is the source of truth.
