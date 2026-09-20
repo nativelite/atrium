@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.37.2] - 2026-09-20
+
+### Fixed
+- **`fleet up` refused every roster whose `cmd` is a configured claude alias.**
+  0.37.1 began vetting each agent's `cmd` at launch with the `ctl spawn` policy,
+  and that policy matched the literal stem `claude` while `is_agent_stem` already
+  counted an alias from `claude_aliases` as an agent, so a second account's shim
+  such as `claude2` fell into the "no trust posture is defined for it" refusal
+  written for aider and gemini. The vet now asks `is_claude_stem`, the same
+  test binding and status use, so any stem the operator lists in `claude_aliases`
+  (the config file, `ATRIUM_CLAUDE_ALIASES`, or the fleet) takes claude's flag
+  policy and claude's posture. Governed flags are still stripped from an alias
+  and unlisted ones still refused, exactly as for `claude`.
+
 ## [0.37.1] - 2026-09-18
 
 ### Changed

@@ -429,9 +429,16 @@ const GOVERNED_FLAGS: [&str; 3] = [
 /// resume, and nothing that changes what the agent is permitted to do. atrium
 /// supplies the posture flags itself.
 fn worker_allowed_flags(stem: &str) -> Option<&'static [&'static str]> {
-    match stem {
+    // A claude alias (`claude2`, a second account's shim named in
+    // `claude_aliases`) IS claude: same flags, same posture. Checked before the
+    // literal match because `is_agent_stem` already counts the alias as an
+    // agent, and an agent with no policy here is refused below — which is what
+    // happened to every alias-based roster once `fleet up` began vetting `cmd`.
+    if crate::bind::is_claude_stem(stem) {
         // Model/effort selection and session continuation only.
-        "claude" => Some(&["--model", "--effort", "--continue", "-c", "--resume", "-r"]),
+        return Some(&["--model", "--effort", "--continue", "-c", "--resume", "-r"]);
+    }
+    match stem {
         // codex takes `--model`; its approval flags are atrium's to set (see
         // `trust::codex_trust_args`), never the caller's.
         "codex" => Some(&["--model", "-m"]),
@@ -2749,6 +2756,36 @@ mod tests {
                 "{stem} should be left to the spawn allowlist"
             );
         }
+    }
+
+    #[test]
+    fn vet_accepts_a_configured_claude_alias() {
+        // A second account's shim named in `claude_aliases` is claude: it takes
+        // claude's flags and claude's posture. Before this, `is_agent_stem`
+        // counted the alias as an agent while the flag policy matched only the
+        // literal "claude", so `fleet up` refused every alias-based roster as
+        // "no trust posture".
+        // The name is the operator's, not a pattern: any stem they list is claude.
+        crate::bind::set_claude_aliases(vec!["claude2".to_string()]);
+        match vet_spawn_argv(&v(&["claude2", "--model", "opus"])) {
+            ArgvVerdict::Ok { argv, stripped } => {
+                assert_eq!(argv, v(&["claude2", "--model", "opus"]));
+                assert!(stripped.is_empty());
+            }
+            ArgvVerdict::Refused(why) => panic!("alias refused: {why}"),
+        }
+        // The governed flags are stripped from an alias exactly as from claude.
+        match vet_spawn_argv(&v(&["claude2", "--dangerously-skip-permissions"])) {
+            ArgvVerdict::Ok { stripped, .. } => {
+                assert_eq!(stripped, v(&["--dangerously-skip-permissions"]));
+            }
+            ArgvVerdict::Refused(why) => panic!("alias refused: {why}"),
+        }
+        // An unlisted flag on an alias is refused, as on claude.
+        assert!(matches!(
+            vet_spawn_argv(&v(&["claude2", "--mcp-config", "x"])),
+            ArgvVerdict::Refused(_)
+        ));
     }
 
     #[test]
