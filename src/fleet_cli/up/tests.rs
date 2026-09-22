@@ -1,6 +1,55 @@
-//! Recognising `atrium up <name>` as `atrium fleet up <name>`.
+//! Recognising `atrium up <name>` as `atrium fleet up <name>`, and the session
+//! posture a launch resolves to.
 
-use super::up_alias;
+use super::{resolve_trust, up_alias};
+use atrium::ctl::TrustMode;
+
+/// One fleet named `f` whose top-level keys are `extra` (a JSON fragment).
+fn fleet_with(extra: &str) -> atrium::fleet::Fleet {
+    let text =
+        format!(r#"{{"fleets":{{"f":{{{extra}"agents":[{{"name":"a","cmd":["claude"]}}]}}}}}}"#);
+    atrium::fleet::parse(&text)
+        .expect("test fleet parses")
+        .get("f")
+        .expect("fleet f")
+        .clone()
+}
+
+#[test]
+fn the_command_line_posture_wins_over_the_files() {
+    let fleet = fleet_with(r#""trust":"plan","#);
+    assert_eq!(
+        resolve_trust("f", TrustMode::Auto, &fleet),
+        Ok(TrustMode::Auto)
+    );
+}
+
+#[test]
+fn the_files_posture_applies_when_the_command_line_said_nothing() {
+    let fleet = fleet_with(r#""trust":"accept","#);
+    assert_eq!(
+        resolve_trust("f", TrustMode::Off, &fleet),
+        Ok(TrustMode::Edits)
+    );
+    // No posture anywhere stays no posture.
+    assert_eq!(
+        resolve_trust("f", TrustMode::Off, &fleet_with("")),
+        Ok(TrustMode::Off)
+    );
+}
+
+#[test]
+fn a_posture_keyword_that_is_not_one_names_itself_and_the_choices() {
+    let fleet = fleet_with(r#""trust":"yolo","#);
+    assert_eq!(
+        resolve_trust("f", TrustMode::Off, &fleet),
+        Err(
+            "atrium fleet: fleet \"f\" declares trust \"yolo\", which is not one of plan, \
+             accept, automode, skip"
+                .to_string()
+        )
+    );
+}
 
 fn v(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| s.to_string()).collect()

@@ -4,9 +4,7 @@
 use super::clean::report_worktree_teardown;
 use super::fsan;
 use super::launch::spawn_fleet_window;
-use super::preflight::{
-    build_pool_line, ctl_without_spawner, deny_unbound, pane_cap_warning, preflight_context_mode,
-};
+use super::preflight::{banner_lines, preflight_context_mode, BannerFacts};
 use crate::*;
 
 /// Is `rest` — the tokens left after atrium's own leading launch flags are
@@ -49,11 +47,43 @@ pub(crate) fn up_alias(rest: &[String]) -> Option<Result<&str, String>> {
     }
 }
 
+/// Everything `fleet up` settles before the operator is asked: validated, and
+/// nothing written yet. The banner is rendered from this value and the launch
+/// runs from it, so what the operator approves is what starts.
+pub(super) struct FleetLaunch<'a> {
+    pub(super) name: &'a str,
+    pub(super) cwd: std::path::PathBuf,
+    /// The roster, with the global config's fleet defaults applied.
+    pub(super) fleet: atrium::fleet::Fleet,
+    pub(super) allow_ctl: bool,
+    /// The session posture, capped to any enclosing atrium.
+    pub(super) trust: atrium::ctl::TrustMode,
+    /// `(agent, posture)` for each agent that runs at a posture other than the session's.
+    pub(super) trust_overrides: Vec<(String, String)>,
+    /// Preflight warnings found while planning; the banner adds its own after these.
+    pub(super) warnings: Vec<String>,
+    pub(super) grid: atrium::spawn::Grid,
+    /// Every directory each agent is granted, resolved once.
+    pub(super) plan: atrium::fleet::Plan,
+    pub(super) wt_plans: Vec<atrium::worktree::WorktreePlan>,
+    /// Worktrees were asked for and the cwd is a git repo.
+    pub(super) wt_active: bool,
+}
+
+/// The worktrees an approved launch created, and the base ref they were cut
+/// from: what the teardown after the run loop needs.
+type Teardown = (Vec<atrium::worktree::WorktreePlan>, String);
+
 /// `atrium fleet up <name>` — read the fleet file, build one tiled window with a
 /// pane per agent (each in its `cwd`, under its identity, with its extra args),
 /// and hand it to the run loop. Any error before spawning (no file, bad JSON,
 /// unknown name, empty fleet, a bad grid, a missing `cwd`) is reported and
 /// **nothing is spawned** — never a partial fleet.
+///
+/// The steps run in a fixed order and the order is part of the behavior: each
+/// prompt and each session-wide setting happens exactly where it is called
+/// below, and everything the operator must weigh is printed before they are
+/// asked.
 pub(crate) fn fleet_up(
     name: &str,
     allow_ctl: bool,
@@ -66,48 +96,13 @@ pub(crate) fn fleet_up(
         return code;
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let located = match atrium::fleet::discover(&cwd) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("atrium fleet: {e}");
-            return ExitCode::FAILURE;
-        }
+    let (located, fleet) = match load_fleet(name, &cwd) {
+        Ok(loaded) => loaded,
+        Err(line) => return fail(&line),
     };
-    let text = match std::fs::read_to_string(&located.path) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("atrium fleet: cannot read {}: {e}", located.path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let fleets = match atrium::fleet::parse(&text) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("atrium fleet: {}: {e}", located.path.display());
-            return ExitCode::FAILURE;
-        }
-    };
-    let fleet = match fleets.get(name) {
-        Some(f) => f.clone(),
-        None => {
-            let available = fleets
-                .names()
-                .iter()
-                .map(|n| fsan(n))
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "atrium fleet: no fleet named \"{}\" (available: {available})",
-                fsan(name)
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    // The global config's fleet defaults fill the keys this fleet left out
-    // (its own keys and the environment still win), then the fleet's
-    // `claude_aliases` are in force from here: the banner's non-claude
-    // warnings, every spawn and later ctl spawns all judge a command by them.
-    let fleet = atrium::config::get().apply_to_fleet(fleet);
+    // The fleet's `claude_aliases` are in force from here: the banner's
+    // non-claude warnings, every spawn and later ctl spawns all judge a command
+    // by them.
     atrium::bind::set_claude_aliases(fleet.claude_aliases.clone());
 
     // Preflight: warn if context-mode plugin is missing — but ONLY when this
@@ -122,32 +117,13 @@ pub(crate) fn fleet_up(
         preflight_context_mode();
     }
 
-    // A fleet may declare its own posture, and the command line wins when it says
-    // anything. A fleet exists to run hands-off, so it NEEDS a posture — and
-    // typing one on every launch is a flag you eventually get wrong. Declared in
-    // the file it lives with the roster it applies to and is reviewable in a diff.
-    //
-    // Still a request, not an override: `set_trust_mode` publishes it, and the
-    // ancestry cap has already lowered `trust` if this atrium is nested, so a fleet
-    // asking for `skip` inside a `plan` session does not get it.
     // The file may switch the control plane on, as `--allow-ctl` does. A
     // coordinating fleet without ctl fails silently — panes come up and publish
     // into nothing — and that has already cost a run.
     let allow_ctl = allow_ctl || fleet.allow_ctl.unwrap_or(false);
-    let trust = match (trust, fleet.trust.as_deref()) {
-        (atrium::ctl::TrustMode::Off, Some(declared)) => {
-            match atrium::ctl::TrustMode::from_policy_keyword(declared) {
-                Some(m) => m,
-                None => {
-                    eprintln!(
-                        "atrium fleet: fleet {name:?} declares trust {declared:?}, which is not \
-                         one of plan, accept, automode, skip"
-                    );
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-        (cli, _) => cli,
+    let trust = match resolve_trust(name, trust, &fleet) {
+        Ok(t) => t,
+        Err(line) => return fail(&line),
     };
     // The SAME two gates the single-pane path applies. `fleet` is dispatched
     // before those, so without this a pane could escape its ceiling simply by
@@ -162,6 +138,115 @@ pub(crate) fn fleet_up(
         return ExitCode::SUCCESS;
     }
 
+    let launch = match plan_launch(name, cwd, &located, fleet, allow_ctl, trust) {
+        Ok(launch) => launch,
+        Err(line) => return fail(&line),
+    };
+
+    for line in banner_lines(&launch, &BannerFacts::read(&launch.fleet)) {
+        eprintln!("{line}");
+    }
+    // Hold here until the operator acknowledges.
+    //
+    // Everything above is printed to the NORMAL screen buffer, and the run loop's
+    // first act is `\x1b[?1049h\x1b[2J\x1b[H` - switch to the alternate screen and
+    // clear. Nothing blocked in between, so the banner was drawn and hidden in the
+    // same breath: an operator never saw the posture, the control plane state, or
+    // who may spawn. The entire argument for putting those in the file rather than
+    // in flags was that they would be VISIBLE at approval time, and they were not.
+    //
+    // A fleet file can be written by an agent and run by a human, and the running
+    // IS the approval - so the approval should be an act, not an assumption. One
+    // keypress is proportionate to starting N agents with filesystem access.
+    //
+    // Skipped when stdin is not a terminal (a script, CI) or `ATRIUM_YES=1`, since
+    // there is nobody to ask; the banner still prints for the log.
+    if !fleet_ack() {
+        eprintln!("atrium fleet: aborted.");
+        return ExitCode::SUCCESS;
+    }
+
+    let teardown = match approve(&launch) {
+        Ok(teardown) => teardown,
+        Err(line) => return fail(&line),
+    };
+    run_fleet(launch, max_depth, teardown)
+}
+
+/// Print `line` and fail the launch.
+fn fail(line: &str) -> ExitCode {
+    eprintln!("{line}");
+    ExitCode::FAILURE
+}
+
+/// Find, read and parse the fleet file and take `name` out of it, with the
+/// global config's fleet defaults applied. `Err` is the line to print.
+fn load_fleet(
+    name: &str,
+    cwd: &std::path::Path,
+) -> Result<(atrium::fleet::Located, atrium::fleet::Fleet), String> {
+    let located = atrium::fleet::discover(cwd).map_err(|e| format!("atrium fleet: {e}"))?;
+    let text = std::fs::read_to_string(&located.path)
+        .map_err(|e| format!("atrium fleet: cannot read {}: {e}", located.path.display()))?;
+    let fleets = atrium::fleet::parse(&text)
+        .map_err(|e| format!("atrium fleet: {}: {e}", located.path.display()))?;
+    let Some(fleet) = fleets.get(name) else {
+        let available = fleets
+            .names()
+            .iter()
+            .map(|n| fsan(n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "atrium fleet: no fleet named \"{}\" (available: {available})",
+            fsan(name)
+        ));
+    };
+    // The global config's fleet defaults fill the keys this fleet left out
+    // (its own keys and the environment still win).
+    let fleet = atrium::config::get().apply_to_fleet(fleet.clone());
+    Ok((located, fleet))
+}
+
+/// The session posture before the ancestry cap: the command line's when it
+/// says anything, else the one the fleet file declares.
+///
+/// A fleet may declare its own posture, and the command line wins when it says
+/// anything. A fleet exists to run hands-off, so it NEEDS a posture — and
+/// typing one on every launch is a flag you eventually get wrong. Declared in
+/// the file it lives with the roster it applies to and is reviewable in a diff.
+///
+/// Still a request, not an override: `set_trust_mode` publishes it, and the
+/// ancestry cap has already lowered `trust` if this atrium is nested, so a fleet
+/// asking for `skip` inside a `plan` session does not get it.
+fn resolve_trust(
+    name: &str,
+    cli: atrium::ctl::TrustMode,
+    fleet: &atrium::fleet::Fleet,
+) -> Result<atrium::ctl::TrustMode, String> {
+    match (cli, fleet.trust.as_deref()) {
+        (atrium::ctl::TrustMode::Off, Some(declared)) => {
+            atrium::ctl::TrustMode::from_policy_keyword(declared).ok_or_else(|| {
+                format!(
+                    "atrium fleet: fleet {name:?} declares trust {declared:?}, which is not \
+                     one of plan, accept, automode, skip"
+                )
+            })
+        }
+        (cli, _) => Ok(cli),
+    }
+}
+
+/// Validate the roster against the resolved posture and resolve everything it
+/// grants, without writing anything or asking anyone. `Err` is the line to print.
+fn plan_launch<'a>(
+    name: &'a str,
+    cwd: std::path::PathBuf,
+    located: &atrium::fleet::Located,
+    fleet: atrium::fleet::Fleet,
+    allow_ctl: bool,
+    trust: atrium::ctl::TrustMode,
+) -> Result<FleetLaunch<'a>, String> {
     // Per-agent trust overrides (the mixed-model case). Validate each keyword now so
     // a typo fails fast, and compute the capped effective posture for the banner.
     // Each request is capped to the session ceiling exactly like a ctl-spawn
@@ -179,12 +264,11 @@ pub(crate) fn fleet_up(
                     }
                 }
                 None => {
-                    eprintln!(
+                    return Err(format!(
                         "atrium fleet: agent \"{}\" declares trust {k:?}, which is not one of \
                          plan, accept, automode, skip",
                         fsan(&a.name)
-                    );
-                    return ExitCode::FAILURE;
+                    ));
                 }
             }
         }
@@ -201,13 +285,13 @@ pub(crate) fn fleet_up(
     //
     // Its notes are collected rather than printed here: everything the operator
     // must weigh has to be on the screen at the Enter prompt, so the printing
-    // order is chosen once, below. They are preflight warnings: loud, never fatal.
+    // order is chosen once, in the banner. They are preflight warnings: loud,
+    // never fatal.
     let mut warnings: Vec<String> = Vec::new();
     for a in &fleet.agents {
         match atrium::ctl::vet_spawn_argv(&a.cmd) {
             atrium::ctl::ArgvVerdict::Refused(why) => {
-                eprintln!("atrium fleet: agent \"{}\": {why}", fsan(&a.name));
-                return ExitCode::FAILURE;
+                return Err(format!("atrium fleet: agent \"{}\": {why}", fsan(&a.name)));
             }
             atrium::ctl::ArgvVerdict::Ok { stripped, .. } if !stripped.is_empty() => {
                 warnings.push(format!(
@@ -228,18 +312,14 @@ pub(crate) fn fleet_up(
         Some(spec) => match atrium::spawn::Grid::parse_spec(spec) {
             Ok(g) if g.total() >= n => g,
             Ok(g) => {
-                eprintln!(
+                return Err(format!(
                     "atrium fleet: grid {:?} has {} cells but fleet \"{}\" has {n} agents",
                     fsan(spec),
                     g.total(),
                     fsan(name)
-                );
-                return ExitCode::FAILURE;
+                ));
             }
-            Err(e) => {
-                eprintln!("atrium fleet: fleet \"{}\": {e}", fsan(name));
-                return ExitCode::FAILURE;
-            }
+            Err(e) => return Err(format!("atrium fleet: fleet \"{}\": {e}", fsan(name))),
         },
         None => atrium::spawn::Grid::balanced(n.max(2)),
     };
@@ -270,12 +350,11 @@ pub(crate) fn fleet_up(
     for ap in &plan.agents {
         if let Some(g) = &ap.cwd {
             if !g.given.is_dir() {
-                eprintln!(
+                return Err(format!(
                     "atrium fleet: agent \"{}\": cwd {} is not a directory",
                     ap.label,
                     atrium::fleet::show_path(&g.given)
-                );
-                return ExitCode::FAILURE;
+                ));
             }
         }
     }
@@ -287,178 +366,27 @@ pub(crate) fn fleet_up(
     let wt_plans = atrium::worktree::plan_worktrees(&fleet, name, &cwd);
     let wt_active = !wt_plans.is_empty() && atrium::worktree::is_git_repo(&cwd);
 
-    // The disclosure, then the posture, then the verdict, then the Enter.
-    //
-    // Order is load-bearing and was measured: a six-agent roster's banner is
-    // taller than a 24-row terminal, so whatever prints FIRST is what scrolls
-    // away. The per-grant lines are the long, skimmable part; the posture, the
-    // spawn capability and the verdict are the short, decisive part, so they go
-    // last and are still on screen when the prompt appears.
-    for line in plan.banner_lines() {
-        eprintln!("atrium fleet: {line}");
-    }
-    // Always say the posture out loud. A fleet file can be authored by an agent
-    // and skimmed by a human; a line naming what everything is about to run under
-    // is the difference between reviewing it and assuming it.
-    //
-    // The compile budget is part of that posture: a fleet's builds are what
-    // exhaust a machine, not its agents. Stated from the plan here; the pool
-    // itself is created only once the operator approves (below).
-    let (pool_suffix, pool_warning) = build_pool_line(
-        atrium::buildpool::planned_size(fleet.build_jobs),
-        atrium::buildpool::inherited(),
-    );
-    let memory = atrium::memguard::describe(
-        atrium::memguard::planned_cap(fleet.memory_mb),
-        atrium::memguard::enforcement(),
-    );
-    // Session-wide deny rules as every claude pane will carry them (built-ins
-    // + ATRIUM_DENY + the fleet's); per-agent rules add to this.
-    let mut session_deny = atrium::trust::parse_deny_env();
-    session_deny.extend(fleet.deny.iter().cloned());
-    let denied = atrium::trust::deny_args(&session_deny, &[]).len() - 1;
-    eprintln!(
-        "atrium fleet: \"{}\" starting {} agent(s) at trust {}{}{pool_suffix}, {memory}, \
-         {denied} deny rules",
-        fsan(name),
-        fleet.agents.len(),
-        trust.policy_label(),
-        if allow_ctl { ", ctl on" } else { ", ctl OFF" }
-    );
-    // Deny rules only reach claude (codex has no equivalent flag). Say so when a
-    // rule is aimed at an agent it can't bind, rather than let it read as enforced.
-    let unbound = deny_unbound(&fleet);
-    if !unbound.is_empty() {
-        warnings.push(format!(
-            "deny rules apply to claude agents only — not enforced for {}",
-            unbound
-                .iter()
-                .map(|n| fsan(n))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if let Some(warning) = pool_warning {
-        warnings.push(
-            warning
-                .strip_prefix("warning: ")
-                .unwrap_or(&warning)
-                .to_string(),
-        );
-    }
-    // Name any agent that runs at a DIFFERENT posture than the session — part of
-    // what the human approves (a mixed-model fleet often runs its haiku agents at
-    // `accept` under an `automode` session).
-    if !trust_overrides.is_empty() {
-        let shown = trust_overrides
-            .iter()
-            .map(|(n, m)| format!("{n}={m}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!("atrium fleet: per-agent trust overrides — {shown}");
-    }
+    Ok(FleetLaunch {
+        name,
+        cwd,
+        fleet,
+        allow_ctl,
+        trust,
+        trust_overrides,
+        warnings,
+        grid,
+        plan,
+        wt_plans,
+        wt_active,
+    })
+}
 
-    // Who may create teammates is part of what the human approves, so say it.
-    let spawners: Vec<String> = plan
-        .agents
-        .iter()
-        .zip(fleet.agents.iter())
-        .filter(|(_, a)| a.can_spawn.unwrap_or(false))
-        .map(|(ap, _)| ap.label.clone())
-        .collect();
-    eprintln!(
-        "atrium fleet: {} of {} may spawn teammates{}",
-        spawners.len(),
-        fleet.agents.len(),
-        if spawners.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", spawners.join(", "))
-        }
-    );
-    // A control-plane fleet where nobody may spawn is almost always a
-    // misconfigured lead: the coordinator comes up unable to create the very
-    // teammates it exists to manage, and the gap stays invisible until the
-    // first mid-run spawn is denied. Surface it here, where the roster can
-    // still be fixed.
-    if ctl_without_spawner(allow_ctl, spawners.len()) {
-        warnings.push(
-            "ctl is on but no agent may spawn teammates — if this fleet coordinates by \
-             spawning, set \"can_spawn\": true on its lead"
-                .to_string(),
-        );
-    }
-    // The pane cap is a preflight warning, not a gate: the operator chose this
-    // roster and the machine may well carry it. What the cap still does is refuse
-    // a mid-run `ctl spawn` past it, and that is worth knowing before launch.
-    if let Some(w) = pane_cap_warning(
-        fleet.agents.len(),
-        spawners.len(),
-        atrium::resources::effective_cap(),
-    ) {
-        warnings.push(w);
-    }
-    // Per-agent worktrees: say which agents leave the main tree, where, and on
-    // what branch — isolation the operator is approving as much as the dirs above.
-    if !wt_plans.is_empty() {
-        if wt_active {
-            eprintln!(
-                "atrium fleet: per-agent worktrees — {} off HEAD; auto-removed on exit only if \
-                 clean + merged, else kept:",
-                wt_plans.len()
-            );
-            for p in &wt_plans {
-                let who = p
-                    .agents
-                    .iter()
-                    .map(|a| fsan(a))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                eprintln!(
-                    "atrium fleet:   {} → {} (branch {}) [{who}]",
-                    fsan(&p.name),
-                    atrium::fleet::show_path(&p.dir),
-                    fsan(&p.branch)
-                );
-            }
-        } else {
-            warnings.push(format!(
-                "this fleet asks for per-agent worktrees, but {} is not a git repo — every \
-                 agent shares the main tree",
-                atrium::fleet::show_path(&cwd)
-            ));
-        }
-    }
-    // Every preflight warning, together, as the last thing before the verdict.
-    let color = std::io::IsTerminal::is_terminal(&std::io::stderr())
-        && std::env::var_os("NO_COLOR").is_none();
-    for line in atrium::fleet::preflight_block(&warnings, color) {
-        eprintln!("{line}");
-    }
-    // The last line before the block, so it cannot scroll: it NAMES the
-    // destinations rather than counting them. A surviving summary line that
-    // omits the payload is the one thing an operator is guaranteed to read and
-    // the one thing that tells them nothing.
-    eprintln!("atrium fleet: {}", plan.verdict());
-    // Hold here until the operator acknowledges.
-    //
-    // Everything above is printed to the NORMAL screen buffer, and the run loop's
-    // first act is `\x1b[?1049h\x1b[2J\x1b[H` - switch to the alternate screen and
-    // clear. Nothing blocked in between, so the banner was drawn and hidden in the
-    // same breath: an operator never saw the posture, the control plane state, or
-    // who may spawn. The entire argument for putting those in the file rather than
-    // in flags was that they would be VISIBLE at approval time, and they were not.
-    //
-    // A fleet file can be written by an agent and run by a human, and the running
-    // IS the approval - so the approval should be an act, not an assumption. One
-    // keypress is proportionate to starting N agents with filesystem access.
-    //
-    // Skipped when stdin is not a terminal (a script, CI) or `ATRIUM_YES=1`, since
-    // there is nobody to ask; the banner still prints for the log.
-    if !fleet_ack() {
-        eprintln!("atrium fleet: aborted.");
-        return ExitCode::SUCCESS;
-    }
+/// What the operator's acknowledgement switches on, in order: the fleet's deny
+/// rules and memory ceiling, the compile pool, the worktrees off HEAD, and the
+/// session posture. `Ok` carries what the teardown needs when worktrees were
+/// created; `Err` is the line to print.
+fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
+    let fleet = &launch.fleet;
     // Approved: record the fleet's deny rules for every pane in the session.
     atrium::trust::set_fleet_deny(fleet.deny.clone());
     // Record the fleet's memory ceiling for the session guard.
@@ -481,49 +409,58 @@ pub(crate) fn fleet_up(
     // BEFORE any pane spawns (so a failure here leaves nothing half-open). Prune
     // first to clear records orphaned by a prior crashed run. The plan + base ref
     // are kept for teardown after the run loop exits.
-    let mut wt_teardown: Option<(Vec<atrium::worktree::WorktreePlan>, String)> = None;
-    if wt_active {
-        let _ = atrium::worktree::prune(&cwd);
-        let base = match atrium::worktree::base_ref(&cwd) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("atrium fleet: cannot read the repo's HEAD for worktrees: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let mut teardown: Option<Teardown> = None;
+    if launch.wt_active {
+        let cwd = &launch.cwd;
+        let _ = atrium::worktree::prune(cwd);
+        let base = atrium::worktree::base_ref(cwd)
+            .map_err(|e| format!("atrium fleet: cannot read the repo's HEAD for worktrees: {e}"))?;
         let seeds = fleet.worktree_seed.as_deref().unwrap_or(&[]);
-        for p in &wt_plans {
-            match atrium::worktree::ensure(&cwd, p) {
+        for p in &launch.wt_plans {
+            match atrium::worktree::ensure(cwd, p) {
                 Ok(_) => {
-                    for w in atrium::worktree::seed(&cwd, &p.dir, seeds) {
+                    for w in atrium::worktree::seed(cwd, &p.dir, seeds) {
                         eprintln!("atrium fleet: worktree \"{}\": {w}", fsan(&p.name));
                     }
-                    for w in atrium::worktree::junction_sibling_deps(&cwd, p) {
+                    for w in atrium::worktree::junction_sibling_deps(cwd, p) {
                         eprintln!("atrium fleet: worktree \"{}\": {w}", fsan(&p.name));
                     }
                 }
                 Err(e) => {
-                    eprintln!(
+                    return Err(format!(
                         "atrium fleet: could not create worktree \"{}\": {e}",
                         fsan(&p.name)
-                    );
-                    return ExitCode::FAILURE;
+                    ));
                 }
             }
         }
-        wt_teardown = Some((wt_plans.clone(), base));
+        teardown = Some((launch.wt_plans.clone(), base));
     }
 
     // Publish the trust policy before the fleet's panes are spawned (they read it
     // via `trust_mode()`), so every agent comes up under the resolved posture.
-    set_trust_mode(trust);
+    set_trust_mode(launch.trust);
+    Ok(teardown)
+}
 
+/// Enter the terminal, spawn the approved roster into one tiled window, run
+/// the session, and tear the worktrees down after it.
+fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) -> ExitCode {
+    let FleetLaunch {
+        name,
+        cwd,
+        fleet,
+        allow_ctl,
+        trust,
+        grid,
+        plan,
+        wt_plans,
+        wt_active,
+        ..
+    } = launch;
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("atrium: stdin/stdout must be a terminal: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail(&format!("atrium: stdin/stdout must be a terminal: {e}")),
     };
     let (rows, cols) = term.size().unwrap_or((24, 80));
 
@@ -554,8 +491,10 @@ pub(crate) fn fleet_up(
     ) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("atrium fleet: cannot start fleet \"{}\": {e}", fsan(name));
-            return ExitCode::FAILURE;
+            return fail(&format!(
+                "atrium fleet: cannot start fleet \"{}\": {e}",
+                fsan(name)
+            ))
         }
     };
 
@@ -583,7 +522,7 @@ pub(crate) fn fleet_up(
     // is removed ONLY if clean and fully merged; anything with uncommitted or
     // unmerged work is kept and its path + branch reported, so nothing is ever
     // destroyed. A final prune clears records for the ones that were removed.
-    if let Some((plans, base)) = &wt_teardown {
+    if let Some((plans, base)) = &teardown {
         report_worktree_teardown(&cwd, plans, base);
         let _ = atrium::worktree::prune(&cwd);
     }
