@@ -40,7 +40,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-ansi"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "nativelite-cred"
@@ -64,7 +64,7 @@ version = "0.1.0"
 
 [[package]]
 name = "nativelite-vterm"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "nativelite-ansi",
  "nativelite-uwidth",

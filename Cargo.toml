@@ -15,8 +15,8 @@ abus = { package = "nativelite-abus", version = "0.2.1", path = "../abus" }
 pty = { package = "nativelite-pty", version = "0.4.1", path = "../pty-rs" }
 akey = { package = "nativelite-akey", version = "0.2", path = "../akey" }
 rawterm = { package = "nativelite-rawterm", version = "0.2.2", path = "../rawterm-rs" }
-ansi = { package = "nativelite-ansi", version = "0.3.1", path = "../ansi-rs" }
-vterm = { package = "nativelite-vterm", version = "0.5.2", path = "../vterm-rs" }
+ansi = { package = "nativelite-ansi", version = "0.4.0", path = "../ansi-rs" }
+vterm = { package = "nativelite-vterm", version = "0.5.3", path = "../vterm-rs" }
 agsess = { package = "nativelite-agsess", version = "0.2.3", path = "../agsess" }
 json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
 
