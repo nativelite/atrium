@@ -100,6 +100,24 @@ pub(crate) fn fleet_ctx_dir(cwd: &std::path::Path, fleet_name: &str) -> std::pat
     fallback
 }
 
+/// Where an agent that belongs to a worktree runs, and what it is told about
+/// it: the worktree's directory (which replaces any fleet-file `cwd`) and the
+/// worktree's behavioral norms. `None` for an agent that stays on the main tree.
+pub(super) fn worktree_placement(
+    worktrees: &[atrium::worktree::WorktreePlan],
+    agent: &str,
+) -> Option<(String, String)> {
+    worktrees
+        .iter()
+        .find(|w| w.agents.iter().any(|a| a == agent))
+        .map(|wt| {
+            (
+                wt.dir.to_string_lossy().into_owned(),
+                atrium::worktree::worktree_norms(&wt.name, &wt.branch),
+            )
+        })
+}
+
 /// Build the fleet's tiled window: one pane per agent, laid out on `grid`
 /// (agents fill leaf ids `0..n` row-major). Each pane runs the agent's `cmd`
 /// plus its fleet args (`--add-dir`/`--append-system-prompt`/`--model`/
@@ -157,16 +175,13 @@ pub(crate) fn spawn_fleet_window(
         // the pane's gate and index are isolated from its teammates'. When
         // `worktrees` is empty (the common case) this never fires.
         let mut pane_norms: Option<String> = None;
-        if let Some(wt) = worktrees
-            .iter()
-            .find(|w| w.agents.iter().any(|a| a == &agent.name))
-        {
-            cwd = Some(wt.dir.to_string_lossy().into_owned());
+        if let Some((dir, norms)) = worktree_placement(worktrees, &agent.name) {
+            cwd = Some(dir);
             // Worktree-specific behavioral norms are passed to spawn_pane_full so
             // they are folded into a SINGLE --append-system-prompt block with the
             // ctl directive (last-wins on the installed claude — two separate flags
             // silently drop the first).
-            pane_norms = Some(atrium::worktree::worktree_norms(&wt.name, &wt.branch));
+            pane_norms = Some(norms);
         }
         // Per-agent context vars: derive the shared ctx_dir endpoint and the
         // agent's role name, then let context_env map (provider, share) →
