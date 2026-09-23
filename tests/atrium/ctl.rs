@@ -277,7 +277,9 @@ fn ctl_respawn_sizes_the_pane_to_its_tile() {
     let (typed, marker): (&str, &[u8]) = if cfg!(windows) {
         ("WRAP^^TAIL9", b"WRAP^TAIL9") // cmd: ^^ escapes to a single ^
     } else {
-        ("'WRAP\"\"TAIL9'", b"WRAPTAIL9") // sh: the quotes vanish on output
+        // sh: the empty "" vanishes on output. (Not inside single quotes,
+        // where it would print literally and the marker could never appear.)
+        ("WRAP\"\"TAIL9", b"WRAPTAIL9")
     };
     p.write(format!("echo {filler}{typed}\r\n").as_bytes())
         .unwrap();

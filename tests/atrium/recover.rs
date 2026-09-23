@@ -248,15 +248,20 @@ fn a_sessions_bus_is_saved_beside_its_snapshot() {
     read_until(&mut p, bar, Duration::from_secs(15));
     let pid = p.pid();
     let atrium = env!("CARGO_BIN_EXE_atrium");
-    p.write(format!("\"{atrium}\" ctl bus sub resume-probe-topic\r\n").as_bytes())
+    // The topic is typed with the shell's own quoting, so the echoed command
+    // never contains it literally and only the reply does. The reply is then
+    // matched by the topic rather than by "subscribed: <topic>": a renderer
+    // may draw the blank after the colon as a cursor move instead of a space.
+    let typed = if cfg!(windows) {
+        "resume-probe-^topic" // cmd: ^t is t
+    } else {
+        "resume-probe-''topic" // sh: the empty '' vanishes
+    };
+    p.write(format!("\"{atrium}\" ctl bus sub {typed}\r\n").as_bytes())
         .unwrap();
-    let out = read_until(
-        &mut p,
-        b"subscribed: resume-probe-topic",
-        Duration::from_secs(20),
-    );
+    let out = read_until(&mut p, b"resume-probe-topic", Duration::from_secs(20));
     assert!(
-        contains(&out, b"subscribed: resume-probe-topic"),
+        contains(&out, b"subscribed:") && contains(&out, b"resume-probe-topic"),
         "no bus subscribe reply: {:?}",
         String::from_utf8_lossy(&out)
     );
