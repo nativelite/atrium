@@ -42,7 +42,6 @@ pub(crate) fn feed_prompt(
                     cols,
                     out,
                     flash,
-                    launch.job,
                 ) {
                     Ok(()) => outcome.reset_frame = true,
                     Err(e) => {

@@ -30,7 +30,6 @@ pub(crate) struct CtlSession<'a> {
     pub(crate) audit: &'a mut atrium::audit::Audit,
     pub(crate) board: &'a mut atrium::board::Board,
     pub(crate) bus: &'a mut atrium::bus::Bus,
-    pub(crate) job: &'a atrium::reap::SessionJob,
 }
 
 /// Is this decision addressed to a live teammate (a `to=<role>` field naming a

@@ -17,7 +17,7 @@ pub(crate) fn respawn(
     privileged: bool,
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
-    let (windows, pending, job) = (&mut *cx.windows, &mut *cx.pending, cx.job);
+    let (windows, pending) = (&mut *cx.windows, &mut *cx.pending);
     let (rows, cols) = (cx.rows, cx.cols);
     let candidates = ctl_candidates(windows);
     let id = match ctl::resolve_target(&rr.target, &candidates) {
@@ -98,7 +98,6 @@ pub(crate) fn respawn(
         Ok(p) => p,
         Err(e) => return ctl::reply_err(&format!("respawn failed: {e}")),
     };
-    job.assign(new_pane.pty.pid());
     // In-place replacement: kill the old child then swap in the new pty,
     // term, and session fields. Role/parent/depth/can_spawn are preserved.
     let p = pane_by_agent_mut(windows, id).unwrap();

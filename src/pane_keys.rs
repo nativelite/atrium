@@ -53,7 +53,6 @@ pub(crate) fn handle_pane_action(
                 cols,
                 out,
                 flash,
-                launch.job,
             ) {
                 Ok(()) => outcome.reset_frame = true,
                 Err(e) => {
@@ -80,7 +79,6 @@ pub(crate) fn handle_pane_action(
                 cols,
                 out,
                 flash,
-                launch.job,
             ) {
                 Ok(()) => outcome.reset_frame = true,
                 Err(e) => {

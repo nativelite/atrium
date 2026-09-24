@@ -111,7 +111,7 @@ impl<'a> RunState<'a> {
                 // Every pane enrolls in the session job at its own spawn (Windows:
                 // created suspended, assigned, then resumed), so there is nothing to
                 // pass for enrollment here.
-                Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash, None),
+                Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
                 None => spawn_window(
                     command,
                     rows,
@@ -120,7 +120,6 @@ impl<'a> RunState<'a> {
                     identity,
                     trust_mode(),
                     &mut flash,
-                    None,
                     None,
                     None,
                 ),

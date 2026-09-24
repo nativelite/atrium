@@ -261,7 +261,6 @@ impl RunState<'_> {
                                 audit: &mut self.ctl_audit,
                                 board: &mut self.board,
                                 bus: &mut self.bus,
-                                job: self.launch.job,
                             },
                         );
                         let _ = listener.respond(&reply.to_json());

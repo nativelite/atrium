@@ -12,7 +12,6 @@ pub(crate) fn spawn_window(
     identity: Option<&str>,
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
-    job: Option<&atrium::reap::SessionJob>,
     cwd: Option<&str>,
     extra_norms: Option<&str>,
 ) -> std::io::Result<Window> {
@@ -31,14 +30,8 @@ pub(crate) fn spawn_window(
         cols,
         flash,
     )?;
-    // Enroll a RUNTIME-spawned pane in the session Job synchronously, before it is
-    // returned, so a pane spawned mid-loop is torn down with atrium even if atrium
-    // is killed the same instant (#94). `job` is `None` for pre-run-loop/startup
-    // panes, which the run loop's lazy pass enrolls as before (status quo).
-    // Idempotent + a no-op on unix + graceful on failure (never blocks the pane).
-    if let Some(j) = job {
-        j.assign(pane.pty.pid());
-    }
+    // The pane is already in the session job: `spawn_pane_full` enrolls every
+    // pane at its own spawn (#94).
     Ok(Window {
         panes: vec![pane],
         tree: Tree::new(0),
@@ -49,15 +42,15 @@ pub(crate) fn spawn_window(
 
 /// What a pane opened from the keyboard runs under, fixed for the whole run: the
 /// command `Ctrl+A c` and splits host, the identity it runs as, and the session
-/// job runtime spawns enroll in.
+/// job, which teardown closes.
 pub(crate) struct Launch<'a> {
     pub(crate) command: &'a [String],
     pub(crate) identity: Option<&'a str>,
     pub(crate) job: &'a atrium::reap::SessionJob,
 }
 
-/// Open `command` as a new window mid-run — enrolled in the session job — and
-/// switch to it. A spawn failure is returned for the caller to word.
+/// Open `command` as a new window mid-run — enrolled in the session job at its
+/// spawn — and switch to it. A spawn failure is returned for the caller to word.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open_window(
     windows: &mut Vec<Window>,
@@ -69,7 +62,6 @@ pub(crate) fn open_window(
     cols: u16,
     out: &mut impl std::io::Write,
     flash: &mut Option<(String, Instant)>,
-    job: &atrium::reap::SessionJob,
 ) -> std::io::Result<()> {
     let w = spawn_window(
         command,
@@ -79,7 +71,6 @@ pub(crate) fn open_window(
         identity,
         mode,
         flash,
-        Some(job),
         None,
         None,
     )?;
@@ -105,7 +96,6 @@ pub(crate) fn spawn_window_grid(
     grid: atrium::spawn::Grid,
     identity: Option<&str>,
     flash: &mut Option<(String, Instant)>,
-    job: Option<&atrium::reap::SessionJob>,
 ) -> std::io::Result<Window> {
     let tree = Tree::grid(grid.rows, grid.cols);
     let n = grid.total();
@@ -125,14 +115,7 @@ pub(crate) fn spawn_window_grid(
             trust_mode(),
             flash,
         ) {
-            Ok(pane) => {
-                // Runtime-grid panes enroll synchronously (see spawn_window); a
-                // startup grid passes `None` and rides the lazy pass (status quo).
-                if let Some(j) = job {
-                    j.assign(pane.pty.pid());
-                }
-                panes.push(pane);
-            }
+            Ok(pane) => panes.push(pane),
             Err(e) => {
                 // Tear down whatever we already started — a partial grid is not
                 // a coherent window.
@@ -320,8 +303,9 @@ pub(crate) fn spawn_pane_full(
     // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This
     // title feeds is_claude/is_codex/vendor_tag, so the fix must live here.
     let title = atrium::bind::command_stem(&command[0]);
-    let (base, folder_trust) = agent_args(command, &title, mode, deny, extra_norms);
-    if folder_trust {
+    let base = agent_args(command, &title, mode, deny, extra_norms);
+    // A trusted claude launch also pre-accepts claude's folder-trust dialog.
+    if atrium::bind::is_claude_stem(&title) && mode != atrium::ctl::TrustMode::Off {
         ensure_folder_trust(cwd, &title, flash);
     }
     // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
@@ -422,15 +406,14 @@ pub(crate) fn spawn_pane_full(
 
 /// The agent's launch argv before the session id: `command` plus the trust
 /// flags for `mode`, the deny list and the folded system prompt, each for the
-/// vendors that take them. The flag says whether this is a trusted claude launch,
-/// the one case that also pre-accepts claude's folder-trust dialog.
+/// vendors that take them.
 fn agent_args(
     command: &[String],
     title: &str,
     mode: atrium::ctl::TrustMode,
     deny: &[String],
     extra_norms: Option<&str>,
-) -> (Vec<String>, bool) {
+) -> Vec<String> {
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands
@@ -444,13 +427,13 @@ fn agent_args(
     // panes atrium opens itself, or — for a ctl spawn — the per-spawn `--mode` after
     // the operator-elevate / worker-cap governance in `apply_ctl`.
     // `--session-id`, `--append-system-prompt`, and the ~/.claude.json folder-trust
-    // gate below are all Claude Code CLI specifics — injecting them into another
+    // gate (`ensure_folder_trust`) are all Claude Code CLI specifics — injecting them into another
     // vendor would break its launch — so the narrow `is_claude` test gates them.
     // The **trust posture** now maps per vendor: claude gets its `--permission-mode`
     // flags, codex gets its own `--ask-for-approval`/`--sandbox` flags (§`--trust`
     // is vendor-aware). Any other agent still launches with its command untouched.
     // The broad `is_agent_stem` continues to govern vendor-neutral treatment like
-    // the identity-env decision in `wants_env` below.
+    // the identity-env decision (`wants_env`, in `spawn_pane_full`).
     let is_claude = atrium::bind::is_claude_stem(title);
     let is_codex = atrium::vendors::vendor_for_stem(title) == Some(agsess::Vendor::Codex);
     let trusted_launch = (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off;
@@ -518,18 +501,21 @@ fn agent_args(
         let block = combine_system_prompt(extra_norms, ctl);
         base = fold_system_prompt(base, block.as_deref());
     }
-    (base, trusted_launch && is_claude)
+    base
 }
 
-/// Pre-accept claude's folder-trust dialog for the pane's working directory.
+/// Pre-accept claude's *folder-trust* dialog for the pane's working directory
+/// (`cwd`, else atrium's) — a separate gate the permission mode does NOT cover
+/// (it's stored per-dir in ~/.claude.json). Without this a trusted launch in an
+/// untrusted folder still blocks on "trust this folder?". claude-only: codex has
+/// its own per-folder trust in ~/.codex/config.toml (TOML — a follow-up; see
+/// `trust::codex_trust_args`).
+///
+/// The caller decides *when*: only for a claude pane whose mode is not `Off`
+/// (any trusted posture, Plan and Auto included). This sets only the trust bit,
+/// only for this one directory; a parse/IO problem is flashed and the pane
+/// spawns anyway.
 fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(String, Instant)>) {
-    // …and pre-accept claude's *folder-trust* dialog for this pane's working
-    // directory — a separate gate the permission mode does NOT cover (it's stored
-    // per-dir in ~/.claude.json). Without this a trusted launch in an untrusted
-    // folder still blocks on "trust this folder?". claude-only: codex has its own
-    // per-folder trust in ~/.codex/config.toml (TOML — a follow-up; see
-    // `trust::codex_trust_args`). Only under --trust/--skip, only the trust bit,
-    // only this pane's cwd; a parse/IO problem is flashed and the pane spawns anyway.
     let dir = cwd
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())

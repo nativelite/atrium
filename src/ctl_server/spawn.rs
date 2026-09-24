@@ -32,6 +32,37 @@ pub(crate) fn worktree_spawn_params(
     Ok((Some(dir), Some(norms)))
 }
 
+/// The worktree a ctl spawn runs in, as `(cwd, norms)`, or the error reply when
+/// it cannot be created.
+fn worker_worktree(
+    sp: &atrium::ctl::SpawnReq,
+) -> Result<(Option<String>, Option<String>), atrium::ctl::Reply> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    worktree_spawn_params(&cwd, sp.worktree.as_deref())
+        .map_err(|e| atrium::ctl::reply_err(&format!("spawn failed: {e}")))
+}
+
+/// Mark a freshly spawned pane as `caller`'s worker and build the spawn reply.
+/// The one place a ctl spawn stamps its pane, for both placements.
+fn adopt_worker(
+    pane: &mut Pane,
+    sp: &atrium::ctl::SpawnReq,
+    caller: Option<AgentId>,
+    new_depth: usize,
+    note: Option<&str>,
+) -> atrium::ctl::Reply {
+    pane.role = sp.role.clone();
+    pane.parent = caller;
+    pane.depth = new_depth;
+    pane.worktree = sp.worktree.clone();
+    atrium::ctl::reply_spawned(
+        pane.agent_id,
+        sp.role.as_deref(),
+        pane.session_id.as_deref(),
+        note,
+    )
+}
+
 /// `ctl spawn` (default): a visible worker in a brand-new window.
 pub(crate) fn spawn_worker_window(
     cx: &mut CtlSession<'_>,
@@ -41,12 +72,11 @@ pub(crate) fn spawn_worker_window(
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
 ) -> atrium::ctl::Reply {
-    let (rows, cols, job) = (cx.rows, cx.cols, cx.job);
+    let (rows, cols) = (cx.rows, cx.cols);
     let windows = &mut *cx.windows;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+    let (wt_cwd, wt_norms) = match worker_worktree(sp) {
         Ok(pair) => pair,
-        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+        Err(reply) => return reply,
     };
     let mut flash = None;
     match spawn_window(
@@ -57,25 +87,18 @@ pub(crate) fn spawn_worker_window(
         sp.identity.as_deref(),
         mode,
         &mut flash,
-        Some(job),
         wt_cwd.as_deref(),
         wt_norms.as_deref(),
     ) {
         Ok(mut w) => {
-            let pane = &mut w.panes[0];
-            pane.role = sp.role.clone();
-            pane.parent = caller;
-            pane.depth = new_depth;
-            pane.worktree = sp.worktree.clone();
-            let agent_id = pane.agent_id;
-            let session = pane.session_id.clone();
+            let reply = adopt_worker(&mut w.panes[0], sp, caller, new_depth, note);
             windows.push(w);
             // Size the new window's pane to its true rect now, so the agent
             // paints full-height immediately instead of at the rough spawn size
             // (which otherwise needs a manual terminal resize to correct).
             let last = windows.len() - 1;
             resize_window(&mut windows[last], rows, cols);
-            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+            reply
         }
         Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
     }
@@ -92,20 +115,18 @@ pub(crate) fn spawn_worker_here(
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
 ) -> atrium::ctl::Reply {
-    let (rows, cols, job) = (cx.rows, cx.cols, cx.job);
+    let (rows, cols) = (cx.rows, cx.cols);
     let windows = &mut *cx.windows;
     let Some(caller_id) = caller else {
         return atrium::ctl::reply_err(
             "`--here` needs a caller pane; run it from inside an atrium pane",
         );
     };
-    // Locate the window holding the caller and that caller's per-window pane id.
-    let Some((wi, caller_pane_id)) = windows.iter().enumerate().find_map(|(i, w)| {
-        w.panes
-            .iter()
-            .find(|p| p.agent_id == caller_id)
-            .map(|p| (i, p.id))
-    }) else {
+    // Locate the window holding the caller.
+    let Some(wi) = windows
+        .iter()
+        .position(|w| w.panes.iter().any(|p| p.agent_id == caller_id))
+    else {
         return atrium::ctl::reply_err("`--here`: caller pane not found (rerun without --here)");
     };
 
@@ -116,10 +137,9 @@ pub(crate) fn spawn_worker_here(
         (rows.saturating_sub(1).max(1) / 2).saturating_sub(2),
         (cols / 2).saturating_sub(2),
     );
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
+    let (wt_cwd, wt_norms) = match worker_worktree(sp) {
         Ok(pair) => pair,
-        Err(e) => return atrium::ctl::reply_err(&format!("spawn failed: {e}")),
+        Err(reply) => return reply,
     };
     let mut flash = None;
     match spawn_pane_full(
@@ -138,15 +158,7 @@ pub(crate) fn spawn_worker_here(
         &mut flash,
     ) {
         Ok(mut pane) => {
-            pane.role = sp.role.clone();
-            pane.parent = caller;
-            pane.depth = new_depth;
-            pane.worktree = sp.worktree.clone();
-            let agent_id = pane.agent_id;
-            let session = pane.session_id.clone();
-            // Enroll this ctl-spawned pane in the session Job synchronously (same
-            // #94 guarantee as spawn_window; idempotent, unix no-op, graceful).
-            job.assign(pane.pty.pid());
+            let reply = adopt_worker(&mut pane, sp, caller, new_depth, note);
             w.panes.push(pane);
             w.next_id += 1;
             // Re-tile the WHOLE window into a balanced near-square grid over all
@@ -155,7 +167,6 @@ pub(crate) fn spawn_worker_here(
             // `--here` worker into one column, so N of them degrade to an
             // unusable `1×N` strip; re-gridding keeps 2→1×2, 4→2×2, 6→2×3,
             // 12→3×4, … balanced. Focus lands on the fresh worker.
-            let _ = caller_pane_id; // (kept for the error message above)
             let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
             w.tree = Tree::grid_from_ids(&ids);
             w.tree.focus_pane(new_id);
@@ -165,7 +176,7 @@ pub(crate) fn spawn_worker_here(
             // half-size and paints short (blank below), fixed only by a manual
             // terminal resize. Mirrors what the interactive split handlers do.
             resize_window(&mut windows[wi], rows, cols);
-            atrium::ctl::reply_spawned(agent_id, sp.role.as_deref(), session.as_deref(), note)
+            reply
         }
         Err(e) => atrium::ctl::reply_err(&format!("spawn failed: {e}")),
     }
