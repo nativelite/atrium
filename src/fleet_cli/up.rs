@@ -505,17 +505,19 @@ fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) 
     // roster can coordinate over the board/bus; without the flag it runs as before.
     let exit = run(
         &mut term,
-        &scratch,
-        fleet.identity.as_deref(),
-        None,
-        Some(window),
-        allow_ctl,
-        max_depth,
-        trust,
-        ctl_listener,
-        // A fleet may declare a canonical topic vocabulary; when it does, the bus
-        // runs strict. Absent ⇒ soft-gate.
-        fleet.topics.clone(),
+        RunArgs {
+            command: &scratch,
+            identity: fleet.identity.as_deref(),
+            grid: None,
+            initial_window: Some(window),
+            allow_ctl,
+            max_depth,
+            trust,
+            ctl_listener,
+            // A fleet may declare a canonical topic vocabulary; when it does, the bus
+            // runs strict. Absent ⇒ soft-gate.
+            canonical_topics: fleet.topics.clone(),
+        },
     );
 
     // Teardown, after the run loop has restored the normal screen. Each worktree

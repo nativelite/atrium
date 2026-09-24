@@ -837,17 +837,19 @@ fn resume_session(
     };
     run(
         &mut term,
-        &[default_shell()],
-        None,
-        None,
-        Some(window),
-        allow_ctl,
-        max_depth,
-        trust,
-        ctl_listener,
-        // A fleet's declared topics keep the bus strict after a resume, as `fleet
-        // up` made it.
-        topics,
+        RunArgs {
+            command: &[default_shell()],
+            identity: None,
+            grid: None,
+            initial_window: Some(window),
+            allow_ctl,
+            max_depth,
+            trust,
+            ctl_listener,
+            // A fleet's declared topics keep the bus strict after a resume, as `fleet
+            // up` made it.
+            canonical_topics: topics,
+        },
     )
 }
 

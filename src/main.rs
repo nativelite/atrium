@@ -664,16 +664,18 @@ fn main() -> ExitCode {
     };
     run(
         &mut term,
-        &command,
-        identity.as_deref(),
-        grid,
-        None,
-        allow_ctl,
-        max_depth,
-        trust,
-        None,
-        // The default (non-fleet) path declares no topic vocabulary: soft-gate.
-        None,
+        RunArgs {
+            command: &command,
+            identity: identity.as_deref(),
+            grid,
+            initial_window: None,
+            allow_ctl,
+            max_depth,
+            trust,
+            ctl_listener: None,
+            // The default (non-fleet) path declares no topic vocabulary: soft-gate.
+            canonical_topics: None,
+        },
     )
 }
 
@@ -768,41 +770,55 @@ fn dedup_preserving_order(v: Vec<String>) -> Vec<String> {
     out
 }
 
-// The run loop threads several independent, well-named launch parameters; a
-// bag struct would obscure more than it helps here.
-#[allow(clippy::too_many_arguments)]
-fn run(
-    term: &mut rawterm::Terminal,
-    command: &[String],
-    identity: Option<&str>,
-    grid: Option<atrium::spawn::Grid>,
-    // A pre-built initial window (the fleet loader spawns its own panes, one per
-    // agent, each with its own identity/cwd). When `Some`, it is used verbatim
-    // as the first window and `command`/`grid` are ignored for it — but they
-    // still drive later `Ctrl+A c` new panes and splits (which host `command`
-    // under `identity`), so a fleet's new panes open a shell as a scratch pane.
-    initial_window: Option<Window>,
-    // ctl control plane (§ atrium-ctl-control-plane): when `allow_ctl`, atrium binds
-    // a per-process control endpoint and injects its address into every pane, so
-    // an agent inside a pane can `atrium ctl spawn/list`. `max_depth` is the
-    // recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
-    allow_ctl: bool,
-    max_depth: usize,
-    // How atrium relaxes each spawned agent's permissions: `Off`, `Edits`
-    // (`--trust`: acceptEdits + safe allowlist), or `Skip` (`--skip-permissions`:
-    // full bypass). Published to the spawn path via `AGENT_TRUST` before the
-    // first spawn.
-    trust: atrium::ctl::TrustMode,
-    // A pre-bound ctl endpoint. The fleet path binds it *before* spawning its
-    // panes (so they get `ATRIUM_CTL` in their env) and hands the listener here;
-    // `None` means run() binds its own after the initial spawn (the default path).
-    mut ctl_listener: Option<atrium::ipc::Listener>,
-    // The fleet's declared canonical topic vocabulary (fleet config `"topics": []`),
-    // if any. `Some` ⇒ the bus enforces strict topic admission (agents route only
-    // on declared topics); `None` ⇒ topics are soft-gated (a novel topic needs
-    // `--new`). The default, non-fleet path passes `None`.
-    canonical_topics: Option<Vec<String>>,
-) -> ExitCode {
+/// What a session is launched with: the three launch paths (a plain launch,
+/// `fleet up` and `recover`) each build one and hand it to [`run`]. Named fields,
+/// because several are `Option`s a positional call passed as runs of `None`.
+pub(crate) struct RunArgs<'a> {
+    /// The command new panes host (`Ctrl+A c`, splits), under `identity`.
+    pub(crate) command: &'a [String],
+    pub(crate) identity: Option<&'a str>,
+    /// Mass-spawn (`-n` / `--grid`): the first window as a grid of `command`.
+    pub(crate) grid: Option<atrium::spawn::Grid>,
+    /// A pre-built initial window (the fleet loader spawns its own panes, one per
+    /// agent, each with its own identity/cwd). When `Some`, it is used verbatim
+    /// as the first window and `command`/`grid` are ignored for it — but they
+    /// still drive later `Ctrl+A c` new panes and splits (which host `command`
+    /// under `identity`), so a fleet's new panes open a shell as a scratch pane.
+    pub(crate) initial_window: Option<Window>,
+    /// ctl control plane (§ atrium-ctl-control-plane): when `allow_ctl`, atrium binds
+    /// a per-process control endpoint and injects its address into every pane, so
+    /// an agent inside a pane can `atrium ctl spawn/list`. `max_depth` is the
+    /// recursion guard (usize::MAX == unlimited). Off ⇒ pre-ctl behavior verbatim.
+    pub(crate) allow_ctl: bool,
+    pub(crate) max_depth: usize,
+    /// How atrium relaxes each spawned agent's permissions: `Off`, `Edits`
+    /// (`--trust`: acceptEdits + safe allowlist), or `Skip` (`--skip-permissions`:
+    /// full bypass). Published to the spawn path via `AGENT_TRUST` before the
+    /// first spawn.
+    pub(crate) trust: atrium::ctl::TrustMode,
+    /// A pre-bound ctl endpoint. The fleet path binds it *before* spawning its
+    /// panes (so they get `ATRIUM_CTL` in their env) and hands the listener here;
+    /// `None` means run() binds its own after the initial spawn (the default path).
+    pub(crate) ctl_listener: Option<atrium::ipc::Listener>,
+    /// The fleet's declared canonical topic vocabulary (fleet config `"topics": []`),
+    /// if any. `Some` ⇒ the bus enforces strict topic admission (agents route only
+    /// on declared topics); `None` ⇒ topics are soft-gated (a novel topic needs
+    /// `--new`). The default, non-fleet path passes `None`.
+    pub(crate) canonical_topics: Option<Vec<String>>,
+}
+
+fn run(term: &mut rawterm::Terminal, args: RunArgs<'_>) -> ExitCode {
+    let RunArgs {
+        command,
+        identity,
+        grid,
+        initial_window,
+        allow_ctl,
+        max_depth,
+        trust,
+        mut ctl_listener,
+        canonical_topics,
+    } = args;
     // Publish the trust policy before any pane is spawned so even the initial
     // agent picks it up.
     set_trust_mode(trust);
@@ -1627,14 +1643,6 @@ fn run(
     ExitCode::SUCCESS
 }
 
-/// Sanitize the terminal on exit and leave the alt screen. atrium owns the alt
-/// buffer (§ the run loop's `\x1b[?1049h` at start), but a hosted app may have
-/// left modes on — mouse reporting, bracketed paste, a hidden cursor, an
-/// altered scroll region, a non-default SGR. Leaving the alt screen alone does
-/// not undo those, so we reset them first, in a sensible order, before the
-/// `?1049l` swap so the user's original shell comes back clean. Called on
-/// **every** exit path in `run` (normal quit, last-pane-exit, read error, and
-/// the initial-spawn failure).
 /// Every mouse-reporting mode atrium ever turns off, in one place.
 ///
 /// This existed twice with DIFFERENT contents: the per-tick suppressor sent
@@ -1644,6 +1652,14 @@ fn run(
 /// Two lists that must agree will not stay in agreement; there is now one.
 const MOUSE_OFF: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l";
 
+/// Sanitize the terminal on exit and leave the alt screen. atrium owns the alt
+/// buffer (§ the run loop's `\x1b[?1049h` at start), but a hosted app may have
+/// left modes on — mouse reporting, bracketed paste, a hidden cursor, an
+/// altered scroll region, a non-default SGR. Leaving the alt screen alone does
+/// not undo those, so we reset them first, in a sensible order, before the
+/// `?1049l` swap so the user's original shell comes back clean. Called on
+/// **every** exit path in `run` (normal quit, last-pane-exit, read error, and
+/// the initial-spawn failure).
 fn cleanup_screen(out: &mut impl Write) {
     let _ = write!(
         out,
