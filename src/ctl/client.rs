@@ -128,6 +128,16 @@ fn fields_to_value(fields: Vec<(String, String)>) -> Value {
     )
 }
 
+/// The token at `idx` — a positional, or a flag's value — unless it is missing
+/// or is itself a flag, which is the error `missing`. A flag's value taken
+/// blindly swallowed the next flag: `--role --here` set role="--here" and lost
+/// the placement.
+fn value_at<'a>(args: &'a [String], idx: usize, missing: &str) -> Result<&'a String, String> {
+    args.get(idx)
+        .filter(|t| !t.starts_with('-'))
+        .ok_or_else(|| missing.to_string())
+}
+
 /// The JSON request under construction: `(key, value)` pairs in wire order.
 type Pairs = Vec<(&'static str, Value)>;
 
@@ -183,36 +193,26 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     while i < args.len() {
         match args[i].as_str() {
             "--worktree" => {
-                let name = args
-                    .get(i + 1)
-                    .cloned()
-                    .ok_or_else(|| "--worktree needs a name".to_string())?;
-                worktree = Some(name);
+                worktree = Some(value_at(args, i + 1, "--worktree needs a name")?.clone());
                 i += 2;
             }
             "--mode" => {
-                let k = args.get(i + 1).ok_or_else(|| {
-                    "--mode needs a value (plan, accept, or automode)".to_string()
-                })?;
+                let k = value_at(
+                    args,
+                    i + 1,
+                    "--mode needs a value (plan, accept, or automode)",
+                )?;
                 mode = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
                     format!("--mode: unknown {k:?} (use plan, accept, or automode)")
                 })?);
                 i += 2;
             }
             "--role" => {
-                role = Some(
-                    args.get(i + 1)
-                        .cloned()
-                        .ok_or_else(|| "--role needs a value".to_string())?,
-                );
+                role = Some(value_at(args, i + 1, "--role needs a value")?.clone());
                 i += 2;
             }
             "--identity" => {
-                identity = Some(
-                    args.get(i + 1)
-                        .cloned()
-                        .ok_or_else(|| "--identity needs a value".to_string())?,
-                );
+                identity = Some(value_at(args, i + 1, "--identity needs a value")?.clone());
                 i += 2;
             }
             "--here" => {
@@ -256,10 +256,7 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 /// `send <target> <text...>`
 fn send_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("send")));
-    let target = args
-        .get(1)
-        .filter(|t| !t.starts_with('-'))
-        .ok_or_else(|| "send needs a target (pane id or role)".to_string())?;
+    let target = value_at(args, 1, "send needs a target (pane id or role)")?;
     let text = args[2..].join(" ");
     if text.trim().is_empty() {
         return Err("send needs text after the target".to_string());
@@ -281,10 +278,7 @@ fn status_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 /// `kill <target>`
 fn kill_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("kill")));
-    let target = args
-        .get(1)
-        .filter(|t| !t.starts_with('-'))
-        .ok_or_else(|| "kill needs a target (pane id or role)".to_string())?;
+    let target = value_at(args, 1, "kill needs a target (pane id or role)")?;
     pairs.push(("target", Value::String(target.clone())));
     Ok(())
 }
@@ -296,7 +290,8 @@ fn audit_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
         let n = tok
             .parse::<usize>()
             .map_err(|_| format!("audit tail must be a number, got {tok:?}"))?;
-        pairs.push(("tail", Value::Number(Number::Int(n as i64))));
+        let n = i64::try_from(n).map_err(|_| format!("audit tail {tok} is too large"))?;
+        pairs.push(("tail", Value::Number(Number::Int(n))));
     }
     Ok(())
 }
@@ -311,10 +306,7 @@ fn board_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("op", s(sub)));
     match sub {
         "set" => {
-            let key = args
-                .get(2)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "board set needs a key".to_string())?;
+            let key = value_at(args, 2, "board set needs a key")?;
             pairs.push(("key", Value::String(key.clone())));
             // Remaining args are `field=value` pairs (empty value clears);
             // unquoted spaced values are joined across tokens.
@@ -327,27 +319,25 @@ fn board_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             }
             pairs.push(("fields", fields_to_value(fields)));
         }
-        "get" | "del" | "release" => {
-            let key = args
-                .get(2)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| format!("board {sub} needs a key"))?;
+        "get" | "del" | "release" | "claim" => {
+            let key = value_at(args, 2, &format!("board {sub} needs a key"))?;
             pairs.push(("key", Value::String(key.clone())));
-        }
-        "claim" => {
-            let key = args
-                .get(2)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "board claim needs a key".to_string())?;
-            pairs.push(("key", Value::String(key.clone())));
-            // Optional `--ttl SECS` overrides the default lease length.
-            if let Some(pos) = args.iter().position(|a| a == "--ttl") {
+            // `claim` only: an optional `--ttl SECS` overrides the default lease.
+            if let Some(pos) = args
+                .iter()
+                .position(|a| a == "--ttl")
+                .filter(|_| sub == "claim")
+            {
                 let secs = args
                     .get(pos + 1)
                     .ok_or_else(|| "--ttl needs a value in seconds".to_string())?
                     .parse::<u64>()
                     .map_err(|_| "--ttl must be a whole number of seconds".to_string())?;
-                pairs.push(("ttl_ms", Value::Number(Number::Int((secs * 1000) as i64))));
+                let ms = secs
+                    .checked_mul(1000)
+                    .and_then(|ms| i64::try_from(ms).ok())
+                    .ok_or_else(|| format!("--ttl {secs} is too large"))?;
+                pairs.push(("ttl_ms", Value::Number(Number::Int(ms))));
             }
         }
         "list" => {}
@@ -383,10 +373,7 @@ fn bus_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
         }
         "feed" => bus_feed(args, pairs)?,
         "resolve" => {
-            let tok = args
-                .get(2)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "bus resolve needs a seq".to_string())?;
+            let tok = value_at(args, 2, "bus resolve needs a seq")?;
             let seq = tok
                 .parse::<i64>()
                 .map_err(|_| format!("bus resolve: seq must be a number, got {tok:?}"))?;
@@ -405,10 +392,7 @@ fn bus_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 
 /// `bus pub <topic> [--decision | --kind K] [--new] [--to R] field=value…`
 fn bus_pub(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
-    let topic = args
-        .get(2)
-        .filter(|t| !t.starts_with('-'))
-        .ok_or_else(|| "bus pub needs a topic".to_string())?;
+    let topic = value_at(args, 2, "bus pub needs a topic")?;
     pairs.push(("topic", Value::String(topic.clone())));
     // Default FYI; `--decision` (or `--kind K`) escalates. Remaining
     // args are `field=value` pairs (unquoted spaced values are
@@ -435,16 +419,12 @@ fn bus_pub(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 // lead). Sugar for a `to=<role>` field: an
                 // agent-addressed decision routes to that agent
                 // instead of firing the human's urgent bar.
-                let role = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--to needs a role (e.g. --to lead)".to_string())?;
+                let role = value_at(args, i + 1, "--to needs a role (e.g. --to lead)")?;
                 fields.push(("to".to_string(), role.clone()));
                 i += 2;
             }
             "--kind" => {
-                let k = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--kind needs fyi or decision_needed".to_string())?;
+                let k = value_at(args, i + 1, "--kind needs fyi or decision_needed")?;
                 kind = crate::bus::Kind::from_keyword(k)
                     .ok_or_else(|| format!("--kind: unknown {k:?} (use fyi or decision_needed)"))?;
                 i += 2;
@@ -468,25 +448,29 @@ fn bus_pub(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 
 /// `bus feed [--since N | --since=N]`
 fn bus_feed(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
-    // `--since N` resumes after cursor N; default 0 = from the start.
+    // `--since N` resumes after cursor N; default 0 = from the start. Given at
+    // most once: a second one used to send the `since` key twice.
+    let mut since: Option<i64> = None;
     let mut i = 2;
     while i < args.len() {
-        if args[i] == "--since" {
-            let n = args
-                .get(i + 1)
-                .and_then(|t| t.parse::<i64>().ok())
-                .ok_or_else(|| "--since needs a number".to_string())?;
-            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
+        let n = if args[i] == "--since" {
             i += 2;
+            args.get(i - 1)
+                .and_then(|t| t.parse::<i64>().ok())
+                .ok_or_else(|| "--since needs a number".to_string())?
         } else if let Some(rest) = args[i].strip_prefix("--since=") {
-            let n = rest
-                .parse::<i64>()
-                .map_err(|_| "--since needs a number".to_string())?;
-            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
             i += 1;
+            rest.parse::<i64>()
+                .map_err(|_| "--since needs a number".to_string())?
         } else {
             return Err(format!("unexpected argument {:?} to bus feed", args[i]));
+        };
+        if since.replace(n).is_some() {
+            return Err("--since may be given only once".to_string());
         }
+    }
+    if let Some(n) = since {
+        pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
     }
     Ok(())
 }
@@ -494,17 +478,11 @@ fn bus_feed(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 /// `respawn <target> [--worktree W]`
 fn respawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("respawn")));
-    let target = args
-        .get(1)
-        .filter(|t| !t.starts_with('-'))
-        .ok_or_else(|| "respawn needs a target (pane id or role)".to_string())?;
+    let target = value_at(args, 1, "respawn needs a target (pane id or role)")?;
     pairs.push(("target", Value::String(target.clone())));
     if let Some(pos) = args.iter().position(|a| a == "--worktree") {
-        let name = args
-            .get(pos + 1)
-            .ok_or_else(|| "--worktree needs a name".to_string())?
-            .clone();
-        pairs.push(("worktree", Value::String(name)));
+        let name = value_at(args, pos + 1, "--worktree needs a name")?;
+        pairs.push(("worktree", Value::String(name.clone())));
     }
     Ok(())
 }
