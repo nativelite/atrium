@@ -6,6 +6,7 @@
 mod dispatch;
 mod panes;
 mod reply;
+mod respawn;
 mod sends;
 mod spawn;
 mod wake;
@@ -13,7 +14,7 @@ mod wake;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use dispatch::{apply_ctl, decision_for_agent};
+pub(crate) use dispatch::{apply_ctl, decision_for_agent, CtlSession};
 pub(crate) use panes::{effective_mode, status_label};
 pub(crate) use reply::truncate;
 pub(crate) use sends::{flush_sends, PendingSend};

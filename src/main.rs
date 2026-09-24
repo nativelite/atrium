@@ -1251,18 +1251,20 @@ fn run(
                     Ok(Some(line)) => {
                         let reply = apply_ctl(
                             &line,
-                            &mut windows,
-                            rows,
-                            cols,
-                            max_depth,
-                            &ctl_extra_allow,
-                            &mut pending_sends,
-                            &world,
-                            identity,
-                            &mut ctl_audit,
-                            &mut board,
-                            &mut bus,
-                            session_job,
+                            &mut CtlSession {
+                                windows: &mut windows,
+                                rows,
+                                cols,
+                                max_depth,
+                                extra_allow: &ctl_extra_allow,
+                                pending: &mut pending_sends,
+                                world: &world,
+                                session_identity: identity,
+                                audit: &mut ctl_audit,
+                                board: &mut board,
+                                bus: &mut bus,
+                                job: session_job,
+                            },
                         );
                         let _ = listener.respond(&reply.to_json());
                         renderer.reset();
