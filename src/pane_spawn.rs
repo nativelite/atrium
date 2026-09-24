@@ -320,6 +320,117 @@ pub(crate) fn spawn_pane_full(
     // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This
     // title feeds is_claude/is_codex/vendor_tag, so the fix must live here.
     let title = atrium::bind::command_stem(&command[0]);
+    let (base, folder_trust) = agent_args(command, &title, mode, deny, extra_norms);
+    if folder_trust {
+        ensure_folder_trust(cwd, &title, flash);
+    }
+    // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
+    // user did not already pick a session, mint a uuid and append
+    // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
+    // wrapping, so the flag reaches claude, not the shim host). Remember the id.
+    let session_id = atrium::bind::session_id_for(&base);
+    let mut user_cmd: Vec<String> = base;
+    if let Some(uuid) = &session_id {
+        user_cmd.push("--session-id".to_string());
+        user_cmd.push(uuid.clone());
+    }
+    let effective = effective_command(&user_cmd);
+    log_spawn(&title, &effective);
+    let r = rows.max(1);
+    let c = cols.max(1);
+
+    // Stamp the process-global agent id now — it is both the pane's spawn-tree
+    // key and the `ATRIUM_PANE` value injected below, so an agent inside can
+    // attribute its own `ctl spawn` calls back to this pane.
+    let agent_id = next_agent_id();
+    let (base_env, token, pane_cgroup) = pane_env(agent_id, extra_env);
+
+    // Identity injection (path B): only for an agent pane with an identity set.
+    // Decide ONCE so the spawn path and the pane's stored tag can never diverge
+    // — a pane tagged with an identity is exactly a pane spawned with its env.
+    let inject = atrium::identity::wants_env(command, identity);
+
+    // We RE-RESOLVE on every spawn — the resolved env (which contains secret
+    // material) lives only in this local, is handed straight to the pty, and is
+    // dropped at the end of this function. It is never cached on the pane,
+    // never logged, never printed. The pane stores only the identity *name*.
+    //
+    // Resolve failure (no such target, vault locked) is surfaced in the bar and
+    // the pane spawns with plain env (ambient creds) but still in `cwd` — visible,
+    // not silent, and never unauthenticated-without-saying-so (§7).
+    let pty = if inject {
+        let name = identity.expect("wants_env implies Some");
+        let merged = identity_env(name, &base_env, flash);
+        start_pty(&effective, r, c, &merged, cwd)?
+    } else {
+        start_pty(&effective, r, c, &base_env, cwd)?
+    };
+    // The second marker, on disk. Measured on macOS 26: `ps -E` prints the
+    // environment of ordinary binaries but NOTHING for a SIP/platform binary,
+    // and `/bin/sh` — what a default pane runs, and the exact population that
+    // stranded — is one of those. So the env marker alone is blind to shells
+    // here; the stamp covers every pane. It records the pane's own start token,
+    // so a stale file cannot become a kill order against a recycled pid.
+    atrium::orphan::stamp(pty.pid());
+    // Into the capped leaf at once, not at the next safety-net tick, so little
+    // the pane starts in its first moments lands outside the cap.
+    if let Some(cg) = pane_cgroup {
+        cg.assign(pty.pid());
+    }
+    Ok(Pane {
+        // The run loop starts the reader thread, with its doorbell.
+        inbox: None,
+        id,
+        pty,
+        term: vterm::Term::new(r as usize, c as usize),
+        filter: atrium::filter::Passthrough::new(),
+        title,
+        activity: false,
+        // A fresh pane is "active" (idle 0) until proven idle; stamped forward on
+        // every output byte in the run loop.
+        last_activity: std::time::Instant::now(),
+        draft: atrium::deliver::Draft::default(),
+        exited: false,
+        session_id,
+        launch_ms: agsess::sessions::now_ms(),
+        cwd: cwd.map(str::to_string),
+        // Store the identity NAME only, and only for panes that would actually
+        // run under it (agent panes) — a shell keeps `None`, so no misleading
+        // tag on a pane that was never credentialed. `inject` is the same
+        // decision the spawn used, so tag and env can never disagree.
+        identity: identity.filter(|_| inject).map(str::to_string),
+        agent_id,
+        token,
+        // Spawn-tree fields default to "root pane the human opened"; the ctl
+        // spawn handler overrides role/parent/depth for a ctl-created worker.
+        role: None,
+        parent: None,
+        depth: 0,
+        can_spawn: true,
+        painted: false,
+        mouse_wanted: false,
+        argv: command.to_vec(),
+        worktree: None,
+        deny: deny.to_vec(),
+        mode,
+        // The fleet launcher marks a kickoff after spawn; nothing else has one.
+        kickoff: false,
+        norms: extra_norms.map(str::to_string),
+        context_env: atrium::context::restorable_env(extra_env),
+    })
+}
+
+/// The agent's launch argv before the session id: `command` plus the trust
+/// flags for `mode`, the deny list and the folded system prompt, each for the
+/// vendors that take them. The flag says whether this is a trusted claude launch,
+/// the one case that also pre-accepts claude's folder-trust dialog.
+fn agent_args(
+    command: &[String],
+    title: &str,
+    mode: atrium::ctl::TrustMode,
+    deny: &[String],
+    extra_norms: Option<&str>,
+) -> (Vec<String>, bool) {
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
     //                                dev-command allowlist; dangerous commands
@@ -340,8 +451,8 @@ pub(crate) fn spawn_pane_full(
     // is vendor-aware). Any other agent still launches with its command untouched.
     // The broad `is_agent_stem` continues to govern vendor-neutral treatment like
     // the identity-env decision in `wants_env` below.
-    let is_claude = atrium::bind::is_claude_stem(&title);
-    let is_codex = atrium::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex);
+    let is_claude = atrium::bind::is_claude_stem(title);
+    let is_codex = atrium::vendors::vendor_for_stem(title) == Some(agsess::Vendor::Codex);
     let trusted_launch = (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off;
     let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
@@ -407,6 +518,11 @@ pub(crate) fn spawn_pane_full(
         let block = combine_system_prompt(extra_norms, ctl);
         base = fold_system_prompt(base, block.as_deref());
     }
+    (base, trusted_launch && is_claude)
+}
+
+/// Pre-accept claude's folder-trust dialog for the pane's working directory.
+fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(String, Instant)>) {
     // …and pre-accept claude's *folder-trust* dialog for this pane's working
     // directory — a separate gate the permission mode does NOT cover (it's stored
     // per-dir in ~/.claude.json). Without this a trusted launch in an untrusted
@@ -414,28 +530,19 @@ pub(crate) fn spawn_pane_full(
     // per-folder trust in ~/.codex/config.toml (TOML — a follow-up; see
     // `trust::codex_trust_args`). Only under --trust/--skip, only the trust bit,
     // only this pane's cwd; a parse/IO problem is flashed and the pane spawns anyway.
-    if trusted_launch && is_claude {
-        let dir = cwd
-            .map(std::path::PathBuf::from)
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_default();
-        // An aliased claude with its own config dir keeps its trust map there.
-        let config_dir = atrium::bind::alias_config_dir(&title);
-        if let Err(e) = atrium::trust::ensure_trusted_in(config_dir, &dir) {
-            *flash = Some((format!("folder-trust: {e}"), Instant::now()));
-        }
+    let dir = cwd
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    // An aliased claude with its own config dir keeps its trust map there.
+    let config_dir = atrium::bind::alias_config_dir(title);
+    if let Err(e) = atrium::trust::ensure_trusted_in(config_dir, &dir) {
+        *flash = Some((format!("folder-trust: {e}"), Instant::now()));
     }
-    // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
-    // user did not already pick a session, mint a uuid and append
-    // `--session-id <uuid>` to the *agent's* args (before any `cmd /C` shim
-    // wrapping, so the flag reaches claude, not the shim host). Remember the id.
-    let session_id = atrium::bind::session_id_for(&base);
-    let mut user_cmd: Vec<String> = base;
-    if let Some(uuid) = &session_id {
-        user_cmd.push("--session-id".to_string());
-        user_cmd.push(uuid.clone());
-    }
-    let effective = effective_command(&user_cmd);
+}
+
+/// Append the exact command a pane launches to `ATRIUM_SPAWN_LOG`, when set.
+fn log_spawn(title: &str, effective: &[String]) {
     // Opt-in spawn diagnostic: `ATRIUM_SPAWN_LOG=<file>` appends the exact command
     // (post trust-flags, post shim) atrium launches for each pane, so a "why isn't
     // this pane in the mode I expected" question is answered by data, not guesses.
@@ -451,15 +558,18 @@ pub(crate) fn spawn_pane_full(
             }
         }
     }
-    let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
-    let r = rows.max(1);
-    let c = cols.max(1);
+}
 
-    // Stamp the process-global agent id now — it is both the pane's spawn-tree
-    // key and the `ATRIUM_PANE` value injected below, so an agent inside can
-    // attribute its own `ctl spawn` calls back to this pane.
-    let agent_id = next_agent_id();
-
+/// The pane's non-secret environment, its ctl capability token (if OS entropy
+/// allowed one) and the capped cgroup it joins once spawned.
+fn pane_env(
+    agent_id: AgentId,
+    extra_env: &[(String, String)],
+) -> (
+    Vec<(String, String)>,
+    Option<String>,
+    Option<&'static atrium::cgroup::PaneCgroup>,
+) {
     // ctl env (non-secret): when the control channel is on, every pane learns
     // the endpoint (`ATRIUM_CTL`) and its own id (`ATRIUM_PANE`). This is the base
     // env; identity secrets (if any) are merged on top for this one spawn.
@@ -496,20 +606,56 @@ pub(crate) fn spawn_pane_full(
         build_pool.as_deref(),
     );
     base_env.extend_from_slice(extra_env);
+    (base_env, token, pane_cgroup)
+}
 
-    // Identity injection (path B): only for an agent pane with an identity set.
-    // Decide ONCE so the spawn path and the pane's stored tag can never diverge
-    // — a pane tagged with an identity is exactly a pane spawned with its env.
-    let inject = atrium::identity::wants_env(command, identity);
+/// Merge the identity `name`'s resolved credentials over `base_env` for one
+/// spawn; a name that fails to resolve is flashed and left out.
+fn identity_env(
+    name: &str,
+    base_env: &[(String, String)],
+    flash: &mut Option<(String, Instant)>,
+) -> Vec<(String, String)> {
+    // An identity may be a comma-separated list (`work,hf`) so one agent gets
+    // several keys at once — each resolves to its own env var(s) and they are
+    // merged. A later entry that maps to the same var wins. The resolved env
+    // holds secret values: merged with the (non-secret) ctl base env for this
+    // one spawn, then dropped — never formatted, logged, or stored.
+    let mut merged = base_env.to_vec();
+    let mut failed: Vec<String> = Vec::new();
+    for part in name.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        match akey::resolve(part) {
+            Ok(env) => merged.extend(env),
+            // Names only in the message (akey's error carries the typed name,
+            // never a secret); one bad name doesn't sink the others.
+            Err(_) => failed.push(part.to_string()),
+        }
+    }
+    if !failed.is_empty() {
+        *flash = Some((
+            format!(
+                "identity {:?} unresolved — running without {}",
+                failed.join(","),
+                if merged.len() == base_env.len() {
+                    "credentials"
+                } else {
+                    "those"
+                }
+            ),
+            Instant::now(),
+        ));
+    }
+    merged
+}
 
-    // We RE-RESOLVE on every spawn — the resolved env (which contains secret
-    // material) lives only in this local, is handed straight to the pty, and is
-    // dropped at the end of this function. It is never cached on the pane,
-    // never logged, never printed. The pane stores only the identity *name*.
-    //
-    // Resolve failure (no such target, vault locked) is surfaced in the bar and
-    // the pane spawns with plain env (ambient creds) but still in `cwd` — visible,
-    // not silent, and never unauthenticated-without-saying-so (§7).
+/// Start `effective` on a `r x c` pty with `env` in `cwd`.
+fn start_pty(
+    effective: &[String],
+    r: u16,
+    c: u16,
+    env: &[(String, String)],
+    cwd: Option<&str>,
+) -> std::io::Result<pty::Pty> {
     // Windows: the pane is created SUSPENDED and joins the session job before it
     // runs a single instruction. Assigned after an ordinary spawn, anything it
     // started first — `claude.cmd` is a cmd.exe that starts node at once — would
@@ -520,41 +666,8 @@ pub(crate) fn spawn_pane_full(
     let spawn = pty::Pty::spawn_suspended;
     #[cfg(not(windows))]
     let spawn = pty::Pty::spawn_full;
-    let pty = if inject {
-        let name = identity.expect("wants_env implies Some");
-        // An identity may be a comma-separated list (`work,hf`) so one agent gets
-        // several keys at once — each resolves to its own env var(s) and they are
-        // merged. A later entry that maps to the same var wins. The resolved env
-        // holds secret values: merged with the (non-secret) ctl base env for this
-        // one spawn, then dropped — never formatted, logged, or stored.
-        let mut merged = base_env.clone();
-        let mut failed: Vec<String> = Vec::new();
-        for part in name.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            match akey::resolve(part) {
-                Ok(env) => merged.extend(env),
-                // Names only in the message (akey's error carries the typed name,
-                // never a secret); one bad name doesn't sink the others.
-                Err(_) => failed.push(part.to_string()),
-            }
-        }
-        if !failed.is_empty() {
-            *flash = Some((
-                format!(
-                    "identity {:?} unresolved — running without {}",
-                    failed.join(","),
-                    if merged.len() == base_env.len() {
-                        "credentials"
-                    } else {
-                        "those"
-                    }
-                ),
-                Instant::now(),
-            ));
-        }
-        spawn(&effective[0], &argrefs, r, c, &merged, cwd)?
-    } else {
-        spawn(&effective[0], &argrefs, r, c, &base_env, cwd)?
-    };
+    let argrefs: Vec<&str> = effective[1..].iter().map(String::as_str).collect();
+    let pty = spawn(&effective[0], &argrefs, r, c, env, cwd)?;
     #[cfg(windows)]
     let pty = {
         // A failed assign degrades to a pane outside the job (as before, R1),
@@ -568,59 +681,7 @@ pub(crate) fn spawn_pane_full(
         }
         pty
     };
-    // The second marker, on disk. Measured on macOS 26: `ps -E` prints the
-    // environment of ordinary binaries but NOTHING for a SIP/platform binary,
-    // and `/bin/sh` — what a default pane runs, and the exact population that
-    // stranded — is one of those. So the env marker alone is blind to shells
-    // here; the stamp covers every pane. It records the pane's own start token,
-    // so a stale file cannot become a kill order against a recycled pid.
-    atrium::orphan::stamp(pty.pid());
-    // Into the capped leaf at once, not at the next safety-net tick, so little
-    // the pane starts in its first moments lands outside the cap.
-    if let Some(cg) = pane_cgroup {
-        cg.assign(pty.pid());
-    }
-    Ok(Pane {
-        // The run loop starts the reader thread, with its doorbell.
-        inbox: None,
-        id,
-        pty,
-        term: vterm::Term::new(r as usize, c as usize),
-        filter: atrium::filter::Passthrough::new(),
-        title,
-        activity: false,
-        // A fresh pane is "active" (idle 0) until proven idle; stamped forward on
-        // every output byte in the run loop.
-        last_activity: std::time::Instant::now(),
-        draft: atrium::deliver::Draft::default(),
-        exited: false,
-        session_id,
-        launch_ms: agsess::sessions::now_ms(),
-        cwd: cwd.map(str::to_string),
-        // Store the identity NAME only, and only for panes that would actually
-        // run under it (agent panes) — a shell keeps `None`, so no misleading
-        // tag on a pane that was never credentialed. `inject` is the same
-        // decision the spawn used, so tag and env can never disagree.
-        identity: identity.filter(|_| inject).map(str::to_string),
-        agent_id,
-        token,
-        // Spawn-tree fields default to "root pane the human opened"; the ctl
-        // spawn handler overrides role/parent/depth for a ctl-created worker.
-        role: None,
-        parent: None,
-        depth: 0,
-        can_spawn: true,
-        painted: false,
-        mouse_wanted: false,
-        argv: command.to_vec(),
-        worktree: None,
-        deny: deny.to_vec(),
-        mode,
-        // The fleet launcher marks a kickoff after spawn; nothing else has one.
-        kickoff: false,
-        norms: extra_norms.map(str::to_string),
-        context_env: atrium::context::restorable_env(extra_env),
-    })
+    Ok(pty)
 }
 
 /// Strip embedded newlines from a shell-arg before it is forwarded through a
