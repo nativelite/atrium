@@ -33,18 +33,16 @@ pub(crate) fn worktree_spawn_params(
 }
 
 /// `ctl spawn` (default): a visible worker in a brand-new window.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_worker_window(
-    windows: &mut Vec<Window>,
+    cx: &mut CtlSession<'_>,
     sp: &atrium::ctl::SpawnReq,
     caller: Option<AgentId>,
     new_depth: usize,
-    rows: u16,
-    cols: u16,
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
-    job: &atrium::reap::SessionJob,
 ) -> atrium::ctl::Reply {
+    let (rows, cols, job) = (cx.rows, cx.cols, cx.job);
+    let windows = &mut *cx.windows;
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (wt_cwd, wt_norms) = match worktree_spawn_params(&cwd, sp.worktree.as_deref()) {
         Ok(pair) => pair,
@@ -86,18 +84,16 @@ pub(crate) fn spawn_worker_window(
 /// `ctl spawn --here`: tile the worker *beside* the caller, in the caller's own
 /// window, so a lead and its ICs sit in one view. Falls back to an error if the
 /// caller's pane can't be located (nothing to sit beside).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_worker_here(
-    windows: &mut [Window],
+    cx: &mut CtlSession<'_>,
     sp: &atrium::ctl::SpawnReq,
     caller: Option<AgentId>,
     new_depth: usize,
-    rows: u16,
-    cols: u16,
     mode: atrium::ctl::TrustMode,
     note: Option<&str>,
-    job: &atrium::reap::SessionJob,
 ) -> atrium::ctl::Reply {
+    let (rows, cols, job) = (cx.rows, cx.cols, cx.job);
+    let windows = &mut *cx.windows;
     let Some(caller_id) = caller else {
         return atrium::ctl::reply_err(
             "`--here` needs a caller pane; run it from inside an atrium pane",
@@ -186,7 +182,7 @@ pub(crate) fn spawn(
     cx: &mut CtlSession<'_>,
 ) -> atrium::ctl::Reply {
     let windows = &mut *cx.windows;
-    let (rows, cols, max_depth, job) = (cx.rows, cx.cols, cx.max_depth, cx.job);
+    let max_depth = cx.max_depth;
     let (extra_allow, session_identity) = (cx.extra_allow, cx.session_identity);
     // Capability check, FIRST. Creating teammates used to be implied by
     // having ctl access at all - so every agent in a fleet could do it,
@@ -298,12 +294,8 @@ pub(crate) fn spawn(
         return ctl::reply_err(&msg);
     }
     if sp.new_window {
-        spawn_worker_window(
-            windows, &sp, caller, new_depth, rows, cols, effective, note, job,
-        )
+        spawn_worker_window(cx, &sp, caller, new_depth, effective, note)
     } else {
-        spawn_worker_here(
-            windows, &sp, caller, new_depth, rows, cols, effective, note, job,
-        )
+        spawn_worker_here(cx, &sp, caller, new_depth, effective, note)
     }
 }
