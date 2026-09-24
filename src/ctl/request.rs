@@ -221,6 +221,11 @@ pub struct StatusReq {
     pub target: Option<String>,
 }
 
+/// The longest lease a board claim may ask for: 365 days. The board stores
+/// `now_ms + ttl_ms`, so an unbounded ttl overflows the lease; a year is
+/// already far past any task a lease exists to time out.
+pub const MAX_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+
 /// A `board` operation — the shared source-of-truth tracker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoardOp {
@@ -237,7 +242,8 @@ pub enum BoardOp {
     /// Remove an entry.
     Del { key: String },
     /// Atomically claim `key` for the caller with an optional lease `ttl_ms`
-    /// (`None` ⇒ the board's [`crate::board::DEFAULT_LEASE_MS`]). The owner is
+    /// (`None` ⇒ the board's [`crate::board::DEFAULT_LEASE_MS`]), clamped to
+    /// [`MAX_TTL_MS`]. The owner is
     /// derived server-side from the caller, never carried in the request, so a
     /// worker can't claim as someone else.
     Claim { key: String, ttl_ms: Option<u64> },
@@ -431,7 +437,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                         .get("ttl_ms")
                         .and_then(Value::as_i64)
                         .filter(|n| *n > 0)
-                        .map(|n| n as u64);
+                        .map(|n| (n as u64).min(MAX_TTL_MS));
                     BoardOp::Claim {
                         key: key()?,
                         ttl_ms,

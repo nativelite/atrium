@@ -8,7 +8,6 @@ pub(crate) fn spawn_window(
     command: &[String],
     rows: u16,
     cols: u16,
-    _idx: usize,
     identity: Option<&str>,
     mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
@@ -63,17 +62,7 @@ pub(crate) fn open_window(
     out: &mut impl std::io::Write,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<()> {
-    let w = spawn_window(
-        command,
-        rows,
-        cols,
-        windows.len(),
-        identity,
-        mode,
-        flash,
-        None,
-        None,
-    )?;
+    let w = spawn_window(command, rows, cols, identity, mode, flash, None, None)?;
     windows.push(w);
     let last = windows.len() - 1;
     switch_window(windows, active, last, rows, cols, out);
@@ -305,7 +294,7 @@ pub(crate) fn spawn_pane_full(
     let title = atrium::bind::command_stem(&command[0]);
     let base = agent_args(command, &title, mode, deny, extra_norms);
     // A trusted claude launch also pre-accepts claude's folder-trust dialog.
-    if atrium::bind::is_claude_stem(&title) && mode != atrium::ctl::TrustMode::Off {
+    if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
         ensure_folder_trust(cwd, &title, flash);
     }
     // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
@@ -404,6 +393,16 @@ pub(crate) fn spawn_pane_full(
     })
 }
 
+/// Does this pane launch under a trust posture: a vendor atrium maps trust
+/// flags for, at any mode but `Off`. The one definition, shared by the trust
+/// flags ([`agent_args`]) and claude's folder-trust pre-accept, so the two
+/// cannot drift.
+fn is_trusted_launch(title: &str, mode: atrium::ctl::TrustMode) -> bool {
+    let is_claude = atrium::bind::is_claude_stem(title);
+    let is_codex = atrium::vendors::vendor_for_stem(title) == Some(agsess::Vendor::Codex);
+    (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off
+}
+
 /// The agent's launch argv before the session id: `command` plus the trust
 /// flags for `mode`, the deny list and the folded system prompt, each for the
 /// vendors that take them.
@@ -436,7 +435,7 @@ fn agent_args(
     // the identity-env decision (`wants_env`, in `spawn_pane_full`).
     let is_claude = atrium::bind::is_claude_stem(title);
     let is_codex = atrium::vendors::vendor_for_stem(title) == Some(agsess::Vendor::Codex);
-    let trusted_launch = (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off;
+    let trusted_launch = is_trusted_launch(title, mode);
     let mut base: Vec<String> = if trusted_launch {
         let mut v = command.to_vec();
         if is_claude {

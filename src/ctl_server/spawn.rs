@@ -83,7 +83,6 @@ pub(crate) fn spawn_worker_window(
         &sp.argv,
         rows,
         cols,
-        windows.len(),
         sp.identity.as_deref(),
         mode,
         &mut flash,

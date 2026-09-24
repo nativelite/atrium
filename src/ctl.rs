@@ -64,5 +64,5 @@ pub use reply::{
 };
 pub use request::{
     parse_request, AgentId, AuditReq, BoardOp, BusOp, Cmd, KillReq, Request, RespawnReq, SendReq,
-    SpawnReq, StatusReq,
+    SpawnReq, StatusReq, MAX_TTL_MS,
 };

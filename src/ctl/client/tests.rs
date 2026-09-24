@@ -102,3 +102,32 @@ fn bus_feed_since_given_twice_is_an_error() {
     let req = build_request(&v(&["bus", "feed", "--since", "3"]), None).unwrap();
     assert!(req.contains(r#""since":3"#), "{req}");
 }
+
+#[test]
+fn ttl_and_tail_report_too_large_consistently() {
+    // Over the lease cap (the server adds it to now_ms), past u64, or past
+    // the parse type: all the same "too large", never "not a number".
+    for argv in [
+        &["board", "claim", "k", "--ttl", "9223372036854775"][..],
+        &["board", "claim", "k", "--ttl", "99999999999999999999"],
+        &["audit", "99999999999999999999"],
+    ] {
+        let err = build_request(&v(argv), None).unwrap_err();
+        assert!(err.contains("too large"), "{argv:?}: {err}");
+    }
+    let err = build_request(&v(&["board", "claim", "k", "--ttl", "--x"]), None).unwrap_err();
+    assert!(err.contains("needs"), "{err}");
+}
+
+#[test]
+fn a_field_named_twice_is_an_error() {
+    // The payload is an ordered list on the wire, so a repeated name reached
+    // the server twice and `get` picked one silently (`--to` is a `to=` field).
+    for argv in [
+        &["bus", "pub", "work", "--to", "lead", "to=dev", "msg=x"][..],
+        &["board", "set", "k", "a=1", "a=2"],
+    ] {
+        let err = build_request(&v(argv), None).unwrap_err();
+        assert!(err.contains("twice"), "{argv:?}: {err}");
+    }
+}

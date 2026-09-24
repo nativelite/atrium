@@ -2,7 +2,7 @@
 
 use super::render::{render_board, render_bus};
 use super::reply::{obj, s};
-use super::{zero_sub_warning, TrustMode, ENV_ADDRESS, ENV_PANE, ENV_TOKEN};
+use super::{zero_sub_warning, TrustMode, ENV_ADDRESS, ENV_PANE, ENV_TOKEN, MAX_TTL_MS};
 use json::{Number, Value};
 use std::process::ExitCode;
 
@@ -108,6 +108,11 @@ fn should_color() -> bool {
 /// arrives before any field has been named.
 fn absorb_field_token(fields: &mut Vec<(String, String)>, tok: &str) -> Result<(), String> {
     if let Some((f, val)) = tok.split_once('=') {
+        // The payload is an ordered list on the wire: a repeated name would
+        // reach the server twice and one would win silently.
+        if fields.iter().any(|(have, _)| have == f) {
+            return Err(format!("field {f:?} given twice"));
+        }
         fields.push((f.to_string(), val.to_string()));
     } else if let Some((_, last)) = fields.last_mut() {
         last.push(' ');
@@ -126,6 +131,16 @@ fn fields_to_value(fields: Vec<(String, String)>) -> Value {
             .map(|(f, v)| (f, Value::String(v)))
             .collect(),
     )
+}
+
+/// Parse a non-negative whole number, telling "too large" (`Ok(None)`) apart
+/// from "not a number" (`Err`), whatever the platform's word size.
+fn parse_whole(tok: &str) -> Result<Option<u64>, ()> {
+    match tok.parse::<u64>() {
+        Ok(n) => Ok(Some(n)),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Ok(None),
+        Err(_) => Err(()),
+    }
 }
 
 /// The token at `idx` — a positional, or a flag's value — unless it is missing
@@ -147,7 +162,8 @@ type Pairs = Vec<(&'static str, Value)>;
 pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, String> {
     let mut pairs: Pairs = Vec::new();
     if let Some(c) = caller {
-        pairs.push(("caller", Value::Number(Number::Int(c as i64))));
+        let c = i64::try_from(c).map_err(|_| format!("caller id {c} is out of range"))?;
+        pairs.push(("caller", Value::Number(Number::Int(c))));
     }
     // The capability token authenticates the caller. It is env-sourced (like the
     // endpoint address and the caller id in `ctl_cmd`); tests, which never set
@@ -287,10 +303,10 @@ fn kill_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
 fn audit_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("audit")));
     if let Some(tok) = args.get(1).filter(|t| !t.starts_with('-')) {
-        let n = tok
-            .parse::<usize>()
-            .map_err(|_| format!("audit tail must be a number, got {tok:?}"))?;
-        let n = i64::try_from(n).map_err(|_| format!("audit tail {tok} is too large"))?;
+        let n = parse_whole(tok)
+            .map_err(|()| format!("audit tail must be a number, got {tok:?}"))?
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| format!("audit tail {tok} is too large"))?;
         pairs.push(("tail", Value::Number(Number::Int(n))));
     }
     Ok(())
@@ -328,16 +344,15 @@ fn board_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 .position(|a| a == "--ttl")
                 .filter(|_| sub == "claim")
             {
-                let secs = args
-                    .get(pos + 1)
-                    .ok_or_else(|| "--ttl needs a value in seconds".to_string())?
-                    .parse::<u64>()
-                    .map_err(|_| "--ttl must be a whole number of seconds".to_string())?;
-                let ms = secs
-                    .checked_mul(1000)
-                    .and_then(|ms| i64::try_from(ms).ok())
-                    .ok_or_else(|| format!("--ttl {secs} is too large"))?;
-                pairs.push(("ttl_ms", Value::Number(Number::Int(ms))));
+                let tok = value_at(args, pos + 1, "--ttl needs a value in seconds")?;
+                // Capped at MAX_TTL_MS, not just i64: the server adds the
+                // lease to now_ms.
+                let ms = parse_whole(tok)
+                    .map_err(|()| "--ttl must be a whole number of seconds".to_string())?
+                    .and_then(|secs| secs.checked_mul(1000))
+                    .filter(|ms| *ms <= MAX_TTL_MS)
+                    .ok_or_else(|| format!("--ttl {tok} is too large (at most 365 days)"))?;
+                pairs.push(("ttl_ms", Value::Number(Number::Int(ms as i64))));
             }
         }
         "list" => {}

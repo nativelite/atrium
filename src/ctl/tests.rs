@@ -516,3 +516,17 @@ fn build_and_parse_audit_with_and_without_tail() {
     let all = parse_request(&build_request(&v(&["audit"]), None).unwrap()).unwrap();
     assert_eq!(all.cmd, Cmd::Audit(AuditReq { tail: None }));
 }
+
+#[test]
+fn server_clamps_a_claim_ttl_to_the_lease_cap() {
+    // A raw request can carry any ttl_ms; the board adds it to now_ms, so an
+    // uncapped one overflows the lease.
+    let req = parse_request(
+        r#"{"caller":0,"cmd":"board","op":"claim","key":"k","ttl_ms":9223372036854775000}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        req.cmd,
+        Cmd::Board(BoardOp::Claim { ttl_ms: Some(ms), .. }) if ms == MAX_TTL_MS
+    ));
+}
