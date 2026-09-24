@@ -128,12 +128,14 @@ fn fields_to_value(fields: Vec<(String, String)>) -> Value {
     )
 }
 
+/// The JSON request under construction: `(key, value)` pairs in wire order.
+type Pairs = Vec<(&'static str, Value)>;
+
 /// Turn `atrium ctl` argv (after the `ctl` word) + caller id into a JSON request
-/// line. Pure and testable. Grammar:
-///   `spawn [--role R] [--here | --window] [-- <cmd...>]`
-///   `list`
+/// line. Pure and testable. A router: `caller` and `token` first, then the
+/// subcommand's own builder below, each of which documents its grammar.
 pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, String> {
-    let mut pairs: Vec<(&str, Value)> = Vec::new();
+    let mut pairs: Pairs = Vec::new();
     if let Some(c) = caller {
         pairs.push(("caller", Value::Number(Number::Int(c as i64))));
     }
@@ -146,322 +148,17 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
         }
     }
     match args.first().map(String::as_str) {
-        Some("spawn") => {
-            pairs.push(("cmd", s("spawn")));
-            let mut role: Option<String> = None;
-            let mut identity: Option<String> = None;
-            let mut new_window = true;
-            let mut mode: Option<TrustMode> = None;
-            let mut worktree: Option<String> = None;
-            let mut argv: Vec<String> = Vec::new();
-            let mut i = 1;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--worktree" => {
-                        let name = args
-                            .get(i + 1)
-                            .cloned()
-                            .ok_or_else(|| "--worktree needs a name".to_string())?;
-                        worktree = Some(name);
-                        i += 2;
-                    }
-                    "--mode" => {
-                        let k = args.get(i + 1).ok_or_else(|| {
-                            "--mode needs a value (plan, accept, or automode)".to_string()
-                        })?;
-                        mode = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
-                            format!("--mode: unknown {k:?} (use plan, accept, or automode)")
-                        })?);
-                        i += 2;
-                    }
-                    "--role" => {
-                        role = Some(
-                            args.get(i + 1)
-                                .cloned()
-                                .ok_or_else(|| "--role needs a value".to_string())?,
-                        );
-                        i += 2;
-                    }
-                    "--identity" => {
-                        identity = Some(
-                            args.get(i + 1)
-                                .cloned()
-                                .ok_or_else(|| "--identity needs a value".to_string())?,
-                        );
-                        i += 2;
-                    }
-                    "--here" => {
-                        new_window = false;
-                        i += 1;
-                    }
-                    "--window" => {
-                        new_window = true;
-                        i += 1;
-                    }
-                    "--" => {
-                        argv = args[i + 1..].to_vec();
-                        break;
-                    }
-                    other => return Err(format!("unexpected argument {other:?} (use `-- <cmd>`)")),
-                }
-            }
-            if argv.is_empty() {
-                return Err("spawn needs a command after `--` (e.g. `-- claude`)".to_string());
-            }
-            if let Some(r) = role {
-                pairs.push(("role", Value::String(r)));
-            }
-            if let Some(x) = identity {
-                pairs.push(("identity", Value::String(x)));
-            }
-            if let Some(m) = mode {
-                pairs.push(("mode", Value::String(m.policy_label().to_string())));
-            }
-            if let Some(w) = worktree {
-                pairs.push(("worktree", Value::String(w)));
-            }
-            pairs.push(("window", Value::Bool(new_window)));
-            pairs.push((
-                "argv",
-                Value::Array(argv.into_iter().map(Value::String).collect()),
-            ));
-        }
+        Some("spawn") => spawn_req(args, &mut pairs)?,
         Some("list") => {
             pairs.push(("cmd", s("list")));
         }
-        Some("send") => {
-            pairs.push(("cmd", s("send")));
-            let target = args
-                .get(1)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "send needs a target (pane id or role)".to_string())?;
-            let text = args[2..].join(" ");
-            if text.trim().is_empty() {
-                return Err("send needs text after the target".to_string());
-            }
-            pairs.push(("target", Value::String(target.clone())));
-            pairs.push(("text", Value::String(text)));
-        }
-        Some("status") => {
-            pairs.push(("cmd", s("status")));
-            if let Some(target) = args.get(1).filter(|t| !t.starts_with('-')) {
-                pairs.push(("target", Value::String(target.clone())));
-            }
-        }
-        Some("kill") => {
-            pairs.push(("cmd", s("kill")));
-            let target = args
-                .get(1)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "kill needs a target (pane id or role)".to_string())?;
-            pairs.push(("target", Value::String(target.clone())));
-        }
-        Some("audit") => {
-            pairs.push(("cmd", s("audit")));
-            if let Some(tok) = args.get(1).filter(|t| !t.starts_with('-')) {
-                let n = tok
-                    .parse::<usize>()
-                    .map_err(|_| format!("audit tail must be a number, got {tok:?}"))?;
-                pairs.push(("tail", Value::Number(Number::Int(n as i64))));
-            }
-        }
-        Some("board") => {
-            pairs.push(("cmd", s("board")));
-            let sub = args
-                .get(1)
-                .map(String::as_str)
-                .ok_or_else(|| "board needs set|get|list|del|claim|release".to_string())?;
-            pairs.push(("op", s(sub)));
-            match sub {
-                "set" => {
-                    let key = args
-                        .get(2)
-                        .filter(|t| !t.starts_with('-'))
-                        .ok_or_else(|| "board set needs a key".to_string())?;
-                    pairs.push(("key", Value::String(key.clone())));
-                    // Remaining args are `field=value` pairs (empty value clears);
-                    // unquoted spaced values are joined across tokens.
-                    let mut fields: Vec<(String, String)> = Vec::new();
-                    for a in &args[3.min(args.len())..] {
-                        absorb_field_token(&mut fields, a)
-                            .map_err(|e| format!("board set: {e}"))?;
-                    }
-                    if fields.is_empty() {
-                        return Err("board set needs at least one field=value".to_string());
-                    }
-                    pairs.push(("fields", fields_to_value(fields)));
-                }
-                "get" | "del" | "release" => {
-                    let key = args
-                        .get(2)
-                        .filter(|t| !t.starts_with('-'))
-                        .ok_or_else(|| format!("board {sub} needs a key"))?;
-                    pairs.push(("key", Value::String(key.clone())));
-                }
-                "claim" => {
-                    let key = args
-                        .get(2)
-                        .filter(|t| !t.starts_with('-'))
-                        .ok_or_else(|| "board claim needs a key".to_string())?;
-                    pairs.push(("key", Value::String(key.clone())));
-                    // Optional `--ttl SECS` overrides the default lease length.
-                    if let Some(pos) = args.iter().position(|a| a == "--ttl") {
-                        let secs = args
-                            .get(pos + 1)
-                            .ok_or_else(|| "--ttl needs a value in seconds".to_string())?
-                            .parse::<u64>()
-                            .map_err(|_| "--ttl must be a whole number of seconds".to_string())?;
-                        pairs.push(("ttl_ms", Value::Number(Number::Int((secs * 1000) as i64))));
-                    }
-                }
-                "list" => {}
-                other => {
-                    return Err(format!(
-                        "board op must be set|get|list|del|claim|release (got {other:?})"
-                    ))
-                }
-            }
-        }
-        Some("bus") => {
-            pairs.push(("cmd", s("bus")));
-            let sub = args
-                .get(1)
-                .map(String::as_str)
-                .ok_or_else(|| "bus needs pub|sub|unsub|feed|resolve".to_string())?;
-            pairs.push(("op", s(sub)));
-            match sub {
-                "pub" => {
-                    let topic = args
-                        .get(2)
-                        .filter(|t| !t.starts_with('-'))
-                        .ok_or_else(|| "bus pub needs a topic".to_string())?;
-                    pairs.push(("topic", Value::String(topic.clone())));
-                    // Default FYI; `--decision` (or `--kind K`) escalates. Remaining
-                    // args are `field=value` pairs (unquoted spaced values are
-                    // joined across tokens) — the structured payload.
-                    let mut kind = crate::bus::Kind::Fyi;
-                    let mut fields: Vec<(String, String)> = Vec::new();
-                    let mut create = false;
-                    let mut i = 3.min(args.len());
-                    while i < args.len() {
-                        let a = &args[i];
-                        match a.as_str() {
-                            "--decision" => {
-                                kind = crate::bus::Kind::DecisionNeeded;
-                                i += 1;
-                            }
-                            "--new" => {
-                                // Deliberately create a not-yet-seen topic (soft-gate
-                                // only; a declared fleet rejects off-list regardless).
-                                create = true;
-                                i += 1;
-                            }
-                            "--to" => {
-                                // Address the event to a teammate role (e.g. the
-                                // lead). Sugar for a `to=<role>` field: an
-                                // agent-addressed decision routes to that agent
-                                // instead of firing the human's urgent bar.
-                                let role = args.get(i + 1).ok_or_else(|| {
-                                    "--to needs a role (e.g. --to lead)".to_string()
-                                })?;
-                                fields.push(("to".to_string(), role.clone()));
-                                i += 2;
-                            }
-                            "--kind" => {
-                                let k = args.get(i + 1).ok_or_else(|| {
-                                    "--kind needs fyi or decision_needed".to_string()
-                                })?;
-                                kind = crate::bus::Kind::from_keyword(k).ok_or_else(|| {
-                                    format!("--kind: unknown {k:?} (use fyi or decision_needed)")
-                                })?;
-                                i += 2;
-                            }
-                            _ => {
-                                absorb_field_token(&mut fields, a)
-                                    .map_err(|e| format!("bus pub: {e}"))?;
-                                i += 1;
-                            }
-                        }
-                    }
-                    if fields.is_empty() {
-                        return Err(
-                            "bus pub needs at least one field=value (e.g. msg=merged the PR)"
-                                .to_string(),
-                        );
-                    }
-                    pairs.push(("kind", s(kind.as_str())));
-                    pairs.push(("fields", fields_to_value(fields)));
-                    if create {
-                        pairs.push(("create", Value::Bool(true)));
-                    }
-                }
-                "sub" | "unsub" => {
-                    let topics: Vec<Value> = args[2.min(args.len())..]
-                        .iter()
-                        .filter(|t| !t.starts_with('-'))
-                        .map(|t| Value::String(t.clone()))
-                        .collect();
-                    if sub == "sub" && topics.is_empty() {
-                        return Err("bus sub needs at least one topic (or `*` for all)".to_string());
-                    }
-                    pairs.push(("topics", Value::Array(topics)));
-                }
-                "feed" => {
-                    // `--since N` resumes after cursor N; default 0 = from the start.
-                    let mut i = 2;
-                    while i < args.len() {
-                        if args[i] == "--since" {
-                            let n = args
-                                .get(i + 1)
-                                .and_then(|t| t.parse::<i64>().ok())
-                                .ok_or_else(|| "--since needs a number".to_string())?;
-                            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
-                            i += 2;
-                        } else if let Some(rest) = args[i].strip_prefix("--since=") {
-                            let n = rest
-                                .parse::<i64>()
-                                .map_err(|_| "--since needs a number".to_string())?;
-                            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
-                            i += 1;
-                        } else {
-                            return Err(format!("unexpected argument {:?} to bus feed", args[i]));
-                        }
-                    }
-                }
-                "resolve" => {
-                    let tok = args
-                        .get(2)
-                        .filter(|t| !t.starts_with('-'))
-                        .ok_or_else(|| "bus resolve needs a seq".to_string())?;
-                    let seq = tok
-                        .parse::<i64>()
-                        .map_err(|_| format!("bus resolve: seq must be a number, got {tok:?}"))?;
-                    pairs.push(("seq", Value::Number(Number::Int(seq.max(0)))));
-                }
-                // No arguments: the op token alone (already pushed) is the request.
-                "topics" => {}
-                other => {
-                    return Err(format!(
-                        "bus op must be pub|sub|unsub|feed|resolve|topics (got {other:?})"
-                    ))
-                }
-            }
-        }
-        Some("respawn") => {
-            pairs.push(("cmd", s("respawn")));
-            let target = args
-                .get(1)
-                .filter(|t| !t.starts_with('-'))
-                .ok_or_else(|| "respawn needs a target (pane id or role)".to_string())?;
-            pairs.push(("target", Value::String(target.clone())));
-            if let Some(pos) = args.iter().position(|a| a == "--worktree") {
-                let name = args
-                    .get(pos + 1)
-                    .ok_or_else(|| "--worktree needs a name".to_string())?
-                    .clone();
-                pairs.push(("worktree", Value::String(name)));
-            }
-        }
+        Some("send") => send_req(args, &mut pairs)?,
+        Some("status") => status_req(args, &mut pairs)?,
+        Some("kill") => kill_req(args, &mut pairs)?,
+        Some("audit") => audit_req(args, &mut pairs)?,
+        Some("board") => board_req(args, &mut pairs)?,
+        Some("bus") => bus_req(args, &mut pairs)?,
+        Some("respawn") => respawn_req(args, &mut pairs)?,
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
@@ -471,6 +168,345 @@ pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, S
         }
     }
     Ok(obj(pairs).to_string())
+}
+
+/// `spawn [--role R] [--identity I] [--mode M] [--worktree W] [--here | --window] -- <cmd...>`
+fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("spawn")));
+    let mut role: Option<String> = None;
+    let mut identity: Option<String> = None;
+    let mut new_window = true;
+    let mut mode: Option<TrustMode> = None;
+    let mut worktree: Option<String> = None;
+    let mut argv: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--worktree" => {
+                let name = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or_else(|| "--worktree needs a name".to_string())?;
+                worktree = Some(name);
+                i += 2;
+            }
+            "--mode" => {
+                let k = args.get(i + 1).ok_or_else(|| {
+                    "--mode needs a value (plan, accept, or automode)".to_string()
+                })?;
+                mode = Some(TrustMode::from_policy_keyword(k).ok_or_else(|| {
+                    format!("--mode: unknown {k:?} (use plan, accept, or automode)")
+                })?);
+                i += 2;
+            }
+            "--role" => {
+                role = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| "--role needs a value".to_string())?,
+                );
+                i += 2;
+            }
+            "--identity" => {
+                identity = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| "--identity needs a value".to_string())?,
+                );
+                i += 2;
+            }
+            "--here" => {
+                new_window = false;
+                i += 1;
+            }
+            "--window" => {
+                new_window = true;
+                i += 1;
+            }
+            "--" => {
+                argv = args[i + 1..].to_vec();
+                break;
+            }
+            other => return Err(format!("unexpected argument {other:?} (use `-- <cmd>`)")),
+        }
+    }
+    if argv.is_empty() {
+        return Err("spawn needs a command after `--` (e.g. `-- claude`)".to_string());
+    }
+    if let Some(r) = role {
+        pairs.push(("role", Value::String(r)));
+    }
+    if let Some(x) = identity {
+        pairs.push(("identity", Value::String(x)));
+    }
+    if let Some(m) = mode {
+        pairs.push(("mode", Value::String(m.policy_label().to_string())));
+    }
+    if let Some(w) = worktree {
+        pairs.push(("worktree", Value::String(w)));
+    }
+    pairs.push(("window", Value::Bool(new_window)));
+    pairs.push((
+        "argv",
+        Value::Array(argv.into_iter().map(Value::String).collect()),
+    ));
+    Ok(())
+}
+
+/// `send <target> <text...>`
+fn send_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("send")));
+    let target = args
+        .get(1)
+        .filter(|t| !t.starts_with('-'))
+        .ok_or_else(|| "send needs a target (pane id or role)".to_string())?;
+    let text = args[2..].join(" ");
+    if text.trim().is_empty() {
+        return Err("send needs text after the target".to_string());
+    }
+    pairs.push(("target", Value::String(target.clone())));
+    pairs.push(("text", Value::String(text)));
+    Ok(())
+}
+
+/// `status [target]`
+fn status_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("status")));
+    if let Some(target) = args.get(1).filter(|t| !t.starts_with('-')) {
+        pairs.push(("target", Value::String(target.clone())));
+    }
+    Ok(())
+}
+
+/// `kill <target>`
+fn kill_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("kill")));
+    let target = args
+        .get(1)
+        .filter(|t| !t.starts_with('-'))
+        .ok_or_else(|| "kill needs a target (pane id or role)".to_string())?;
+    pairs.push(("target", Value::String(target.clone())));
+    Ok(())
+}
+
+/// `audit [tail]`
+fn audit_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("audit")));
+    if let Some(tok) = args.get(1).filter(|t| !t.starts_with('-')) {
+        let n = tok
+            .parse::<usize>()
+            .map_err(|_| format!("audit tail must be a number, got {tok:?}"))?;
+        pairs.push(("tail", Value::Number(Number::Int(n as i64))));
+    }
+    Ok(())
+}
+
+/// `board set|get|list|del|claim|release …`
+fn board_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("board")));
+    let sub = args
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| "board needs set|get|list|del|claim|release".to_string())?;
+    pairs.push(("op", s(sub)));
+    match sub {
+        "set" => {
+            let key = args
+                .get(2)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "board set needs a key".to_string())?;
+            pairs.push(("key", Value::String(key.clone())));
+            // Remaining args are `field=value` pairs (empty value clears);
+            // unquoted spaced values are joined across tokens.
+            let mut fields: Vec<(String, String)> = Vec::new();
+            for a in &args[3.min(args.len())..] {
+                absorb_field_token(&mut fields, a).map_err(|e| format!("board set: {e}"))?;
+            }
+            if fields.is_empty() {
+                return Err("board set needs at least one field=value".to_string());
+            }
+            pairs.push(("fields", fields_to_value(fields)));
+        }
+        "get" | "del" | "release" => {
+            let key = args
+                .get(2)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| format!("board {sub} needs a key"))?;
+            pairs.push(("key", Value::String(key.clone())));
+        }
+        "claim" => {
+            let key = args
+                .get(2)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "board claim needs a key".to_string())?;
+            pairs.push(("key", Value::String(key.clone())));
+            // Optional `--ttl SECS` overrides the default lease length.
+            if let Some(pos) = args.iter().position(|a| a == "--ttl") {
+                let secs = args
+                    .get(pos + 1)
+                    .ok_or_else(|| "--ttl needs a value in seconds".to_string())?
+                    .parse::<u64>()
+                    .map_err(|_| "--ttl must be a whole number of seconds".to_string())?;
+                pairs.push(("ttl_ms", Value::Number(Number::Int((secs * 1000) as i64))));
+            }
+        }
+        "list" => {}
+        other => {
+            return Err(format!(
+                "board op must be set|get|list|del|claim|release (got {other:?})"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// `bus pub|sub|unsub|feed|resolve|topics …`
+fn bus_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("bus")));
+    let sub = args
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| "bus needs pub|sub|unsub|feed|resolve".to_string())?;
+    pairs.push(("op", s(sub)));
+    match sub {
+        "pub" => bus_pub(args, pairs)?,
+        "sub" | "unsub" => {
+            let topics: Vec<Value> = args[2.min(args.len())..]
+                .iter()
+                .filter(|t| !t.starts_with('-'))
+                .map(|t| Value::String(t.clone()))
+                .collect();
+            if sub == "sub" && topics.is_empty() {
+                return Err("bus sub needs at least one topic (or `*` for all)".to_string());
+            }
+            pairs.push(("topics", Value::Array(topics)));
+        }
+        "feed" => bus_feed(args, pairs)?,
+        "resolve" => {
+            let tok = args
+                .get(2)
+                .filter(|t| !t.starts_with('-'))
+                .ok_or_else(|| "bus resolve needs a seq".to_string())?;
+            let seq = tok
+                .parse::<i64>()
+                .map_err(|_| format!("bus resolve: seq must be a number, got {tok:?}"))?;
+            pairs.push(("seq", Value::Number(Number::Int(seq.max(0)))));
+        }
+        // No arguments: the op token alone (already pushed) is the request.
+        "topics" => {}
+        other => {
+            return Err(format!(
+                "bus op must be pub|sub|unsub|feed|resolve|topics (got {other:?})"
+            ))
+        }
+    }
+    Ok(())
+}
+
+/// `bus pub <topic> [--decision | --kind K] [--new] [--to R] field=value…`
+fn bus_pub(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    let topic = args
+        .get(2)
+        .filter(|t| !t.starts_with('-'))
+        .ok_or_else(|| "bus pub needs a topic".to_string())?;
+    pairs.push(("topic", Value::String(topic.clone())));
+    // Default FYI; `--decision` (or `--kind K`) escalates. Remaining
+    // args are `field=value` pairs (unquoted spaced values are
+    // joined across tokens) — the structured payload.
+    let mut kind = crate::bus::Kind::Fyi;
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut create = false;
+    let mut i = 3.min(args.len());
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--decision" => {
+                kind = crate::bus::Kind::DecisionNeeded;
+                i += 1;
+            }
+            "--new" => {
+                // Deliberately create a not-yet-seen topic (soft-gate
+                // only; a declared fleet rejects off-list regardless).
+                create = true;
+                i += 1;
+            }
+            "--to" => {
+                // Address the event to a teammate role (e.g. the
+                // lead). Sugar for a `to=<role>` field: an
+                // agent-addressed decision routes to that agent
+                // instead of firing the human's urgent bar.
+                let role = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--to needs a role (e.g. --to lead)".to_string())?;
+                fields.push(("to".to_string(), role.clone()));
+                i += 2;
+            }
+            "--kind" => {
+                let k = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--kind needs fyi or decision_needed".to_string())?;
+                kind = crate::bus::Kind::from_keyword(k)
+                    .ok_or_else(|| format!("--kind: unknown {k:?} (use fyi or decision_needed)"))?;
+                i += 2;
+            }
+            _ => {
+                absorb_field_token(&mut fields, a).map_err(|e| format!("bus pub: {e}"))?;
+                i += 1;
+            }
+        }
+    }
+    if fields.is_empty() {
+        return Err("bus pub needs at least one field=value (e.g. msg=merged the PR)".to_string());
+    }
+    pairs.push(("kind", s(kind.as_str())));
+    pairs.push(("fields", fields_to_value(fields)));
+    if create {
+        pairs.push(("create", Value::Bool(true)));
+    }
+    Ok(())
+}
+
+/// `bus feed [--since N | --since=N]`
+fn bus_feed(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    // `--since N` resumes after cursor N; default 0 = from the start.
+    let mut i = 2;
+    while i < args.len() {
+        if args[i] == "--since" {
+            let n = args
+                .get(i + 1)
+                .and_then(|t| t.parse::<i64>().ok())
+                .ok_or_else(|| "--since needs a number".to_string())?;
+            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
+            i += 2;
+        } else if let Some(rest) = args[i].strip_prefix("--since=") {
+            let n = rest
+                .parse::<i64>()
+                .map_err(|_| "--since needs a number".to_string())?;
+            pairs.push(("since", Value::Number(Number::Int(n.max(0)))));
+            i += 1;
+        } else {
+            return Err(format!("unexpected argument {:?} to bus feed", args[i]));
+        }
+    }
+    Ok(())
+}
+
+/// `respawn <target> [--worktree W]`
+fn respawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("respawn")));
+    let target = args
+        .get(1)
+        .filter(|t| !t.starts_with('-'))
+        .ok_or_else(|| "respawn needs a target (pane id or role)".to_string())?;
+    pairs.push(("target", Value::String(target.clone())));
+    if let Some(pos) = args.iter().position(|a| a == "--worktree") {
+        let name = args
+            .get(pos + 1)
+            .ok_or_else(|| "--worktree needs a name".to_string())?
+            .clone();
+        pairs.push(("worktree", Value::String(name)));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
