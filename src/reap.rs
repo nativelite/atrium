@@ -1059,13 +1059,27 @@ pub fn reap_stale() -> (usize, usize, Vec<crate::orphan::Victim>) {
 /// crashed session's pane trees were never cleaned up, and its registry stayed on
 /// disk for days. The one path that exists for crash recovery did not run.
 fn sweep_dir(dir: &Path) -> usize {
+    sweep_dir_waiting(dir, || std::thread::sleep(GRACE))
+}
+
+/// [`sweep_dir`] with the grace wait passed in, so a test can see it happen.
+///
+/// TERM every group of every dead session, wait once, then KILL them all - the
+/// same policy as `watchdog_main` and the main teardown. Firing both back to back
+/// made the SIGTERM decorative on the one path that exists for crash recovery, so
+/// nothing ever got the chance to exit cleanly. The wait is `FnOnce` because it
+/// was once per session: `atrium reap` after 64 dead sessions sat silent for 48 s.
+/// It is skipped when no TERM was delivered - every group already gone, and
+/// always on Windows, where the Job Object is the reaper and `signal_group` sends
+/// nothing.
+fn sweep_dir_waiting(dir: &Path, wait: impl FnOnce()) -> usize {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         // Cannot read the directory: no registries to sweep. A stuck watchdog is
         // found through the process table and is handled by the caller.
         Err(_) => return 0,
     };
-    let mut cleaned = 0;
+    let mut stale = Vec::new();
     for e in entries.flatten() {
         let path = e.path();
         let owner = path
@@ -1078,24 +1092,21 @@ fn sweep_dir(dir: &Path) -> usize {
         if pid_running(owner) {
             continue; // a live session owns this one
         }
-        // TERM every group, wait once, then KILL - the same policy as
-        // `watchdog_main` and the main teardown. Firing both back to back made
-        // the SIGTERM decorative on the one path that exists for crash recovery,
-        // so nothing ever got the chance to exit cleanly.
-        let pgids = read_registry(&path);
-        for p in &pgids {
-            term_tree(*p);
-        }
-        if !pgids.is_empty() {
-            std::thread::sleep(GRACE);
-        }
-        for p in &pgids {
-            kill_tree(*p);
-        }
-        let _ = std::fs::remove_file(&path);
-        cleaned += 1;
+        stale.push(path);
     }
-    cleaned
+    let pgids: Vec<u32> = stale.iter().flat_map(|p| read_registry(p)).collect();
+    // No short-circuit: every group must get its TERM.
+    let delivered = pgids.iter().fold(false, |any, p| term_tree(*p) | any);
+    if delivered {
+        wait();
+    }
+    for p in &pgids {
+        kill_tree(*p);
+    }
+    for path in &stale {
+        let _ = std::fs::remove_file(path);
+    }
+    stale.len()
 }
 
 /// Re-exec atrium as a detached watchdog for this session.
@@ -1196,6 +1207,74 @@ mod tests {
             mine.exists(),
             "a live session's registry must be left alone"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write one dead-owner registry per group into a fresh scratch directory.
+    fn dead_registries(tag: &str, groups: &[u32]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("atrium-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, g) in groups.iter().enumerate() {
+            let dead = std::process::id() + 1_000_000 + i as u32; // never a live pid
+            let path = dir.join(format!("atrium-session-{dead}.pids"));
+            std::fs::write(&path, format!("policy=plan\n{g}\n")).unwrap();
+        }
+        dir
+    }
+
+    /// Sessions whose groups are already gone need no grace at all. The sweep
+    /// slept once per dead session regardless - and on Windows, where nothing is
+    /// ever signalled, for nothing: 64 leftover registries made `atrium reap`
+    /// hang silently for 48 s.
+    #[test]
+    fn a_sweep_of_groups_already_gone_does_not_wait() {
+        // A child that has exited and been reaped: its pid names no group.
+        let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+            .args(if cfg!(windows) {
+                ["/c", "exit"]
+            } else {
+                ["-c", "exit"]
+            })
+            .spawn()
+            .unwrap();
+        let gone = child.id();
+        child.wait().unwrap();
+        let dir = dead_registries("sweep-gone", &[gone, gone, gone]);
+
+        let mut waited = false;
+        assert_eq!(sweep_dir_waiting(&dir, || waited = true), 3);
+        assert!(!waited, "nothing was signalled, so nothing to wait for");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Live groups across many dead sessions share one grace, then all die.
+    #[cfg(unix)]
+    #[test]
+    fn a_sweep_of_many_dead_sessions_waits_once_then_kills_every_group() {
+        use std::os::unix::process::CommandExt;
+        let mut kids: Vec<_> = (0..3)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .process_group(0) // its own group, as a pane child is
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let groups: Vec<u32> = kids.iter().map(|k| k.id()).collect();
+        let dir = dead_registries("sweep-live", &groups);
+
+        let mut waits = 0;
+        assert_eq!(sweep_dir_waiting(&dir, || waits += 1), 3);
+        assert_eq!(waits, 1, "one grace for every session, not one each");
+        for k in &mut kids {
+            assert!(
+                !k.wait().unwrap().success(),
+                "every group must be signalled"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
