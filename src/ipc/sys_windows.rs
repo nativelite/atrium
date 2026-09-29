@@ -148,7 +148,11 @@ fn current_user_sddl() -> Option<Vec<u16>> {
         unsafe { CloseHandle(token) };
         return None;
     }
-    let mut buf = vec![0u8; need as usize];
+    // Sized in `usize` words, not bytes: the buffer is read back below as a
+    // `SidAndAttributes`, which holds a pointer and so needs pointer alignment.
+    // A `Vec<u8>` only promises alignment 1 - casting it made that read UB.
+    let word = std::mem::size_of::<usize>();
+    let mut buf = vec![0usize; (need as usize + word - 1) / word];
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -163,6 +167,8 @@ fn current_user_sddl() -> Option<Vec<u16>> {
         return None;
     }
     // The buffer begins with a SID_AND_ATTRIBUTES whose `sid` points inside it.
+    // SAFETY: the call succeeded, so the buffer holds a TOKEN_USER, whose first
+    // member is this struct; `buf` is `usize`-aligned and at least `need` bytes.
     let sa = unsafe { &*(buf.as_ptr() as *const SidAndAttributes) };
     let mut sid_str: *mut u16 = std::ptr::null_mut();
     if unsafe { ConvertSidToStringSidW(sa.sid, &mut sid_str) } == 0 || sid_str.is_null() {
@@ -727,5 +733,23 @@ fn read_reply(h: Handle, start: Instant, stall: Duration, hard: Duration) -> io:
             ));
         }
         thread::sleep(CLIENT_POLL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The pipe DACL is built from the token's user SID. A failure falls back to
+    /// the default DACL without a word (`bind` keeps going), so only a direct
+    /// check shows the token read - and the aligned buffer it is read through -
+    /// actually works.
+    #[test]
+    fn the_pipe_dacl_names_the_current_user() {
+        let sddl = super::current_user_sddl().expect("the current user's SID resolves");
+        let text = String::from_utf16_lossy(&sddl);
+        assert!(text.starts_with("D:P(A;;GA;;;S-1-5-"), "{text}");
+        assert!(
+            text.ends_with("(A;;GA;;;SY)\0") || text.ends_with("(A;;GA;;;SY)"),
+            "{text}"
+        );
     }
 }
