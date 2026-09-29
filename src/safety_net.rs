@@ -461,7 +461,6 @@ impl Upkeep {
     const POLL: Duration = Duration::from_millis(100);
 
     pub(crate) fn start(job: &'static atrium::reap::SessionJob) -> Upkeep {
-        use std::sync::atomic::Ordering;
         let panes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (tx, events) = std::sync::mpsc::channel();

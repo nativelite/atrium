@@ -4,6 +4,7 @@
 
 use crate::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_window(
     command: &[String],
     rows: u16,
@@ -533,7 +534,6 @@ fn log_spawn(title: &str, effective: &[String]) {
     // this pane in the mode I expected" question is answered by data, not guesses.
     if let Ok(path) = std::env::var("ATRIUM_SPAWN_LOG") {
         if !path.is_empty() {
-            use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -680,7 +680,7 @@ fn start_pty(
 /// this sanitization (a multi-line prompt is valid and meaningful there).
 pub(crate) fn sanitize_shim_arg(s: &str) -> String {
     // Collapse CRLF first so it counts as one space, then lone CR and LF.
-    s.replace("\r\n", " ").replace('\r', " ").replace('\n', " ")
+    s.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// The argv atrium spawns for `command` given where it `resolved` on PATH.

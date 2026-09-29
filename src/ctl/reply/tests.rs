@@ -85,13 +85,10 @@ fn humanize_idle_scales_by_magnitude() {
     assert_eq!(humanize_idle(86_400_000 + 3_600_000), "1d1h");
 }
 
-#[test]
-fn idle_render_threshold_keeps_active_panes_quiet() {
-    // A pane idle under the threshold should not be surfaced as idle; at or
-    // past it, it should. (The pure monotonic idle_ms is unit-tested in ipc.rs.)
-    assert!(5_000 < IDLE_RENDER_MIN_MS);
-    assert!(20_000 >= IDLE_RENDER_MIN_MS);
-}
+// A pane idle under the threshold should not be surfaced as idle; at or past
+// it, it should. (The pure monotonic idle_ms is unit-tested in ipc.rs.) Both
+// sides are constants, so this is checked at compile time, not by a test.
+const _: () = assert!(5_000 < IDLE_RENDER_MIN_MS && 20_000 >= IDLE_RENDER_MIN_MS);
 
 #[test]
 fn reply_killed_lists_the_torn_down_panes() {

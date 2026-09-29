@@ -715,7 +715,6 @@ fn fleet_ack() -> bool {
 /// `y`/`yes` proceeds. Any other input, EOF, or a non-interactive stdin aborts,
 /// so the dangerous mode is never entered by accident. Runs before raw mode.
 fn confirm_skip_permissions() -> bool {
-    use std::io::Write;
     let mut err = std::io::stderr();
     let _ = writeln!(
         err,

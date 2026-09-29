@@ -75,7 +75,7 @@ pub fn jobserver_auth(flags: &str) -> Option<&str> {
             flags
                 .split_whitespace()
                 .filter_map(|arg| arg.strip_prefix(prefix))
-                .last()
+                .next_back()
         })
         .filter(|v| !v.is_empty())
 }
@@ -487,7 +487,7 @@ mod sys {
         pub fn try_take(&self) -> bool {
             use std::io::Read;
             self.available().is_some_and(|n| n > 0)
-                && (&self.file).read(&mut [0u8; 1]).map_or(false, |n| n == 1)
+                && (&self.file).read(&mut [0u8; 1]).is_ok_and(|n| n == 1)
         }
 
         #[cfg(test)]

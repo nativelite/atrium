@@ -65,7 +65,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
             Component::CurDir => {}
             Component::ParentDir => {
                 let at_root = matches!(
-                    out.components().last(),
+                    out.components().next_back(),
                     Some(Component::RootDir) | Some(Component::Prefix(_)) | None
                 );
                 if !at_root {

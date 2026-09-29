@@ -477,7 +477,7 @@ fn real_atrium_ctl_binary_delivers_a_20kb_request() {
     let mut server = Listener::bind(&a).expect("bind");
     let payload = "X".repeat(20 * 1024); // 20 KB, no interior newline
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_atrium"))
+    let child = Command::new(env!("CARGO_BIN_EXE_atrium"))
         .args(["ctl", "send", "1", &payload])
         .env("ATRIUM_CTL", &a)
         .env("ATRIUM_PANE", "1")

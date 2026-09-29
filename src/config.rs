@@ -430,7 +430,7 @@ fn whole(v: Option<&json::Value>, key: &str) -> Result<Option<u64>, String> {
 /// known the path is kept as written, so the error surfaces where it is used.
 fn expand_home(s: &str, home: Option<&Path>) -> PathBuf {
     match (s.strip_prefix('~'), home) {
-        (Some(rest), Some(h)) if rest.is_empty() => h.to_path_buf(),
+        (Some(""), Some(h)) => h.to_path_buf(),
         (Some(rest), Some(h)) if rest.starts_with('/') || rest.starts_with('\\') => {
             h.join(&rest[1..])
         }

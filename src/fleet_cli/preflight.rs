@@ -58,10 +58,8 @@ pub(super) fn preflight_context_mode() {
     // enabledPlugins is either an array ["pkg@name", …] (older format) or an
     // object {"pkg@name": true, …} (current Claude Code format). Both are valid.
     let has_context_mode = if let Some(arr) = enabled.as_array() {
-        arr.iter().any(|p| {
-            p.as_str()
-                .map_or(false, |s| s == "context-mode@context-mode")
-        })
+        arr.iter()
+            .any(|p| p.as_str() == Some("context-mode@context-mode"))
     } else if let Some(map) = enabled.as_object() {
         map.iter()
             .any(|(k, v)| k == "context-mode@context-mode" && plugin_value_enabled(v))

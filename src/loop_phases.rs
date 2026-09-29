@@ -397,7 +397,7 @@ pub(crate) fn decision_note(bus: &atrium::bus::Bus, windows: &[Window]) -> Strin
     let decisions_open = bus
         .pending_decisions()
         .iter()
-        .filter(|e| !decision_for_agent(e, &windows))
+        .filter(|e| !decision_for_agent(e, windows))
         .count();
     match decisions_open {
         0 => String::new(),

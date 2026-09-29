@@ -4,7 +4,8 @@
 The same `check` gate as every nativelite package, so the muscle memory is
 identical across languages. Here `check` is the zero-dependency guard, then the
 drift check (generated docs and the marketplace's copy of the skills), then
-`cargo fmt --check`, then `cargo test` (unit + integration + doctests). Invoke it
+`cargo fmt --check`, then clippy and the MSRV build, then `cargo test` (unit +
+integration + doctests). Invoke it
 however your platform
 spells Python — `python` is Windows-only, macOS/Linux ship `python3`, and the
 shebang + exec bit make `./dev.py` work everywhere:
@@ -13,6 +14,7 @@ shebang + exec bit make `./dev.py` work everywhere:
   ./dev.py test       # cargo test, under a wall-clock budget
   ./dev.py build      # cargo build --release
   ./dev.py fmt        # cargo fmt --check
+  ./dev.py lint       # clippy -D warnings (host + unix targets), MSRV build
   ./dev.py guard      # zero-dependency guard
   ./dev.py drift      # docs/*.html match docs/*.md; skills match the plugin's copy
 
@@ -210,6 +212,63 @@ def fmt() -> int:
     return run("cargo", "fmt", "--check", "--manifest-path", str(ABUS_MANIFEST))
 
 
+#: Cross targets clippy also runs for, when installed. The gate runs on Windows,
+#: where every `cfg(unix)` line is compiled out: unix code was never linted, and
+#: the only unix check was a hand-run `cargo check --target`.
+LINT_TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-apple-darwin")
+
+
+def _installed_targets() -> set[str]:
+    try:
+        out = subprocess.run(
+            ["rustup", "target", "list", "--installed"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return set()
+    return set(out.split())
+
+
+def _msrv() -> str | None:
+    import re
+    m = re.search(r'^rust-version\s*=\s*"([^"]+)"', (ROOT / "Cargo.toml").read_text(), re.M)
+    return m.group(1) if m else None
+
+
+def lint() -> int:
+    """clippy with warnings as errors, then a build on the declared MSRV.
+
+    Neither ran anywhere before: 17 clippy warnings built up unseen, and a
+    `div_ceil` (Rust 1.73) shipped in releases that declared `rust-version =
+    1.70` - `cargo install` failed on 1.70-1.72 for every release from 0.32.0.
+    A missing target or toolchain is skipped out loud, never silently passed.
+    """
+    code = run("cargo", "clippy", "--all-targets", "--", "-D", "warnings")
+    if code:
+        return code
+    installed = _installed_targets()
+    for target in LINT_TARGETS:
+        if target not in installed:
+            print(f"lint: target {target} not installed, skipping its clippy")
+            continue
+        code = run("cargo", "clippy", "--all-targets", "--target", target, "--", "-D", "warnings")
+        if code:
+            return code
+    msrv = _msrv()
+    if msrv is None:
+        return 0
+    try:
+        have = subprocess.run(
+            ["rustup", "run", msrv, "rustc", "--version"], capture_output=True
+        ).returncode == 0
+    except OSError:
+        have = False
+    if not have:
+        print(f"lint: toolchain {msrv} not installed (rustup toolchain install {msrv}), skipping the MSRV build")
+        return 0
+    return run("cargo", f"+{msrv}", "check", "--all-targets", "--locked")
+
+
 def guard() -> int:
     return run(PY, "tools/dep_guard.py")
 
@@ -267,14 +326,15 @@ def drift() -> int:
 
 def check() -> int:
     # guard (cheap) → drift (cheap) → fmt (cheap, fail fast on style drift) →
-    # test (expensive).
-    return guard() or drift() or fmt() or test()
+    # lint (a compile, no run) → test (expensive).
+    return guard() or drift() or fmt() or lint() or test()
 
 
 COMMANDS = {
     "test": test,
     "build": build,
     "fmt": fmt,
+    "lint": lint,
     "guard": guard,
     "drift": drift,
     "check": check,

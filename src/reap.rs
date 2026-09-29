@@ -510,7 +510,7 @@ mod sys {
         // ULONG_PTR array, so the array starts 8 bytes in on both 32- and 64-bit.
         // A `usize` buffer keeps that alignment.
         let word = core::mem::size_of::<usize>();
-        let header_words = 8usize.div_ceil(word);
+        let header_words = (8 + word - 1) / word; // not `div_ceil`: that is 1.73, the MSRV is 1.70
         let mut capacity = 256usize;
         loop {
             let mut buf = vec![0usize; header_words + capacity];

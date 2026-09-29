@@ -128,6 +128,7 @@ pub(super) fn worktree_placement(
 /// `fleet_name` and `cwd` are used to derive the shared context directory
 /// (`ctx_dir`) via [`fleet_ctx_dir`]; spawn-wire threads `ctx_dir` into each
 /// pane's environment via `context_env`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_fleet_window(
     fleet: &atrium::fleet::Fleet,
     plan: &atrium::fleet::Plan,

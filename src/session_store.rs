@@ -442,11 +442,7 @@ pub fn superseded(
 
 /// The session a launch should offer to resume: the newest [`Liveness::Crashed`]
 /// one. Only a crash is offered — a deliberate quit is not a reason to ask.
-pub fn offer<'a>(
-    stored: &'a [Stored],
-    now_ms: u64,
-    running: impl Fn(u32) -> bool,
-) -> Option<&'a Stored> {
+pub fn offer(stored: &[Stored], now_ms: u64, running: impl Fn(u32) -> bool) -> Option<&Stored> {
     stored.iter().find(|s| {
         liveness(&s.snapshot.meta, now_ms, &running) == Liveness::Crashed
             && !superseded(stored, s, now_ms, &running)
@@ -455,11 +451,11 @@ pub fn offer<'a>(
 
 /// The session a bare `atrium recover` restores: the newest one that is not
 /// still running, whether it crashed or closed cleanly.
-pub fn recoverable<'a>(
-    stored: &'a [Stored],
+pub fn recoverable(
+    stored: &[Stored],
     now_ms: u64,
     running: impl Fn(u32) -> bool,
-) -> Option<&'a Stored> {
+) -> Option<&Stored> {
     stored.iter().find(|s| {
         liveness(&s.snapshot.meta, now_ms, &running) != Liveness::Running
             && !superseded(stored, s, now_ms, &running)

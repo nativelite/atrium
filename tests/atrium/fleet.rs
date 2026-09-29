@@ -52,7 +52,7 @@ fn fleet_up_opens_a_two_agent_window() {
     let out = read_until(&mut p, b"2:two", Duration::from_secs(20));
     for (i, label) in [(1, &b"1:one"[..]), (2, &b"2:two"[..])] {
         assert!(
-            contains(&out, &label),
+            contains(&out, label),
             "fleet pane {i} label missing: {:?}",
             String::from_utf8_lossy(&out)
         );

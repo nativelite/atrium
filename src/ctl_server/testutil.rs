@@ -2,11 +2,13 @@
 
 use crate::*;
 
+/// Each agent's role.
+type Roles = Vec<(AgentId, Option<String>)>;
+/// Each agent's parent.
+type Parents = Vec<(AgentId, Option<AgentId>)>;
+
 /// root 0 (lead) -> 1 (builder), 2 (reviewer); root 3 is another fleet's lead.
-pub(super) fn crew() -> (
-    Vec<(AgentId, Option<String>)>,
-    Vec<(AgentId, Option<AgentId>)>,
-) {
+pub(super) fn crew() -> (Roles, Parents) {
     let c = vec![
         (AgentId(0), Some("lead".to_string())),
         (AgentId(1), Some("builder".to_string())),
