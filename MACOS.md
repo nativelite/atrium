@@ -58,18 +58,18 @@ macOS rather than assuming a Windows shell.
 ## Runtime caveats (not build breakers; need a Mac to exercise)
 
 1. **Unix-domain-socket path length.** macOS caps `sun_path` at 104 bytes
-   (Linux 108). `ipc.rs::default_address` builds `$TMPDIR/atrium-ctl-<pid>.sock`.
+   (Linux 108). `ipc/sys_unix.rs::default_address` builds `$TMPDIR/atrium-ctl-<pid>.sock`.
    Under launchd `$TMPDIR` (`/var/folders/…`) is ~50 chars, so the total stays
    ~70 < 104 — fine in practice; only a pathologically deep `$TMPDIR` would
-   overflow. **Addressed:** a 104-byte `sun_path` guard + test was added in
-   `ipc.rs` by the agent-cli/ipc thread (board `macos-support`), so an overflow
+   overflow. **Addressed:** a 104-byte `sun_path` guard + test was added
+   (`ipc/sys_unix.rs`, tested in `ipc/tests_unix.rs`) by the agent-cli/ipc thread (board `macos-support`), so an overflow
    now fails fast with a clear error instead of a truncated bind.
-2. **Resolver case-sensitivity (test-only).** `resolver_finds_shims_and_flags_shell_hosting`
-   in `tests/atrium.rs` is not `cfg`-gated and matches `tool.exe` against ext
-   `.EXE`. It passes on the default case-insensitive APFS volume; on a
-   case-sensitive volume it could fail. The resolver (`resolve.rs`) is only
-   *used* on Windows — the unix `effective_command` bypasses it — so this is a
-   test artifact, not a runtime path.
+2. **Resolver case-sensitivity (test-only).** **Addressed:**
+   `resolver_finds_shims_and_flags_shell_hosting` (`tests/atrium/resolve.rs`)
+   matches `tool.exe` against ext `.EXE`, which assumes a case-insensitive
+   filesystem, so it is now `#[cfg(windows)]`. The resolver (`resolve.rs`) is
+   only *used* on Windows — the unix `effective_command` bypasses it — so this
+   was a test artifact, never a runtime path.
 
 ## Recommended follow-ups (next increment)
 
