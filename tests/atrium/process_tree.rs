@@ -598,3 +598,39 @@ fn hard_killed_atrium_still_takes_its_tree_down_windows() {
         "tree survived taskkill /F of atrium {atrium} — kill-on-close did not fire"
     );
 }
+
+/// A clean quit of a plain shell pane reports no survivors. It did, on every
+/// quit: `pty.kill()` sends SIGKILL but does not reap, so the pane's direct
+/// child was still a zombie when teardown asked `killpg(pgid, 0)` whether the
+/// group was alive - and a group whose leader is an unreaped zombie answers
+/// yes. The warning named a group with nothing left running in it.
+#[cfg(unix)]
+#[test]
+fn a_clean_quit_reports_no_surviving_pane_groups() {
+    let mut p = spawn_atrium_shell(24, 80);
+    p.write(b"\x01q").unwrap();
+    let end = Instant::now() + Duration::from_secs(15);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        if let Ok(Some(n)) = p.read_timeout(&mut buf, Duration::from_millis(100)) {
+            out.extend_from_slice(&buf[..n]);
+        }
+        if p.try_wait().unwrap().is_some() {
+            // Whatever teardown printed is already in the pty; take the rest.
+            while let Ok(Some(n)) = p.read_timeout(&mut buf, Duration::from_millis(100)) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            break;
+        }
+        assert!(Instant::now() < end, "atrium did not exit in time");
+    }
+    assert!(
+        !contains(&out, b"survived teardown"),
+        "a clean quit reported survivors: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}

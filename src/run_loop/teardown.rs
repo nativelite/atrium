@@ -71,9 +71,22 @@ impl RunState<'_> {
             atrium::reap::kill_tree(*pid);
         }
         for w in windows.iter_mut() {
-            // Still reap the direct child, so it does not linger as a zombie.
+            // Kill the direct child too, in case it left its own group.
             for pane in w.panes.iter_mut() {
                 let _ = pane.pty.kill();
+            }
+        }
+        // Then reap it. `kill` sends SIGKILL and does not wait, and an unreaped
+        // child is a zombie that `killpg(pgid, 0)` still answers for - so every
+        // clean quit on unix reported its panes as survivors, with nothing left
+        // running. Bounded: a child stuck in uninterruptible sleep must not hang
+        // the quit (it is then reported, which is the truth).
+        let reap_by = Instant::now() + std::time::Duration::from_millis(250);
+        for w in windows.iter_mut() {
+            for pane in w.panes.iter_mut() {
+                while matches!(pane.pty.try_wait(), Ok(None)) && Instant::now() < reap_by {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
             }
         }
         // Do not claim success if something survived: a teardown that can fail
