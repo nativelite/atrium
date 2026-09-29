@@ -6,9 +6,10 @@ built one per fresh session, checkpointed, reviewed fresh, merged one at a time
 by the integrator, who runs the only full gate and pushes `main` after each
 green merge. M4 starts after M1 and M3 are merged; M5 after M4.
 
-File and line references were refreshed on 2026-09-22 against `432dbb2`, after the
+File and line references were refreshed on 2026-09-29 against `d33a784`: after the
 file-split refactor moved `fleet`, `fleet_cli`, `ctl_server`, the recovery code and the
-e2e suite into directories.
+e2e suite into directories (2026-09-22), `run()` itself moved to `src/run_loop.rs` and
+became `RunArgs` in, `RunState::start` / `tick` / `teardown`.
 
 ## Items
 
@@ -17,7 +18,7 @@ e2e suite into directories.
 | M1 attention module | M | attention | `src/attention.rs` (new), `src/lib.rs` | module + 10 unit tests green (`cargo test --lib attention`) |
 | M2 filter strips child titles | M | filter | `src/filter.rs` | 4 filter tests green; OSC 52/8 still pass |
 | M3 config + fleet keys | M | config | `src/config.rs`, `src/fleet/schema.rs` (the `Fleet` struct, `parse_fleet` and its constructor `:398`), the four `Fleet` literals (`src/fleet/plan/tests.rs:58`, `src/fleet/plan/tests.rs:326`, `src/fleet_cli/preflight/tests.rs:185`, `src/worktree.rs:522`) | `notify`/`title` parse, wrong types error, `apply_to_fleet` fills; tests green |
-| M4 plumbing | M (after M1+M3 merge) | fresh builder | `src/main.rs` (`run` arg, startup push, tick before `renderer.paint`, teardown reset), `src/loop_phases.rs` (`attention_facts`), `src/recover.rs` (the recovery path's `run` call), `src/fleet_cli/up.rs` (`run_fleet`: Setup from the launch) | builds; `cargo test --lib` green; title visible in a live launch |
+| M4 plumbing | M (after M1+M3 merge) | fresh builder | `src/run_loop.rs` (`RunArgs` field, `RunState` field, tick before `renderer.paint`), `src/run_loop/setup.rs` (startup push, `Tracker::new`), `src/main.rs` (`cleanup_screen` reset, the plain launch's `RunArgs`), `src/loop_phases.rs` (`attention_facts`), `src/recover.rs` (the recovery path's `RunArgs`), `src/fleet_cli/up.rs` (`run_fleet`: Setup from the launch) | builds; `cargo test --lib` green; title visible in a live launch |
 | M5 docs + e2e + changelog | M (after M4 merge) | fresh builder | README, `docs/agent-status.md`, `docs/fleets.md`, `docs/control-plane.md`, `CHANGELOG.md`, `tests/atrium/session.rs` | `python docs/build.py`; e2e `host_title_names_the_project_and_is_reset_on_quit` green; integrator's full gate green |
 
 
@@ -25,7 +26,7 @@ e2e suite into directories.
 
 When atrium is in a background tab or window, nothing tells the operator what the fleet is doing or that an agent is blocked on them. The status bar already knows (`?` marker, `N waiting`, `N decisions need you`), but only when you are looking. The feature surfaces that outside the pane: the host terminal's title names the session and summarizes state, and a transition into "needs you" rings the terminal.
 
-Two latent defects get fixed on the way: atrium never owns the title, and in passthrough mode a child's own `OSC 0/2` title escape leaks straight to the host (`src/filter.rs:176-178`), so claude's tab title and atrium's would fight.
+Two latent defects get fixed on the way: atrium never owns the title, and in passthrough mode a child's own `OSC 0/2` title escape leaks straight to the host (`src/filter.rs:176-177`), so claude's tab title and atrium's would fight.
 
 Decisions taken with the founder (2026-09-18): channel default **bell + toast**; notify on **needs-you only** (title changes for everything); name = **fleet name, else project directory**, fleet may override with `title`.
 
@@ -39,7 +40,7 @@ Precedence needs-you > working > idle, the bar's own ladder. `Idle | WaitingProm
 
 **Notify** on transitions only: a pane newly `WaitingApproval` (by pane key, 30 s cooldown per pane) or a newly pending human-addressed decision (by bus `seq`, so resolve-then-new is not hidden by an equal count). Channels: `BEL`; `OSC 9;<text>` toast (iTerm2/ConEmu); and for Windows Terminal, which ignores plain OSC 9, the tab progress indicator `OSC 9;4;2;0` (error/red) while `needs() > 0` and `OSC 9;4;0` to clear — persistent on the tab, cleared when handled. Config `notify`: `both` (default) | `bell` | `toast` | `off`, in `config.json` and per fleet.
 
-**Plumbing**: a pure `attention` module; the loop computes a `Summary` every tick from the same facts `bar_infos` uses and writes the tracker's bytes to `out` right before `renderer.paint` (`src/main.rs:1480`) — same `Screen` chunk as the frame, one write on Windows, fires on an idle tick when the frame is empty. Title pushed at startup (`CSI 22;2 t`), reset at teardown (empty `OSC 2` then `CSI 23;2 t`).
+**Plumbing**: a pure `attention` module; the loop computes a `Summary` every tick from the same facts `bar_infos` uses and writes the tracker's bytes to `out` right before `renderer.paint` (`RunState::tick`, `src/run_loop.rs:218`) — same `Screen` chunk as the frame, one write on Windows, fires on an idle tick when the frame is empty. Title pushed at startup (`CSI 22;2 t`), reset at teardown (empty `OSC 2` then `CSI 23;2 t`).
 
 ## Edits (ordered)
 
@@ -52,12 +53,12 @@ Precedence needs-you > working > idle, the bar's own ladder. `Idle | WaitingProm
    - `TITLE_PUSH = "\x1b[22;2t"`, `TITLE_RESET = "\x1b]2;\x07\x1b[23;2t"`, `title_osc(text)`, `bell()`, `toast_osc(text)`, `progress_osc(on: bool)` (`\x1b]9;4;2;0\x07` / `\x1b]9;4;0;0\x07`).
    - `enum Event { PaneNeedsYou { key, label }, DecisionNeedsYou { seq } }`; `struct Edges { cooldown_ms, last_rang }` with `diff(prev, next, now_ms) -> Vec<Event>` (`COOLDOWN_MS = 30_000`).
    - `struct Tracker { setup, prev, edges, last_title, progress_on }` with `tick(next: Summary, now_ms) -> Vec<u8>`: title OSC iff changed; on events and notify≠Off, one BEL and/or one toast (`atrium: builder needs you` / `atrium: 2 need you`); progress on/off iff the needs state flipped and toast is enabled.
-2. **`src/filter.rs`**: `enum Osc { Strip(usize), Hold, No }` + `fn osc(rest)` beside `xtwinops` (`:93-113`): `ESC ]` Ps ∈ {0,1,2} (whole number; `10` ≠ `1`) → strip through `BEL`/`ESC \`; other Ps → pass (52 clipboard, 8 links); unterminated < 512 bytes → hold; over → pass. Wire into `feed` after the xtwinops arm (`:141-154`); update the module doc. Note ConPTY re-emits a child's title as `OSC 0`.
+2. **`src/filter.rs`**: `enum Osc { Strip(usize), Hold, No }` + `fn osc(rest)` beside `xtwinops` (`:93-113`): `ESC ]` Ps ∈ {0,1,2} (whole number; `10` ≠ `1`) → strip through `BEL`/`ESC \`; other Ps → pass (52 clipboard, 8 links); unterminated < 512 bytes → hold; over → pass. Wire into `feed` after the xtwinops arm (`:144-154`); update the module doc. Note ConPTY re-emits a child's title as `OSC 0`.
 3. **`src/config.rs`**: `GlobalConfig.notify: Option<Notify>`; parse `"notify"` via `opt_str` + `Notify::parse`, error naming the four values; `apply_to_fleet` fills `fleet.notify`.
 4. **`src/fleet/schema.rs`**: `Fleet.title: Option<String>`, `Fleet.notify: Option<Notify>`; parse in `parse_fleet` beside `identity` (`:287-294`); add to the constructor (`:398`) and the four `Fleet { .. }` literals (`src/fleet/plan/tests.rs:58`, `src/fleet/plan/tests.rs:326`, `src/fleet_cli/preflight/tests.rs:185`, `src/worktree.rs:522`).
-5. **`src/main.rs`**: `run()` gains `attention: atrium::attention::Setup`; startup write (`:837`) prefixed with `TITLE_PUSH`; `let mut attention = Tracker::new(setup)` after `Renderer::new()` (`:1020`); before `renderer.paint` (`:1480`): build facts (`attention_facts`), human decisions (`bus.pending_decisions()` filtered by `decision_for_agent`, `src/ctl_server/dispatch.rs:26-33`, mapped to `seq`), `attention.tick(Summary::build(..), now_ms)`, `out.write_all` if non-empty. `cleanup_screen` (`:1645-1654`): `TITLE_RESET` after `\x1b[r`, before `?1049l`. Callers `src/main.rs:665` (plain) and `src/recover.rs:838` (recover): `Setup { name: Setup::project_dir_name(), notify: config::get().notify.unwrap_or(DEFAULT) }`.
+5. **`src/run_loop.rs`, `src/run_loop/setup.rs`, `src/main.rs`**: `RunArgs` (`src/run_loop.rs:20`) gains `attention: atrium::attention::Setup`; in `RunState::start` (`src/run_loop/setup.rs:11`) the startup write (`:57`) is prefixed with `TITLE_PUSH`, and `Tracker::new(setup)` is built beside `Renderer::new()` (`:239`) and kept on `RunState` (`src/run_loop.rs:77`); in `RunState::tick` (`src/run_loop.rs:124`), before `self.renderer.paint` (`:218`): build facts (`attention_facts`), human decisions (`bus.pending_decisions()` filtered by `decision_for_agent`, `src/ctl_server/dispatch.rs:39`, mapped to `seq`), `attention.tick(Summary::build(..), now_ms)`, `out.write_all` if non-empty. `cleanup_screen` (`src/main.rs:791`): `TITLE_RESET` after `\x1b[r`, before `?1049l`. `RunArgs` literals `src/main.rs:669` (plain) and `src/recover.rs:840` (recover): `Setup { name: Setup::project_dir_name(), notify: config::get().notify.unwrap_or(DEFAULT) }`.
 6. **`src/loop_phases.rs`**: `attention_facts(windows, world) -> Vec<PaneFact>` beside `bar_infos` (`:359`): key = `p.agent_id.0` (verify uniqueness across windows; else `(window_idx << 32) | p.id`), label = `role` else `title`, `exited`, `status = world.status_for(session_id)`.
-7. **`src/fleet_cli/up.rs`**, `run_fleet` (its `run(` call, `:506`): pass `Setup { name: fleet.title.clone().unwrap_or(name), notify: fleet.notify.unwrap_or(DEFAULT) }` from the launch (`apply_to_fleet` has already run, in `load_fleet`).
+7. **`src/fleet_cli/up.rs`**, `run_fleet` (its `RunArgs` literal, `:508`): pass `Setup { name: fleet.title.clone().unwrap_or(name), notify: fleet.notify.unwrap_or(DEFAULT) }` from the launch (`apply_to_fleet` has already run, in `load_fleet`).
 8. **Docs**: README config block + bullet for `notify`; short "Title and notifications" note; `docs/agent-status.md` new section after "### Status bar" (format, precedence, channels, cooldown, WT/tmux caveats); `docs/fleets.md` keys `title`, `notify`; `docs/control-plane.md` ~:81 "and rings the terminal"; `CHANGELOG.md` `[Unreleased]` → `### Added`. Rebuild `docs/build.py`.
 
 ## Verification

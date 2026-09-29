@@ -58,7 +58,10 @@ mod sys {
     }
 
     pub fn signal_group(pid: u32, sig: i32) -> bool {
-        if pid == 0 {
+        // Above i32::MAX the cast goes negative: glibc refuses it, but macOS
+        // `killpg` negates it back into `kill` of one unrelated pid. Registries
+        // are plain files the same uid can write, so this is not hypothetical.
+        if pid == 0 || pid > i32::MAX as u32 {
             return false;
         }
         // SAFETY: a plain signal send; `pid` is a pane child's pid, which is its
@@ -91,16 +94,21 @@ mod sys {
     const SIGHUP: i32 = 1;
     const SIGINT: i32 = 2;
 
-    /// A running process, not a corpse. `kill(pid, 0)` succeeds on a zombie, so
-    /// process state has to be read to tell them apart. macOS reports an exiting
-    /// or zombie process with `Z`, or an `E` flag, in `ps -o stat=`.
     /// Signal one process, not its group — used to put down a stuck watchdog,
     /// which is a lone process and not a pane tree.
     pub fn signal_pid(pid: u32, sig: i32) -> bool {
+        // Above i32::MAX the cast goes negative, and `kill(-1, sig)` signals
+        // every process this user may signal. Same guard as `pid_alive`.
+        if pid == 0 || pid > i32::MAX as u32 {
+            return false;
+        }
         // SAFETY: a plain signal send; no memory crosses the call.
-        pid != 0 && unsafe { kill(pid as i32, sig) == 0 }
+        unsafe { kill(pid as i32, sig) == 0 }
     }
 
+    /// A running process, not a corpse. `kill(pid, 0)` succeeds on a zombie, so
+    /// process state has to be read to tell them apart. macOS reports an exiting
+    /// or zombie process with `Z`, or an `E` flag, in `ps -o stat=`.
     pub fn pid_running(pid: u32) -> bool {
         if !pid_alive(pid) {
             return false;
@@ -1322,6 +1330,22 @@ mod tests {
         let _ = kid.kill();
         let _ = kid.wait();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pid above `i32::MAX` casts negative, and a negative `kill` target is
+    /// not one process: -1 is every process this user may signal, and on macOS
+    /// `killpg` negates its argument back into a single pid. Signal 0 delivers
+    /// nothing, so asking is safe - and before the guard, both said yes.
+    #[cfg(unix)]
+    #[test]
+    fn a_pid_that_casts_negative_is_never_signalled() {
+        for pid in [u32::MAX, i32::MAX as u32 + 1, u32::MAX - 1] {
+            assert!(!sys::signal_pid(pid, 0), "signal_pid({pid}) reached kill");
+            assert!(
+                !sys::signal_group(pid, 0),
+                "signal_group({pid}) reached killpg"
+            );
+        }
     }
 
     /// Live groups across many dead sessions share one grace, then all die.
