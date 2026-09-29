@@ -416,7 +416,7 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
         let base = atrium::worktree::base_ref(cwd)
             .map_err(|e| format!("atrium fleet: cannot read the repo's HEAD for worktrees: {e}"))?;
         let seeds = fleet.worktree_seed.as_deref().unwrap_or(&[]);
-        for p in &launch.wt_plans {
+        for (i, p) in launch.wt_plans.iter().enumerate() {
             match atrium::worktree::ensure(cwd, p) {
                 Ok(_) => {
                     for w in atrium::worktree::seed(cwd, &p.dir, seeds) {
@@ -427,6 +427,10 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
                     }
                 }
                 Err(e) => {
+                    // The launch is off: the members made before this one are
+                    // torn down under the usual rule, not stranded.
+                    report_worktree_teardown(cwd, &launch.wt_plans[..i], &base);
+                    let _ = atrium::worktree::prune(cwd);
                     return Err(format!(
                         "atrium fleet: could not create worktree \"{}\": {e}",
                         fsan(&p.name)
@@ -443,9 +447,28 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     Ok(teardown)
 }
 
-/// Enter the terminal, spawn the approved roster into one tiled window, run
-/// the session, and tear the worktrees down after it.
+/// Run the session, then tear the worktrees down - however it ended. The
+/// early exits (no terminal to take, the roster failing to spawn) came after
+/// the worktrees were made and returned straight past the teardown, leaving
+/// them on disk for good.
 fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) -> ExitCode {
+    let cwd = launch.cwd.clone();
+    let exit = run_session(launch, max_depth);
+    // After the run loop has restored the normal screen (or never left it).
+    // Each worktree is removed ONLY if clean and fully merged; anything with
+    // uncommitted or unmerged work is kept and its path + branch reported, so
+    // nothing is ever destroyed. A final prune clears records for the ones that
+    // were removed.
+    if let Some((plans, base)) = &teardown {
+        report_worktree_teardown(&cwd, plans, base);
+        let _ = atrium::worktree::prune(&cwd);
+    }
+    exit
+}
+
+/// Enter the terminal, spawn the approved roster into one tiled window and run
+/// the session.
+fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
     let FleetLaunch {
         name,
         cwd,
@@ -503,7 +526,7 @@ fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) 
     let scratch = vec![default_shell()];
     // ctl is opt-in for a fleet too (`atrium fleet up <name> --allow-ctl`), so the
     // roster can coordinate over the board/bus; without the flag it runs as before.
-    let exit = run(
+    run(
         &mut term,
         RunArgs {
             command: &scratch,
@@ -518,17 +541,7 @@ fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) 
             // runs strict. Absent ⇒ soft-gate.
             canonical_topics: fleet.topics.clone(),
         },
-    );
-
-    // Teardown, after the run loop has restored the normal screen. Each worktree
-    // is removed ONLY if clean and fully merged; anything with uncommitted or
-    // unmerged work is kept and its path + branch reported, so nothing is ever
-    // destroyed. A final prune clears records for the ones that were removed.
-    if let Some((plans, base)) = &teardown {
-        report_worktree_teardown(&cwd, plans, base);
-        let _ = atrium::worktree::prune(&cwd);
-    }
-    exit
+    )
 }
 
 #[cfg(test)]

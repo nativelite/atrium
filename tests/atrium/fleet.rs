@@ -550,3 +550,78 @@ fn fleet_init_writes_a_builtin_or_the_users_template_and_never_overwrites() {
     assert!(stdout.contains("(shadows the built-in)"), "{stdout}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `git` in the lab's project, with an identity so `commit` works on a machine
+/// that has none configured.
+fn lab_git(lab: &FleetLab, args: &[&str]) {
+    let ok = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=atrium-test",
+            "-c",
+            "user.email=t@example.invalid",
+        ])
+        .args(args)
+        .current_dir(lab.proj())
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(ok, "git {args:?} failed");
+}
+
+/// A lab project that is a git repo with one commit, so worktrees can be made.
+fn git_lab(tag: &str) -> FleetLab {
+    let lab = FleetLab::new(tag);
+    lab_git(&lab, &["init", "-q"]);
+    std::fs::write(lab.proj().join("README"), "x").unwrap();
+    lab_git(&lab, &["add", "README"]);
+    lab_git(&lab, &["commit", "-q", "-m", "init"]);
+    lab
+}
+
+/// The fleet's worktree directories that still exist (default base: a sibling
+/// `.atrium-worktrees/<fleet>/` of the project).
+fn leftover_worktrees(lab: &FleetLab, fleet: &str) -> Vec<String> {
+    let base = lab.root.join(".atrium-worktrees").join(fleet);
+    std::fs::read_dir(&base)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Worktrees are made after approval and before the terminal is taken. A launch
+/// that then cannot take the terminal returned straight away, so the clean
+/// worktrees it had just made were left on disk for good.
+#[test]
+fn a_launch_that_cannot_take_the_terminal_removes_the_worktrees_it_made() {
+    let lab = git_lab("wtraw");
+    lab.file(r#"{"fleets":{"t":{"worktrees":true,"agents":[{"name":"a","cmd":["claude"]}]}}}"#);
+    let (code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(
+        err.contains("must be a terminal"),
+        "it must fail at the tty handoff: {err}"
+    );
+    assert_eq!(leftover_worktrees(&lab, "t"), Vec::<String>::new(), "{err}");
+}
+
+/// The same when a later worktree cannot be made: the earlier ones in the same
+/// launch are torn down, not stranded. Member b's branch is checked out in the
+/// main tree, which is exactly what `git worktree add` refuses.
+#[test]
+fn a_worktree_that_cannot_be_made_takes_the_earlier_ones_with_it() {
+    let lab = git_lab("wtpart");
+    lab_git(&lab, &["checkout", "-q", "-b", "atrium/t/b"]);
+    lab.file(
+        r#"{"fleets":{"t":{"worktrees":true,"agents":[
+            {"name":"a","cmd":["claude"]},{"name":"b","cmd":["claude"]}]}}}"#,
+    );
+    let (code, _out, err) = lab.run(&["fleet", "up", "t"]);
+    assert_ne!(code, 0, "{err}");
+    assert!(err.contains("could not create worktree \"b\""), "{err}");
+    assert_eq!(leftover_worktrees(&lab, "t"), Vec::<String>::new(), "{err}");
+}
