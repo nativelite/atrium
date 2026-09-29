@@ -100,7 +100,7 @@ pub(crate) fn respawn(
     };
     // In-place replacement: kill the old child then swap in the new pty,
     // term, and session fields. Role/parent/depth/can_spawn are preserved.
-    let p = pane_by_agent_mut(windows, id).unwrap();
+    let p = pane_by_agent_mut(windows, id).expect("found above, and nothing has removed it since");
     let _ = p.pty.kill();
     // The old reader goes with the old child, and before its `Pty` drops
     // (see `Pane::inbox`). Kept, it went on reading the dead pty, and since

@@ -113,6 +113,8 @@ fn os_random(buf: &mut [u8]) -> bool {
     // Use the system-preferred RNG so no algorithm handle is needed.
     const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
     // Returns STATUS_SUCCESS (0) on success.
+    // SAFETY: `buf` is a live writable slice and the length passed is its own;
+    // a null algorithm handle is what BCRYPT_USE_SYSTEM_PREFERRED_RNG requires.
     let status = unsafe {
         BCryptGenRandom(
             std::ptr::null_mut(),

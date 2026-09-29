@@ -288,6 +288,8 @@ mod sys {
     // SAFETY: a semaphore handle is a kernel object reference; every operation on
     // it is thread-safe, and the pool never mutates the handle after creation.
     unsafe impl Send for Pool {}
+    // SAFETY: as for Send - shared use only calls the semaphore's thread-safe
+    // wait and release, and never writes the handle.
     unsafe impl Sync for Pool {}
 
     impl Pool {

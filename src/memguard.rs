@@ -852,6 +852,8 @@ mod unix {
             // most `size` bytes and a short write is rejected below.
             let mut info: ProcTaskInfo = unsafe { core::mem::zeroed() };
             let size = core::mem::size_of::<ProcTaskInfo>() as i32;
+            // SAFETY: `info` is a live local of exactly `size` bytes, the length
+            // passed, so the kernel cannot write past it.
             let got = unsafe {
                 proc_pidinfo(
                     pid,

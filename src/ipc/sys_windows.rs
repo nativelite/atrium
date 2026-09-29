@@ -122,11 +122,21 @@ struct SidAndAttributes {
 }
 
 /// Read a NUL-terminated wide (UTF-16) string the OS allocated.
+///
+/// # Safety
+///
+/// `p` must be non-null and point to a NUL-terminated UTF-16 string that
+/// stays valid (not freed or written) for the whole call.
 unsafe fn read_wide(mut p: *const u16) -> String {
     let mut units = Vec::new();
-    while *p != 0 {
-        units.push(*p);
-        p = p.add(1);
+    // SAFETY: the caller guarantees `p` starts a live NUL-terminated string,
+    // and the loop below never advances `p` past that terminator.
+    while unsafe { *p } != 0 {
+        // SAFETY: `p` is in bounds — the condition just read it as non-NUL.
+        units.push(unsafe { *p });
+        // SAFETY: `*p` is not the terminator, so `p + 1` is still inside the
+        // string (at worst it lands on the NUL).
+        p = unsafe { p.add(1) };
     }
     String::from_utf16_lossy(&units)
 }
@@ -135,16 +145,22 @@ unsafe fn read_wide(mut p: *const u16) -> String {
 /// and LocalSystem, e.g. `D:P(A;;GA;;;S-1-5-21-…)(A;;GA;;;SY)`. `None` if the
 /// user SID can't be resolved (caller then falls back to the default DACL).
 fn current_user_sddl() -> Option<Vec<u16>> {
-    // GetCurrentProcess returns a pseudo-handle; no CloseHandle needed for it.
+    // SAFETY: GetCurrentProcess takes no arguments and returns a pseudo-handle;
+    // no CloseHandle is needed for it.
     let proc = unsafe { GetCurrentProcess() };
     let mut token: Handle = std::ptr::null_mut();
+    // SAFETY: `proc` is the current-process pseudo-handle, and `token` is a
+    // live local the call writes the opened token handle into.
     if unsafe { OpenProcessToken(proc, TOKEN_QUERY, &mut token) } == 0 {
         return None;
     }
     // First call sizes the buffer; second fills it.
     let mut need = 0u32;
+    // SAFETY: `token` is open; a null buffer with length 0 is the documented
+    // sizing call, and `need` is a live local that receives the required size.
     unsafe { GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut need) };
     if need == 0 {
+        // SAFETY: `token` was opened above and is closed once, on this return.
         unsafe { CloseHandle(token) };
         return None;
     }
@@ -153,6 +169,8 @@ fn current_user_sddl() -> Option<Vec<u16>> {
     // A `Vec<u8>` only promises alignment 1 - casting it made that read UB.
     let word = std::mem::size_of::<usize>();
     let mut buf = vec![0usize; (need as usize + word - 1) / word];
+    // SAFETY: `token` is still open; `buf` is a live allocation of at least
+    // `need` bytes (rounded up to whole words), and `need` is a live local.
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -162,6 +180,8 @@ fn current_user_sddl() -> Option<Vec<u16>> {
             &mut need,
         )
     };
+    // SAFETY: `token` is open and nothing uses it after this; this is its one
+    // close on this path.
     unsafe { CloseHandle(token) };
     if ok == 0 {
         return None;
@@ -171,10 +191,16 @@ fn current_user_sddl() -> Option<Vec<u16>> {
     // member is this struct; `buf` is `usize`-aligned and at least `need` bytes.
     let sa = unsafe { &*(buf.as_ptr() as *const SidAndAttributes) };
     let mut sid_str: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `sa.sid` points into `buf`, which is alive for the call, and
+    // `sid_str` is a live local that receives the allocated string.
     if unsafe { ConvertSidToStringSidW(sa.sid, &mut sid_str) } == 0 || sid_str.is_null() {
         return None;
     }
+    // SAFETY: the call succeeded and `sid_str` is non-null, so it is a
+    // NUL-terminated wide string the OS allocated; it is freed only below.
     let sid = unsafe { read_wide(sid_str) };
+    // SAFETY: `sid_str` came from ConvertSidToStringSidW, whose contract is to
+    // free it with LocalFree, and it is not used after this.
     unsafe { LocalFree(sid_str as *mut c_void) };
     // P = protected (no inheritance); GA = generic all; SY = LocalSystem.
     let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)");
@@ -238,6 +264,9 @@ struct PipeConn {
 impl Conn for PipeConn {
     fn recv(&mut self, buf: &mut [u8]) -> Recv {
         let mut n = 0u32;
+        // SAFETY: `self.handle` is an open pipe instance the Listener owns and
+        // closes only in its Drop; `buf` is a live slice at least the length
+        // passed, `n` a live local, and a null OVERLAPPED means synchronous I/O.
         let ok = unsafe {
             ReadFile(
                 self.handle,
@@ -258,6 +287,9 @@ impl Conn for PipeConn {
         // rest goes out on the following passes as the client drains.
         let take = (buf.len() as u32).min(PIPE_BUF);
         let mut written = 0u32;
+        // SAFETY: `self.handle` is an open pipe instance the Listener owns;
+        // `take` <= `buf.len()`, so the OS reads only within the live slice, and
+        // `written` is a live local.
         let ok = unsafe {
             WriteFile(
                 self.handle,
@@ -274,6 +306,9 @@ impl Conn for PipeConn {
     fn peer_gone(&mut self) -> bool {
         let mut scratch = [0u8; 64];
         let mut n = 0u32;
+        // SAFETY: `self.handle` is an open pipe instance the Listener owns;
+        // `scratch` is a live 64-byte local of exactly the length passed, and
+        // `n` is a live local.
         let ok = unsafe {
             ReadFile(
                 self.handle,
@@ -315,7 +350,9 @@ pub struct Listener {
     serving: Option<usize>,
 }
 
-// The handles are owned solely by this Listener, used only from the run loop.
+// SAFETY: the raw pointers are kernel pipe handles, which are usable from any
+// thread; they are owned solely by this Listener and reachable only through it,
+// used only from the run loop, so moving the Listener moves sole access.
 unsafe impl Send for Listener {}
 
 impl Listener {
@@ -333,6 +370,9 @@ impl Listener {
             inherit: 0,
         };
         if let Some(sddl) = current_user_sddl() {
+            // SAFETY: `sddl` is a NUL-terminated wide string (built by `wide`)
+            // alive for the call; `psd` is a live local out-pointer, and a null
+            // size pointer is permitted.
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     sddl.as_ptr(),
@@ -350,6 +390,9 @@ impl Listener {
         if first {
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
         }
+        // SAFETY: `addr` is the NUL-terminated wide name `bind` built with `wide`,
+        // alive for the call; `sec_ptr` is null or points at `sa`, a live local
+        // whose `sd` is the descriptor built above (still unfreed).
         let h = unsafe {
             CreateNamedPipeW(
                 addr.as_ptr(),
@@ -365,6 +408,8 @@ impl Listener {
         // The kernel copies the descriptor into the object at create time, so
         // the local SD can be freed immediately after the call.
         if !psd.is_null() {
+            // SAFETY: `psd` is non-null, was allocated by the SDDL conversion
+            // (freed with LocalFree per its contract), and is not used after this.
             unsafe { LocalFree(psd) };
         }
         if h == INVALID_HANDLE_VALUE {
@@ -398,6 +443,8 @@ impl Listener {
 
     /// Drop the current client and re-arm this instance to listen again.
     fn recycle(&mut self, i: usize, now: Instant) {
+        // SAFETY: the handle is an open pipe instance this Listener owns and
+        // closes only in Drop; with no client attached the call just fails.
         unsafe {
             DisconnectNamedPipe(self.instances[i].handle);
         }
@@ -471,6 +518,9 @@ impl Listener {
             if self.instances[i].phase != Phase::Idle {
                 continue;
             }
+            // SAFETY: the handle is an open pipe instance this Listener owns; a
+            // null OVERLAPPED is valid since it was created without
+            // FILE_FLAG_OVERLAPPED.
             let r = unsafe { ConnectNamedPipe(self.instances[i].handle, std::ptr::null_mut()) };
             let err = if r == 0 { last() } else { 0 };
             match winmap::connect_outcome(r, err) {
@@ -573,6 +623,8 @@ impl Listener {
 impl Drop for Listener {
     fn drop(&mut self) {
         for inst in &self.instances {
+            // SAFETY: each handle came from CreateNamedPipeW in `bind`, is still
+            // open, and is closed exactly once, here, as the Listener drops.
             unsafe {
                 DisconnectNamedPipe(inst.handle);
                 CloseHandle(inst.handle);
@@ -589,6 +641,8 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     let deadline = start + REPLY_DEADLINE;
     let mut h = INVALID_HANDLE_VALUE;
     while Instant::now() < deadline {
+        // SAFETY: `name` is a NUL-terminated wide string (from `wide`) alive for
+        // the call; null security attributes and template handle are permitted.
         h = unsafe {
             CreateFileW(
                 name.as_ptr(),
@@ -623,6 +677,8 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     // ERROR_NO_DATA retry loop could never fire and a server that answered
     // nothing hung `atrium ctl` for as long as it liked.
     let mut mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+    // SAFETY: `h` is the valid handle CreateFileW just returned; `mode` is a
+    // live local, and the null pointers leave those settings unchanged.
     unsafe {
         SetNamedPipeHandleState(h, &mut mode, std::ptr::null_mut(), std::ptr::null_mut());
     }
@@ -640,6 +696,8 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
         // once the server has drained the previous chunk (see PIPE_BUF).
         let end = (off + PIPE_BUF as usize).min(line.len());
         let chunk = &line.as_bytes()[off..end];
+        // SAFETY: `h` is open (closed only on the return paths below); `chunk`
+        // is a live slice of exactly the length passed, `written` a live local.
         let ok = unsafe {
             WriteFile(
                 h,
@@ -651,11 +709,13 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
         };
         let e = if ok == 0 { last() } else { 0 };
         if ok == 0 && e != ERROR_NO_DATA {
+            // SAFETY: `h` is open and this return path never uses it again.
             unsafe { CloseHandle(h) };
             return Err(io::Error::from_raw_os_error(e));
         }
         if written == 0 {
             if Instant::now() >= deadline {
+                // SAFETY: `h` is open and this return path never uses it again.
                 unsafe { CloseHandle(h) };
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -669,6 +729,8 @@ pub fn request(addr: &str, req: &str) -> io::Result<String> {
     }
 
     let out = read_reply(h, start, REPLY_STALL, REPLY_DEADLINE);
+    // SAFETY: `h` is open; `read_reply` has returned and nothing uses the
+    // handle after this single close.
     unsafe { CloseHandle(h) };
     out
 }
@@ -682,6 +744,9 @@ fn read_reply(h: Handle, start: Instant, stall: Duration, hard: Duration) -> io:
     let mut buf = [0u8; 8192];
     loop {
         let mut n = 0u32;
+        // SAFETY: `h` is the caller's open handle (`request` closes it only after
+        // this returns); `buf` is a live array of exactly the length passed, and
+        // `n` is a live local.
         let ok = unsafe {
             ReadFile(
                 h,

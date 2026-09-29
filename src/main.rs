@@ -692,12 +692,12 @@ fn fleet_ack() -> bool {
     if std::env::var_os("ATRIUM_YES").is_some() {
         return true;
     }
-    // SAFETY: isatty on a borrowed fd, no ownership taken.
     #[cfg(unix)]
     {
         extern "C" {
             fn isatty(fd: i32) -> i32;
         }
+        // SAFETY: isatty on a borrowed fd, no ownership taken.
         if unsafe { isatty(0) } == 0 {
             return true;
         }

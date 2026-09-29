@@ -40,7 +40,7 @@ pub(crate) fn fleet_ls_templates() -> ExitCode {
                 println!("  (none)");
             }
             for name in names {
-                let f = fleets.get(name).unwrap();
+                let f = fleets.get(name).expect("`names` are the fleets' own keys");
                 let roster: Vec<&str> = f.agents.iter().map(|a| a.name.as_str()).collect();
                 let shadows = if atrium::templates::NAMES.contains(&name) {
                     "  (shadows the built-in)"

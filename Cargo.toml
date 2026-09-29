@@ -33,3 +33,16 @@ path = "src/main.rs"
 [[bench]]
 name = "terminal"
 harness = false
+
+# Enforced by the gate: `dev.py lint` runs clippy with -D warnings. Cargo < 1.74
+# ignores this table (with a warning), so the 1.70 MSRV build is unaffected.
+# Not here: `allow_attributes_without_reason` - its `reason =` needs Rust 1.81.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn" # every unsafe block states why it is sound
+unwrap_used = "warn"                # expect("invariant") or `?`; tests: clippy.toml
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"

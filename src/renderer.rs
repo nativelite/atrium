@@ -246,7 +246,7 @@ impl Renderer {
                     _ => self.tiled_buf = Some(ansi::Screen::new(cur_rows, cur_cols)),
                 }
                 render_tiled(
-                    self.tiled_buf.as_mut().unwrap(),
+                    self.tiled_buf.as_mut().expect("set just above"),
                     &windows[active],
                     rows,
                     cols,
@@ -261,16 +261,24 @@ impl Renderer {
                         .into_iter()
                         .find(|(id, _)| *id == sel.pane_id);
                     if let (true, false, Some((_, rect))) = (*win == active, sel.is_empty(), rect) {
-                        atrium::select::highlight(sel, self.tiled_buf.as_mut().unwrap(), &rect);
+                        atrium::select::highlight(
+                            sel,
+                            self.tiled_buf.as_mut().expect("set just above"),
+                            &rect,
+                        );
                     }
                 }
                 match &self.prev_master {
-                    Some(prev) => {
-                        frame.extend_from_slice(&prev.diff(self.tiled_buf.as_ref().unwrap()))
-                    }
-                    None => {
-                        frame.extend_from_slice(&self.tiled_buf.as_ref().unwrap().render_full())
-                    }
+                    Some(prev) => frame.extend_from_slice(
+                        &prev.diff(self.tiled_buf.as_ref().expect("set just above")),
+                    ),
+                    None => frame.extend_from_slice(
+                        &self
+                            .tiled_buf
+                            .as_ref()
+                            .expect("set just above")
+                            .render_full(),
+                    ),
                 };
                 // Rotate buffers: tiled_buf (just written) becomes prev_master for
                 // the next diff, and the old prev_master's allocation becomes the

@@ -51,6 +51,8 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
         gid: 0,
     };
     let mut len = std::mem::size_of::<Ucred>() as u32;
+    // SAFETY: `cred` and `len` are live locals, and `len` is exactly the size of
+    // the buffer getsockopt may write; `fd` is only borrowed for the call.
     let r = unsafe {
         getsockopt(
             fd,
@@ -70,6 +72,7 @@ fn peer_uid(fd: std::os::unix::io::RawFd) -> Option<u32> {
     }
     let mut euid = 0u32;
     let mut egid = 0u32;
+    // SAFETY: both out-pointers are live locals; `fd` is only borrowed.
     (unsafe { getpeereid(fd, &mut euid, &mut egid) } == 0).then_some(euid)
 }
 
@@ -379,6 +382,7 @@ impl Listener {
                     // the OS could not vouch for the peer at all — is exactly
                     // when to refuse.
                     match peer_uid(stream.as_raw_fd()) {
+                        // SAFETY: geteuid takes no arguments and cannot fail.
                         Some(peer) if peer == unsafe { geteuid() } => {}
                         _ => {
                             // Counted, not printed here: see `report_refusals`.

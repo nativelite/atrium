@@ -416,7 +416,7 @@ fn obj_entry<'a>(members: &'a mut Vec<(String, Value)>, key: &str) -> &'a mut Va
         &mut members[i].1
     } else {
         members.push((key.to_string(), Value::Object(Vec::new())));
-        &mut members.last_mut().unwrap().1
+        &mut members.last_mut().expect("just pushed").1
     }
 }
 

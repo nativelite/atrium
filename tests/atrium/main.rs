@@ -2,6 +2,10 @@
 //! thing — atrium itself spawned inside a `pty`, driven with keystrokes,
 //! its passthrough output read back. Deadline-bounded throughout.
 
+// Test code: a panic is the failure report. `allow-unwrap-in-tests` covers
+// #[test] fns, not the helpers they share.
+#![allow(clippy::unwrap_used)]
+
 mod support;
 
 mod bar;

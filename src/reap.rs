@@ -97,6 +97,7 @@ mod sys {
     /// Signal one process, not its group — used to put down a stuck watchdog,
     /// which is a lone process and not a pane tree.
     pub fn signal_pid(pid: u32, sig: i32) -> bool {
+        // SAFETY: a plain signal send; no memory crosses the call.
         pid != 0 && unsafe { kill(pid as i32, sig) == 0 }
     }
 
@@ -207,6 +208,8 @@ mod sys {
         if pid == 0 {
             return false;
         }
+        // SAFETY: the handle is used only after the null check and closed on the
+        // one path that opened it; `in_job` is a live local out-param.
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
             if h.is_null() {
@@ -323,6 +326,7 @@ mod sys {
         // SAFETY: FFI call with null attributes and null name.
         let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
         if job.is_null() {
+            // SAFETY: GetLastError takes no arguments; it reads this thread's error.
             debug_warn("CreateJobObjectW", unsafe { GetLastError() });
             return job;
         }
@@ -341,6 +345,7 @@ mod sys {
             )
         };
         if ok == 0 {
+            // SAFETY: GetLastError takes no arguments; it reads this thread's error.
             debug_warn("SetInformationJobObject", unsafe { GetLastError() });
             // SAFETY: closing the handle we just created.
             unsafe { CloseHandle(job) };
@@ -415,6 +420,7 @@ mod sys {
             )
         };
         if ok == 0 {
+            // SAFETY: GetLastError takes no arguments; it reads this thread's error.
             debug_warn("SetInformationJobObject(memory)", unsafe { GetLastError() });
         }
         ok != 0

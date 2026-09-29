@@ -73,6 +73,9 @@ mod q1 {
     fn read_triple(server: Handle) -> (i32, u32, u32) {
         let mut buf = [0u8; 8192];
         let mut n = 0u32;
+        // SAFETY: `buf` is a live local and `buf.len()` is its exact size; `n` is a
+        // live local out-pointer; null overlapped suits this non-overlapped handle.
+        // A stale or bogus `server` value only makes ReadFile fail.
         let ok = unsafe {
             ReadFile(
                 server,
@@ -83,6 +86,8 @@ mod q1 {
             )
         };
         let err = if ok == 0 {
+            // SAFETY: GetLastError takes no arguments and only reads this thread's
+            // last-error value.
             unsafe { GetLastError() }
         } else {
             0
@@ -111,6 +116,8 @@ mod q1 {
     fn q1_readfile_triples_on_a_nowait_server_handle() {
         let addr = format!(r"\\.\pipe\atrium-q1-{}", std::process::id());
         let waddr = wide(&addr);
+        // SAFETY: `waddr` is a NUL-terminated UTF-16 buffer that lives to the end of
+        // the test; a null security-attributes pointer selects the default descriptor.
         let server = unsafe {
             CreateNamedPipeW(
                 waddr.as_ptr(),
@@ -126,9 +133,13 @@ mod q1 {
         assert!(
             server != INVALID_HANDLE_VALUE,
             "CreateNamedPipeW failed: {}",
+            // SAFETY: GetLastError takes no arguments and only reads this thread's
+            // last-error value.
             unsafe { GetLastError() }
         );
 
+        // SAFETY: `waddr` is still a live NUL-terminated UTF-16 buffer; the security
+        // attributes and template handle are null, which CreateFileW accepts.
         let client = unsafe {
             CreateFileW(
                 waddr.as_ptr(),
@@ -143,12 +154,18 @@ mod q1 {
         assert!(
             client != INVALID_HANDLE_VALUE,
             "client CreateFileW failed: {}",
+            // SAFETY: GetLastError takes no arguments and only reads this thread's
+            // last-error value.
             unsafe { GetLastError() }
         );
         // Server-side accept (NOWAIT): with a client already on the line this
         // returns 0 + ERROR_PIPE_CONNECTED (535).
+        // SAFETY: `server` was checked != INVALID_HANDLE_VALUE above and is still
+        // open; null overlapped matches a pipe created without FILE_FLAG_OVERLAPPED.
         let cok = unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) };
         let cerr = if cok == 0 {
+            // SAFETY: GetLastError takes no arguments and only reads this thread's
+            // last-error value.
             unsafe { GetLastError() }
         } else {
             0
@@ -168,6 +185,9 @@ mod q1 {
         // State 2: client sent a partial line (no '\n').
         let msg = b"partial-no-newline";
         let mut wrote = 0u32;
+        // SAFETY: `client` was checked != INVALID_HANDLE_VALUE and is still open;
+        // `msg` is a static byte string passed with its own length; `wrote` is a live
+        // local out-pointer; null overlapped suits the non-overlapped handle.
         unsafe {
             WriteFile(
                 client,
@@ -188,6 +208,8 @@ mod q1 {
         );
 
         // State 3: client has closed its handle.
+        // SAFETY: `client` is a valid handle this test opened; it is closed exactly
+        // once here and never used afterwards.
         unsafe { CloseHandle(client) };
         std::thread::sleep(Duration::from_millis(50));
         let s3 = read_triple(server);
@@ -199,6 +221,8 @@ mod q1 {
             winmap_says(s3.0, s3.1, s3.2)
         );
 
+        // SAFETY: `server` is the pipe handle this test created and still owns; it is
+        // disconnected and closed exactly once here and never used afterwards.
         unsafe {
             DisconnectNamedPipe(server);
             CloseHandle(server);
@@ -380,6 +404,8 @@ fn q3b_a_non_reading_client_does_not_block_the_loop() {
         // Retry briefly until the pipe is available.
         let mut h = INVALID;
         for _ in 0..200 {
+            // SAFETY: `w` is a NUL-terminated UTF-16 buffer owned by this closure that
+            // outlives the call; null security attributes and template are accepted.
             h = unsafe {
                 CreateFileW(
                     w.as_ptr(),
@@ -399,6 +425,8 @@ fn q3b_a_non_reading_client_does_not_block_the_loop() {
         assert!(h != INVALID, "deadbeat could not open the pipe");
         let req = b"deadbeat-request\n";
         let mut wrote = 0u32;
+        // SAFETY: `h` was asserted != INVALID and is still open; `req` is a static
+        // byte string passed with its own length; `wrote` is a live local out-pointer.
         unsafe {
             WriteFile(
                 h,
@@ -586,8 +614,14 @@ mod exploits {
     /// everything we sent, so a following disconnect can't discard unread bytes.
     /// This makes the truncation tests test "got the partial then EOF" and the
     /// control test test "got the whole honest reply".
+    ///
+    /// # Safety
+    ///
+    /// `server` must be a valid, open pipe handle owned by the caller and not
+    /// closed concurrently while this call blocks.
     unsafe fn flush_to_client(server: Handle) {
-        FlushFileBuffers(server);
+        // SAFETY: the caller guarantees `server` is a valid, open pipe handle.
+        unsafe { FlushFileBuffers(server) };
     }
 
     /// A BLOCKING byte-mode named-pipe server — a scripted test peer, not atrium's
@@ -595,6 +629,8 @@ mod exploits {
     /// `usize` so it can cross a thread boundary (a raw pointer is not `Send`).
     fn blocking_server(a: &str) -> usize {
         let w = wide(a);
+        // SAFETY: `w` is a NUL-terminated UTF-16 buffer that lives to the end of this
+        // fn; a null security-attributes pointer selects the default descriptor.
         let h = unsafe {
             CreateNamedPipeW(
                 w.as_ptr(),
@@ -607,6 +643,8 @@ mod exploits {
                 std::ptr::null_mut(),
             )
         };
+        // SAFETY: GetLastError takes no arguments and only reads this thread's
+        // last-error value.
         assert!(h != INVALID, "CreateNamedPipeW failed: {}", unsafe {
             GetLastError()
         });
@@ -614,18 +652,29 @@ mod exploits {
     }
 
     /// Accept one client and drain its request line (`\n`-terminated).
+    ///
+    /// # Safety
+    ///
+    /// `server` must be a valid, open, non-overlapped named-pipe server handle
+    /// owned by the caller and not used by another thread during the call.
     unsafe fn accept_and_read_request(server: Handle) {
-        ConnectNamedPipe(server, std::ptr::null_mut()); // blocks for a client / ERROR_PIPE_CONNECTED
+        // SAFETY: the caller guarantees `server` is a valid, open, non-overlapped
+        // pipe handle, so a null overlapped pointer is correct.
+        unsafe { ConnectNamedPipe(server, std::ptr::null_mut()) }; // blocks for a client / ERROR_PIPE_CONNECTED
         let mut buf = [0u8; 8192];
         loop {
             let mut n = 0u32;
-            let ok = ReadFile(
-                server,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                &mut n,
-                std::ptr::null_mut(),
-            );
+            // SAFETY: `server` is valid per the fn contract; `buf` is a live local and
+            // `buf.len()` is its exact size; `n` is a live local out-pointer.
+            let ok = unsafe {
+                ReadFile(
+                    server,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut n,
+                    std::ptr::null_mut(),
+                )
+            };
             if ok == 0 || n == 0 {
                 break;
             }
@@ -636,17 +685,25 @@ mod exploits {
     }
 
     /// Write all of `bytes`; `false` once the peer is gone.
+    ///
+    /// # Safety
+    ///
+    /// `h` must be a valid, open, non-overlapped pipe handle owned by the caller.
     unsafe fn send_all(h: Handle, bytes: &[u8]) -> bool {
         let mut off = 0usize;
         while off < bytes.len() {
             let mut w = 0u32;
-            let ok = WriteFile(
-                h,
-                bytes[off..].as_ptr(),
-                (bytes.len() - off) as u32,
-                &mut w,
-                std::ptr::null_mut(),
-            );
+            // SAFETY: `h` is valid per the fn contract; `bytes[off..]` is a live slice
+            // and `bytes.len() - off` is exactly its length; `w` is a live local.
+            let ok = unsafe {
+                WriteFile(
+                    h,
+                    bytes[off..].as_ptr(),
+                    (bytes.len() - off) as u32,
+                    &mut w,
+                    std::ptr::null_mut(),
+                )
+            };
             if ok == 0 || w == 0 {
                 return false;
             }
@@ -661,6 +718,9 @@ mod exploits {
     fn truncated_reply_must_err(reply_len: usize, label: &str) {
         let a = format!(r"\\.\pipe\atrium-d7-{}-{label}", std::process::id());
         let sh = blocking_server(&a);
+        // SAFETY: `sh` is the open pipe handle `blocking_server` just returned, moved
+        // into this thread as its sole user, which satisfies the helpers' contracts; it
+        // is disconnected and closed exactly once at the end and never used after.
         let srv = std::thread::spawn(move || unsafe {
             let server = sh as Handle;
             accept_and_read_request(server);
@@ -701,6 +761,9 @@ mod exploits {
         // succeed intact, so the truncation checks above aren't just "large=error".
         let a = format!(r"\\.\pipe\atrium-d7-{}-ctrl", std::process::id());
         let sh = blocking_server(&a);
+        // SAFETY: `sh` is the open pipe handle `blocking_server` just returned, moved
+        // into this thread as its sole user, which satisfies the helpers' contracts; it
+        // is disconnected and closed exactly once at the end and never used after.
         let srv = std::thread::spawn(move || unsafe {
             let server = sh as Handle;
             accept_and_read_request(server);
@@ -727,6 +790,9 @@ mod exploits {
     fn d6_an_unbounded_reply_is_refused() {
         let a = format!(r"\\.\pipe\atrium-d6-{}", std::process::id());
         let sh = blocking_server(&a);
+        // SAFETY: `sh` is the open pipe handle `blocking_server` just returned, moved
+        // into this thread as its sole user, which satisfies the helpers' contracts; it
+        // is disconnected and closed exactly once at the end and never used after.
         let srv = std::thread::spawn(move || unsafe {
             let server = sh as Handle;
             accept_and_read_request(server);
@@ -766,6 +832,8 @@ mod exploits {
         let mut silent: Vec<Handle> = Vec::new();
         for _ in 0..12 {
             let w = wide(&a);
+            // SAFETY: `w` is a NUL-terminated UTF-16 buffer that outlives the call; null
+            // security attributes and template handle are accepted by CreateFileW.
             let h = unsafe {
                 CreateFileW(
                     w.as_ptr(),
@@ -802,6 +870,8 @@ mod exploits {
         }
         let reply = good.join().expect("good client thread");
         for h in silent {
+            // SAFETY: every `h` in `silent` was opened by CreateFileW above and checked
+            // != INVALID; consuming the Vec closes each exactly once.
             unsafe { CloseHandle(h) };
         }
         println!("[D5] staged silent clients; real client served={served} reply={reply:?}");

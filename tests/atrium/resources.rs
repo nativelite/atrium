@@ -79,10 +79,11 @@ fn a_pane_is_given_a_live_build_pool_windows() {
         // SAFETY: a null-terminated name; the handle is closed below.
         let sem = unsafe { OpenSemaphoreW(SEMAPHORE_QUERY_STATE | SYNCHRONIZE, 0, wide.as_ptr()) };
         let mut info = [0i32; 2];
-        // SAFETY: SEMAPHORE_BASIC_INFORMATION is two LONGs; the length says so.
         let status = if sem.is_null() {
             -1
         } else {
+            // SAFETY: `sem` is a non-null handle this test opened;
+            // SEMAPHORE_BASIC_INFORMATION is two LONGs and the length says so.
             unsafe {
                 NtQuerySemaphore(
                     sem,
