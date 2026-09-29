@@ -1073,11 +1073,29 @@ fn sweep_dir(dir: &Path) -> usize {
 /// always on Windows, where the Job Object is the reaper and `signal_group` sends
 /// nothing.
 fn sweep_dir_waiting(dir: &Path, wait: impl FnOnce()) -> usize {
+    let stale = stale_registries(dir);
+    let pgids: Vec<u32> = stale.iter().flat_map(|p| read_registry(p)).collect();
+    // No short-circuit: every group must get its TERM.
+    let delivered = pgids.iter().fold(false, |any, p| term_tree(*p) | any);
+    if delivered {
+        wait();
+    }
+    for p in &pgids {
+        kill_tree(*p);
+    }
+    for path in &stale {
+        let _ = std::fs::remove_file(path);
+    }
+    stale.len()
+}
+
+/// The registries in `dir` whose owning atrium is no longer running.
+fn stale_registries(dir: &Path) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         // Cannot read the directory: no registries to sweep. A stuck watchdog is
         // found through the process table and is handled by the caller.
-        Err(_) => return 0,
+        Err(_) => return Vec::new(),
     };
     let mut stale = Vec::new();
     for e in entries.flatten() {
@@ -1094,15 +1112,30 @@ fn sweep_dir_waiting(dir: &Path, wait: impl FnOnce()) -> usize {
         }
         stale.push(path);
     }
-    let pgids: Vec<u32> = stale.iter().flat_map(|p| read_registry(p)).collect();
-    // No short-circuit: every group must get its TERM.
-    let delivered = pgids.iter().fold(false, |any, p| term_tree(*p) | any);
-    if delivered {
-        wait();
-    }
-    for p in &pgids {
-        kill_tree(*p);
-    }
+    stale
+}
+
+/// Remove the registries of sessions that died without a teardown. Run at
+/// every launch on Windows.
+///
+/// Windows has no watchdog (the Job Object kills a pane tree however atrium
+/// dies) and no console-close handler, so every session ended by closing its
+/// window, a logoff or a crash left its registry in `%TEMP%` for good - only
+/// `atrium reap` ever removed one. The files were inert (nothing on Windows
+/// reads a registry's policy) but they piled up, and `atrium reap` once waited
+/// 750 ms per file. This removes files and signals nothing: the trees they name
+/// went with the job, and killing belongs to `atrium reap`. An owner pid that
+/// Windows has since reused reads as running, so its file waits for a later
+/// launch - harmless, as it is today.
+#[cfg(not(unix))]
+pub fn prune_dead_registries() -> usize {
+    prune_dir(&registry_dir())
+}
+
+/// [`prune_dead_registries`] against any directory, for tests.
+#[cfg(any(not(unix), test))]
+fn prune_dir(dir: &Path) -> usize {
+    let stale = stale_registries(dir);
     for path in &stale {
         let _ = std::fs::remove_file(path);
     }
@@ -1246,6 +1279,42 @@ mod tests {
         assert_eq!(sweep_dir_waiting(&dir, || waited = true), 3);
         assert!(!waited, "nothing was signalled, so nothing to wait for");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launch-time prune removes a dead owner's record and nothing else: a
+    /// live session's record stays, and no group it names is ever signalled -
+    /// it runs on every launch, where the sweep's kills belong to `atrium reap`.
+    #[test]
+    fn a_launch_prune_removes_dead_owners_records_and_signals_nothing() {
+        #[cfg(unix)]
+        let mut kid = {
+            use std::os::unix::process::CommandExt;
+            std::process::Command::new("sleep")
+                .arg("30")
+                .process_group(0)
+                .spawn()
+                .unwrap()
+        };
+        #[cfg(not(unix))]
+        let mut kid = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = dead_registries("prune", &[kid.id(), kid.id()]);
+        let mine = dir.join(format!("atrium-session-{}.pids", std::process::id()));
+        std::fs::write(&mine, "policy=plan\n").unwrap();
+
+        assert_eq!(prune_dir(&dir), 2, "exactly the dead owners' records");
+        assert!(mine.exists(), "a live session's record must be left alone");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        assert!(
+            kid.try_wait().unwrap().is_none(),
+            "a prune must never signal the groups a record names"
+        );
+        let _ = kid.kill();
+        let _ = kid.wait();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

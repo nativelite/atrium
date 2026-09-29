@@ -166,6 +166,10 @@ impl SafetyNet {
         if let Some((dir, _, project)) = location {
             prune_sessions(dir, project);
         }
+        // Nothing else removes a registry left by a session that was killed or
+        // had its window closed on Windows; see `prune_dead_registries`.
+        #[cfg(not(unix))]
+        atrium::reap::prune_dead_registries();
         let snapshot_path = location.map(|(_, file, _)| file.clone());
         let keep = location.map(|(_, _, project)| project);
         let warden = atrium::warden::Warden::new(registry_path.clone());
