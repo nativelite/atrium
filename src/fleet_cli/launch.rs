@@ -118,6 +118,21 @@ pub(super) fn worktree_placement(
         })
 }
 
+/// The fleet a [`spawn_fleet_window`] launches: its roster, what the operator was
+/// shown for it, and where it runs.
+pub(crate) struct FleetSpawn<'a> {
+    /// The loaded fleet file.
+    pub(crate) fleet: &'a atrium::fleet::Fleet,
+    /// What the banner disclosed per agent, one entry per `fleet.agents`, in order.
+    pub(crate) plan: &'a atrium::fleet::Plan,
+    /// The fleet's name, which keys its shared context directory.
+    pub(crate) name: &'a str,
+    /// The directory the fleet was launched from.
+    pub(crate) cwd: &'a std::path::Path,
+    /// The worktree each member runs in; empty when worktrees are off.
+    pub(crate) worktrees: &'a [atrium::worktree::WorktreePlan],
+}
+
 /// Build the fleet's tiled window: one pane per agent, laid out on `grid`
 /// (agents fill leaf ids `0..n` row-major). Each pane runs the agent's `cmd`
 /// plus its fleet args (`--add-dir`/`--append-system-prompt`/`--model`/
@@ -125,21 +140,23 @@ pub(super) fn worktree_placement(
 /// resolved `cwd`. If any agent fails to spawn, the panes already started are
 /// killed and the whole window is abandoned — never a partial fleet.
 ///
-/// `fleet_name` and `cwd` are used to derive the shared context directory
+/// `fleet.name` and `fleet.cwd` are used to derive the shared context directory
 /// (`ctx_dir`) via [`fleet_ctx_dir`]; spawn-wire threads `ctx_dir` into each
 /// pane's environment via `context_env`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_fleet_window(
-    fleet: &atrium::fleet::Fleet,
-    plan: &atrium::fleet::Plan,
+    fleet: FleetSpawn<'_>,
     grid: atrium::spawn::Grid,
     rows: u16,
     cols: u16,
-    fleet_name: &str,
-    cwd: &std::path::Path,
-    worktrees: &[atrium::worktree::WorktreePlan],
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Window> {
+    let FleetSpawn {
+        fleet,
+        plan,
+        name: fleet_name,
+        cwd,
+        worktrees,
+    } = fleet;
     // Stable, writable directory shared by every pane in this fleet instance.
     // Computed once here so all panes agree on a single root; spawn-wire
     // picks this up and injects it as CONTEXT_MODE_DIR via context_env.

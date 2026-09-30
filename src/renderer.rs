@@ -26,6 +26,24 @@ const BAR_QUIET: Duration = Duration::from_millis(150);
 /// The least time between two repairs.
 const BAR_REFRESH: Duration = Duration::from_millis(500);
 
+/// Everything [`Renderer::paint`] draws from this tick, by name.
+pub(crate) struct Scene<'a> {
+    pub(crate) windows: &'a mut [Window],
+    pub(crate) active: usize,
+    pub(crate) views: &'a mut Views,
+    /// The drag selection in progress, with the window it started in.
+    pub(crate) selection: &'a Option<(usize, Selection)>,
+    /// The command prompt's line while it is open.
+    pub(crate) prompt: Option<&'a str>,
+    pub(crate) coord: Coord<'a>,
+    /// This tick's repaint request.
+    pub(crate) force_repaint: bool,
+    /// Whether the active window's drain changed a tiled pane.
+    pub(crate) tiled_dirty: bool,
+    /// Whether any pane produced output this tick.
+    pub(crate) pane_output: bool,
+}
+
 /// Whether to repaint the bar with bytes **identical** to what is already on
 /// screen — a repair, not a change. A changed bar always paints at once; the
 /// caller compares the bytes first.
@@ -139,27 +157,26 @@ impl Renderer {
     /// the outer terminal paints panes and bar atomically — no mid-frame tearing.
     /// An empty frame (idle tick) emits nothing, so the markers never spam.
     ///
-    /// `force_repaint` is this tick's repaint request; `tiled_dirty` is whether
-    /// the active window's drain changed a tiled pane.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn paint(
-        &mut self,
-        windows: &mut [Window],
-        active: usize,
-        views: &mut Views,
-        selection: &Option<(usize, Selection)>,
-        prompt: Option<&str>,
-        world: &atrium::vendors::AgentState,
-        board: &atrium::board::Board,
-        bus: &atrium::bus::Bus,
-        flash: &mut Option<(String, Instant)>,
-        mut force_repaint: bool,
-        tiled_dirty: bool,
-        pane_output: bool,
-        rows: u16,
-        cols: u16,
-        out: &mut impl std::io::Write,
-    ) {
+    /// `scene` is what this tick draws from; `ui` is the terminal it draws on.
+    pub(crate) fn paint(&mut self, scene: Scene<'_>, ui: Ui<'_, impl std::io::Write>) {
+        let Scene {
+            windows,
+            active,
+            views,
+            selection,
+            prompt,
+            coord,
+            mut force_repaint,
+            tiled_dirty,
+            pane_output,
+        } = scene;
+        let Coord { world, board, bus } = coord;
+        let Ui {
+            rows,
+            cols,
+            out,
+            flash,
+        } = ui;
         let spin_frame = (self.anim_start.elapsed().as_millis() / 120) as usize;
         let mut frame: Vec<u8> = Vec::new();
         // Set when this tick composited the startup splash into `frame`; its `2J`
@@ -219,17 +236,7 @@ impl Renderer {
             if force_repaint {
                 let now = agsess::sessions::now_ms();
                 frame.extend_from_slice(
-                    render_log_panel(
-                        windows,
-                        world,
-                        board,
-                        bus,
-                        rows,
-                        cols,
-                        views.log_scroll,
-                        now,
-                    )
-                    .as_bytes(),
+                    render_log_panel(windows, coord, rows, cols, views.log_scroll, now).as_bytes(),
                 );
             }
         } else if windows[active].tiled() {

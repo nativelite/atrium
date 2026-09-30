@@ -50,6 +50,7 @@ mod run_loop;
 mod safety_net;
 mod snapshot;
 mod tiled;
+mod ui;
 pub(crate) use config_cli::*;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
@@ -67,6 +68,7 @@ pub(crate) use run_loop::{run, RunArgs};
 pub(crate) use safety_net::*;
 pub(crate) use snapshot::*;
 pub(crate) use tiled::*;
+pub(crate) use ui::*;
 
 /// A process-global, monotonic **agent id** stamped on every pane atrium hosts —
 /// the stable key of the ctl spawn tree (`Pane.id` is only unique within a

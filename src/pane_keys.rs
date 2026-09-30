@@ -8,17 +8,19 @@ use crate::*;
 
 /// Apply a window/pane `action` to `windows`; any other action is a no-op.
 /// Keyboard-opened panes run under `launch`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_pane_action(
     action: &Action,
-    windows: &mut Vec<Window>,
-    active: &mut usize,
+    desk: Desk<'_>,
     launch: &Launch,
-    rows: u16,
-    cols: u16,
-    out: &mut impl std::io::Write,
-    flash: &mut Option<(String, Instant)>,
+    ui: Ui<'_, impl std::io::Write>,
 ) -> KeyOutcome {
+    let Desk { windows, active } = desk;
+    let Ui {
+        rows,
+        cols,
+        out,
+        flash,
+    } = ui;
     let mut outcome = KeyOutcome::default();
     let full_repaint = KeyOutcome {
         reset_frame: true,
@@ -44,15 +46,16 @@ pub(crate) fn handle_pane_action(
         }
         Action::NewPane => {
             match open_window(
-                windows,
-                active,
+                Desk { windows, active },
                 launch.command,
                 launch.identity,
                 trust_mode(),
-                rows,
-                cols,
-                out,
-                flash,
+                Ui {
+                    rows,
+                    cols,
+                    out,
+                    flash,
+                },
             ) {
                 Ok(()) => outcome.reset_frame = true,
                 Err(e) => {
@@ -70,15 +73,16 @@ pub(crate) fn handle_pane_action(
             // so you can run `atrium ctl board list` here and see it rendered.
             let shell = vec![default_shell()];
             match open_window(
-                windows,
-                active,
+                Desk { windows, active },
                 &shell,
                 None,
                 atrium::ctl::TrustMode::Off,
-                rows,
-                cols,
-                out,
-                flash,
+                Ui {
+                    rows,
+                    cols,
+                    out,
+                    flash,
+                },
             ) {
                 Ok(()) => outcome.reset_frame = true,
                 Err(e) => {

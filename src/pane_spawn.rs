@@ -4,32 +4,16 @@
 
 use crate::*;
 
-#[allow(clippy::too_many_arguments)]
+/// Open `spec` as the only pane of a new window, sized to the screen less the
+/// status bar. `spec.id` is the pane's id in the new window's tree, which starts
+/// at `0`.
 pub(crate) fn spawn_window(
-    command: &[String],
+    spec: PaneSpec<'_>,
     rows: u16,
     cols: u16,
-    identity: Option<&str>,
-    mode: atrium::ctl::TrustMode,
     flash: &mut Option<(String, Instant)>,
-    cwd: Option<&str>,
-    extra_norms: Option<&str>,
 ) -> std::io::Result<Window> {
-    let pane = spawn_pane_full(
-        PaneSpec {
-            command,
-            id: 0,
-            identity,
-            cwd,
-            mode,
-            extra_env: &[],
-            extra_norms,
-            deny: &[],
-        },
-        rows.saturating_sub(1).max(1),
-        cols,
-        flash,
-    )?;
+    let pane = spawn_pane_full(spec, rows.saturating_sub(1).max(1), cols, flash)?;
     // The pane is already in the session job: `spawn_pane_full` enrolls every
     // pane at its own spawn (#94).
     Ok(Window {
@@ -51,19 +35,35 @@ pub(crate) struct Launch<'a> {
 
 /// Open `command` as a new window mid-run — enrolled in the session job at its
 /// spawn — and switch to it. A spawn failure is returned for the caller to word.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn open_window(
-    windows: &mut Vec<Window>,
-    active: &mut usize,
+    desk: Desk<'_>,
     command: &[String],
     identity: Option<&str>,
     mode: atrium::ctl::TrustMode,
-    rows: u16,
-    cols: u16,
-    out: &mut impl std::io::Write,
-    flash: &mut Option<(String, Instant)>,
+    ui: Ui<'_, impl std::io::Write>,
 ) -> std::io::Result<()> {
-    let w = spawn_window(command, rows, cols, identity, mode, flash, None, None)?;
+    let Desk { windows, active } = desk;
+    let Ui {
+        rows,
+        cols,
+        out,
+        flash,
+    } = ui;
+    let w = spawn_window(
+        PaneSpec {
+            command,
+            id: 0,
+            identity,
+            cwd: None,
+            mode,
+            extra_env: &[],
+            extra_norms: None,
+            deny: &[],
+        },
+        rows,
+        cols,
+        flash,
+    )?;
     windows.push(w);
     let last = windows.len() - 1;
     switch_window(windows, active, last, rows, cols, out);

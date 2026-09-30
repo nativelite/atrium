@@ -1,5 +1,14 @@
 use crate::*;
 
+/// The coordination state the overlays read: the agents' sessions, the shared
+/// board, and the bus.
+#[derive(Clone, Copy)]
+pub(crate) struct Coord<'a> {
+    pub(crate) world: &'a atrium::vendors::AgentState,
+    pub(crate) board: &'a atrium::board::Board,
+    pub(crate) bus: &'a atrium::bus::Bus,
+}
+
 /// Render the full-screen coordination overlay (`Ctrl+A b`): the shared **board**
 /// (durable "what is true") on top, a divider, then the **bus** feed (recent
 /// events + any open `decision_needed` escalations, "what just happened") below.
@@ -275,17 +284,15 @@ pub(crate) fn ago(now_ms: u64, ts_ms: u64) -> String {
 /// The activity-log panel (`Ctrl+A l`): the merged [`collect_log`] rendered
 /// newest-at-the-bottom (tailing), scrollable up for history. `scroll` is how
 /// many events back from the newest the window is shifted.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn render_log_panel(
     windows: &[Window],
-    world: &atrium::vendors::AgentState,
-    board: &atrium::board::Board,
-    bus: &atrium::bus::Bus,
+    coord: Coord<'_>,
     rows: u16,
     cols: u16,
     scroll: usize,
     now_ms: u64,
 ) -> String {
+    let Coord { world, board, bus } = coord;
     let mut out = String::from("\x1b[?25l\x1b[2J");
     let log = collect_log(windows, world, board, bus);
     out.push_str(&format!(

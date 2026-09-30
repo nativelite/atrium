@@ -118,20 +118,22 @@ impl KeyOutcome {
 
 /// Handle `action` if an overlay is up. `None` means no overlay is open and the
 /// action belongs to the panes; `Some` means it was consumed.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_overlay_key(
     action: &Action,
     views: &mut Views,
-    windows: &mut [Window],
+    desk: Desk<'_>,
     world: &atrium::vendors::AgentState,
     board: &atrium::board::Board,
     bus: &mut atrium::bus::Bus,
-    active: &mut usize,
-    rows: u16,
-    cols: u16,
-    out: &mut impl std::io::Write,
-    flash: &mut Option<(String, Instant)>,
+    ui: Ui<'_, impl std::io::Write>,
 ) -> Option<KeyOutcome> {
+    let Desk { windows, active } = desk;
+    let Ui {
+        rows,
+        cols,
+        out,
+        flash,
+    } = ui;
     let mut outcome = KeyOutcome::default();
     // While the overview is open, keystrokes drive the selection cursor and
     // dive-in — not the panes. `Ctrl+A o` (toggle) and `Ctrl+A q` (quit)

@@ -80,14 +80,19 @@ pub(crate) fn spawn_worker_window(
     };
     let mut flash = None;
     match spawn_window(
-        &sp.argv,
+        PaneSpec {
+            command: &sp.argv,
+            id: 0,
+            identity: sp.identity.as_deref(),
+            cwd: wt_cwd.as_deref(),
+            mode,
+            extra_env: &[],
+            extra_norms: wt_norms.as_deref(),
+            deny: &[],
+        },
         rows,
         cols,
-        sp.identity.as_deref(),
-        mode,
         &mut flash,
-        wt_cwd.as_deref(),
-        wt_norms.as_deref(),
     ) {
         Ok(mut w) => {
             let reply = adopt_worker(&mut w.panes[0], sp, caller, new_depth, note);

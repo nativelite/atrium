@@ -216,21 +216,27 @@ impl RunState<'_> {
 
         // 6-7. paint the active window and the bar as one synchronized frame.
         self.renderer.paint(
-            &mut self.windows,
-            self.active,
-            &mut self.views,
-            &self.selection,
-            self.prompt.as_deref(),
-            &self.world,
-            &self.board,
-            &self.bus,
-            &mut self.flash,
-            self.force_repaint,
-            tiled_dirty,
-            drained.pane_output,
-            self.rows,
-            self.cols,
-            &mut self.out,
+            Scene {
+                windows: &mut self.windows,
+                active: self.active,
+                views: &mut self.views,
+                selection: &self.selection,
+                prompt: self.prompt.as_deref(),
+                coord: Coord {
+                    world: &self.world,
+                    board: &self.board,
+                    bus: &self.bus,
+                },
+                force_repaint: self.force_repaint,
+                tiled_dirty,
+                pane_output: drained.pane_output,
+            },
+            Ui {
+                rows: self.rows,
+                cols: self.cols,
+                out: &mut self.out,
+                flash: &mut self.flash,
+            },
         );
         self.force_repaint = false;
         // Hand anything a phase wrote without flushing to the terminal this tick.

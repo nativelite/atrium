@@ -3,49 +3,32 @@
 
 use crate::*;
 
-/// Build a [`atrium::session::PaneCapture`] from the individual pane metadata
-/// fields that `snapshot_if_changed` reads from a live [`Pane`]. Extracted
-/// from the inline closure so the field mapping is directly unit-testable
-/// without a real PTY — if `worktree` (or any other field) is accidentally
-/// dropped, the test at `capture_pane_fields_propagates_worktree` fails.
-// The field list is the point: this is the one place a live `Pane` becomes a
-// `PaneCapture`, and naming every field here is what makes a dropped one a
-// compile error rather than a silently thinner snapshot. A bag struct would just
-// be `PaneCapture` again.
-#[allow(clippy::too_many_arguments)]
-fn capture_pane_fields(
-    id: usize,
-    role: Option<String>,
-    argv: Vec<String>,
-    cwd: Option<String>,
-    identity: Option<String>,
-    session_id: Option<String>,
-    worktree: Option<String>,
-    deny: Vec<String>,
-    can_spawn: bool,
-    depth: usize,
-    parent_pane: Option<usize>,
-    mode: atrium::ctl::TrustMode,
-    kickoff: bool,
-    norms: Option<String>,
-    context_env: Vec<(String, String)>,
-) -> atrium::session::PaneCapture {
+/// The one place a live [`Pane`] becomes a [`atrium::session::PaneCapture`].
+/// The literal names every field, so a field added to `PaneCapture` and not
+/// mapped here is a compile error rather than a silently thinner snapshot.
+/// `parent_pane` is the parent's pane id, resolved by the caller (a pane stores
+/// its parent as a per-process `AgentId`, which a snapshot must not carry).
+///
+/// It takes the pane itself, not its fields: the old 15-argument form let two
+/// adjacent `Option<String>`s (`cwd`, `identity`) swap without a complaint.
+fn capture_pane(p: &Pane, parent_pane: Option<usize>) -> atrium::session::PaneCapture {
     atrium::session::PaneCapture {
-        id,
-        role,
-        argv,
-        cwd,
-        identity,
-        session_id,
-        worktree,
-        deny,
-        can_spawn,
-        depth,
+        id: p.id,
+        role: p.role.clone(),
+        argv: p.argv.clone(),
+        cwd: p.cwd.clone(),
+        identity: p.identity.clone(),
+        session_id: p.session_id.clone(),
+        // Set by spawn_worker_* via sp.worktree.
+        worktree: p.worktree.clone(),
+        deny: p.deny.clone(),
+        can_spawn: p.can_spawn,
+        depth: p.depth,
         parent_pane,
-        mode: Some(mode),
-        kickoff,
-        norms,
-        context_env,
+        mode: Some(p.mode),
+        kickoff: p.kickoff,
+        norms: p.norms.clone(),
+        context_env: p.context_env.clone(),
     }
 }
 
@@ -89,25 +72,7 @@ pub(crate) fn snapshot_if_changed(
         w.tree.focus(),
         w.panes
             .iter()
-            .map(|p| {
-                capture_pane_fields(
-                    p.id,
-                    p.role.clone(),
-                    p.argv.clone(),
-                    p.cwd.clone(),
-                    p.identity.clone(),
-                    p.session_id.clone(),
-                    p.worktree.clone(), // set by spawn_worker_* via sp.worktree
-                    p.deny.clone(),
-                    p.can_spawn,
-                    p.depth,
-                    parent_pane(p.parent),
-                    p.mode,
-                    p.kickoff,
-                    p.norms.clone(),
-                    p.context_env.clone(),
-                )
-            })
+            .map(|p| capture_pane(p, parent_pane(p.parent)))
             .collect(),
         atrium::session::policy(),
     );

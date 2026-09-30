@@ -10,18 +10,19 @@ use crate::*;
 /// Feed a chunk of raw input to the open prompt (`line` is `Some` while open).
 /// Enter opens the typed command as a new window under `launch`'s identity and
 /// session job; Esc / Ctrl+C closes the prompt. A launch failure is flashed.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn feed_prompt(
     line: &mut Option<String>,
     bytes: &[u8],
-    windows: &mut Vec<Window>,
-    active: &mut usize,
+    desk: Desk<'_>,
     launch: &Launch,
-    rows: u16,
-    cols: u16,
-    out: &mut impl std::io::Write,
-    flash: &mut Option<(String, Instant)>,
+    ui: Ui<'_, impl std::io::Write>,
 ) -> KeyOutcome {
+    let Ui {
+        rows,
+        cols,
+        out,
+        flash,
+    } = ui;
     let mut outcome = KeyOutcome::default();
     let Some(buf) = line.as_mut() else {
         return outcome;
@@ -33,15 +34,16 @@ pub(crate) fn feed_prompt(
             let argv = split_cmdline(line.take().unwrap_or_default().trim());
             if !argv.is_empty() {
                 match open_window(
-                    windows,
-                    active,
+                    desk,
                     &argv,
                     launch.identity,
                     trust_mode(),
-                    rows,
-                    cols,
-                    out,
-                    flash,
+                    Ui {
+                        rows,
+                        cols,
+                        out,
+                        flash,
+                    },
                 ) {
                     Ok(()) => outcome.reset_frame = true,
                     Err(e) => {

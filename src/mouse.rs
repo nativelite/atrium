@@ -32,17 +32,19 @@ pub(crate) fn tile_at(
 
 /// Apply a mouse `action` to the active window; any other action is a no-op.
 /// `selection` is the drag in progress, with the window it started in.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_mouse(
     action: &Action,
     windows: &mut [Window],
     active: usize,
     selection: &mut Option<(usize, Selection)>,
-    rows: u16,
-    cols: u16,
-    out: &mut impl std::io::Write,
-    flash: &mut Option<(String, Instant)>,
+    ui: Ui<'_, impl std::io::Write>,
 ) -> KeyOutcome {
+    let Ui {
+        rows,
+        cols,
+        out,
+        flash,
+    } = ui;
     let mut outcome = KeyOutcome::default();
     match *action {
         Action::MouseClick { col, row } => {

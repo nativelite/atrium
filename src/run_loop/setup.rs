@@ -112,14 +112,19 @@ impl<'a> RunState<'a> {
                 // created suspended, assigned, then resumed; Linux: its cgroup).
                 Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
                 None => spawn_window(
-                    command,
+                    PaneSpec {
+                        command,
+                        id: 0,
+                        identity,
+                        cwd: None,
+                        mode: trust_mode(),
+                        extra_env: &[],
+                        extra_norms: None,
+                        deny: &[],
+                    },
                     rows,
                     cols,
-                    identity,
-                    trust_mode(),
                     &mut flash,
-                    None,
-                    None,
                 ),
             },
         };

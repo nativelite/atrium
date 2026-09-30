@@ -71,61 +71,49 @@ fn find_latest_dir_with_no_matching_files_returns_none() {
 
 // --- Bug 2: worktree field flows through the real snapshot mapping path ---
 
+/// A real (idle) shell pane, so `capture_pane` maps the same struct the run
+/// loop holds. The caller kills its pty.
+fn shell_pane() -> crate::Pane {
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let mut flash = None;
+    crate::spawn_pane(
+        &[shell.to_string()],
+        5,
+        20,
+        1,
+        None,
+        TrustMode::Off,
+        &mut flash,
+    )
+    .expect("a shell to host the pane")
+}
+
 /// Guards the `p.worktree -> PaneCapture.worktree` mapping inside
-/// `snapshot_if_changed` (main.rs:818-827, now via `capture_pane_fields`).
+/// `snapshot_if_changed` (via `capture_pane`).
 ///
 /// The original bug: `spawn_worker_window`/`spawn_worker_here` never set
 /// `pane.worktree`, so every live snapshot saw `None` even for worktree
 /// panes. The fix adds `pane.worktree = sp.worktree.clone()` in both spawn
 /// paths. This test fails if `worktree` is dropped or hardcoded to `None`
-/// in `capture_pane_fields` — the function `snapshot_if_changed` calls with
-/// `p.worktree.clone()` as the final argument.
+/// in `capture_pane`.
 #[test]
-fn capture_pane_fields_propagates_worktree() {
-    let cap = super::capture_pane_fields(
-        7,
-        Some("fix".to_string()),
-        vec!["claude".to_string()],
-        Some("/work".to_string()),
-        None,
-        Some("sess-fix".to_string()),
-        Some("fix".to_string()),
-        vec!["git push".to_string()],
-        false,
-        1,
-        Some(0),
-        TrustMode::Edits,
-        false,
-        None,
-        Vec::new(),
-    );
+fn capture_pane_propagates_worktree() {
+    let mut pane = shell_pane();
+    pane.worktree = Some("fix".to_string());
+    let cap = super::capture_pane(&pane, Some(0));
     assert_eq!(
         cap.worktree.as_deref(),
         Some("fix"),
-        "worktree must flow through capture_pane_fields unchanged"
+        "worktree must flow through capture_pane unchanged"
     );
     // None must propagate too — a non-worktree pane must not invent a name.
-    let cap_none = super::capture_pane_fields(
-        8,
-        None,
-        vec!["bash".to_string()],
-        None,
-        None,
-        None,
-        None,
-        Vec::new(),
-        true,
-        0,
-        None,
-        TrustMode::Off,
-        false,
-        None,
-        Vec::new(),
-    );
+    pane.worktree = None;
+    let cap_none = super::capture_pane(&pane, None);
     assert!(
         cap_none.worktree.is_none(),
         "non-worktree pane must have None"
     );
+    let _ = pane.pty.kill();
 }
 
 // --- recovery restores the session policy, not just the layout ---------
@@ -135,24 +123,17 @@ fn capture_pane_fields_propagates_worktree() {
 /// `can_spawn` bit went missing from recovery: the pane held them, the
 /// snapshot never saw them.
 #[test]
-fn capture_pane_fields_propagates_the_capability_fields() {
-    let cap = super::capture_pane_fields(
-        2,
-        Some("builder".to_string()),
-        vec!["claude".to_string()],
-        None,
-        None,
-        None,
-        None,
-        vec!["cargo test --workspace".to_string()],
-        false,
-        3,
-        Some(1),
-        TrustMode::Plan,
-        false,
-        None,
-        Vec::new(),
-    );
+fn capture_pane_propagates_the_capability_fields() {
+    let mut pane = shell_pane();
+    pane.deny = vec!["cargo test --workspace".to_string()];
+    pane.can_spawn = false;
+    pane.depth = 3;
+    pane.mode = TrustMode::Plan;
+    // The two adjacent `Option<String>`s the positional form could swap.
+    pane.cwd = Some("/work".to_string());
+    pane.identity = Some("work-id".to_string());
+    let cap = super::capture_pane(&pane, Some(1));
+    let _ = pane.pty.kill();
     assert_eq!(cap.deny, vec!["cargo test --workspace".to_string()]);
     assert!(
         !cap.can_spawn,
@@ -161,4 +142,6 @@ fn capture_pane_fields_propagates_the_capability_fields() {
     assert_eq!(cap.depth, 3);
     assert_eq!(cap.parent_pane, Some(1));
     assert_eq!(cap.mode, Some(TrustMode::Plan));
+    assert_eq!(cap.cwd.as_deref(), Some("/work"));
+    assert_eq!(cap.identity.as_deref(), Some("work-id"));
 }

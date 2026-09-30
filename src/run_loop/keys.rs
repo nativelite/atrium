@@ -31,13 +31,17 @@ impl RunState<'_> {
             feed_prompt(
                 &mut self.prompt,
                 bytes,
-                &mut self.windows,
-                &mut self.active,
+                Desk {
+                    windows: &mut self.windows,
+                    active: &mut self.active,
+                },
                 &self.launch,
-                self.rows,
-                self.cols,
-                &mut self.out,
-                &mut self.flash,
+                Ui {
+                    rows: self.rows,
+                    cols: self.cols,
+                    out: &mut self.out,
+                    flash: &mut self.flash,
+                },
             )
             .apply(&mut self.renderer, &mut self.force_repaint);
             b""
@@ -60,13 +64,17 @@ impl RunState<'_> {
             feed_prompt(
                 &mut self.prompt,
                 b,
-                &mut self.windows,
-                &mut self.active,
+                Desk {
+                    windows: &mut self.windows,
+                    active: &mut self.active,
+                },
                 &self.launch,
-                self.rows,
-                self.cols,
-                &mut self.out,
-                &mut self.flash,
+                Ui {
+                    rows: self.rows,
+                    cols: self.cols,
+                    out: &mut self.out,
+                    flash: &mut self.flash,
+                },
             )
             .apply(&mut self.renderer, &mut self.force_repaint);
             return Flow::Continue;
@@ -74,15 +82,19 @@ impl RunState<'_> {
         if let Some(outcome) = handle_overlay_key(
             &action,
             &mut self.views,
-            &mut self.windows,
+            Desk {
+                windows: &mut self.windows,
+                active: &mut self.active,
+            },
             &self.world,
             &self.board,
             &mut self.bus,
-            &mut self.active,
-            self.rows,
-            self.cols,
-            &mut self.out,
-            &mut self.flash,
+            Ui {
+                rows: self.rows,
+                cols: self.cols,
+                out: &mut self.out,
+                flash: &mut self.flash,
+            },
         ) {
             if outcome.apply(&mut self.renderer, &mut self.force_repaint) {
                 self.deliberate_exit = true;
@@ -109,13 +121,17 @@ impl RunState<'_> {
             | Action::KillPane => {
                 handle_pane_action(
                     &action,
-                    &mut self.windows,
-                    &mut self.active,
+                    Desk {
+                        windows: &mut self.windows,
+                        active: &mut self.active,
+                    },
                     &self.launch,
-                    self.rows,
-                    self.cols,
-                    &mut self.out,
-                    &mut self.flash,
+                    Ui {
+                        rows: self.rows,
+                        cols: self.cols,
+                        out: &mut self.out,
+                        flash: &mut self.flash,
+                    },
                 )
                 .apply(&mut self.renderer, &mut self.force_repaint);
             }
@@ -156,10 +172,12 @@ impl RunState<'_> {
                     &mut self.windows,
                     self.active,
                     &mut self.selection,
-                    self.rows,
-                    self.cols,
-                    &mut self.out,
-                    &mut self.flash,
+                    Ui {
+                        rows: self.rows,
+                        cols: self.cols,
+                        out: &mut self.out,
+                        flash: &mut self.flash,
+                    },
                 )
                 .apply(&mut self.renderer, &mut self.force_repaint);
             }

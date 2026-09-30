@@ -3,7 +3,7 @@
 
 use super::clean::report_worktree_teardown;
 use super::fsan;
-use super::launch::spawn_fleet_window;
+use super::launch::{spawn_fleet_window, FleetSpawn};
 use super::preflight::{banner_lines, preflight_context_mode, BannerFacts};
 use crate::*;
 
@@ -502,14 +502,16 @@ fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
     // means every pane keeps its fleet-file cwd — today's behavior, unchanged.
     let wt_for_spawn: &[atrium::worktree::WorktreePlan] = if wt_active { &wt_plans } else { &[] };
     let window = match spawn_fleet_window(
-        &fleet,
-        &plan,
+        FleetSpawn {
+            fleet: &fleet,
+            plan: &plan,
+            name,
+            cwd: &cwd,
+            worktrees: wt_for_spawn,
+        },
         grid,
         rows,
         cols,
-        name,
-        &cwd,
-        wt_for_spawn,
         &mut flash,
     ) {
         Ok(w) => w,
