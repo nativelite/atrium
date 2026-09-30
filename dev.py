@@ -240,7 +240,8 @@ def lint() -> int:
 
     Neither ran anywhere before: 17 clippy warnings built up unseen, and a
     `div_ceil` (Rust 1.73) shipped in releases that declared `rust-version =
-    1.70` - `cargo install` failed on 1.70-1.72 for every release from 0.32.0.
+    1.70` - `cargo install` failed on Windows on 1.70-1.72 for every release
+    from 0.33.0 to 0.37.2.
     A missing target or toolchain is skipped out loud, never silently passed.
     """
     code = run("cargo", "clippy", "--all-targets", "--", "-D", "warnings")
