@@ -7,6 +7,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-09-30
+
+A hardening release. Most of the 33 commits reorganize the source for the people
+and agents who maintain it, with no change in behavior. The rest fix what a
+review of that work and an audit against the rustkb knowledge base turned up.
+
+It is the first release since 0.32.0 that builds on Windows with the Rust version
+it declares (1.70), and the local gate now checks that on every push.
+
+### Fixed
+- **`cargo install atrium` works on Rust 1.70-1.72 on Windows again.** Since
+  0.33.0 the Windows reaper called `usize::div_ceil`, which needs Rust 1.73, so
+  on Windows every release from 0.33.0 to 0.37.2 failed to build on the
+  `rust-version` it declared. The call is replaced by plain ceiling division, and `dev.py check`
+  now runs `cargo +1.70 check --all-targets --locked`.
+- **`atrium ctl` refuses a malformed command instead of sending the wrong
+  request.**
+  - A flag that takes a value (`--role`, `--identity`, `--worktree`, `--mode`,
+    `--to`, `--kind`) used to swallow the next flag when its value was missing.
+    `bus pub work --to --decision item=X` addressed a role named `--decision`
+    and sent the escalation as an FYI. A flag is no longer accepted as a value.
+  - An oversized `board claim --ttl` could wrap the lease negative, and a huge
+    `audit <n>` asked for a negative tail. Both now report "too large".
+  - Leases are capped at 365 days. The client refuses a longer `--ttl`, and the
+    server clamps any request's `ttl_ms`, since a raw request is not bound by
+    the client.
+  - A repeated `--since`, or a field named twice (`board set k a=1 a=2`), is an
+    error. Before, both copies reached the server and one won silently.
+- **`atrium reap` waits once per sweep, not once per dead session.** Cleaning up
+  64 dead sessions took 48 s, because each registry got its own 750 ms grace
+  period. On Windows, where nothing is signalled (the Job Object is the reaper),
+  it no longer waits at all.
+- **Windows: a dead session's registry file is removed at the next launch.**
+  Any session that ended without a teardown (the window's X, logoff, a crash)
+  left its `atrium-session-<pid>.pids` in `%TEMP%`, and only a manual
+  `atrium reap` removed it.
+- **A failed `fleet up` removes the worktrees it made.** If the terminal could
+  not be taken, the roster failed to spawn, or a later member's worktree could
+  not be made, the worktrees created before the failure stayed on disk. They are
+  now torn down under the usual rule: removed only if clean and fully merged,
+  otherwise kept and reported.
+- **Linux: a clean quit no longer reports "pane process group(s) survived
+  teardown"** for plain shell panes. Teardown now reaps each pane's child
+  (bounded at 250 ms) before checking for survivors.
+- **Unix: atrium never signals a pid above `i32::MAX`.** The cast to a signed
+  pid went negative, and `kill(-1, sig)` signals every process the user owns.
+  The pids come from `ps` and from registry files the same user can write.
+- **Windows: the control pipe's access list is built from a correctly aligned
+  buffer.** The token read cast a byte buffer to a pointer-aligned struct, which
+  is undefined behaviour. It was harmless in practice, but it sits on the path
+  that restricts the pipe to the current user. A new test checks the result.
+
+### Changed
+- **Library API: `atrium::ctl::build_request` returns
+  `Result<String, UsageError>`** instead of `Result<String, String>`.
+  `UsageError` implements `Display` (the message alone) and
+  `std::error::Error`. `atrium ctl` prints the same messages as before.
+- **Built on `nativelite-ansi` 0.4.0 and `nativelite-vterm` 0.5.3,** whose
+  tokenizer no longer allocates per token when feeding pane output. atrium's
+  own throughput was not re-measured for this release.
+- **The source is split into modules a reader can navigate.** `ipc`, `ctl`,
+  `fleet`, `ctl_server` and `fleet_cli` are now directories, and the end-to-end
+  suite has one module per area. Long functions became named steps: `run()`,
+  `fleet_up`, `dispatch_ctl`, `build_request` and `spawn_pane_full`. `main.rs`
+  went from 4,365 lines to 594. No behavior changed.
+- **Stricter lint discipline, enforced by the gate.** The gate runs clippy
+  with `-D warnings` for Windows, Linux and macOS. The crate has a `[lints]`
+  table, every `unsafe` block states why it is sound (`// SAFETY:`), and
+  `unwrap` is refused outside tests.
+
 ## [0.37.2] - 2026-09-20
 
 ### Fixed
@@ -1672,7 +1742,9 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.37.1...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/nativelite/atrium/compare/v0.37.2...v0.38.0
+[0.37.2]: https://github.com/nativelite/atrium/compare/v0.37.1...v0.37.2
 [0.37.1]: https://github.com/nativelite/atrium/compare/v0.37.0...v0.37.1
 [0.37.0]: https://github.com/nativelite/atrium/compare/v0.36.1...v0.37.0
 [0.36.1]: https://github.com/nativelite/atrium/compare/v0.36.0...v0.36.1
