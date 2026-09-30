@@ -349,6 +349,7 @@ fn build_spawn_mode_roundtrips_through_parse() {
     assert!(
         build_request(&v(&["spawn", "--mode", "yolo", "--", "claude"]), None)
             .unwrap_err()
+            .to_string()
             .contains("--mode")
     );
 }
@@ -419,6 +420,7 @@ fn bus_pub_to_addresses_a_decision_to_a_role() {
     assert!(
         build_request(&v(&["bus", "pub", "t", "--decision", "--to"]), None)
             .unwrap_err()
+            .to_string()
             .contains("--to")
     );
 }
@@ -458,6 +460,7 @@ fn build_board_claim_and_release_roundtrip() {
     assert!(
         build_request(&v(&["board", "claim", "cli", "--ttl", "soon"]), Some(0))
             .unwrap_err()
+            .to_string()
             .contains("--ttl")
     );
 }

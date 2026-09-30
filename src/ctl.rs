@@ -47,7 +47,7 @@ mod tests;
 #[cfg(test)]
 mod testutil;
 
-pub use client::{build_request, ctl_cmd};
+pub use client::{build_request, ctl_cmd, UsageError};
 pub use launch::{parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG};
 pub use policy::{
     delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, parse_allow_list,

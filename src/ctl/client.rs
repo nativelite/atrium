@@ -156,10 +156,37 @@ fn value_at<'a>(args: &'a [String], idx: usize, missing: &str) -> Result<&'a Str
 /// The JSON request under construction: `(key, value)` pairs in wire order.
 type Pairs = Vec<(&'static str, Value)>;
 
+/// Why `atrium ctl` argv could not become a request. Always the caller's usage,
+/// never the session's state, which is why `ctl_cmd` answers it with the help
+/// text. The message names what was wrong (`"send needs text after the target"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageError(String);
+
+impl UsageError {
+    /// The message, without the `atrium ctl:` prefix.
+    pub fn message(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for UsageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UsageError {}
+
 /// Turn `atrium ctl` argv (after the `ctl` word) + caller id into a JSON request
 /// line. Pure and testable. A router: `caller` and `token` first, then the
 /// subcommand's own builder below, each of which documents its grammar.
-pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, String> {
+pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, UsageError> {
+    build_pairs(args, caller).map_err(UsageError)
+}
+
+/// [`build_request`]'s body. The subcommand builders word their errors as plain
+/// strings; the public boundary types them once.
+fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String> {
     let mut pairs: Pairs = Vec::new();
     if let Some(c) = caller {
         let c = i64::try_from(c).map_err(|_| format!("caller id {c} is out of range"))?;

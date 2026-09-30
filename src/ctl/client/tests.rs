@@ -5,19 +5,25 @@ use crate::ctl::testutil::v;
 
 #[test]
 fn bus_pub_without_fields_is_an_error() {
-    let err = build_request(&v(&["bus", "pub", "deploy"]), None).unwrap_err();
+    let err = build_request(&v(&["bus", "pub", "deploy"]), None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("field=value"), "{err}");
 }
 
 #[test]
 fn send_without_text_is_an_error() {
-    let err = build_request(&v(&["send", "dev_1"]), None).unwrap_err();
+    let err = build_request(&v(&["send", "dev_1"]), None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("text"), "{err}");
 }
 
 #[test]
 fn spawn_without_command_is_an_error() {
-    let err = build_request(&v(&["spawn", "--role", "x"]), None).unwrap_err();
+    let err = build_request(&v(&["spawn", "--role", "x"]), None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("needs a command"), "{err}");
 }
 
@@ -26,23 +32,27 @@ fn board_set_needs_a_field() {
     // A key with no field=value is a clear client error, and a bad pair too.
     assert!(build_request(&v(&["board", "set", "auth"]), None)
         .unwrap_err()
+        .to_string()
         .contains("field=value"));
     assert!(
         build_request(&v(&["board", "set", "auth", "nofieldeq"]), None)
             .unwrap_err()
+            .to_string()
             .contains("field=value")
     );
 }
 
 #[test]
 fn kill_without_target_is_an_error() {
-    let err = build_request(&v(&["kill"]), None).unwrap_err();
+    let err = build_request(&v(&["kill"]), None).unwrap_err().to_string();
     assert!(err.contains("target"), "{err}");
 }
 
 #[test]
 fn audit_non_numeric_tail_is_an_error() {
-    let err = build_request(&v(&["audit", "lots"]), None).unwrap_err();
+    let err = build_request(&v(&["audit", "lots"]), None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("number"), "{err}");
 }
 
@@ -57,7 +67,7 @@ fn a_value_flag_never_swallows_the_next_flag() {
         &["respawn", "dev", "--worktree", "--x"],
         &["bus", "pub", "work", "--to", "--decision", "item=X"],
     ] {
-        let err = build_request(&v(argv), None).unwrap_err();
+        let err = build_request(&v(argv), None).unwrap_err().to_string();
         assert!(err.contains("needs"), "{argv:?}: {err}");
     }
 }
@@ -82,7 +92,7 @@ fn oversized_numbers_are_errors_not_wraps() {
         &["board", "claim", "k", "--ttl", "9300000000000000"],
         &["audit", "18446744073709551615"],
     ] {
-        let err = build_request(&v(argv), None).unwrap_err();
+        let err = build_request(&v(argv), None).unwrap_err().to_string();
         assert!(err.contains("too large"), "{argv:?}: {err}");
     }
     let req = build_request(&v(&["board", "claim", "k", "--ttl", "60"]), None).unwrap();
@@ -96,7 +106,7 @@ fn bus_feed_since_given_twice_is_an_error() {
         &["bus", "feed", "--since", "3", "--since=9"][..],
         &["bus", "feed", "--since=3", "--since", "9"],
     ] {
-        let err = build_request(&v(argv), None).unwrap_err();
+        let err = build_request(&v(argv), None).unwrap_err().to_string();
         assert!(err.contains("once"), "{argv:?}: {err}");
     }
     let req = build_request(&v(&["bus", "feed", "--since", "3"]), None).unwrap();
@@ -112,10 +122,12 @@ fn ttl_and_tail_report_too_large_consistently() {
         &["board", "claim", "k", "--ttl", "99999999999999999999"],
         &["audit", "99999999999999999999"],
     ] {
-        let err = build_request(&v(argv), None).unwrap_err();
+        let err = build_request(&v(argv), None).unwrap_err().to_string();
         assert!(err.contains("too large"), "{argv:?}: {err}");
     }
-    let err = build_request(&v(&["board", "claim", "k", "--ttl", "--x"]), None).unwrap_err();
+    let err = build_request(&v(&["board", "claim", "k", "--ttl", "--x"]), None)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("needs"), "{err}");
 }
 
@@ -127,7 +139,18 @@ fn a_field_named_twice_is_an_error() {
         &["bus", "pub", "work", "--to", "lead", "to=dev", "msg=x"][..],
         &["board", "set", "k", "a=1", "a=2"],
     ] {
-        let err = build_request(&v(argv), None).unwrap_err();
+        let err = build_request(&v(argv), None).unwrap_err().to_string();
         assert!(err.contains("twice"), "{argv:?}: {err}");
     }
+}
+
+/// A bad argv is a typed [`UsageError`]: it displays exactly its message (what
+/// `ctl_cmd` prints after `atrium ctl: `) and travels as a `std::error::Error`.
+#[test]
+fn a_usage_error_displays_its_message_and_is_an_error() {
+    let err = build_request(&v(&["frobnicate"]), None).unwrap_err();
+    assert_eq!(err.message(), "unknown subcommand \"frobnicate\"");
+    assert_eq!(err.to_string(), err.message());
+    let boxed: Box<dyn std::error::Error> = Box::new(err);
+    assert!(boxed.to_string().contains("frobnicate"));
 }
