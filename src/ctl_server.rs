@@ -18,11 +18,3 @@ pub(crate) use dispatch::{apply_ctl, decision_for_agent, CtlSession};
 pub(crate) use panes::{effective_mode, status_label};
 pub(crate) use reply::truncate;
 pub(crate) use sends::{flush_sends, PendingSend};
-
-// Reached through the crate root only by `main.rs`'s tests.
-#[cfg(test)]
-pub(crate) use panes::privilege_for;
-#[cfg(test)]
-pub(crate) use reply::audit_outcome;
-#[cfg(test)]
-pub(crate) use spawn::worktree_spawn_params;

@@ -314,3 +314,6 @@ pub(crate) fn spawn(
         spawn_worker_here(cx, &sp, caller, new_depth, effective, note)
     }
 }
+
+#[cfg(test)]
+mod tests;

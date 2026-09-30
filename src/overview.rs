@@ -343,3 +343,6 @@ pub(crate) fn render_overview_panel(
     ));
     out
 }
+
+#[cfg(test)]
+mod tests;

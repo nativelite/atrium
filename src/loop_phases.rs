@@ -406,6 +406,64 @@ pub(crate) fn decision_note(bus: &atrium::bus::Bus, windows: &[Window]) -> Strin
     }
 }
 
+/// True while a pane's emulator has produced no *visible* content yet — every
+/// cell is default. Used to keep the startup splash up until the agent actually
+/// paints (its terminal-setup bytes arrive first and must not count as painted).
+/// Short-circuits, so it is cheap and only fully scans during the brief boot.
+fn term_blank(t: &vterm::Term) -> bool {
+    let s = t.screen();
+    let blank = ansi::Cell::default();
+    for r in 0..s.rows() {
+        for c in 0..s.cols() {
+            if s.cell(r, c) != blank {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// True if `bytes` contains a full-screen erase (`ESC[2J` or `ESC[3J`). Unlike a
+/// scroll, `2J`/`3J` ignore the scroll region and wipe the whole screen — the bar
+/// row included — so atrium must repaint the bar after one.
+fn clears_screen(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| w == b"\x1b[2J" || w == b"\x1b[3J")
+}
+
+/// Sniff a pty output chunk for the app turning mouse tracking on/off — a
+/// DECSET/DECRST for private mode 1000/1002/1003 (`ESC [ ? … h` / `… l`). Returns
+/// `Some(true)` if the chunk last enabled mouse, `Some(false)` if it last
+/// disabled it, `None` if it touched neither. Handles combined params
+/// (`ESC[?1002;1006h`). Best-effort and stateless: a sequence split across two
+/// reads may be missed, but apps emit these as a single write at startup/teardown
+/// so it reliably tracks whether a pane wants the wheel. Drives `Pane::mouse_wanted`.
+fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
+    let mut result = None;
+    let mut i = 0;
+    while i + 3 < buf.len() {
+        if buf[i] == 0x1b && buf[i + 1] == b'[' && buf[i + 2] == b'?' {
+            let start = i + 3;
+            let mut j = start;
+            while j < buf.len() && (buf[j].is_ascii_digit() || buf[j] == b';') {
+                j += 1;
+            }
+            if j < buf.len() && (buf[j] == b'h' || buf[j] == b'l') {
+                let is_mouse = std::str::from_utf8(&buf[start..j])
+                    .ok()
+                    .map(|s| s.split(';').any(|p| matches!(p, "1000" | "1002" | "1003")))
+                    .unwrap_or(false);
+                if is_mouse {
+                    result = Some(buf[j] == b'h');
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,5 +515,44 @@ mod tests {
             "unsticking is not activity"
         );
         let _ = pane.pty.kill();
+    }
+
+    /// The startup logo holds until it has been seen, but never hides a pane that
+    /// has nothing to show, and never outlives a pane that already exited.
+    #[test]
+    fn the_startup_logo_holds_until_seen_unless_the_pane_is_done() {
+        use super::splash_may_hand_off as may;
+        assert!(!may(true, false, false), "a fast shell waits out the hold");
+        assert!(may(true, true, false), "then hands off");
+        assert!(!may(false, true, false), "nothing drawn yet: keep the logo");
+        assert!(
+            may(true, false, true),
+            "an exited one-shot shows its output at once"
+        );
+    }
+
+    /// An open synchronized update is only abandoned once the pane has been
+    /// quiet past the limit; a working app's frame (bytes still arriving) and a
+    /// pane not in an update are never touched.
+    #[test]
+    fn a_sync_frame_is_stuck_only_when_open_and_long_quiet() {
+        use super::sync_frame_stuck as stuck;
+        use std::time::Duration;
+        let limit = Duration::from_millis(250);
+        let cases: &[(bool, u64, bool, &str)] = &[
+            (true, 251, true, "open and quiet past the limit: stuck"),
+            (true, 5000, true, "open and long quiet: stuck"),
+            (true, 250, false, "open, quiet exactly the limit: not yet"),
+            (true, 10, false, "open, bytes still arriving: a live frame"),
+            (false, 5000, false, "not in an update: nothing to close"),
+            (false, 0, false, "not in an update, busy: nothing to close"),
+        ];
+        for &(open, quiet_ms, want, label) in cases {
+            assert_eq!(
+                stuck(open, Duration::from_millis(quiet_ms), limit),
+                want,
+                "{label}"
+            );
+        }
     }
 }

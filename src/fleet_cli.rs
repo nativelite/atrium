@@ -109,6 +109,4 @@ mod ls;
 mod preflight;
 mod up;
 
-#[cfg(test)]
-pub(crate) use launch::fleet_launch;
 pub(crate) use up::{fleet_up, up_alias};

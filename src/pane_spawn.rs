@@ -736,3 +736,6 @@ pub(crate) fn effective_command(command: &[String]) -> Vec<String> {
 pub(crate) fn effective_command(command: &[String]) -> Vec<String> {
     assemble_command(command, None)
 }
+
+#[cfg(test)]
+mod tests;

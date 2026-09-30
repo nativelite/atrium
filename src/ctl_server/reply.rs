@@ -105,3 +105,6 @@ pub(crate) fn reply_tree(
         .collect();
     atrium::ctl::reply_list(&nodes)
 }
+
+#[cfg(test)]
+mod tests;

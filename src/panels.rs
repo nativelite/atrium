@@ -647,3 +647,6 @@ pub(crate) fn draw_startup_splash(
         let _ = write!(out, "\x1b[{};{col}H{line}", top + i);
     }
 }
+
+#[cfg(test)]
+mod tests;

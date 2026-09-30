@@ -287,3 +287,18 @@ impl<'a> RunState<'a> {
         })
     }
 }
+
+/// Drop repeats, keeping first-seen order. Small-n by construction (a deny list),
+/// so the quadratic scan is cheaper than the allocation a set would need.
+fn dedup_preserving_order(v: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(v.len());
+    for e in v {
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests;

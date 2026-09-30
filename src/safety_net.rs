@@ -544,3 +544,31 @@ impl Drop for Upkeep {
         self.stop();
     }
 }
+
+/// Surface a best-effort operation's failure in the bar **once per failure
+/// streak**: the first `Err` flashes `<what> failed: <error>`, later ones stay
+/// quiet until an `Ok` resets the streak. Returns the success value, if any. The
+/// pattern the r10 audit (B8) asked every swallowed best-effort `Result` to follow.
+fn surface_once<T>(
+    failing: &mut bool,
+    result: std::io::Result<T>,
+    what: &str,
+    flash: &mut Option<(String, Instant)>,
+) -> Option<T> {
+    match result {
+        Ok(v) => {
+            *failing = false;
+            Some(v)
+        }
+        Err(e) => {
+            if !*failing {
+                *failing = true;
+                *flash = Some((format!("{what} failed: {e}"), Instant::now()));
+            }
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
