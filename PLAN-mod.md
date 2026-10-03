@@ -776,14 +776,9 @@ agent's reasoning without touching it, per-pane credentials, and a trust
 ladder with a human at the top. Mechanisms are named; sizes are guesses.
 
 **X1. The warden: a fleet immune system.**
-One cheap pane (`--warden sonnet`) whose mod gets, every few seconds, each
-tile's screen delta (R2, broker-side, no transcript) and runs
-`$.model.classify` over it: `fine | looping | stuck | off-task | dangerous`.
-`looping` and `stuck` post an fyi with the evidence; `dangerous` (a command
-that matches nothing in the deny list but reads as destructive in context)
-sends `ctl interrupt <target>` (a new verb: Esc through the pty atrium owns,
-then a held send) and a decision to the human. A watcher that can press Esc
-on a runaway agent, in under five seconds, for cents.
+The feature that exists only when mods exist. Designed in full in Part IV,
+because it has to extend `src/warden.rs` and honour the reasons that module
+gives for never killing.
 
 **X2. Quorum before a risky action.**
 A `tool.check` ask for a command the fleet marks `quorum` (`git push`, a
@@ -903,3 +898,202 @@ harness around the model: the screen it draws, the context it holds, the
 credential it runs under, the ladder it climbs. That is the position atrium
 chose on day one, and the mod is the piece that lets the harness hear the
 engine. Everything in Part III is that pairing used as hard as it goes.
+
+---
+
+# Part IV — The warden, finished
+
+`src/warden.rs` today is an **integrity** warden: it digests atrium's binary,
+watches the session registry and the snapshot, walks process ancestry from
+kernel state, and *reports* (audit, a bus decision, the bar). Its module doc
+records why `ATRIUM_WARDEN=enforce` was removed and is not coming back:
+
+1. Under a correct ancestry rule the enforceable set is empty, and a broken
+   chain is indistinguishable from an ordinary reparenting: a kill there is a
+   kill on a coin flip.
+2. The kill read the suspect's own registry, a file the suspect could write:
+   a tripwire that can be pointed at a target is worse than none.
+
+The mod changes both facts, for behaviour rather than ancestry. It gives the
+warden **evidence the suspect cannot plant for another pane** and **levers
+that are not kills**. This part designs the behaviour warden on top of the
+integrity one, under the same rules.
+
+## IV.1 What stays true
+
+- **atrium is not a sandbox.** The same-uid ceiling holds. An agent can still
+  run a bare `claude` with no mod and no atrium. What the mod closes is the
+  easy path *from inside the engine it runs in*, which is where the one-liners
+  the module doc lists are typed.
+- **The warden never kills.** Kill stays the human's verb (`ctl kill`). The
+  strongest thing the warden does is **hold** a pane, which costs the human one
+  keystroke to lift if the warden was wrong.
+- **Nothing a pane says about another pane is trusted**, with one bounded
+  exception written in IV.4.
+- **It reports through what exists.** New alert kinds flow through
+  `SafetyNet::tick` → audit + bus decision + bar flash, exactly as the
+  integrity alerts do. One `Alert` type, more kinds.
+
+## IV.2 Evidence: three sources, none of them a file the suspect writes
+
+| source | what it is | who can forge it for pane N |
+| --- | --- | --- |
+| **the pane's own reports** | `tool.call` and `tool.check` facts from N's mod: tool, argv, exit code, path, verdict, with N's token | only N, and only about N |
+| **the pane's screen** | N's vterm, which atrium owns and N's process draws | only N, by what it actually does |
+| **the broker's own ledger** | N's statuses, costs, touched files, bus posts, timings | nobody: atrium wrote it |
+
+Every detector below uses only these about pane N. A pane can lie about
+itself; it cannot make the warden act on a sibling. That is the property the
+old `enforce` lacked.
+
+## IV.3 Detectors
+
+Structural detectors are pure Rust in the broker (`src/warden/behavior.rs`),
+run on every `SafetyNet::tick`, unit-tested against recorded sequences, and
+need no model. The language detectors run in a **warden pane** (a cheap model
+spawned by atrium itself) and are advisory unless policy says otherwise.
+Each detector has a per-pane, per-kind cooldown so a condition fires once.
+
+**Structural (no model):**
+
+| kind | signal | default action |
+| --- | --- | --- |
+| `looping` | the same Bash argv (normalised) with the same exit code ≥ 4 times in 10 min, or the same `Edit` to the same hunk ≥ 3 times; corroborated by screen-delta similarity (the vterm diff between runs is near-identical) | decision → hold |
+| `stuck` | `working` with no tool call and no stream progress for 5 min; or `waiting-approval` for 10 min with the human never focused on the tile (title feature counts it as needs-you already) | decision |
+| `spending` | cost per minute above 4× the pane's own median, or a single turn above `warden.turn_usd` | decision; hold under `budget: hard` |
+| `evasion` | a `tool.call` whose argv matches the one-liners the module doc names: `claude --dangerously-skip-permissions` (any posture above the ceiling), `env -u ATRIUM_*`, `exec -a atrium`, `setsid`/double-fork of an `atrium`, a `Write` to `.claude/settings*.json`, `~/.claude.json` or `settings.local.json`, an `Edit` of the atrium binary's path or the session registry; plus the integrity warden's existing alerts | `tool.check` → `ask` with the reason, decision, audit; never silent |
+| `scope` | an `Edit`/`Write` real path outside the pane's owned files or worktree (F6 denies it; the warden counts the attempts) ≥ 3 | fyi; decision at 10 |
+| `collision` | R4 | fyi; decision for the lead |
+
+**Language (warden pane, `$.model.classify`):**
+
+| kind | input | labels | default action |
+| --- | --- | --- | --- |
+| `off-task` | the item brief from the board + the last screen delta | `on-task`, `off-task`, `unclear` | fyi; decision after 3 in a row |
+| `dangerous` | a `tool.check` ask the pane forwarded (R10) or any Bash argv the structural pass could not place, with 20 screen rows of context | `routine`, `risky`, `destructive` | `risky` → ask; `destructive` → interrupt + hold + decision |
+| `distress` | the model's own text in the last delta | `fine`, `confused`, `apologising-loop`, `asking-the-void` | fyi; `apologising-loop` → hold |
+
+A fleet with `warden: { model: "off" }` runs the structural pass alone and is
+still a warden. The language pass is what the mod makes affordable: the
+warden pane sees screens, never transcripts, and asks a cheap model one
+question per delta.
+
+## IV.4 The warden pane, and the one exception to the trust rule
+
+atrium spawns the warden itself when the fleet (or `--warden <model>`) asks:
+`--role warden`, depth 0, no worktree, `plan` mode (it never edits anything),
+with a mod that does only three things:
+
+1. Pull screen deltas for every pane from the broker (`ctl peek --delta`,
+   a verb only the warden role may call, which is how `peek` stays off for
+   everyone else).
+2. Run the language detectors on them.
+3. Report verdicts: `report verdict pane=<n> kind=<k> label=<l> rows=<a-b>`.
+
+The exception: the broker accepts a warden's report *about another pane*, but
+only if (a) the reporting pane was spawned by atrium itself with the warden
+role, never by a pane; (b) the verdict cites screen rows (`rows=`) and the
+broker **re-reads those rows from its own vterm** to confirm the quoted text
+exists; and (c) the action the policy maps it to is at most a hold. A
+compromised warden can therefore cause a reversible hold on a pane whose own
+screen contains the cited lines, and nothing else. That is a bounded harm
+with a one-keystroke remedy, which is the test the old `enforce` failed.
+
+## IV.5 Levers, from softest to hardest; none is a kill
+
+| lever | mechanism | reversible by |
+| --- | --- | --- |
+| **note** | bus fyi + audit | — |
+| **flash** | the bar, as integrity alerts flash today | time |
+| **decision** | `DecisionNeeded` on the bus, addressed to the human (or the lead for `collision`) | `bus resolve` |
+| **ask** | the pane's own mod turns the next matching `tool.check` from allow into `ask`, reason attached; the human answers in the pane or through R10 | the answer |
+| **hold** | the broker marks the pane held; the pane's mod denies every `tool.call` with `warden hold: <kind>: <evidence>; release with ctl warden release <pane>`; the tile shows `⏸`, the bar `1 held`; the pane's model sees the reason and waits | `ctl warden release <pane>` (human or the ceiling-holding lead), or `warden.hold_ttl` |
+| **interrupt** | `ctl interrupt <target>`: Esc written into the pty atrium owns (the keystroke the human would press), then hold | the same |
+
+A hold is enforced *inside the held pane's own engine* by its own mod, on
+the broker's word. The pane cannot answer for a sibling, and the broker
+never writes into a pane's process to do it. Policy maps kinds to levers in
+the fleet file:
+
+```json
+"warden": {
+  "model": "haiku",
+  "hold_on": ["looping", "evasion", "destructive", "apologising-loop"],
+  "interrupt_on": ["destructive"],
+  "hold_ttl_s": 1800,
+  "turn_usd": 2.0,
+  "release": "human"
+}
+```
+
+`release: "human"` (default) or `"lead"` (the ceiling-holding ancestor may
+release; the human always may).
+
+## IV.6 What the warden looks like
+
+The warden pane's own screen is a live table drawn by its mod
+(`$.ui.open`, a `Pane`, redrawn on every verdict):
+
+```
+ warden · haiku · 6 panes · 1 held · $0.41 spent on verdicts
+ pane  role       status   last verdict           evidence            action
+ 3     attention  working  on-task                —                   —
+ 4     filter     ⏸ held   looping (cargo test ×5) rows 12–31 same ×5 [r]elease
+ 5     config     working  risky: rm -rf target   rows 40–41          asked
+ 6     reviewer   idle     on-task                —                   —
+```
+
+The overview (`Ctrl+A o`) shows `⏸` and the kind on a held tile; the title
+feature counts a hold as needs-you, so a backgrounded fleet rings.
+
+## IV.7 Code
+
+- `src/warden.rs`: unchanged except new `Alert` kinds and a one-paragraph
+  addition to the module doc: "behaviour, under the same rules, lives in
+  `warden/behavior.rs`".
+- `src/warden/behavior.rs` (new, pure): `Detector` state per pane, `observe(Fact)`
+  → `Vec<Alert>`, cooldowns, the argv normaliser, the screen-similarity
+  measure (a cheap shingle hash over rows), tests on recorded sequences.
+- `src/ctl_server/holds.rs` (new): holds, TTLs, release authority.
+- `src/ctl/request.rs`, `src/ctl_server/dispatch.rs`: `interrupt`,
+  `warden hold|release|list`, `peek --delta` (warden role only), `report verdict`.
+- `src/safety_net.rs`: the behaviour pass in `tick`, feeding the same alert
+  path as the integrity warden.
+- `src/fleet/schema.rs`, `src/argv.rs`: the `warden` block, `--warden <model>`.
+- `src/overview.rs`, `src/bar.rs`, `src/theme.rs`: `⏸`, `N held`.
+- Mod: `hooks/warden-client.ts` (hold enforcement in `tool.check`/`tool.call`,
+  the evasion patterns, argv reports), `hooks/warden-pane.tsx` (the warden
+  role: delta loop, classify, verdicts, the table).
+
+## IV.8 Verification
+
+- Unit: each structural detector against a recorded sequence fires once and
+  respects its cooldown; the argv normaliser treats `cargo test --lib x` and
+  `cargo  test --lib x` as one; a verdict whose cited rows are not on the
+  pane's screen is refused; a verdict from a non-warden pane is refused; a
+  hold expires at its TTL; release authority follows `release`.
+- Mod: under hold every `tool.call` is denied with the reason; the evasion
+  argvs turn `allow` into `ask` with the reason and a report; a non-matching
+  argv is untouched.
+- e2e: a fake claude that runs the same failing command five times is held
+  within two ticks of the fifth and shows `⏸`; `ctl warden release` lifts it
+  and the next command runs; an evasion one-liner produces an `ask`, an audit
+  row and a decision; a second fake pane posting a forged verdict about the
+  first is refused and audited.
+- Live: a real looping agent (a test that cannot pass) is held, the human
+  releases it with a hint, and the flight record (R5) shows the hold.
+
+## IV.9 Honest limits
+
+- A pane that spawns a bare `claude` without the mod is outside the warden's
+  engine-level sight, as the module doc already says; the structural pass
+  still sees its screen and its cost if atrium hosts it, and the integrity
+  warden still sees its ancestry.
+- Whether the model can disable a loaded plugin from inside a session is a
+  fact of the engine to verify on the build in use; if it can, the write that
+  does it is a `tool.call` the mod sees first, and `evasion` fires on it.
+- The language detectors are opinions from a cheap model; that is why their
+  default lever is a note or a decision, and a hold needs three in a row or
+  a structural corroboration.
+- A hold is a denial the model can read; a model that argues with it in text
+  costs tokens while held. `hold_ttl_s` and `spending` bound that.
