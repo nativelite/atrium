@@ -105,6 +105,57 @@ fn ctl_status_reports_a_pane() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// A pane's mod speaks `hello` and `report` over the channel with the pane's
+/// own token, and `ctl status` and `ctl whoami` then show what it said: the
+/// reported status replaces the transcript inference, end to end. Needles are
+/// reply-only text (quoted keys), so the shell's echo of the typed command can
+/// never satisfy them.
+#[test]
+fn ctl_hello_and_report_drive_the_panes_status() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl hello mod=0.1.0 caps=status,bogus\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"accepted\":[\"status\"]"),
+        "hello was not taken (bogus caps must be dropped): {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl report status=waiting-approval reason=Bash\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"{\"ok\":true,\"pane\":0}", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"{\"ok\":true,\"pane\":0}"),
+        "report was not taken: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl status 0\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(
+        &mut p,
+        b"\"status\":\"waiting-approval\"",
+        Duration::from_secs(20),
+    );
+    assert!(
+        contains(&out, b"\"status\":\"waiting-approval\""),
+        "status does not show the report: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl whoami\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"mod\":{", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"pane\":0")
+            && contains(&out, b"\"version\":\"0.1.0\"")
+            && contains(&out, b"\"caps\":[\"status\"]"),
+        "whoami does not describe the pane and its mod: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the

@@ -8,6 +8,7 @@ impl RunState<'_> {
     pub(super) fn teardown(self) -> ExitCode {
         let RunState {
             term: _,
+            mods: _,
             mut out,
             rows: _,
             cols: _,

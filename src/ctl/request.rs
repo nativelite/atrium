@@ -69,6 +69,15 @@ pub enum Cmd {
     /// Kill a target pane's child process and relaunch it in a new working
     /// directory — optionally an ad-hoc worktree created on demand.
     Respawn(RespawnReq),
+    /// A pane's mod announces itself: its version and capabilities. About the
+    /// caller only ([`crate::modstate`]).
+    Hello(HelloReq),
+    /// A pane's mod reports its own status, usage or last answer. About the
+    /// caller only ([`crate::modstate`]).
+    Report(ReportReq),
+    /// What is the caller: its pane, role, parent, mode, deny rules, mod and
+    /// the board item briefed to its role.
+    Whoami,
 }
 
 impl Cmd {
@@ -85,6 +94,9 @@ impl Cmd {
         match self {
             Cmd::List | Cmd::Status(_) | Cmd::Audit(_) => true,
             Cmd::Spawn(_) | Cmd::Send(_) | Cmd::Kill(_) | Cmd::Respawn(_) => false,
+            // A mod's reports write broker state, and `whoami` answers about
+            // the caller, which an unauthenticated request does not have.
+            Cmd::Hello(_) | Cmd::Report(_) | Cmd::Whoami => false,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }
@@ -177,8 +189,51 @@ impl Cmd {
                     rr.worktree.as_deref().unwrap_or("-")
                 ),
             ),
+            Cmd::Hello(h) => (
+                "hello",
+                format!("mod={} caps={}", h.version, h.caps.join(",")),
+            ),
+            // The answer's length, never its text: it is the model's output.
+            Cmd::Report(r) => (
+                "report",
+                format!(
+                    "status={} context={} answer_len={}",
+                    r.status.map(|s| s.label()).unwrap_or("-"),
+                    r.context_pct
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    r.answer.as_ref().map(|a| a.chars().count()).unwrap_or(0)
+                ),
+            ),
+            Cmd::Whoami => ("whoami", String::new()),
         }
     }
+}
+
+/// A `hello` request's payload: what a pane's mod says about itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloReq {
+    /// The mod's version string.
+    pub version: String,
+    /// The hosting Claude Code's version, when the mod could read it.
+    pub engine: Option<String>,
+    /// The capabilities it offers; the server keeps those in
+    /// [`crate::modstate::CAPS`].
+    pub caps: Vec<String>,
+}
+
+/// A `report` request's payload: the mod's own status, usage or answer.
+pub type ReportReq = crate::modstate::Report;
+
+/// `hello` and `report` are about the caller: a request that names a target
+/// is a request to speak for another pane, and is refused outright.
+fn refuse_target(v: &Value, cmd: &str) -> Result<(), String> {
+    if v.get("target").is_some() {
+        return Err(format!(
+            "{cmd} is about the caller only: it takes no target"
+        ));
+    }
+    Ok(())
 }
 
 /// A `kill` request's payload.
@@ -404,6 +459,93 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .map(|n| n.max(0) as usize);
             Cmd::Audit(AuditReq { tail })
         }
+        Some("hello") => {
+            refuse_target(&v, "hello")?;
+            let version = v
+                .get("mod")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "hello needs mod=<version>".to_string())?
+                .to_string();
+            let engine = v.get("engine").and_then(Value::as_str).map(str::to_string);
+            let caps = match v.get("caps") {
+                None => Vec::new(),
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|it| it.as_str().map(str::to_string))
+                    .collect::<Option<Vec<String>>>()
+                    .ok_or_else(|| "caps must be an array of strings".to_string())?,
+                Some(Value::String(list)) => list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                Some(_) => return Err("caps must be an array of strings".to_string()),
+            };
+            Cmd::Hello(HelloReq {
+                version,
+                engine,
+                caps,
+            })
+        }
+        Some("report") => {
+            refuse_target(&v, "report")?;
+            let status = match v.get("status").and_then(Value::as_str) {
+                Some(label) => Some(crate::modstate::ModStatus::parse(label).ok_or_else(|| {
+                    format!(
+                        "unknown status {label:?} (use working, waiting-approval, \
+                         waiting-prompt, idle, errored or ended)"
+                    )
+                })?),
+                None => None,
+            };
+            let reason = v.get("reason").and_then(Value::as_str).map(str::to_string);
+            let context_pct = match v.get("context") {
+                None => None,
+                Some(n) => Some(
+                    n.as_i64()
+                        .filter(|p| (0..=100).contains(p))
+                        .map(|p| p as u8)
+                        .ok_or_else(|| "context must be a whole number 0..100".to_string())?,
+                ),
+            };
+            let cost_usd = match v.get("cost") {
+                None => None,
+                Some(n) => Some(
+                    n.as_f64()
+                        .filter(|c| c.is_finite() && *c >= 0.0)
+                        .ok_or_else(|| "cost must be a non-negative number".to_string())?,
+                ),
+            };
+            let turns = match v.get("turns") {
+                None => None,
+                Some(n) => Some(
+                    n.as_i64()
+                        .filter(|t| *t >= 0)
+                        .map(|t| t as u64)
+                        .ok_or_else(|| "turns must be a whole number".to_string())?,
+                ),
+            };
+            let answer = v.get("answer").and_then(Value::as_str).map(str::to_string);
+            let r = ReportReq {
+                status,
+                reason,
+                context_pct,
+                cost_usd,
+                turns,
+                answer,
+            };
+            if r == ReportReq::default() {
+                return Err(
+                    "report needs at least one of status, reason, context, cost, turns or answer"
+                        .to_string(),
+                );
+            }
+            Cmd::Report(r)
+        }
+        Some("whoami") => Cmd::Whoami,
         Some("board") => {
             let key = || -> Result<String, String> {
                 v.get("key")

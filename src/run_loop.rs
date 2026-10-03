@@ -104,6 +104,9 @@ struct RunState<'a> {
     last_sidecar_flush: Instant,
     agents: atrium::vendors::AgentWatch,
     world: atrium::vendors::AgentState,
+    /// What each pane's mod reported; laid over `world` by
+    /// [`RunState::lay_mod_reports`].
+    mods: atrium::modstate::ModState,
     /// What `Ctrl+A c`, splits and the command prompt launch under; its `job`
     /// is the session job.
     launch: Launch<'a>,
@@ -249,10 +252,12 @@ impl RunState<'_> {
         //     (non-blocking; usually zero). Each request is applied as a pane
         //     operation and answered on the same connection. A spawn appends a
         //     visible new window, so we force a repaint after any request.
+        let mut served = false;
         if let Some(listener) = self.ctl_listener.as_mut() {
             for _ in 0..8 {
                 match listener.poll() {
                     Ok(Some(line)) => {
+                        served = true;
                         let reply = apply_ctl(
                             &line,
                             &mut CtlSession {
@@ -267,6 +272,7 @@ impl RunState<'_> {
                                 audit: &mut self.ctl_audit,
                                 board: &mut self.board,
                                 bus: &mut self.bus,
+                                mods: &mut self.mods,
                             },
                         );
                         let _ = listener.respond(&reply.to_json());
@@ -278,6 +284,26 @@ impl RunState<'_> {
                 }
             }
         }
+        // A `report` may have landed: lay it over the snapshot now, so the
+        // border and bar show it on this very tick rather than after the next
+        // transcript refresh.
+        if served {
+            self.lay_mod_reports();
+        }
+    }
+
+    /// Lay every fresh mod-reported status over the inferred snapshot
+    /// ([`atrium::modstate::ModState::overlay`]). Called after each refresh
+    /// (a fresh snapshot carries no overrides) and after each served request.
+    fn lay_mod_reports(&mut self) {
+        let panes: Vec<(usize, Option<String>)> = self
+            .windows
+            .iter()
+            .flat_map(|w| w.panes.iter())
+            .map(|p| (p.agent_id.0, p.session_id.clone()))
+            .collect();
+        self.mods
+            .overlay(&mut self.world, &panes, atrium::session_store::now_ms());
     }
 
     fn reap_panes(&mut self) -> Flow {
@@ -345,6 +371,7 @@ impl RunState<'_> {
         let mut did_refresh = false;
         if let Some(snapshot) = self.agents.latest() {
             self.world = snapshot;
+            self.lay_mod_reports();
             did_refresh = true;
             // Keep the overview and activity log live but calm: repaint once per
             // refresh (~1 Hz), not every tick, so they update without flicker.

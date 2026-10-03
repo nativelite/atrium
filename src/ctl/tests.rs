@@ -533,3 +533,135 @@ fn server_clamps_a_claim_ttl_to_the_lease_cap() {
         Cmd::Board(BoardOp::Claim { ttl_ms: Some(ms), .. }) if ms == MAX_TTL_MS
     ));
 }
+
+// ---- hello / report / whoami: the mod's verbs ------------------------------
+
+#[test]
+fn hello_builds_and_parses_with_caps() {
+    let line = build_request(
+        &v(&["hello", "mod=0.1.0", "engine=2.1.288", "caps=status,inbox"]),
+        Some(3),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Hello(h) => {
+            assert_eq!(h.version, "0.1.0");
+            assert_eq!(h.engine.as_deref(), Some("2.1.288"));
+            assert_eq!(h.caps, v(&["status", "inbox"]));
+        }
+        other => panic!("expected hello, got {other:?}"),
+    }
+    assert!(
+        build_request(&v(&["hello"]), None).is_err(),
+        "mod= is required"
+    );
+    assert!(build_request(&v(&["hello", "mod=1", "bogus=2"]), None).is_err());
+    // A caps string on the wire (a hand-rolled request) is accepted too.
+    match parse_request(r#"{"cmd":"hello","mod":"x","caps":"status, guard,"}"#)
+        .unwrap()
+        .cmd
+    {
+        Cmd::Hello(h) => assert_eq!(h.caps, v(&["status", "guard"])),
+        other => panic!("expected hello, got {other:?}"),
+    }
+    assert!(parse_request(r#"{"cmd":"hello","mod":"x","caps":7}"#).is_err());
+    assert!(parse_request(r#"{"cmd":"hello","mod":"  "}"#).is_err());
+}
+
+/// A mod speaks for the pane it runs in and no other: a `target` on either
+/// verb is refused before any handler sees it.
+#[test]
+fn hello_and_report_refuse_a_target() {
+    let err = parse_request(r#"{"cmd":"hello","mod":"0.1.0","target":"2"}"#).unwrap_err();
+    assert!(err.contains("caller only"), "{err}");
+    let err = parse_request(r#"{"cmd":"report","status":"idle","target":"lead"}"#).unwrap_err();
+    assert!(err.contains("caller only"), "{err}");
+}
+
+#[test]
+fn report_builds_typed_numbers_and_parses() {
+    let line = build_request(
+        &v(&[
+            "report",
+            "status=waiting-approval",
+            "context=42",
+            "cost=1.25",
+            "turns=7",
+            "answer=all",
+            "done",
+            "here",
+        ]),
+        Some(1),
+    )
+    .unwrap();
+    assert!(line.contains("\"context\":42"), "typed on the wire: {line}");
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Report(r) => {
+            assert_eq!(r.status, Some(crate::modstate::ModStatus::WaitingApproval));
+            assert_eq!(r.context_pct, Some(42));
+            assert_eq!(r.cost_usd, Some(1.25));
+            assert_eq!(r.turns, Some(7));
+            assert_eq!(r.answer.as_deref(), Some("all done here"));
+            assert_eq!(r.reason, None);
+        }
+        other => panic!("expected report, got {other:?}"),
+    }
+}
+
+#[test]
+fn report_refuses_nonsense_on_both_sides() {
+    assert!(build_request(&v(&["report"]), None).is_err());
+    assert!(build_request(&v(&["report", "context=101"]), None).is_err());
+    assert!(build_request(&v(&["report", "cost=-1"]), None).is_err());
+    assert!(build_request(&v(&["report", "turns=x"]), None).is_err());
+    assert!(build_request(&v(&["report", "mood=great"]), None).is_err());
+    let err = parse_request(r#"{"cmd":"report","status":"busy"}"#).unwrap_err();
+    assert!(err.contains("busy"), "names the bad label: {err}");
+    assert!(
+        parse_request(r#"{"cmd":"report"}"#).is_err(),
+        "an empty report"
+    );
+    assert!(parse_request(r#"{"cmd":"report","context":250}"#).is_err());
+    assert!(parse_request(r#"{"cmd":"report","cost":-0.5}"#).is_err());
+    assert!(parse_request(r#"{"cmd":"report","turns":-1}"#).is_err());
+}
+
+#[test]
+fn whoami_builds_and_parses_and_the_mod_verbs_need_a_token() {
+    let line = build_request(&v(&["whoami"]), None).unwrap();
+    assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Whoami));
+    let verbs = [
+        Cmd::Whoami,
+        Cmd::Hello(HelloReq {
+            version: "1".to_string(),
+            engine: None,
+            caps: Vec::new(),
+        }),
+        Cmd::Report(ReportReq {
+            turns: Some(1),
+            ..ReportReq::default()
+        }),
+    ];
+    for c in verbs {
+        assert!(
+            !c.is_read_only(),
+            "{c:?} is about the caller: needs a token"
+        );
+    }
+}
+
+/// The audit log is readable by anyone in the subtree; a report's answer is
+/// the model's output and never goes in it.
+#[test]
+fn report_audit_label_never_carries_the_answer() {
+    let c = Cmd::Report(ReportReq {
+        answer: Some("secret text".to_string()),
+        status: Some(crate::modstate::ModStatus::Idle),
+        ..ReportReq::default()
+    });
+    let (action, detail) = c.audit_label();
+    assert_eq!(action, "report");
+    assert!(!detail.contains("secret"), "{detail}");
+    assert!(detail.contains("answer_len=11"), "{detail}");
+    assert!(detail.contains("status=idle"), "{detail}");
+}

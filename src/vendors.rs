@@ -322,6 +322,7 @@ impl VendorWorlds {
     /// What the UI reads, copied out: the run loop holds this, never the worlds.
     pub fn snapshot(&self) -> AgentState {
         AgentState {
+            overrides: Default::default(),
             sessions: self
                 .worlds
                 .iter()
@@ -369,13 +370,32 @@ impl From<&agsess::AgentSession> for SessionView {
 #[derive(Debug, Clone, Default)]
 pub struct AgentState {
     sessions: Vec<SessionView>,
+    /// Statuses a pane's mod reported, laid over the inferred ones by
+    /// [`crate::modstate::ModState::overlay`]; keyed by session id. A fresh
+    /// snapshot from the watch thread carries none, so the loop lays them
+    /// again after every refresh.
+    overrides: std::collections::HashMap<String, Status>,
 }
 
 impl AgentState {
-    /// See [`VendorWorlds::status_for`].
+    /// See [`VendorWorlds::status_for`]. A status the pane's own mod reported
+    /// (see [`crate::modstate`]) wins over the inference.
     pub fn status_for(&self, session_id: Option<&str>) -> Option<Status> {
         let id = session_id?;
+        if let Some(s) = self.overrides.get(id) {
+            return Some(*s);
+        }
         self.sessions.iter().find(|s| s.id == id).map(|s| s.status)
+    }
+
+    /// Lay a reported status over the inferred one for `session_id`.
+    pub fn set_status_override(&mut self, session_id: &str, status: Status) {
+        self.overrides.insert(session_id.to_string(), status);
+    }
+
+    /// Drop every reported status, back to the inference alone.
+    pub fn clear_status_overrides(&mut self) {
+        self.overrides.clear();
     }
 
     /// See [`VendorWorlds::awaiting_tool_for`].

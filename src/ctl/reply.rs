@@ -94,6 +94,19 @@ pub enum Reply {
         idle_ms: u64,
     },
     Tree(Vec<ListNode>),
+    /// `{"ok":true,"pane":N,"accepted":[...]}` — the caps a `hello` was granted.
+    Hello {
+        pane: AgentId,
+        accepted: Vec<String>,
+    },
+    /// `{"ok":true,"pane":N[,"seq":S]}` — a `report` taken; `seq` numbers an
+    /// answer it carried.
+    Reported {
+        pane: AgentId,
+        seq: Option<u64>,
+    },
+    /// `{"ok":true,<field>:...}` — `whoami`'s facts, flat.
+    Whoami(Vec<(String, Value)>),
 }
 
 /// An owned org-chart node inside [`Reply::Tree`]; built from a [`TreeNode`].
@@ -233,6 +246,26 @@ impl Reply {
                 ("status", opt_s(status)),
                 ("idle_ms", u(*idle_ms)),
             ]),
+            Reply::Hello { pane, accepted } => obj(vec![
+                ok,
+                ("pane", i(pane.0)),
+                (
+                    "accepted",
+                    Value::Array(accepted.iter().map(|c| s(c)).collect()),
+                ),
+            ]),
+            Reply::Reported { pane, seq } => {
+                let mut pairs = vec![ok, ("pane", i(pane.0))];
+                if let Some(n) = seq {
+                    pairs.push(("seq", u(*n)));
+                }
+                obj(pairs)
+            }
+            Reply::Whoami(fields) => {
+                let mut pairs = vec![ok];
+                pairs.extend(fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
+                obj(pairs)
+            }
             Reply::Tree(nodes) => obj(vec![
                 ok,
                 (
@@ -273,6 +306,21 @@ impl std::fmt::Display for Reply {
 /// `{"ok":false,"err":"<msg>"}`
 pub fn reply_err(msg: &str) -> Reply {
     Reply::Err(msg.to_string())
+}
+
+/// `{"ok":true,"pane":N,"accepted":[...]}` — a `hello` taken.
+pub fn reply_hello(pane: AgentId, accepted: Vec<String>) -> Reply {
+    Reply::Hello { pane, accepted }
+}
+
+/// `{"ok":true,"pane":N[,"seq":S]}` — a `report` taken.
+pub fn reply_reported(pane: AgentId, seq: Option<u64>) -> Reply {
+    Reply::Reported { pane, seq }
+}
+
+/// `{"ok":true,...}` — `whoami`'s facts as flat fields beside `ok`.
+pub fn reply_whoami(fields: Vec<(String, Value)>) -> Reply {
+    Reply::Whoami(fields)
 }
 
 /// `{"ok":true,"key":<key>,"entry":<entry|null>}` — a board `get`/`set` result.

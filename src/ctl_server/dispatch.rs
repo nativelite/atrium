@@ -30,6 +30,9 @@ pub(crate) struct CtlSession<'a> {
     pub(crate) audit: &'a mut atrium::audit::Audit,
     pub(crate) board: &'a mut atrium::board::Board,
     pub(crate) bus: &'a mut atrium::bus::Bus,
+    /// What each pane's mod has said (`hello`, `report`); see
+    /// [`atrium::modstate`].
+    pub(crate) mods: &'a mut atrium::modstate::ModState,
 }
 
 /// Is this decision addressed to a live teammate (a `to=<role>` field naming a
@@ -143,7 +146,7 @@ pub(crate) fn dispatch_ctl(
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
     match req.cmd {
-        Cmd::List => reply_tree(cx.windows, cx.world, None),
+        Cmd::List => reply_tree(cx.windows, cx.world, cx.mods, None),
         Cmd::Status(sr) => status(sr, caller, privileged, cx),
         Cmd::Send(sr) => send(sr, caller, privileged, cx),
         Cmd::Spawn(sp) => spawn(sp, caller, privileged, cx),
@@ -153,7 +156,113 @@ pub(crate) fn dispatch_ctl(
         Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
         Cmd::Board(op) => board(op, caller, cx),
         Cmd::Bus(op) => bus(op, caller, privileged, cx),
+        Cmd::Hello(h) => hello(h, caller, cx),
+        Cmd::Report(r) => report(r, caller, cx),
+        Cmd::Whoami => whoami(caller, cx),
     }
+}
+
+/// `ctl hello`: the caller's mod announces itself. The pane is the token's,
+/// never a named one, so a mod can only ever speak for the pane it runs in.
+fn hello(h: ctl::HelloReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
+    let Some(me) = caller else {
+        return ctl::reply_err("hello needs an authenticated pane (ATRIUM_TOKEN)");
+    };
+    let accepted = cx.mods.hello(
+        me.0,
+        &h.version,
+        h.engine.as_deref(),
+        &h.caps,
+        atrium::session_store::now_ms(),
+    );
+    ctl::reply_hello(me, accepted)
+}
+
+/// `ctl report`: the caller's mod reports its own status, usage or answer.
+fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
+    let Some(me) = caller else {
+        return ctl::reply_err("report needs an authenticated pane (ATRIUM_TOKEN)");
+    };
+    let seq = cx.mods.report(me.0, &r, atrium::session_store::now_ms());
+    ctl::reply_reported(me, seq)
+}
+
+/// `ctl whoami`: what the caller is, from the broker's own records: its pane,
+/// role, parent, depth, trust mode, worktree, cwd, deny rules, whether it may
+/// spawn, what its mod said, and the board item briefed to its role (an entry
+/// whose `owner` or `builder` field names the role) with that item's `files`.
+fn whoami(caller: Option<AgentId>, cx: &CtlSession<'_>) -> ctl::Reply {
+    use json::{Number, Value};
+    let Some(me) = caller else {
+        return ctl::reply_err("whoami needs an authenticated pane (ATRIUM_TOKEN)");
+    };
+    let Some(p) = pane_by_agent(cx.windows, me) else {
+        return ctl::reply_err("the calling pane is gone");
+    };
+    let s = |v: &str| Value::String(v.to_string());
+    let opt = |v: Option<&str>| v.map(s).unwrap_or(Value::Null);
+    let int = |n: usize| Value::Number(Number::Int(n as i64));
+    let mut fields: Vec<(String, Value)> = vec![
+        ("pane".to_string(), int(me.0)),
+        ("role".to_string(), opt(p.role.as_deref())),
+        (
+            "parent".to_string(),
+            p.parent.map(|a| int(a.0)).unwrap_or(Value::Null),
+        ),
+        ("depth".to_string(), int(p.depth)),
+        ("mode".to_string(), s(p.mode.policy_label())),
+        ("worktree".to_string(), opt(p.worktree.as_deref())),
+        ("cwd".to_string(), opt(p.cwd.as_deref())),
+        ("can_spawn".to_string(), Value::Bool(p.can_spawn)),
+        (
+            "deny".to_string(),
+            Value::Array(p.deny.iter().map(|d| s(d)).collect()),
+        ),
+    ];
+    let modv = match cx.mods.info(me.0) {
+        Some(i) => Value::Object(
+            vec![
+                ("version".to_string(), s(&i.version)),
+                ("engine".to_string(), opt(i.engine.as_deref())),
+                (
+                    "caps".to_string(),
+                    Value::Array(i.caps.iter().map(|c| s(c)).collect()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+        None => Value::Null,
+    };
+    fields.push(("mod".to_string(), modv));
+    // The item briefed to this role, if the lead recorded one on the board.
+    let item = p.role.as_deref().and_then(|role| {
+        cx.board.list().into_iter().find(|(_, e)| {
+            e.fields.get("owner").map(String::as_str) == Some(role)
+                || e.fields.get("builder").map(String::as_str) == Some(role)
+        })
+    });
+    match item {
+        Some((key, entry)) => {
+            fields.push(("item".to_string(), s(key)));
+            let files: Vec<Value> = entry
+                .fields
+                .get("files")
+                .map(|f| {
+                    f.split(|c: char| c == ',' || c.is_whitespace())
+                        .filter(|x| !x.is_empty())
+                        .map(s)
+                        .collect()
+                })
+                .unwrap_or_default();
+            fields.push(("files".to_string(), Value::Array(files)));
+        }
+        None => {
+            fields.push(("item".to_string(), Value::Null));
+            fields.push(("files".to_string(), Value::Array(Vec::new())));
+        }
+    }
+    ctl::reply_whoami(fields)
 }
 
 /// `ctl status`: the caller's subtree, or one target's status and idle time.
@@ -168,7 +277,7 @@ fn status(
         None => {
             // No target: the caller's subtree (whole tree for the operator).
             let root = if privileged { None } else { caller };
-            reply_tree(windows, world, root)
+            reply_tree(windows, world, cx.mods, root)
         }
         Some(t) => {
             let candidates = ctl_candidates(windows);
@@ -180,8 +289,15 @@ fn status(
                 return deny;
             }
             let pane = pane_by_agent(windows, id);
-            let status =
-                pane.and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label));
+            // A status the pane's own mod reported wins over the inference and
+            // keeps its richer label (`errored`, `ended`).
+            let status = cx
+                .mods
+                .status_for(id.0, atrium::session_store::now_ms())
+                .map(|s| s.label())
+                .or_else(|| {
+                    pane.and_then(|p| world.status_for(p.session_id.as_deref()).map(status_label))
+                });
             let idle = pane
                 .map(|p| atrium::ipc::idle_ms(p.last_activity, std::time::Instant::now()))
                 .unwrap_or(0);

@@ -27,6 +27,9 @@ pub(crate) fn respawn(
     if let Some(deny) = scope_denied(windows, caller, privileged, id) {
         return deny;
     }
+    // The new process's mod will say hello again; nothing the old one
+    // reported (its status, its answer) belongs to the relaunch.
+    cx.mods.forget(id.0);
     // Capture the info we need before mutating the pane.
     let (pane_slot_id, cmd, identity_name, deny, mode, context_env, place) = {
         let Some(p) = pane_by_agent(windows, id) else {

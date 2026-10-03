@@ -76,6 +76,7 @@ pub(crate) fn audit_reply(
 pub(crate) fn reply_tree(
     windows: &[Window],
     world: &atrium::vendors::AgentState,
+    mods: &atrium::modstate::ModState,
     root: Option<AgentId>,
 ) -> atrium::ctl::Reply {
     let parents = ctl_parents(windows);
@@ -91,6 +92,7 @@ pub(crate) fn reply_tree(
     // One monotonic reading for the whole snapshot so every node's idle is
     // measured against the same instant (no per-pane clock drift within a reply).
     let now = std::time::Instant::now();
+    let now_ms = atrium::session_store::now_ms();
     let nodes: Vec<atrium::ctl::TreeNode> = panes
         .iter()
         .map(|p| atrium::ctl::TreeNode {
@@ -99,7 +101,11 @@ pub(crate) fn reply_tree(
             role: p.role.as_deref(),
             title: &p.title,
             depth: p.depth,
-            status: world.status_for(p.session_id.as_deref()).map(status_label),
+            // A status the pane's own mod reported wins over the inference.
+            status: mods
+                .status_for(p.agent_id.0, now_ms)
+                .map(|s| s.label())
+                .or_else(|| world.status_for(p.session_id.as_deref()).map(status_label)),
             idle_ms: atrium::ipc::idle_ms(p.last_activity, now),
         })
         .collect();

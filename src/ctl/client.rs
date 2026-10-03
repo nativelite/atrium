@@ -212,10 +212,16 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         Some("board") => board_req(args, &mut pairs)?,
         Some("bus") => bus_req(args, &mut pairs)?,
         Some("respawn") => respawn_req(args, &mut pairs)?,
+        Some("hello") => hello_req(args, &mut pairs)?,
+        Some("report") => report_req(args, &mut pairs)?,
+        Some("whoami") => {
+            pairs.push(("cmd", s("whoami")));
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
-                "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | respawn"
+                "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | \
+                 respawn | hello | report | whoami"
                     .to_string(),
             )
         }
@@ -323,6 +329,98 @@ fn kill_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("kill")));
     let target = value_at(args, 1, "kill needs a target (pane id or role)")?;
     pairs.push(("target", Value::String(target.clone())));
+    Ok(())
+}
+
+/// `hello mod=<version> [engine=<version>] [caps=<a,b,...>]` — a pane's mod
+/// announcing itself. Field tokens, like `board set`; `caps` is a comma list.
+fn hello_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("hello")));
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for a in &args[1.min(args.len())..] {
+        absorb_field_token(&mut fields, a).map_err(|e| format!("hello: {e}"))?;
+    }
+    let mut saw_mod = false;
+    for (k, val) in fields {
+        match k.as_str() {
+            "mod" => {
+                saw_mod = true;
+                pairs.push(("mod", Value::String(val)));
+            }
+            "engine" => pairs.push(("engine", Value::String(val))),
+            "caps" => pairs.push((
+                "caps",
+                Value::Array(
+                    val.split(',')
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                        .map(|c| Value::String(c.to_string()))
+                        .collect(),
+                ),
+            )),
+            other => {
+                return Err(format!(
+                    "hello: unknown field {other:?} (use mod, engine, caps)"
+                ))
+            }
+        }
+    }
+    if !saw_mod {
+        return Err("hello needs mod=<version>".to_string());
+    }
+    Ok(())
+}
+
+/// `report [status=<s>] [reason=<r>] [context=<pct>] [cost=<usd>] [turns=<n>] [answer=<text...>]`
+/// — a pane's mod reporting about itself. Numbers are typed on the wire so the
+/// server never parses text it did not ask for.
+fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("report")));
+    let mut fields: Vec<(String, String)> = Vec::new();
+    for a in &args[1.min(args.len())..] {
+        absorb_field_token(&mut fields, a).map_err(|e| format!("report: {e}"))?;
+    }
+    if fields.is_empty() {
+        return Err(
+            "report needs at least one field=value (status, reason, context, cost, turns, answer)"
+                .to_string(),
+        );
+    }
+    for (k, val) in fields {
+        match k.as_str() {
+            "status" => pairs.push(("status", Value::String(val))),
+            "reason" => pairs.push(("reason", Value::String(val))),
+            "answer" => pairs.push(("answer", Value::String(val))),
+            "context" => {
+                let n = parse_whole(&val)
+                    .map_err(|()| format!("report: context must be a whole number, got {val:?}"))?
+                    .filter(|n| *n <= 100)
+                    .ok_or_else(|| format!("report: context must be 0..100, got {val:?}"))?;
+                pairs.push(("context", Value::Number(Number::Int(n as i64))));
+            }
+            "turns" => {
+                let n = parse_whole(&val)
+                    .map_err(|()| format!("report: turns must be a whole number, got {val:?}"))?
+                    .and_then(|n| i64::try_from(n).ok())
+                    .ok_or_else(|| format!("report: turns {val} is too large"))?;
+                pairs.push(("turns", Value::Number(Number::Int(n))));
+            }
+            "cost" => {
+                let c: f64 = val
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|c: &f64| c.is_finite() && *c >= 0.0)
+                    .ok_or_else(|| format!("report: cost must be a non-negative number, got {val:?}"))?;
+                pairs.push(("cost", Value::Number(Number::Float(c))));
+            }
+            other => {
+                return Err(format!(
+                    "report: unknown field {other:?} (use status, reason, context, cost, turns, answer)"
+                ))
+            }
+        }
+    }
     Ok(())
 }
 

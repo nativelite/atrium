@@ -284,6 +284,7 @@ impl<'a> RunState<'a> {
             wake,
             keys,
             deliberate_exit: false,
+            mods: atrium::modstate::ModState::default(),
         })
     }
 }
