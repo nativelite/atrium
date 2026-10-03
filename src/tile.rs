@@ -77,6 +77,10 @@ impl PaneState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AgentMark {
     pub status: agsess::Status,
+    /// The pane's mod reported its last turn ended on an error or a refusal
+    /// ([`crate::vendors::AgentState::errored_for`]). Outranks `status`: the
+    /// prompt is free, but the agent needs the human.
+    pub errored: bool,
 }
 
 /// One pane to composite: its emulated screen, its rect in master coords, its
@@ -124,6 +128,12 @@ impl PaneView<'_> {
     fn border_style(&self) -> Style {
         match self.state {
             PaneState::Focused | PaneState::Exited => self.state.style(),
+            // Red: the agent's mod reported an errored turn. The pane is alive
+            // and at its prompt, but nothing will happen until a human looks.
+            _ if self.agent.is_some_and(|a| a.errored) => Style {
+                fg: crate::theme::ERRORED,
+                ..Style::default()
+            },
             _ => match self.agent.map(|a| a.status) {
                 // Amber: an agent is blocked on the human.
                 Some(agsess::Status::WaitingApproval) => Style {
@@ -149,6 +159,9 @@ impl PaneView<'_> {
     fn title_badge(&self) -> &'static str {
         if matches!(self.state, PaneState::Focused | PaneState::Exited) {
             return "";
+        }
+        if self.agent.is_some_and(|a| a.errored) {
+            return "! ";
         }
         match self.agent.map(|a| a.status) {
             Some(agsess::Status::WaitingApproval) => "? ",
@@ -465,11 +478,68 @@ mod tests {
             index,
             title,
             state,
-            agent: Some(AgentMark { status }),
+            agent: Some(AgentMark {
+                status,
+                errored: false,
+            }),
             identity: None,
             role: None,
             painted: !screen_is_blank(screen),
         }
+    }
+
+    /// An errored agent pane is red with a `!` badge when unfocused, and
+    /// keeps the focus style when focused, like every other attention state.
+    #[test]
+    fn unfocused_errored_pane_is_red_with_a_bang_badge() {
+        let inner = filled(3, 18, ' ');
+        let mut view = agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::WaitingPrompt,
+        );
+        view.agent = Some(AgentMark {
+            status: agsess::Status::WaitingPrompt,
+            errored: true,
+        });
+        let m = compose(5, 20, &[view], 0);
+        assert_eq!(
+            m.cell(0, 0).style.fg,
+            crate::theme::ERRORED,
+            "an errored border is red"
+        );
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(top.starts_with(" 2:claude ! "), "top edge was {top:?}");
+
+        let mut focused = agent_view(
+            &inner,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 20,
+            },
+            2,
+            "claude",
+            PaneState::Focused,
+            agsess::Status::WaitingPrompt,
+        );
+        focused.agent = Some(AgentMark {
+            status: agsess::Status::WaitingPrompt,
+            errored: true,
+        });
+        let m = compose(5, 20, &[focused], 0);
+        assert_ne!(m.cell(0, 0).style.fg, crate::theme::ERRORED);
+        let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
+        assert!(!top.contains('!'), "focused pane shows no badge: {top:?}");
     }
 
     /// A pane view carrying a credential identity name-tag.

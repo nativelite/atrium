@@ -63,7 +63,10 @@ pub(crate) fn render_tiled(
                 } else {
                     world
                         .status_for(p.session_id.as_deref())
-                        .map(|status| AgentMark { status })
+                        .map(|status| AgentMark {
+                            status,
+                            errored: world.errored_for(p.session_id.as_deref()),
+                        })
                 };
                 let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
                 PaneView {

@@ -18,6 +18,11 @@ pub(crate) struct OverviewNode {
     /// appearance is unchanged; `"gem"`, `"cdx"` for the other supported agents).
     /// Empty for non-agent panes.
     pub(crate) vtag: &'static str,
+    /// The pane's mod reported its last turn ended on an error or a refusal.
+    pub(crate) errored: bool,
+    /// Context-window fill and cost so far, as the pane's mod reported them.
+    pub(crate) context_pct: Option<u8>,
+    pub(crate) cost_usd: Option<f64>,
 }
 
 /// Collect every pane, across all windows, as an overview node in spawn-tree
@@ -32,6 +37,7 @@ pub(crate) fn overview_nodes(
     for (wi, w) in windows.iter().enumerate() {
         for p in &w.panes {
             let status = world.status_for(p.session_id.as_deref());
+            let facts = world.mod_facts_for(p.session_id.as_deref());
             let action = p
                 .session_id
                 .as_deref()
@@ -51,6 +57,9 @@ pub(crate) fn overview_nodes(
                 vtag: atrium::vendors::vendor_for_stem(&p.title)
                     .map(atrium::vendors::vendor_tag)
                     .unwrap_or(""),
+                errored: world.errored_for(p.session_id.as_deref()),
+                context_pct: facts.and_then(|f| f.context_pct),
+                cost_usd: facts.and_then(|f| f.cost_usd),
             });
         }
     }
@@ -72,6 +81,9 @@ pub(crate) fn overview_glyph(node: &OverviewNode) -> (&'static str, String) {
     if node.exited {
         return ("\u{2717}", sgr(theme::EXITED)); // ✗
     }
+    if node.errored {
+        return ("\u{203C}", sgr(theme::ERRORED)); // ‼
+    }
     match node.status {
         Some(agsess::Status::Working) => ("\u{25CF}", sgr(theme::ACTIVITY)), // ●
         Some(agsess::Status::WaitingApproval) => ("\u{0021}", sgr(theme::WAITING)), // !
@@ -90,6 +102,10 @@ pub(crate) struct WindowAgg {
     pub(crate) waiting: usize,
     pub(crate) idle: usize,
     pub(crate) exited: usize,
+    /// Agents whose mod reported an errored turn (counted apart from waiting).
+    pub(crate) errored: usize,
+    /// The window's cost so far, summed over the panes that reported one.
+    pub(crate) cost_usd: f64,
 }
 
 /// One row in the overview body: either an aggregated per-window header or an
@@ -109,11 +125,16 @@ pub(crate) fn window_agg(nodes: &[OverviewNode], window: usize) -> WindowAgg {
         waiting: 0,
         idle: 0,
         exited: 0,
+        errored: 0,
+        cost_usd: 0.0,
     };
     for n in nodes.iter().filter(|n| n.window == window) {
         a.total += 1;
+        a.cost_usd += n.cost_usd.unwrap_or(0.0);
         if n.exited {
             a.exited += 1;
+        } else if n.errored {
+            a.errored += 1;
         } else {
             match n.status {
                 Some(agsess::Status::Working) => a.working += 1,
@@ -176,10 +197,14 @@ pub(crate) fn render_overview_panel(
     // deselected row's highlight and any stale content are wiped without a clear.
     let mut out = String::from("\x1b[?25l");
     let _ = windows; // reserved for future tree connectors
-    let (mut working, mut waiting, mut idle, mut exited) = (0, 0, 0, 0);
+    let (mut working, mut waiting, mut idle, mut exited, mut errored) = (0, 0, 0, 0, 0);
+    let mut cost = 0.0;
     for n in nodes {
+        cost += n.cost_usd.unwrap_or(0.0);
         if n.exited {
             exited += 1;
+        } else if n.errored {
+            errored += 1;
         } else {
             match n.status {
                 Some(agsess::Status::Working) => working += 1,
@@ -196,8 +221,18 @@ pub(crate) fn render_overview_panel(
          \x1b[38;2;95;240;140m\u{25CF} {working} working\x1b[0m   \
          \x1b[38;2;255;200;70m\u{0021} {waiting} waiting\x1b[0m   \
          \x1b[38;2;150;152;165m\u{00B7} {idle} idle\x1b[0m   \
-         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}\x1b[0m\x1b[K",
+         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}{}{}\x1b[0m\x1b[K",
         nodes.len(),
+        if errored == 0 {
+            String::new()
+        } else {
+            format!("   \x1b[1;38;2;255;95;95m\u{203C} {errored} errored\x1b[0m")
+        },
+        if cost > 0.0 {
+            format!("   \x1b[2m${cost:.2}\x1b[0m")
+        } else {
+            String::new()
+        },
         if decisions.is_empty() {
             String::new()
         } else {
@@ -270,13 +305,23 @@ pub(crate) fn render_overview_panel(
                          \x1b[38;2;95;240;140m\u{25CF}{}\x1b[0m \
                          \x1b[38;2;255;200;70m\u{0021}{}\x1b[0m \
                          \x1b[38;2;150;152;165m\u{00B7}{}\x1b[0m \
-                         \x1b[38;2;255;95;95m\u{2717}{}\x1b[0m",
+                         \x1b[38;2;255;95;95m\u{2717}{}\x1b[0m{}{}",
                         a.window + 1,
                         a.total,
                         a.working,
                         a.waiting,
                         a.idle,
                         a.exited,
+                        if a.errored == 0 {
+                            String::new()
+                        } else {
+                            format!(" \x1b[1;38;2;255;95;95m\u{203C}{}\x1b[0m", a.errored)
+                        },
+                        if a.cost_usd > 0.0 {
+                            format!("  \x1b[2m${:.2}\x1b[0m", a.cost_usd)
+                        } else {
+                            String::new()
+                        },
                     );
                     out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
                 }
@@ -285,13 +330,27 @@ pub(crate) fn render_overview_panel(
                     let (glyph, color) = overview_glyph(n);
                     let selected = *i == sel;
                     let indent = "  ".repeat(n.depth);
-                    let status = n.status.map(status_label).unwrap_or(if n.exited {
-                        "exited"
-                    } else if n.is_agent {
-                        "starting"
+                    let status = if n.errored && !n.exited {
+                        "errored"
                     } else {
-                        "shell"
-                    });
+                        n.status.map(status_label).unwrap_or(if n.exited {
+                            "exited"
+                        } else if n.is_agent {
+                            "starting"
+                        } else {
+                            "shell"
+                        })
+                    };
+                    // What the pane's mod measured: the context fill and the
+                    // cost so far, dim, after the identity.
+                    let usage = match (n.context_pct, n.cost_usd) {
+                        (None, None) => String::new(),
+                        (ctx, cost) => format!(
+                            "  \x1b[2m{}{}\x1b[0m",
+                            ctx.map(|p| format!("ctx {p}%")).unwrap_or_default(),
+                            cost.map(|c| format!(" ${c:.2}")).unwrap_or_default()
+                        ),
+                    };
                     let ident = n
                         .identity
                         .as_deref()
@@ -314,7 +373,7 @@ pub(crate) fn render_overview_panel(
                         format!(" \x1b[2m{}\x1b[0m", n.vtag)
                     };
                     let line = format!(
-                        "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{action}",
+                        "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{usage}{action}",
                         truncate(&n.label, 16),
                     );
                     if selected {

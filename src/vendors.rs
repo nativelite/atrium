@@ -323,6 +323,7 @@ impl VendorWorlds {
     pub fn snapshot(&self) -> AgentState {
         AgentState {
             overrides: Default::default(),
+            mod_facts: Default::default(),
             sessions: self
                 .worlds
                 .iter()
@@ -375,6 +376,21 @@ pub struct AgentState {
     /// snapshot from the watch thread carries none, so the loop lays them
     /// again after every refresh.
     overrides: std::collections::HashMap<String, Status>,
+    /// What else the mod reported for the same panes: the richer status
+    /// (`errored`), its reason, the context fill and the cost. Laid and
+    /// cleared with `overrides`.
+    mod_facts: std::collections::HashMap<String, ModFacts>,
+}
+
+/// What a pane's mod reported beyond the four inferred statuses: the chrome
+/// reads `status` for the states the inference has no word for (`errored`),
+/// the overview reads the fill and the cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModFacts {
+    pub status: crate::modstate::ModStatus,
+    pub reason: Option<String>,
+    pub context_pct: Option<u8>,
+    pub cost_usd: Option<f64>,
 }
 
 impl AgentState {
@@ -393,9 +409,27 @@ impl AgentState {
         self.overrides.insert(session_id.to_string(), status);
     }
 
-    /// Drop every reported status, back to the inference alone.
+    /// Drop every reported status and fact, back to the inference alone.
     pub fn clear_status_overrides(&mut self) {
         self.overrides.clear();
+        self.mod_facts.clear();
+    }
+
+    /// Record what the pane's mod reported beyond its status.
+    pub fn set_mod_facts(&mut self, session_id: &str, facts: ModFacts) {
+        self.mod_facts.insert(session_id.to_string(), facts);
+    }
+
+    /// What the pane's mod reported, when it did and the report is fresh.
+    pub fn mod_facts_for(&self, session_id: Option<&str>) -> Option<&ModFacts> {
+        self.mod_facts.get(session_id?)
+    }
+
+    /// Did the pane's mod report its last turn ended on an error or a refusal?
+    /// A state the transcript inference cannot see: the chrome shows it red.
+    pub fn errored_for(&self, session_id: Option<&str>) -> bool {
+        self.mod_facts_for(session_id)
+            .is_some_and(|f| f.status == crate::modstate::ModStatus::Errored)
     }
 
     /// See [`VendorWorlds::awaiting_tool_for`].

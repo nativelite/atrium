@@ -31,6 +31,9 @@ pub const FOCUSED: Color = Color::Rgb(70, 235, 255);
 pub const WAITING: Color = Color::Rgb(255, 200, 70);
 /// The pane's process exited — red.
 pub const EXITED: Color = Color::Rgb(255, 95, 95);
+/// An agent whose last turn ended on an API error or a refusal, as its mod
+/// reported (the inference cannot see it): the same red, a different fact.
+pub const ERRORED: Color = EXITED;
 /// Background output arrived while unfocused — green.
 pub const ACTIVITY: Color = Color::Rgb(95, 240, 140);
 /// Quiet / idle — a clearly-dimmer grey, still legible against the slate.

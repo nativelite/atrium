@@ -271,12 +271,24 @@ impl ModState {
             let Some(id) = session.as_deref() else {
                 continue;
             };
-            if let Some(s) = self
-                .status_for(*pane, now_ms)
-                .and_then(ModStatus::as_agsess)
-            {
+            let Some(status) = self.status_for(*pane, now_ms) else {
+                continue;
+            };
+            if let Some(s) = status.as_agsess() {
                 world.set_status_override(id, s);
             }
+            // The facts beside the status: what the chrome and the overview
+            // read for the states and figures the inference has no word for.
+            let r = self.report_for(*pane);
+            world.set_mod_facts(
+                id,
+                crate::vendors::ModFacts {
+                    status,
+                    reason: r.and_then(|r| r.reason.clone()),
+                    context_pct: r.and_then(|r| r.context_pct),
+                    cost_usd: r.and_then(|r| r.cost_usd),
+                },
+            );
         }
     }
 }
@@ -586,6 +598,13 @@ mod tests {
             world.status_for(Some("s2")),
             Some(agsess::Status::WaitingPrompt),
             "errored shows as at-the-prompt"
+        );
+        assert!(world.errored_for(Some("s2")), "and the facts say errored");
+        assert!(!world.errored_for(Some("s1")));
+        assert_eq!(
+            world.mod_facts_for(Some("s3")).map(|f| f.status),
+            Some(ModStatus::Ended),
+            "ended lays no status but its facts are kept"
         );
         assert_eq!(
             world.status_for(Some("s3")),

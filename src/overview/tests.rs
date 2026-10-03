@@ -16,7 +16,72 @@ fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> Overv
         action: String::new(),
         is_agent: true,
         vtag: "",
+        errored: false,
+        context_pct: None,
+        cost_usd: None,
     }
+}
+
+/// An errored agent that also reported its usage.
+fn errored_node(window: usize, ctx: u8, cost: f64) -> OverviewNode {
+    OverviewNode {
+        errored: true,
+        context_pct: Some(ctx),
+        cost_usd: Some(cost),
+        ..ov_node(window, Some(agsess::Status::WaitingPrompt), false)
+    }
+}
+
+/// An errored agent is counted apart from waiting and idle, its cost joins
+/// the window's sum, and exited still wins over everything.
+#[test]
+fn window_agg_counts_errored_apart_and_sums_cost() {
+    let nodes = vec![
+        errored_node(0, 40, 1.25),
+        OverviewNode {
+            cost_usd: Some(0.5),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+        OverviewNode {
+            errored: true,
+            ..ov_node(0, Some(agsess::Status::Working), true)
+        },
+    ];
+    let a = window_agg(&nodes, 0);
+    assert_eq!(
+        (a.total, a.working, a.waiting, a.idle, a.exited, a.errored),
+        (3, 1, 0, 0, 1, 1)
+    );
+    assert!((a.cost_usd - 1.75).abs() < 1e-9, "{}", a.cost_usd);
+    let (glyph, _) = overview_glyph(&nodes[0]);
+    assert_eq!(glyph, "\u{203C}");
+    let (glyph, _) = overview_glyph(&nodes[2]);
+    assert_eq!(glyph, "\u{2717}", "exited outranks errored");
+}
+
+/// The panel says `errored` in its header and on the row, and shows the
+/// context fill and cost the mod reported, per agent and in total.
+#[test]
+fn overview_panel_shows_errored_context_and_cost() {
+    let bus = atrium::bus::Bus::new();
+    let nodes = vec![
+        errored_node(0, 41, 0.12),
+        OverviewNode {
+            context_pct: Some(7),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+    ];
+    let r = strip_csi(&render_overview_panel(&[], &bus, &nodes, 0, 24, 120));
+    assert!(r.contains("1 errored"), "{r}");
+    assert!(r.contains("$0.12"), "{r}");
+    assert!(r.contains("ctx 41% $0.12"), "{r}");
+    assert!(r.contains("ctx 7%"), "{r}");
+    let plain = vec![ov_node(0, Some(agsess::Status::Working), false)];
+    let r = strip_csi(&render_overview_panel(&[], &bus, &plain, 0, 24, 120));
+    assert!(
+        !r.contains("errored") && !r.contains("ctx ") && !r.contains('$'),
+        "{r}"
+    );
 }
 
 #[test]

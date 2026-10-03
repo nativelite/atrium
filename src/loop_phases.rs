@@ -375,7 +375,7 @@ pub(crate) fn bar_infos(
                     matches!(
                         world.status_for(p.session_id.as_deref()),
                         Some(agsess::Status::WaitingApproval)
-                    )
+                    ) || world.errored_for(p.session_id.as_deref())
                 }),
                 w.panes.iter().any(|p| p.activity),
             ),
