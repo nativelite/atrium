@@ -11,6 +11,7 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N4 status precedence + chrome | `20c8b89` | precedence landed in N1; `cargo test --lib -- tile overview modstate vendors` and `--bin atrium -- overview tile`; clippy and 1.70 clean |
 | N6 typed tools + role section + guard | `cae7a88` | 15 `claude plugin test` cases; `claude plugin validate` lists exactly the intended hooks and calls; live: a real claude called `atrium_list` with no dialog and answered its pane number from the role section |
 | N7 visible subagents | `a7d7b2e` | `ctl answer`/`wait` unit and e2e tests; 20 `claude plugin test` cases; live: a real claude's `atrium_subagent` opened a second real claude as a tile, which answered, was closed, and the parent replied "child said pong." |
+| N9 docs, skills, changelog | `b6f9b4f` | README, the four deep docs, both delegation skills, CHANGELOG; `python docs/build.py` and the drift check clean. The e2e half landed with each item. Not done: the marketplace plugin's copy of the skills and the mod (that repo) |
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
 N7, where it is first needed; `inbox --wait` stays in N5. The mod offers only
