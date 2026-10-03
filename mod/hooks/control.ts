@@ -28,10 +28,6 @@ export const TOOLS: readonly Spec[] = [
         description: str('A short (3-5 word) description of the task; becomes the pane\'s role.'),
         prompt: str('The task for the subagent, in full.'),
         keep: { type: 'boolean', description: 'Leave the pane open after its answer (default: close it).' },
-        headless: {
-          type: 'boolean',
-          description: 'Run the child as `claude -p` with the task on its command line: it answers once and exits by itself (default: an interactive claude that is sent the task).',
-        },
       },
       required: ['description', 'prompt'],
     },

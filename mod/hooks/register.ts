@@ -102,15 +102,15 @@ async function runSubagent(
   if (who === undefined) return { deny: 'atrium_subagent: this pane is not registered with atrium yet' }
   const role = slug(description)
   const task = subagentPrompt(who.pane, description, prompt)
-  const headless = input.headless === true
-  const spawned = await ctl($, ['spawn', '--here', '--role', role, '--', 'claude', ...(headless ? ['-p', task] : [])])
+  // An interactive claude that is sent the task: the spawn policy lets a
+  // teammate choose no claude flag beyond the model and effort ones, so a
+  // `claude -p <task>` child is not an option here.
+  const spawned = await ctl($, ['spawn', '--here', '--role', role, '--', 'claude'])
   const pane = spawnedPane(spawned)
   if (pane === undefined) return { deny: `atrium_subagent: cannot spawn a pane: ${spawned.err ?? 'no reply'}` }
   if (toolUseId !== undefined) $.ui.notice(toolUseId, `running as atrium pane ${pane} (${role})`)
-  if (!headless) {
-    const sent = await ctl($, ['send', String(pane), task])
-    if (!sent.ok) return { deny: `atrium_subagent: pane ${pane} opened but the task was not delivered: ${sent.err ?? 'no reply'}` }
-  }
+  const sent = await ctl($, ['send', String(pane), task])
+  if (!sent.ok) return { deny: `atrium_subagent: pane ${pane} opened but the task was not delivered: ${sent.err ?? 'no reply'}` }
   let answer: { answer: string; seq: number } | undefined
   for (let i = 0; i < WAIT_SLICES && answer === undefined; i += 1) {
     const reply = await ctl($, ['wait', String(pane), '--for', 'answer', '--timeout', String(WAIT_SLICE_S)], (WAIT_SLICE_S + 30) * 1000)
@@ -122,8 +122,7 @@ async function runSubagent(
   if (answer === undefined) {
     return { deny: `atrium_subagent: pane ${pane} (${role}) is still working after ${(WAIT_SLICES * WAIT_SLICE_S) / 60} minutes; read it with atrium_status or atrium_answer later, or kill it` }
   }
-  // A headless child leaves by itself; a kill of a gone pane is a harmless refusal.
-  const keep = !headless && (input.keep === true || who.subagentsKeep)
+  const keep = input.keep === true || who.subagentsKeep
   if (!keep) await ctl($, ['kill', String(pane)])
   if (toolUseId !== undefined) $.ui.notice(toolUseId, `atrium pane ${pane} (${role}) answered${keep ? '' : ' and was closed'}`)
   return { result: answer.answer }
