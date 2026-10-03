@@ -17,8 +17,12 @@ claude --plugin-dir /path/to/atrium/mod
 ```
 
 or for every session a host starts, with `CLAUDE_CODE_PLUGIN_DIRS` naming the
-folder. atrium will inject that variable into the claude panes it spawns once
-`atrium mod install` exists (PLAN-mod.md, N3).
+folder. atrium carries these files inside its binary: `atrium mod install`
+writes them to `mod/` under the platform config directory (or `--at <dir>`),
+and every claude pane atrium then spawns gets `CLAUDE_CODE_PLUGIN_DIRS` naming
+that folder and `ATRIUM_BIN` naming the atrium that hosts it. `atrium mod
+status` says what is installed; `"mod": false` in `config.json` or in a fleet
+turns the injection off.
 
 Check it: `claude plugin validate mod` and `claude plugin test mod`
 (`python dev.py check` runs both when `claude` is on PATH).

@@ -48,6 +48,8 @@ fn facts() -> BannerFacts {
         env_deny: Vec::new(),
         pane_cap: 30,
         color: false,
+        mod_line: "mod: installed 0.1.0 at /cfg/mod".to_string(),
+        mod_missing: false,
     }
 }
 
@@ -187,6 +189,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         identity: None,
         trust: None,
         allow_ctl: None,
+        mod_enabled: None,
         context: None,
         topics: None,
         worktrees: None,
@@ -239,4 +242,34 @@ fn the_banner_names_the_compile_budget() {
     let (off, warn) = build_pool_line(None, false);
     assert!(off.contains("OFF"), "{off}");
     assert!(warn.is_some_and(|w| w.starts_with("warning:")));
+}
+
+/// The mod's state is part of the posture: a line when it is installed, a
+/// warning in the preflight block when claude panes would load none, and
+/// nothing at all for a roster with no claude pane.
+#[test]
+fn the_banner_states_the_mod_and_warns_when_claude_panes_would_load_none() {
+    let lines = banner_lines(&launch_of(TWO_AGENTS, true, &[]), &facts());
+    assert!(
+        lines.contains(&"atrium fleet: mod: installed 0.1.0 at /cfg/mod".to_string()),
+        "{lines:#?}"
+    );
+    let mut missing = facts();
+    missing.mod_line = "mod: not installed at /cfg/mod; run `atrium mod install`".to_string();
+    missing.mod_missing = true;
+    let lines = banner_lines(&launch_of(TWO_AGENTS, true, &[]), &missing);
+    assert!(
+        lines.iter().any(|l| l.contains("not installed")),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines.contains(&format!("atrium fleet: {}", missing.mod_line)),
+        "a warning goes in the preflight block, not the posture: {lines:#?}"
+    );
+    let codex_only = r#"{"agents":[{"name":"cx","cmd":["codex"]}]}"#;
+    let lines = banner_lines(&launch_of(codex_only, true, &[]), &missing);
+    assert!(
+        !lines.iter().any(|l| l.contains("mod:")),
+        "no claude pane, nothing to say: {lines:#?}"
+    );
 }

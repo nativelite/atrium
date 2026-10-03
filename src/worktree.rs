@@ -524,6 +524,7 @@ mod tests {
             identity: None,
             trust: None,
             allow_ctl: None,
+            mod_enabled: None,
             context: None,
             topics: None,
             worktrees,

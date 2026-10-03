@@ -15,7 +15,7 @@ atrium {v} — one terminal, many agents
 
 usage: atrium [session flags] [command [args...]]   host a command in a pane (default: your shell)
        atrium [session flags] up <fleet>            launch a saved fleet (session flags go first)
-       atrium <family> ...                          fleet | ctl | config | recover | reap
+       atrium <family> ...                          fleet | ctl | config | mod | recover | reap
 
 session flags:
   --trust [<policy>]        the mode spawned agents run in, and their ceiling: plan (read-only) |
@@ -34,6 +34,7 @@ session flags:
 families:  atrium fleet --help     saved rosters: up, init, ls, clean
            atrium ctl --help       the control plane, from inside a pane
            atrium config --help    the user-global config.json
+           atrium mod --help       the plugin a claude pane loads: install, status
            atrium recover --help   restore this project's last session
            atrium reap             clean up orphaned pane groups, then exit
 
@@ -109,6 +110,21 @@ usage: atrium config <command>    the user-global config.json
 
 The file holds claude_aliases, deny, ctl_allow, trust_allow, build_jobs, memory_mb and
 fleet_defaults. ATRIUM_CONFIG names its full path outright. See the README's Config section.
+";
+
+/// `atrium mod --help`.
+pub const MOD: &str = "\
+usage: atrium mod <command>    the plugin of function hooks a claude pane loads
+
+  install [--at <dir>]  write the mod built into this atrium to its folder (the config's
+                        mod.path, else mod/ under the platform config directory, else <dir>);
+                        an upgrade of atrium is an upgrade of the mod, a hand edit is restored
+  status                what is installed there, and whether claude panes will load it
+
+Once installed, every claude pane atrium spawns gets CLAUDE_CODE_PLUGIN_DIRS naming the
+folder and reports its status to atrium for certain instead of by inference. ATRIUM_MOD
+names the folder outright; \"mod\": false in config.json or a fleet turns injection off.
+See PLAN-mod.md and mod/README.md.
 ";
 
 /// `atrium recover --help`.

@@ -53,9 +53,11 @@ mod tiled;
 mod ui;
 mod window;
 pub(crate) use config_cli::*;
+mod mod_cli;
 pub(crate) use ctl_server::*;
 pub(crate) use fleet_cli::*;
 pub(crate) use loop_phases::*;
+pub(crate) use mod_cli::*;
 pub(crate) use mouse::*;
 pub(crate) use overlay_keys::*;
 pub(crate) use overview::*;
@@ -336,6 +338,11 @@ fn main() -> ExitCode {
             eprintln!("atrium: {e}");
             return ExitCode::FAILURE;
         }
+    }
+    // `atrium mod …`: the plugin a claude pane loads, written out of this
+    // binary. After the config, which may name its folder.
+    if first == Some("mod") {
+        return mod_cmd(&args[1..]);
     }
     // `atrium recover` rehydrates the most recent session snapshot — same dispatch
     // level as `fleet` and `ctl`, before flag parsing, so `recover` is never

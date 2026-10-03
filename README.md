@@ -297,6 +297,7 @@ control plane exists.
 | `atrium fleet up <name>` / `ls` / `clean <name>` | bring up a saved roster / list rosters / reclaim a fleet's clean, merged worktrees |
 | `atrium fleet init <template> [--agents N]` / `ls --templates` | start a project's `atrium.fleet.json` from a built-in reference fleet (`solo`, `pair`, `crew`) or one of your own from the global `fleet.json` ([templates](docs/fleets.md#templates)) |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
+| `atrium mod install [--at <dir>]` / `status` | write the Claude Code plugin built into atrium (the mod) to its folder, so claude panes report their status for certain / what is installed |
 | `atrium config path` / `init [--at <path>]` | where the user-global config is read from / write a starter there (asks for the location on a first run; see [Config](#config)) |
 | `atrium recover [--list \| --snapshot <path>]` | restore this project's last session — also offered automatically when a launch finds one that crashed ([session recovery](docs/session-recovery.md)) |
 | `atrium reap` / `--reap-orphans` | clean up orphaned pane groups ([reaping](docs/reaping.md)) |
@@ -333,6 +334,7 @@ and win over the pointer.
   "trust_allow": [],
   "build_jobs": null,
   "memory_mb": null,
+  "mod": null,
   "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
 }
 ```
@@ -346,6 +348,9 @@ and win over the pointer.
   `ATRIUM_CTL_ALLOW`, `ATRIUM_TRUST_ALLOW`; they merge with the variable and the
   fleet's own.
 - **`build_jobs`**, **`memory_mb`** — defaults for fleets that set neither.
+- **`mod`** — `false` keeps atrium's Claude Code plugin (the mod, `atrium mod
+  install`) out of every claude pane on this machine; `{ "path": "<dir>" }` names
+  the folder when it was installed somewhere else.
 - **`fleet_defaults`** — `trust`, `identity`, `allow_ctl`, `grid` for fleets that
   leave them out.
 

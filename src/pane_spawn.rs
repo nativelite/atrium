@@ -317,7 +317,21 @@ pub(crate) fn spawn_pane_full(
     // key and the `ATRIUM_PANE` value injected below, so an agent inside can
     // attribute its own `ctl spawn` calls back to this pane.
     let agent_id = next_agent_id();
-    let (base_env, token, pane_cgroup) = pane_env(agent_id, extra_env);
+    let (mut base_env, token, pane_cgroup) = pane_env(agent_id, extra_env);
+    // The mod: a claude pane loads atrium's plugin of function hooks when it
+    // is installed and the session allows it (`atrium mod install`; a fleet's
+    // or the config's `mod: false`). It reports the pane's status for certain
+    // through `atrium ctl`, so it also learns which atrium to run.
+    if atrium::modfiles::session_enabled() {
+        base_env.extend(atrium::modfiles::pane_env(
+            atrium::bind::is_claude_stem(&title),
+            atrium::modfiles::installed_dir().as_deref(),
+            std::env::var(atrium::modfiles::ENV_PLUGIN_DIRS)
+                .ok()
+                .as_deref(),
+            std::env::current_exe().ok().as_deref(),
+        ));
+    }
 
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge

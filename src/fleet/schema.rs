@@ -52,6 +52,11 @@ pub struct Fleet {
     /// reviewable definition of a spin-up, the control plane belongs in it rather
     /// than in a flag the operator has to remember.
     pub allow_ctl: Option<bool>,
+    /// `mod: false` keeps atrium's plugin of function hooks
+    /// ([`crate::modfiles`]) out of this fleet's claude panes; absent or
+    /// `true` injects it when it is installed. The config's `"mod": false`
+    /// fills an absent key.
+    pub mod_enabled: Option<bool>,
     /// Optional context-mode configuration for the whole fleet. Absent → no
     /// context injection; present → [`crate::context::parse_block`] resolves the
     /// provider and share level tolerantly (unknown values warn to stderr and
@@ -276,6 +281,13 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         ),
         None => None,
     };
+    let mod_enabled = match get("mod") {
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("fleet {name:?}: \"mod\" must be true or false"))?,
+        ),
+        None => None,
+    };
     let trust = match get("trust") {
         Some(v) => Some(
             v.as_str()
@@ -399,6 +411,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         grid,
         trust,
         allow_ctl,
+        mod_enabled,
         identity,
         context,
         topics,

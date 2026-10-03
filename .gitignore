@@ -13,3 +13,8 @@ __pycache__/
 
 # Crash dumps from git-bash / MSYS tools run in this tree.
 *.stackdump
+
+# Laid beside the mod by Claude Code whenever it loads or validates mod/: the
+# engine's own declarations and a tsconfig extending them, per build.
+mod/.claude-plugin/types/
+mod/tsconfig.json

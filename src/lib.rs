@@ -38,6 +38,7 @@ pub mod input;
 pub mod ipc;
 pub mod layout;
 pub mod memguard;
+pub mod modfiles;
 pub mod modstate;
 pub mod orphan;
 pub mod reap;

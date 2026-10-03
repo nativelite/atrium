@@ -163,10 +163,18 @@ pub(super) struct BannerFacts {
     pub(super) pane_cap: usize,
     /// Colour the preflight block.
     pub(super) color: bool,
+    /// The mod's state for this fleet's claude panes, one line
+    /// ([`atrium::modfiles::describe`]), and whether it is a warning.
+    pub(super) mod_line: String,
+    pub(super) mod_missing: bool,
 }
 
 impl BannerFacts {
     pub(super) fn read(fleet: &atrium::fleet::Fleet) -> BannerFacts {
+        let (mod_line, mod_missing) = atrium::modfiles::describe(
+            &atrium::modfiles::status(),
+            fleet.mod_enabled.unwrap_or(true),
+        );
         BannerFacts {
             pool_size: atrium::buildpool::planned_size(fleet.build_jobs),
             pool_inherited: atrium::buildpool::inherited(),
@@ -176,6 +184,8 @@ impl BannerFacts {
             pane_cap: atrium::resources::effective_cap(),
             color: std::io::IsTerminal::is_terminal(&std::io::stderr())
                 && std::env::var_os("NO_COLOR").is_none(),
+            mod_line,
+            mod_missing,
         }
     }
 }
@@ -225,6 +235,20 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
             ", ctl OFF"
         }
     ));
+    // The mod: whether this fleet's claude panes will report status for certain.
+    // A missing install is a warning, not a gate: the inference still works.
+    let has_claude = fleet.agents.iter().any(|a| {
+        a.cmd
+            .first()
+            .is_some_and(|c| atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)))
+    });
+    if has_claude {
+        if facts.mod_missing {
+            warnings.push(facts.mod_line.clone());
+        } else {
+            out.push(format!("atrium fleet: {}", facts.mod_line));
+        }
+    }
     // Deny rules only reach claude (codex has no equivalent flag). Say so when a
     // rule is aimed at an agent it can't bind, rather than let it read as enforced.
     let unbound = deny_unbound(fleet);

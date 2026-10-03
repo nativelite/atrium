@@ -389,6 +389,8 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     let fleet = &launch.fleet;
     // Approved: record the fleet's deny rules for every pane in the session.
     atrium::trust::set_fleet_deny(fleet.deny.clone());
+    // And whether its claude panes load the mod.
+    atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
     // Record the fleet's memory ceiling for the session guard.
     if let Some(mb) = fleet.memory_mb {
         atrium::memguard::set_fleet_mb(mb);

@@ -15,6 +15,7 @@
 //!   "trust_allow": [],
 //!   "build_jobs": null,
 //!   "memory_mb": null,
+//!   "mod": { "path": "~/.config/atrium/mod" },
 //!   "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
 //! }
 //! ```
@@ -63,6 +64,11 @@ pub struct GlobalConfig {
     pub trust_allow: Vec<String>,
     pub build_jobs: Option<usize>,
     pub memory_mb: Option<u64>,
+    /// `mod.path`: where `atrium mod install` put the mod, when not the
+    /// default folder ([`crate::modfiles::default_dir`]).
+    pub mod_path: Option<PathBuf>,
+    /// `"mod": false`: inject the mod into no claude pane on this machine.
+    pub mod_off: bool,
     pub fleet_defaults: FleetDefaults,
 }
 
@@ -102,6 +108,9 @@ impl GlobalConfig {
         fleet.grid = fleet.grid.or_else(|| d.grid.clone());
         fleet.build_jobs = fleet.build_jobs.or(self.build_jobs);
         fleet.memory_mb = fleet.memory_mb.or(self.memory_mb);
+        if self.mod_off {
+            fleet.mod_enabled = fleet.mod_enabled.or(Some(false));
+        }
         fleet
     }
 }
@@ -201,6 +210,7 @@ pub const STARTER: &str = r#"{
   "trust_allow": [],
   "build_jobs": null,
   "memory_mb": null,
+  "mod": null,
   "fleet_defaults": {
     "trust": null,
     "identity": null,
@@ -320,10 +330,30 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         trust_allow: str_list(get("trust_allow"), "trust_allow")?,
         build_jobs: None,
         memory_mb: None,
+        mod_path: None,
+        mod_off: false,
         fleet_defaults: FleetDefaults::default(),
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
     cfg.memory_mb = whole(get("memory_mb"), "memory_mb")?;
+    // `mod`: `false` turns injection off; an object names the folder; `true`
+    // and `null` mean the defaults. Anything else is a typo, named.
+    match get("mod") {
+        None | Some(json::Value::Null) | Some(json::Value::Bool(true)) => {}
+        Some(json::Value::Bool(false)) => cfg.mod_off = true,
+        Some(json::Value::Object(_)) => {
+            let v = get("mod").and_then(|v| v.as_object());
+            let path = v.and_then(|o| o.iter().rev().find(|(k, _)| k == "path").map(|(_, v)| v));
+            cfg.mod_path = opt_str(path, "mod.path")?
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| expand_home(&p, home));
+        }
+        Some(_) => {
+            return Err(
+                "config.json: \"mod\" must be false, or an object with \"path\"".to_string(),
+            )
+        }
+    }
     if let Some(v) = get("fleet_defaults").filter(|v| !matches!(v, json::Value::Null)) {
         let d = v
             .as_object()
@@ -777,5 +807,57 @@ mod tests {
             answer_to_path("\"/x/y.json\"", d, Some(h)),
             PathBuf::from("/x/y.json")
         );
+    }
+
+    #[test]
+    fn the_mod_key_is_false_an_object_or_an_error_naming_it() {
+        let off = parse_with_home(r#"{"mod": false}"#, home()).unwrap();
+        assert!(off.mod_off);
+        assert_eq!(off.mod_path, None);
+        let on = parse_with_home(r#"{"mod": true}"#, home()).unwrap();
+        assert!(!on.mod_off);
+        let at = parse_with_home(r#"{"mod": {"path": "~/mods/atrium"}}"#, home()).unwrap();
+        assert_eq!(at.mod_path, Some(PathBuf::from("/home/u/mods/atrium")));
+        assert!(!at.mod_off);
+        let blank = parse_with_home(r#"{"mod": {"path": ""}}"#, home()).unwrap();
+        assert_eq!(blank.mod_path, None);
+        let empty = parse_with_home(r#"{"mod": {}}"#, home()).unwrap();
+        assert_eq!(empty.mod_path, None);
+        let null = parse_with_home(r#"{"mod": null}"#, home()).unwrap();
+        assert!(!null.mod_off);
+        for bad in [
+            r#"{"mod": "yes"}"#,
+            r#"{"mod": 1}"#,
+            r#"{"mod": {"path": 3}}"#,
+        ] {
+            let err = parse_with_home(bad, home()).unwrap_err();
+            assert!(err.contains("mod"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_config_mod_off_fills_only_a_fleets_absent_mod_key() {
+        let roster = r#"{"fleets":{"a":{"agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+        let fleet = crate::fleet::parse(roster)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone();
+        let off = parse_with_home(r#"{"mod": false}"#, home()).unwrap();
+        assert_eq!(off.apply_to_fleet(fleet.clone()).mod_enabled, Some(false));
+        let explicit =
+            r#"{"fleets":{"a":{"mod": true, "agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+        let fleet_on = crate::fleet::parse(explicit)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            off.apply_to_fleet(fleet_on).mod_enabled,
+            Some(true),
+            "the fleet's own key wins"
+        );
+        let plain = parse_with_home("{}", home()).unwrap();
+        assert_eq!(plain.apply_to_fleet(fleet).mod_enabled, None);
     }
 }

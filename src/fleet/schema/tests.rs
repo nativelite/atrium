@@ -545,3 +545,20 @@ fn context_block_unknown_share_degrades_to_knowledge() {
     let ctx = f.get("f").unwrap().context.as_ref().unwrap();
     assert_eq!(ctx.share, crate::context::Share::Knowledge);
 }
+
+#[test]
+fn a_fleet_can_turn_the_mod_off_and_a_non_bool_is_a_clear_error() {
+    let f = parse(
+        r#"{ "fleets": { "a": { "mod": false, "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+    )
+    .unwrap();
+    assert_eq!(f.get("a").unwrap().mod_enabled, Some(false));
+    let f = parse(r#"{ "fleets": { "a": { "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#)
+        .unwrap();
+    assert_eq!(f.get("a").unwrap().mod_enabled, None);
+    let err = parse(
+        r#"{ "fleets": { "a": { "mod": "off", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("\"mod\""), "unhelpful error: {err}");
+}
