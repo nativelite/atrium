@@ -765,3 +765,141 @@ Every item keeps Part I's principles: upgrade never require, the broker stays
 the source of truth, nothing a pane says about another pane is trusted,
 nothing is written silently, and a feature that the engine of the day cannot
 serve goes dark with a visible line, never a broken pane.
+
+---
+
+# Part III — Firsts
+
+Ideas I have not seen in any agent harness. Each stands on a combination
+only atrium has: the screen of every agent, a broker that can fork any
+agent's reasoning without touching it, per-pane credentials, and a trust
+ladder with a human at the top. Mechanisms are named; sizes are guesses.
+
+**X1. The warden: a fleet immune system.**
+One cheap pane (`--warden sonnet`) whose mod gets, every few seconds, each
+tile's screen delta (R2, broker-side, no transcript) and runs
+`$.model.classify` over it: `fine | looping | stuck | off-task | dangerous`.
+`looping` and `stuck` post an fyi with the evidence; `dangerous` (a command
+that matches nothing in the deny list but reads as destructive in context)
+sends `ctl interrupt <target>` (a new verb: Esc through the pty atrium owns,
+then a held send) and a decision to the human. A watcher that can press Esc
+on a runaway agent, in under five seconds, for cents.
+
+**X2. Quorum before a risky action.**
+A `tool.check` ask for a command the fleet marks `quorum` (`git push`, a
+migration, `rm -r`) is fanned by the broker to N sibling panes as `ask`
+(R3): each answers from its *own* context with `$.model.fork`, "would you run
+this, and what breaks if it is wrong", in one sentence. The human's approval
+band shows the command and the three answers. Dissent surfaces before the
+click, from agents who already hold the surrounding context, with no new
+session and no interruption.
+
+**X3. Belief diff.**
+`ctl ask --all "state the contract of <symbol> in one line"` collects one
+fork answer per pane that touched the symbol (R4) and diffs them. Two agents
+who believe different things about the same function are an integration bug
+that has not happened yet; the broker posts it as a decision with both
+sentences. Run it automatically on every board `status=DONE` for the
+symbols the item's commit touched.
+
+**X4. Contract-locked edits.**
+An agent, or the lead, pins a contract on the board (`contract:parse
+sig="fn parse(&str) -> Result<Ast>"`). Every mod's guard (F6) checks an
+`Edit` against pinned signatures in the file by a cheap diff of the hunk; a
+change to a pinned line is denied with "contract pinned by lead: post a
+decision". Interfaces stop drifting under parallel builders.
+
+**X5. Speculative forks.**
+When a builder posts `status=DONE review=pending`, the broker forks it
+(R14) into a scratch worktree with the kickoff "the review will likely ask
+for X; prepare it", where X comes from the reviewer's past findings on the
+board. If the review passes, the fork is killed unseen. If it fails on X,
+the prepared fix is already a commit. Branch prediction for agents: spend
+idle capacity on the likely next step.
+
+**X6. Interview the dead.**
+A reaped pane's transcript is still on disk. For a post-mortem, `atrium
+fleet interview <role> "<question>"` spawns a pane on
+`claude --resume <its session>` for exactly one forked question (R3) and
+reaps it again. "Why did you choose the lookup table over a match?" asked
+of the session that made the choice, answered from its context, after the
+run. Reviewers and humans get testimony instead of guesses.
+
+**X7. Nothing dies without a will.**
+Reaping a pane first asks its mod for a will: `$.session.compact` with the
+instructions "write the handoff: what was done, what is open, the hazards,
+the files touched, what you would do next" and the result goes to the board
+under `will:<role>` and into the flight record. A respawn or a successor
+reads it in `whoami`. Context stops dying with sessions; it is distilled by
+the session itself, at the end, when it knows the most.
+
+**X8. The model escalation ladder.**
+Fleet key `escalate: ["haiku", "sonnet", "opus"]`. A worker starts on the
+first; on an `errored` report, a warden `stuck`, or a failed review, the
+broker respawns it one rung up with `--resume --fork-session`, so the whole
+context carries over and only the model changes. Cheap by default, expensive
+exactly where it was needed, and the record shows which rung each item took.
+
+**X9. Secrets never enter a transcript.**
+akey resolves the identity's secret for one child and nothing else sees it.
+The mod closes the last gap: a `session.append` hook scrubs the exact secret
+value (and common encodings of it) from every tool result and text block
+before the row is stored, replacing it with `«akey:work»`. A worker that
+runs `env` or cats a config writes nothing it should not to disk. The
+secret's value reaches the mod only as a one-way hash set handed over at
+spawn, so the mod itself never holds it.
+
+**X10. Cache-aware delivery.**
+Every turn reports `cache_read_input_tokens` and `cache_creation_input_tokens`.
+The broker learns each pane's cache lifetime from the gaps between its turns
+and times queued deliveries to land before the prefix goes cold: a low-
+priority send to an idle pane is released at the last useful moment instead
+of at once, and a burst of wakes for one pane coalesces into one turn. The
+status bar shows `cache 71%` for the fleet. Real money, saved by the one
+process that sees every pane's rhythm.
+
+**X11. Catch-up captions.**
+When the human focuses a tile they have not looked at for a while, the broker
+diffs that pane's vterm against its screen at the last focus and
+`$.model.classify`/`complete` summarizes the delta in one line at the top of
+the tile for five seconds: "while you were away: ran filter tests, 2 failed,
+now editing src/filter.rs:93". Switching between twelve agents stops costing a
+re-read of twelve screens.
+
+**X12. Dollar blame, and why blame.**
+With cost per turn (F7) and touched files per turn (R4), `atrium blame
+--cost src/filter.rs` shows what each hunk cost to write and which pane wrote
+it. With the mod recording the model's text that preceded each `Edit`
+(opt-in, conversation text), `atrium why src/filter.rs:93` prints the
+agent's own sentence before it made that edit. `git blame` says who; this
+says why and what it cost.
+
+**X13. Earned trust.**
+`trust: earned` starts every worker at `accept` and tracks, on the board,
+its outcomes: reviews passed, denies hit, warden flags. Past a threshold the
+broker raises that pane's mode one rung (never above the session ceiling)
+and posts an fyi; a warden flag drops it back. The trust ladder becomes a
+record, per agent, instead of a setting.
+
+**X14. Two-person rule.**
+A fleet marks commands `dual` (`git push --force`, a prod migration). The
+ask must be approved by the human *and* by the lead's fork (X2 with N=1,
+required rather than advisory) within a window; either alone is a deny. The
+most dangerous commands in an unattended run get the control a bank would
+use, with the second person being an agent that already holds the plan.
+
+**X15. Fleet from a plan.**
+`atrium fleet from-plan PLAN.md` reads the items table that the coordinate
+skill already prescribes (item, size, files, done-signal) and writes the
+roster: one builder per item with its worktree, its `files` for the guard
+(F6), its test command as the only allowed `cargo test`, a reviewer, an
+integrator and a lead whose brief is the plan. The plan the lead writes
+anyway becomes the fleet, with ownership enforced instead of described.
+
+## What these share
+
+None of them needs the model to be told anything new. They work on the
+harness around the model: the screen it draws, the context it holds, the
+credential it runs under, the ladder it climbs. That is the position atrium
+chose on day one, and the mod is the piece that lets the harness hear the
+engine. Everything in Part III is that pairing used as hard as it goes.
