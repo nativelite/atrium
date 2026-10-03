@@ -13,9 +13,18 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N7 visible subagents | `a7d7b2e` | `ctl answer`/`wait` unit and e2e tests; 20 `claude plugin test` cases; live: a real claude's `atrium_subagent` opened a second real claude as a tile, which answered, was closed, and the parent replied "child said pong." |
 | N9 docs, skills, changelog | `b6f9b4f` | README, the four deep docs, both delegation skills, CHANGELOG; `python docs/build.py` and the drift check clean. The e2e half landed with each item. Not done: the marketplace plugin's copy of the skills and the mod (that repo) |
 
+Not started: **N5** (the inbox transport: deliveries through the engine's own
+prompt queue instead of pty keystrokes; the one change to the broker's I/O
+model, a long-lived client per pane) and **N8** (the `respawn_at` decision and
+the in-pane board view; the overview's context and cost columns landed with
+N4). Until N5, a subagent's task is typed into its pane as one line.
+
 Deviations from the design as written: `wait --for answer` moved from N1 to
-N7, where it is first needed; `inbox --wait` stays in N5. The mod offers only
-the caps it implements (`status`, `answer`, `context`).
+N7 and is a client-side poll, so the server stays one request, one reply; the
+`claude -p` child option is closed by the spawn policy (a teammate may choose
+no claude flag beyond model, effort and resume), so a subagent pane is always
+an interactive claude that is sent its task; the mod offers only the caps it
+implements (`status`, `answer`, `context`, `tools`, `guard`).
 
 Read `PLAN.md` for the format a running fleet uses.
 
