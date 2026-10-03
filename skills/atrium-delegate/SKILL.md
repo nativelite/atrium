@@ -36,6 +36,12 @@ A fresh teammate per part keeps every session small.
     atrium ctl spawn --role <short-name> -- claude
     atrium ctl send <short-name> "<the subtask>"
 
+When atrium's mod is loaded you also have these as tools: `atrium_spawn`,
+`atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`, the `atrium_board_*`
+and `atrium_bus_*` tools, and `atrium_subagent`, which runs a subagent as a
+visible pane and returns its answer. The tools and the shell verbs are the same
+control plane; use whichever you have.
+
 A teammate starts **blank** — a fresh agent that cannot see this conversation,
 your goal, or your work in progress. Every `send` must be fully self-contained:
 the goal, the exact file paths, the constraints, and how it will know it is done.

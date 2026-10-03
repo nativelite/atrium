@@ -60,7 +60,22 @@ Because a pane atrium did not launch as an agent is never bound, non-agent panes
 
 The waiting-on-you status is an inference over the transcript tail, gated by Claude Code's `permissionMode`. On a machine running mostly in `auto` mode, the loud yellow border correctly stays quiet: auto mode does not block on the human, so there is nothing to surface. The yellow is reserved for the sessions where an agent is genuinely blocked.
 
-A future opt-in hook can replace the inference with a certainty. It is not part of this release.
+The mod replaces the inference with a certainty, below.
+
+## Certainty: the mod
+
+`atrium mod install` writes a small Claude Code plugin out of atrium's binary, and every claude pane atrium then spawns loads it (`CLAUDE_CODE_PLUGIN_DIRS`). Inside the engine the mod hooks the turn and tool events and reports the pane's status to atrium the moment it changes, over the same control channel `atrium ctl` uses and with the pane's own capability token, so a pane can only ever speak for itself.
+
+| reported | when |
+| --- | --- |
+| `working` | a turn started, or a tool call ran |
+| `waiting-approval` | a permission check resolved to an ask, with the tool as the reason |
+| `waiting-prompt` | the turn ended with an answer, or was interrupted |
+| `idle` | nothing has happened for a while |
+| `errored` | the turn ended on an API error or a refusal: the border turns **red** with a `!` badge, the bar counts it with the waiting panes, and the overview marks it ‼ |
+| `ended` | the session ended |
+
+A reported status wins over the inferred one for two minutes, then the inference is used again, so a mod that died cannot pin a pane. The mod also reports the context-window fill and the cost so far, which the overview (`Ctrl+A o`) shows per agent (`ctx 41% $0.12`) and summed per window, and the text of each answer, which only the pane that spawned it as a subagent may read (`atrium ctl answer`, `wait`). It never sends conversation text anywhere else. Codex and gemini panes, and a claude without the mod, keep the inference. `atrium ctl status` and `ctl list` show the reported label, including `errored` and `ended`.
 
 ## See also
 

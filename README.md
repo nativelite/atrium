@@ -95,6 +95,26 @@ cp -r skills/atrium-delegate skills/atrium-coordinate skills/atrium-fleet ~/.cla
 
 Plain single-pane use (`atrium claude`) needs neither.
 
+### Install the mod
+
+atrium carries a small Claude Code plugin, **the mod**, inside its binary. Once
+installed, every claude pane atrium spawns loads it, and the pane's status comes
+from the engine itself instead of from a transcript inference: the yellow border
+appears the instant a permission prompt does, a turn that ends on an API error
+shows red, and the overview shows each agent's context fill and cost. The mod
+also gives the model the control plane as typed `atrium_*` tools, tells it which
+pane and item it is, refuses edits outside its item's files, and runs the
+model's subagents as visible panes.
+
+```bash
+atrium mod install     # once per machine, and again after upgrading atrium
+atrium mod status      # what is installed, and whether panes will load it
+```
+
+Nothing else changes: a pane without the mod keeps the inferred status, and
+codex panes are untouched. `"mod": false` in `config.json` or in a fleet keeps
+it out of every pane. Details: [mod/README.md](mod/README.md).
+
 ## Quickstart
 
 ```bash
@@ -173,6 +193,13 @@ crate, over the transcript files Claude Code writes on your own disk) and render
 no prompts, no replies, no credentials, no network. Full detail:
 [docs/agent-status.md](docs/agent-status.md).
 
+With [the mod installed](#install-the-mod) the status is **reported by the
+engine** instead of inferred: a pane says `working`, `waiting-approval`,
+`waiting-prompt`, `idle`, `errored` or `ended` the moment it changes, over the
+same control channel `atrium ctl` uses and with the pane's own token, so it can
+only ever speak for itself. An `errored` turn (an API error or a refusal) draws
+the border **red** with a `!` badge, a state no transcript inference can see.
+
 ### Credential identity
 
 `--identity <name>` (short `-I`) launches an agent under a chosen credential,
@@ -249,6 +276,13 @@ It stands on three pieces:
   act?"), with `fyi` and `decision_needed` urgencies: `atrium ctl bus
   pub/sub/feed/resolve`.
 
+With [the mod installed](#install-the-mod), a claude pane also has all of this
+as **typed tools** (`atrium_spawn`, `atrium_send`, `atrium_board_set`,
+`atrium_bus_pub`, …), is told in its system prompt which pane, role and item it
+is, and runs the model's own **subagents as visible panes**: an Agent call
+becomes `atrium_subagent`, a tile beside the caller whose answer is collected
+when it is done.
+
 **Trust** governs how hands-off it runs. `--trust <plan|accept|automode|skip>`
 sets the posture for spawned agents *and* the ceiling they're capped at. A
 teammate's `--mode` can de-escalate but never elevate. `accept` (the safe default)
@@ -288,6 +322,9 @@ control plane exists.
 | `ATRIUM_DENY` | commands no claude agent in the session may run (comma-separated claude rules like `Bash(git push --force*)` or command prefixes); added to the built-in fail-safes |
 | `ATRIUM_MEMORY_MB` | fixed ceiling on the panes' memory (default: dynamic, tracking the machine's free memory); `off` disables it. Hard limit on Windows, and on Linux under `systemd-run --user --scope -p Delegate=yes`; soft guard otherwise |
 | `ATRIUM_DEBUG` | `=1` adds stage markers on stderr |
+| `ATRIUM_MOD` | the folder the mod is installed in, when kept elsewhere than `mod/` under the config directory or the config's `mod.path` |
+| `CLAUDE_CODE_PLUGIN_DIRS` | set by atrium in every claude pane when the mod is installed: the mod's folder, joined onto whatever the variable already held |
+| `ATRIUM_BIN` | set by atrium in every claude pane when the mod is installed: this atrium, which the mod runs for `atrium ctl` |
 
 ### Subcommands
 

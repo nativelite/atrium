@@ -149,6 +149,11 @@ from `board get lead`" can skip the `send`.
 
 ## How to delegate
 
+When atrium's mod is loaded, every verb below is also a tool (`atrium_spawn`,
+`atrium_send`, `atrium_board_set`, `atrium_bus_pub`, …) and the Agent tool is
+refused with a pointer to `atrium_subagent`, a subagent that is a visible pane.
+The tools and the shell verbs are the same control plane; use whichever you have.
+
     atrium ctl spawn --here --role <short-name> -- claude     # tile beside you
     atrium ctl send <short-name> "<the subtask>"
 

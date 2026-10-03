@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The mod: a Claude Code plugin in every claude pane.** `atrium mod install`
+  writes a plugin of function hooks out of atrium's binary; every claude pane
+  atrium then spawns loads it (`CLAUDE_CODE_PLUGIN_DIRS`, with `ATRIUM_BIN`
+  naming the atrium to call). Inside the engine it reports the pane's status
+  the moment it changes (`working`, `waiting-approval` with the tool as the
+  reason, `waiting-prompt`, `idle`, `errored`, `ended`), its context fill and
+  cost, and the text of each answer, over the control channel with the pane's
+  own token. A reported status wins over the transcript inference for two
+  minutes; `errored` draws the border red with a `!` badge and the overview
+  shows `ctx 41% $0.12` per agent. `atrium mod status` says what is installed;
+  `"mod": false` in `config.json` or a fleet keeps it out.
+- **New ctl verbs** `hello`, `report`, `whoami`, `answer` and `wait`: the first
+  three are what the mod speaks and are about the caller only (a `target` is
+  refused); `answer` reads a pane's last reported answer up the spawn tree,
+  and `wait` polls for it, for idle, or for exit.
+- **Typed control-plane tools.** With the mod, a claude pane has
+  `atrium_spawn`, `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`,
+  `atrium_board_*` and `atrium_bus_*` as tools; each call is one `atrium ctl`
+  run, and an ask for one of them is answered by the mod, never a dialog.
+- **The role section and the file guard.** The mod appends an `atrium:role`
+  section to the system prompt from `whoami` (pane, role, parent, mode, item,
+  owned files, worktree, whether it may spawn) and refuses an `Edit`, `Write`
+  or `NotebookEdit` outside the item's files, by real path, naming the owner.
+- **Subagents as visible panes.** `atrium_subagent` spawns a claude pane beside
+  the caller, sends it the task, waits for the answer its mod reports, closes
+  the pane unless kept, and returns the answer; the model's Agent tool is
+  refused with a pointer to it. Fleet keys `subagents` (`panes` | `native` |
+  `deny`) and `subagents_keep`; config key `mod`; `ATRIUM_MOD` names the
+  mod's folder. The fleet preflight states the mod's line and warns when claude
+  panes would load none.
+
 ## [0.38.0] - 2026-09-30
 
 A hardening release. Most of the 33 commits reorganize the source for the people

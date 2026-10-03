@@ -58,6 +58,11 @@ Targets are a pane **id** (its numeric agent id) or a **role** label (`dev_1`); 
 | `atrium ctl bus feed [--since <seq>]` | Pull the caller's subscribed events with `seq > since` (no echo of your own); returns a `cursor` to resume from. | `{"ok":true,"feed":[{"seq":7,"topic":"deploy",…}],"cursor":7}` |
 | `atrium ctl bus resolve <seq>` | Mark a `decision_needed` event answered (clears the bar/panel escalation). | `{"ok":true,"seq":7,"resolved":true}` |
 | `atrium ctl bus topics` | List the active topics with how many panes subscribe to each — discoverability before you `sub`. | `{"ok":true,"topics":[{"topic":"deploy","subs":2},…]}` |
+| `atrium ctl hello mod=<v> [engine=<v>] [caps=<a,b,…>]` | A pane's mod announces itself; the broker answers with the capabilities it accepts. About the caller only. | `{"ok":true,"pane":3,"accepted":["status","answer",…]}` |
+| `atrium ctl report [status=<s>] [reason=<r>] [context=<pct>] [cost=<usd>] [turns=<n>] [answer=<text>]` | A pane's mod reports its own status, usage or last answer. About the caller only; a `target` is refused. | `{"ok":true,"pane":3}` |
+| `atrium ctl whoami` | What the caller is: pane, role, parent, depth, mode, worktree, cwd, deny rules, whether it may spawn, its mod, the board item whose `owner`/`builder` names its role and that item's `files`, and the session's subagent policy. | `{"ok":true,"pane":3,"role":"builder",…,"item":"M1","files":[…],"subagents":"panes"}` |
+| `atrium ctl answer <target>` | A pane's last reported answer and status, for the ancestor that spawned it (subtree-scoped like `send`; a pane that answered and exited stays readable by its parent). | `{"ok":true,"pane":4,"status":"waiting-prompt","seq":2,"answer":"…"}` |
+| `atrium ctl wait <target> [--for answer\|idle\|exit] [--timeout <s>] [--after <seq>]` | Poll until the pane has an answer newer than `seq`, is at its prompt, or is gone. A client-side loop over `answer`/`status`; an empty poll leaves no audit row. | the last `answer`/`status` reply, or `{"ok":false,"err":"timeout after 300s …"}` |
 
 ## The board: shared source of truth
 
@@ -122,6 +127,16 @@ atrium ctl audit
 ```
 
 The multiplier: many workers, coordinated by a few of them, driven by one human, and every level is a pane you can watch, redirect, zoom into (`Ctrl+A z`), or kill. `ctl` is the small verb layer; the panes, tiling, identity injection, and `agsess` status it stands on already existed.
+
+## The mod: typed tools, the role section and subagent panes
+
+With `atrium mod install` done, every claude pane carries a plugin (the mod, `mod/`) that speaks the verbs above for it and gives the model three things:
+
+- **Typed tools.** `atrium_spawn`, `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`, `atrium_board_set|get|list|claim|release` and `atrium_bus_pub|feed|resolve|topics`: each call is one `atrium ctl` run with the pane's own token, and the reply is what the model reads. The shell verbs stay the same surface, so the skills and the docs remain true either way. A permission ask for one of these tools is answered by the mod, never a dialog; a deny from a rule stands.
+- **The role section.** An `atrium:role` section of the system prompt, from `whoami`: the pane, its role, parent, depth and trust mode, its item on the board and the files that item owns, its worktree, whether it may spawn, and what a `[atrium bus #` line is. Re-read every turn, so a lead's re-brief lands. When the item owns files, an `Edit`, `Write` or `NotebookEdit` anywhere else is refused by real path with the owner named.
+- **Subagents as panes.** Under the session's `subagents` policy (`panes`, the default; a fleet may say `native` or `deny`), the model's Agent tool is refused with a pointer to `atrium_subagent`, which spawns a claude pane beside the caller (`--here`), sends it the task, waits for the answer the child's own mod reports, closes the pane unless `keep` or the fleet's `subagents_keep`, and returns the answer. Every subagent is a tile the human can watch, send to and kill.
+
+What the broker believes of a mod is bounded: a report is about the reporter (a `target` is refused), an answer is capped, scrubbed and read only up the spawn tree, and a mod cannot widen trust (it rewrites an ask to allow for its own tools only; a deny is never overridden). See [trust and security](trust-and-security.md).
 
 ## Delegation skills: atrium-delegate, atrium-coordinate and atrium-fleet
 

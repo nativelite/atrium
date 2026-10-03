@@ -157,4 +157,12 @@ limits, each one unit-tested as a pure function:
    hidden: it's a pane with a status border, in the org chart, killable. That is
    the whole reason to do this in atrium instead of as opaque subagents.
 
+## What the mod adds
+
+[The mod](control-plane.md#the-mod-typed-tools-the-role-section-and-subagent-panes) runs inside a pane's Claude Code and speaks to atrium over the same channel as `atrium ctl`, with the same per-pane token. Three more points hold for it.
+
+8. **A report is about the reporter.** `hello`, `report` and `whoami` take no target and act on the token-matched caller; a request that names one is refused by the parser. A pane cannot mark a sibling idle to get a delivery through, nor forge its answer. A reported status is an upgrade over the transcript inference, never a requirement, and stops counting two minutes after it was made.
+9. **An answer is data.** `report answer=` is capped (16 KiB), scrubbed of control characters, kept out of the audit log (its length is recorded, never its text), and returned by `answer`/`wait` only up the spawn tree: to the pane's ancestors, and to the pane that spawned it after it has exited. It is never typed into a pane and never shown as operator text.
+10. **The mod cannot widen trust.** It turns a permission ask into an allow for its own `atrium_*` tools only, and returns the engine's verdict whenever that is a deny: rules, policy and `ATRIUM_DENY` are never overridden. The mod's folder is written only by `atrium mod install`, from the copy built into the binary, and a fleet or the config may keep it out of every pane with `mod: false`.
+
 See the [project README](../README.md) for the wider picture.
