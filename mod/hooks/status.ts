@@ -9,7 +9,7 @@ export const MOD_VERSION = '0.1.0'
  * The capabilities this version implements, offered in `hello`. The broker
  * keeps the ones it knows (`modstate::CAPS`) and answers with `accepted`.
  */
-export const CAPS = ['status', 'answer', 'context'] as const
+export const CAPS = ['status', 'answer', 'context', 'tools', 'guard'] as const
 
 /** The most of an answer sent to the broker; it caps again on its side. */
 export const ANSWER_CAP = 16 * 1024

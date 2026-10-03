@@ -10,6 +10,26 @@ It speaks `atrium ctl hello` and `atrium ctl report` with the pane's own token
 (`ATRIUM_TOKEN`), so it can only ever speak for the pane it runs in. Outside
 atrium it does nothing.
 
+It also gives the model the control plane as typed tools and tells it who it
+is:
+
+- **`atrium_*` tools** (`spawn`, `send`, `status`, `list`, `kill`,
+  `board_set|get|list|claim|release`, `bus_pub|feed|resolve|topics`): each
+  call is one `atrium ctl` run with the pane's token, and the reply is what the
+  model reads. The shell verbs are the same, so the skills stay true. An ask for
+  one of these tools is answered by the mod, never a dialog; a deny from a rule
+  stands.
+- **The `atrium:role` section** of the system prompt, from `atrium ctl whoami`:
+  the pane, its role, parent, depth and trust mode, its item on the board and
+  the files that item owns, its worktree, whether it may spawn, and what a
+  `[atrium bus #` line is. Re-read at every turn, so a lead's re-brief lands.
+- **The file guard**: when the item owns files, an `Edit`, `Write` or
+  `NotebookEdit` anywhere else is refused with the owner named, by real path,
+  and a toast says so. Off when nothing is owned or the pane is in plan mode.
+
+Each piece is a capability the mod offers in `hello` (`status`, `answer`,
+`context`, `tools`, `guard`); the broker's `accepted` list switches it on.
+
 Load it for one session:
 
 ```bash
