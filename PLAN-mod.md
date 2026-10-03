@@ -523,3 +523,245 @@ N7 after N5; N8 after N4+N6; N9 last.
 | N7 visible subagents (F3) | M+ (new surface) | `mod/hooks/agents.ts`, `src/ctl_server/dispatch.rs` (`wait --for answer`), `src/fleet/schema.rs` (`subagents*`) | an Agent call under `panes` opens a tile and returns the pane's answer; `deny` mode names `atrium_spawn` |
 | N8 telemetry + respawn decision + in-pane UI (F7, F8) | M | `mod/hooks/ui.tsx`, `src/ctl_server/dispatch.rs` (`respawn_at` decision), `src/overview.rs` | `/atrium` pane draws board and decisions; crossing `respawn_at` posts one decision to the parent; status bar cost meter |
 | N9 docs, skills, changelog, e2e | M | README, `docs/*.md`, `skills/*`, `CHANGELOG.md`, `tests/atrium/ctl.rs`, `tests/atrium/session.rs` | `python docs/build.py`; e2e fake-claude `hello`/`report`/`inbox` green; integrator's full gate green |
+
+---
+
+# Part II — Reach
+
+Part I makes atrium's existing promises exact. Part II is what becomes
+possible once every pane has a mod and the broker can hear it. Each entry
+names the mechanism it stands on; everything named here exists in the
+engine's declaration file or in atrium today. Sizes are rough; the order of
+attack is at the end.
+
+What atrium holds that nobody else does: a **vterm emulator per pane** (the
+screen of every agent), a **spawn tree** with trust ceilings, **worktrees** per
+worker, **akey identities** per pane, a **board, a bus and an audit log** in
+one process, **session snapshots** for recovery, and now a **voice inside every
+engine**. Combine them.
+
+## A. Sight
+
+**R1. Captions: what each agent is doing, in six words.**
+The mod hooks `turn.step` (the streaming model request) and, every N seconds
+of streaming, runs `$.model.classify` or a tiny `$.model.complete` on the last
+few hundred characters of the model's own text with "what is this agent doing
+right now, six words". It reports `doing="running the filter tests"`. The
+overview (`Ctrl+A o`) and the tile border show the caption beside the status
+glyph. Mission control gets subtitles. Cost: one haiku-sized call per caption,
+rate-limited by the mod, off under `captions: false`.
+
+**R2. Peek: read a worker's screen.**
+`ctl peek <target> [--rows N]` returns the target's vterm screen as text.
+atrium already renders every pane's emulator; this exposes it over ctl,
+subtree-scoped like `send`. A lead reads a worker's failing test output
+without a transcript; a reviewer checks what the builder actually ran.
+*Security:* a screen can show conversation text, which atrium today never
+exposes. So `peek` is behind a session flag (`--allow-peek`), is disclosed at
+`fleet up` like the directory grant, and is written to the audit log.
+
+**R3. Ask an agent without interrupting it.**
+`ctl ask <target> "<question>"` is delivered to the target's mod, which runs
+`$.model.fork({ prompt })`: one tool-less completion over that session's own
+transcript, as the engine already does for its own forks. The answer comes
+back over `report`. The worker's turn is untouched, its context is not
+appended to, and its transcript never leaves its pane. `Ctrl+A ?` on a tile
+asks "what are you doing, what do you need, what is blocking you" and shows
+the answer as an overlay. This is the one that makes a 12-pane fleet feel
+like a team you can talk to.
+
+**R4. Collision radar.**
+Mods report the real path of every `Edit`, `Write` and `MultiEdit` at
+`turn.complete` (`report touched=…`). The broker keeps a live map of file →
+{pane, branch, first touch, last touch}. Two panes on different worktrees
+touching the same file lights a `⚡` on both tiles, lists them under
+"collisions" in the overview, and posts one `--decision --to lead` the first
+time. `ctl who <path>` answers "who has this file open". The integrator gets
+the list before it merges instead of after.
+
+**R5. Flight recorder and replay.**
+Every report, bus event, board write and audit row already has a timestamp;
+add a vterm screen snapshot per pane every few seconds (text, diffed, cheap)
+and write the run as one append-only file under the session store.
+`atrium replay <run>` scrubs the timeline: every tile's screen at time T, the
+board as it was, the decisions open. `atrium fleet resume --from <t>` rebuilds
+the fleet from that moment: worktrees are already on disk, the board and bus
+reload from the record, and each pane comes back with `claude --resume` on the
+transcript it had. A three-hour run becomes a thing you can rewind.
+
+## B. Voice
+
+**R6. The model's own messaging, routed through atrium.**
+Claude Code's `SendMessage` and `ListAgents` fire `session.send`; the mod
+readdresses `to: "dev_1"` into `ctl send` and feeds `ctl inbox` lines into
+`session.receive`. The model uses the tool it already knows; atrium gets the
+audit, the rate cap, the subtree scope and the no-echo rule it already
+enforces. `ListAgents` lists the pane's visible subtree.
+
+**R7. A shared live document.**
+A board key `doc:<name>` holds Markdown. The mod draws it in a pane
+(`Markdown` element) in every pane that opened it, re-rendered on every board
+write (2 s poll, or a bus event `doc:<name>`). Agents write it with
+`board set`; the human edits it in place (`Input`) and the write goes back to
+the board. A whiteboard the whole fleet and the human share, with no file to
+fight over.
+
+**R8. Guided operation.**
+In the lead's and the human's panes the mod uses `prompt.suggest` after a bus
+event: a builder posts `status=done`, and the lead's prompt box shows, dim,
+`atrium_send reviewer "review M1: commit 3cbec20"` with Tab to take it. The
+coordinate skill's loop becomes a sequence of Tabs when the human is driving.
+
+**R9. Review inside the pane.**
+The reviewer's mod renders the item's diff (`Code` with `format: 'diff'`)
+beside the brief, with `[p]ass` and `[f]ail` buttons that write the board and
+post to the bus. The human can be the reviewer from any pane, in the
+overview, with two keys.
+
+## C. Control
+
+**R10. Approvals routed to wherever you are.**
+`tool.check` resolving to `ask` is the permission dialog. Instead of waiting in
+a pane the human is not looking at, the mod sends the ask to the broker and
+waits (bounded; on timeout the local dialog shows as today). The broker shows
+the ask in the human's *focused* pane as a band with hotkeys (`y`/`n`/`a` for
+always), in the overview, and on the phone (R19). The answer returns as the
+hook's `{ decision }`. The trust ladder is respected: a lead may answer a
+worker's ask only if the lead's own ceiling allows that action; otherwise it
+is the human's. Two live-run reliefs: "approve for all siblings running the
+same command" and "deny once, add to the session deny list" (R11).
+
+**R11. Deny propagation.**
+A denial in one pane offers, by toast with a button, to add the rule to the
+session deny list that `--trust` already distributes; the broker records it
+and every pane's mod applies it in `tool.check` at once.
+
+**R12. Budgets.**
+Fleet keys `budget_usd` (whole fleet) and per-agent `budget_usd`, fed by
+`session.measure`. At 80% the broker posts a decision; at 100% it refuses new
+spawns and, under `budget: hard`, sends a checkpoint-and-stop to each pane
+and then kills. The status bar shows `$12.40 / $40`. The first terminal
+multiplexer with a money kill-switch.
+
+**R13. Credential failover.**
+`session.measure` reports rate-limit windows. When a pane's window passes
+`identity_failover_at` (say 95%), the broker respawns that pane in place
+under the next identity in its `identities: ["work", "work2"]` list, through
+akey as today, and posts an fyi. A fleet rides out a rate limit across
+accounts without a human. Nobody else has per-pane credential injection to do
+this with.
+
+**R14. Fork a worker.**
+`ctl spawn --fork-of dev_1 --role dev_1b` launches
+`claude --resume <dev_1's session> --fork-session` in a new pane: a copy of a
+worker's full context at this moment, on a fresh worktree. Branch an agent the
+way you branch a repo. Pair with R21 to race three forks with three hints and
+keep the winner.
+
+## D. Memory
+
+**R15. Compaction-safe fleets.**
+The mod hooks `session.compact`: before the engine compacts, it writes the
+checkpoint to the board (what it is doing, what is open, the files touched)
+and, on the way back, prepends the role section and the board's state to the
+summary. A pane that compacts mid-item loses nothing the fleet needs. The
+broker can also *trigger* a compaction (`ctl compact <target>`, via
+`$.session.compact`) as the gentle alternative to `respawn_at`.
+
+**R16. The right fact reaches the right agent.**
+A hazard or decision posted on the bus carries `files=`. The broker appends it
+with `$.session.append` (a meta row the model reads at its next turn, no wake)
+only into panes whose owned or touched files overlap. No message storm; the
+agent that needs the fact has it before its next edit.
+
+**R17. Memory across runs.**
+The board's final state and every hazard are stored per project under the
+session store. The next fleet's `whoami` carries "last run: open items,
+hazards, what was reverted", so a Monday lead starts where Friday's stopped.
+
+## E. Reach
+
+**R18. Any Claude Code joins the fleet.**
+A `claude` started outside atrium (a VS Code terminal, a plain shell) with the
+mod installed finds a running broker through atrium's session registry and
+asks to join. atrium shows the request in the bar (`join? vscode:claude · y/n`);
+on yes the session appears in the overview as a *remote* pane: status, captions,
+sends, bus, approvals, no tile. The documented v1 limitation ("an agent you
+started inside a shell pane is not bound") is gone, and atrium becomes mission
+control for every Claude Code on the machine.
+
+**R19. The phone.**
+Claude Code can attach a mobile surface to a session (`session.attach`,
+`surface: "mobile"`). One anchor pane's mod draws the fleet lobby for it:
+every pane's status and caption, the open decisions with resolve buttons, the
+pending approvals (R10) with approve/deny, the budget meter. Walk away from
+the desk; the fleet keeps going and asks you on your phone.
+
+**R20. Chrome for any process.**
+`atrium ctl run --role tests --ok 'test result: ok' --fail 'FAILED|error' -- cargo watch -x test`
+opens a non-agent pane whose border color follows regexes over its own vterm
+output. A test watcher, a dev server, a tail of a log: green, red, or grey at a
+glance, in the same grid as the agents. The status model stops being
+agent-only.
+
+## F. Science
+
+**R21. Fleet bench.**
+`atrium fleet bench <fleet> --runs 3 --vary lead.model=opus,sonnet` runs the
+same PLAN under each variant and prints a table: wall time, cost per agent and
+total, turns, review pass rate, collisions, respawns. Each run is a flight
+record (R5). atrium becomes the harness for comparing multi-agent setups,
+which today nobody can do except by feel.
+
+**R22. Prompt experiments.**
+The fleet's `rules` and each agent's `prompt` are `prompt.compose` sections;
+the bench varies them (`--vary builder.rules=@rules-a.md,@rules-b.md`). A/B
+your agent instructions with numbers.
+
+**R23. The tool EKG.**
+The mod pane draws a `Raster` heat map: panes down, minutes across, cell
+brightness = tool calls, colored by kind. An agent that runs the same command
+six times in a row is flagged `looping` by the broker and surfaces as a
+decision. Loops are the most expensive failure in long runs and today they are
+invisible until the bill.
+
+## Three tasks this makes possible
+
+**The overnight refactor, from your phone.** A twelve-pane fleet with
+`budget_usd: 40`, `identities` failover, approvals routed (R10) to the lobby
+on your phone (R19), collision radar (R4) and compaction-safe panes (R15).
+You answer three approvals and one decision before bed. In the morning the
+flight record (R5) replays the run in four minutes, the bench table (R21) says
+what it cost per item, and the integrator has already merged what passed
+review.
+
+**The living map.** Six builders and one indexer pane. The indexer reads
+captions (R1) and touched-file reports (R4) off the bus and keeps a shared
+document (R7) current: what each part of the codebase is becoming, who owns
+it this hour, which hazards were posted. The human watches the map draw itself
+and asks any pane a question without interrupting it (R3).
+
+**Fork and race.** A worker is stuck. Fork it three times (R14) with three
+different hints in the kickoff, run them as a bench (R21), watch the EKG (R23)
+for the one that loops, kill the losers from the overview, merge the winner.
+Twenty minutes instead of an afternoon.
+
+## Order of attack
+
+After Part I's N1–N9. Groups are independent of each other; within a group
+the order is the dependency order.
+
+| group | items | why first |
+|---|---|---|
+| see | R1 captions, R3 ask, R4 collision radar | pure additions on `report`; the biggest legibility gain per line |
+| guard | R12 budgets, R10 approvals, R11 deny propagation | the unattended-run enablers; R10 touches trust and gets its own review |
+| remember | R15 compaction-safe, R16 targeted injection, R5 flight recorder | R5 is the largest single item in Part II |
+| reach | R18 join, R19 phone, R20 any process | R18 and R19 change who atrium is for |
+| voice | R6 native messaging, R7 shared doc, R8 suggest, R9 review pane | polish on top of F8 |
+| science | R21 bench, R22 experiments, R23 EKG | needs R5 and F7 |
+| branch | R13 failover, R14 fork | small, each one unique to atrium |
+
+Every item keeps Part I's principles: upgrade never require, the broker stays
+the source of truth, nothing a pane says about another pane is trusted,
+nothing is written silently, and a feature that the engine of the day cannot
+serve goes dark with a visible line, never a broken pane.
