@@ -1,8 +1,18 @@
 # PLAN — the atrium mod: a Claude Code plugin in every pane
 
-Status: design, 2026-10-03, against `b826f79`. Not yet a fleet plan: the item
-table at the end is the proposed split. Read `PLAN.md` for the format a running
-fleet uses.
+Status: building, 2026-10-03. Designed against `b826f79`; the item table in
+§9 is the split. Done so far (each a commit on `main`):
+
+| item | commit | proof |
+|---|---|---|
+| N1 broker verbs + modstate | `41bec29` | `cargo test --lib -- ctl modstate`; e2e `ctl_hello_and_report_drive_the_panes_status`; clippy and the 1.70 build clean |
+| N2 mod skeleton + status | `9389ebd` | `claude plugin validate mod` clean; `claude plugin test mod` 9 pass; strict `tsc` against the engine's declarations clean; live: a real `claude -p --plugin-dir mod` inside an `--allow-ctl` pane produced `hello`, `report status=working`, `waiting-approval`, `waiting-prompt`, `context=3 answer_len=4`, `ended` in the audit log, and `ctl status` then read `ended` |
+
+Deviations from the design as written: `wait --for answer` moved from N1 to
+N7, where it is first needed; `inbox --wait` stays in N5. The mod offers only
+the caps it implements (`status`, `answer`, `context`).
+
+Read `PLAN.md` for the format a running fleet uses.
 
 Claude Code now loads **mods**: a TypeScript module of function hooks that runs
 inside the engine, hooks its events (`tool.check`, `turn.start`, `agent.spawn`,
