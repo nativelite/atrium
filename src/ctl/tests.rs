@@ -665,3 +665,117 @@ fn report_audit_label_never_carries_the_answer() {
     assert!(detail.contains("answer_len=11"), "{detail}");
     assert!(detail.contains("status=idle"), "{detail}");
 }
+
+// ---- answer / wait: collecting a subagent pane's answer ----------------------
+
+#[test]
+fn answer_builds_parses_and_needs_a_token() {
+    let line = build_request(&v(&["answer", "dev_1"]), Some(0)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Answer(a) => assert_eq!(a.target, "dev_1"),
+        other => panic!("expected answer, got {other:?}"),
+    }
+    assert!(build_request(&v(&["answer"]), None).is_err());
+    assert!(!Cmd::Answer(AnswerReq {
+        target: "x".to_string()
+    })
+    .is_read_only());
+    let (action, detail) = Cmd::Answer(AnswerReq {
+        target: "dev_1".to_string(),
+    })
+    .audit_label();
+    assert_eq!((action, detail.as_str()), ("answer", "target=dev_1"));
+}
+
+#[test]
+fn wait_parses_its_flags_and_refuses_nonsense() {
+    let spec = parse_wait(&v(&["wait", "dev_1"])).unwrap();
+    assert_eq!(
+        spec,
+        WaitSpec {
+            target: "dev_1".to_string(),
+            what: WaitFor::Answer,
+            timeout_s: 300,
+            after: 0
+        }
+    );
+    let spec = parse_wait(&v(&[
+        "wait",
+        "3",
+        "--for",
+        "idle",
+        "--timeout",
+        "7",
+        "--after",
+        "4",
+    ]))
+    .unwrap();
+    assert_eq!(
+        (spec.what, spec.timeout_s, spec.after),
+        (WaitFor::Idle, 7, 4)
+    );
+    assert_eq!(
+        parse_wait(&v(&["wait", "3", "--for", "exit"]))
+            .unwrap()
+            .what,
+        WaitFor::Exit
+    );
+    assert!(parse_wait(&v(&["wait"])).is_err());
+    assert!(parse_wait(&v(&["wait", "3", "--for", "done"])).is_err());
+    assert!(parse_wait(&v(&["wait", "3", "--timeout", "0"])).is_err());
+    assert!(parse_wait(&v(&["wait", "3", "--timeout", "999999"])).is_err());
+    assert!(parse_wait(&v(&["wait", "3", "--bogus"])).is_err());
+}
+
+#[test]
+fn wait_ends_on_a_newer_answer_an_idle_status_or_a_gone_pane() {
+    let answer = WaitSpec {
+        target: "3".to_string(),
+        what: WaitFor::Answer,
+        timeout_s: 1,
+        after: 2,
+    };
+    assert!(!wait_done(
+        &answer,
+        r#"{"ok":true,"pane":3,"status":"working","seq":null,"answer":null}"#
+    ));
+    assert!(!wait_done(
+        &answer,
+        r#"{"ok":true,"pane":3,"status":"waiting-prompt","seq":2,"answer":"old"}"#
+    ));
+    assert!(wait_done(
+        &answer,
+        r#"{"ok":true,"pane":3,"status":"waiting-prompt","seq":3,"answer":"new"}"#
+    ));
+    assert!(!wait_done(&answer, r#"{"ok":false,"err":"no such pane"}"#));
+    assert!(!wait_done(&answer, "not json"));
+    let idle = WaitSpec {
+        what: WaitFor::Idle,
+        ..answer.clone()
+    };
+    assert!(!wait_done(
+        &idle,
+        r#"{"ok":true,"pane":3,"status":"working","idle_ms":1}"#
+    ));
+    assert!(wait_done(
+        &idle,
+        r#"{"ok":true,"pane":3,"status":"waiting-prompt","idle_ms":1}"#
+    ));
+    assert!(wait_done(
+        &idle,
+        r#"{"ok":true,"pane":3,"status":"errored","idle_ms":1}"#
+    ));
+    assert!(!wait_done(
+        &idle,
+        r#"{"ok":true,"pane":3,"status":null,"idle_ms":1}"#
+    ));
+    let exit = WaitSpec {
+        what: WaitFor::Exit,
+        ..answer
+    };
+    assert!(!wait_done(
+        &exit,
+        r#"{"ok":true,"pane":3,"status":"working","idle_ms":1}"#
+    ));
+    assert!(wait_done(&exit, r#"{"ok":false,"err":"no such pane 3"}"#));
+}

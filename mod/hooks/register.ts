@@ -10,6 +10,7 @@
 // does nothing at all.
 
 import type { EngineInterface, Register } from 'claude-code'
+import { WAIT_SLICES, WAIT_SLICE_S, reportedAnswer, slug, spawnPointer, spawnedPane, subagentPrompt } from './agents'
 import { TOOLS, TOOL_PREFIX, argvFor, isAtriumTool } from './control'
 import { acceptedCaps, parseReply } from './ctl'
 import type { Reply } from './ctl'
@@ -31,10 +32,10 @@ async function inAtrium($: EngineInterface): Promise<boolean> {
  * environment atrium injected at spawn, and read its one-line reply. Never
  * throws: a failure to start is a refused reply.
  */
-async function ctl($: EngineInterface, args: readonly string[]): Promise<Reply> {
+async function ctl($: EngineInterface, args: readonly string[], timeoutMs = 10_000): Promise<Reply> {
   const bin = (await $.env.get('ATRIUM_BIN')) || 'atrium'
   try {
-    const ran = await $.process.run([bin, 'ctl', ...args], { timeoutMs: 10_000 })
+    const ran = await $.process.run([bin, 'ctl', ...args], { timeoutMs })
     return parseReply(ran)
   } catch (e) {
     return { ok: false, err: e instanceof Error ? e.message : String(e) }
@@ -84,6 +85,50 @@ async function guard($: EngineInterface, path: string | undefined): Promise<stri
   return reason
 }
 
+/**
+ * A subagent as a pane: spawn a claude beside this one, send it the task,
+ * wait for the answer its mod reports, close the pane unless kept, and hand
+ * the answer back as the tool's result. Every step is one `atrium ctl` run.
+ */
+async function runSubagent(
+  $: EngineInterface,
+  input: Record<string, unknown>,
+  toolUseId: string | undefined,
+): Promise<{ result: string } | { deny: string }> {
+  const description = typeof input.description === 'string' ? input.description : ''
+  const prompt = typeof input.prompt === 'string' ? input.prompt : ''
+  if (description.trim() === '' || prompt.trim() === '') return { deny: 'atrium_subagent: description and prompt are required' }
+  const who = state.who
+  if (who === undefined) return { deny: 'atrium_subagent: this pane is not registered with atrium yet' }
+  const role = slug(description)
+  const task = subagentPrompt(who.pane, description, prompt)
+  const headless = input.headless === true
+  const spawned = await ctl($, ['spawn', '--here', '--role', role, '--', 'claude', ...(headless ? ['-p', task] : [])])
+  const pane = spawnedPane(spawned)
+  if (pane === undefined) return { deny: `atrium_subagent: cannot spawn a pane: ${spawned.err ?? 'no reply'}` }
+  if (toolUseId !== undefined) $.ui.notice(toolUseId, `running as atrium pane ${pane} (${role})`)
+  if (!headless) {
+    const sent = await ctl($, ['send', String(pane), task])
+    if (!sent.ok) return { deny: `atrium_subagent: pane ${pane} opened but the task was not delivered: ${sent.err ?? 'no reply'}` }
+  }
+  let answer: { answer: string; seq: number } | undefined
+  for (let i = 0; i < WAIT_SLICES && answer === undefined; i += 1) {
+    const reply = await ctl($, ['wait', String(pane), '--for', 'answer', '--timeout', String(WAIT_SLICE_S)], (WAIT_SLICE_S + 30) * 1000)
+    answer = reportedAnswer(reply)
+    if (answer === undefined && reply.ok !== true && !String(reply.err ?? '').startsWith('timeout')) {
+      return { deny: `atrium_subagent: pane ${pane} (${role}) gave no answer: ${reply.err ?? 'no reply'}` }
+    }
+  }
+  if (answer === undefined) {
+    return { deny: `atrium_subagent: pane ${pane} (${role}) is still working after ${(WAIT_SLICES * WAIT_SLICE_S) / 60} minutes; read it with atrium_status or atrium_answer later, or kill it` }
+  }
+  // A headless child leaves by itself; a kill of a gone pane is a harmless refusal.
+  const keep = !headless && (input.keep === true || who.subagentsKeep)
+  if (!keep) await ctl($, ['kill', String(pane)])
+  if (toolUseId !== undefined) $.ui.notice(toolUseId, `atrium pane ${pane} (${role}) answered${keep ? '' : ' and was closed'}`)
+  return { result: answer.answer }
+}
+
 export const register: Register = on => {
 
   const say = (v: Verdict | undefined): void => {
@@ -126,6 +171,20 @@ export const register: Register = on => {
     }
     say(transition(state.status, { kind: 'start', interactive: e.isInteractive }))
     return started
+  })
+
+  // The model's own subagents: under `panes` (the default) the Agent tool is
+  // refused with a pointer to atrium_subagent and its agent types are hidden,
+  // so a subagent is always a pane the human can see; `deny` refuses outright;
+  // `native` leaves the engine alone.
+  on('agent.spawn', ($, e, next) => {
+    const mode = state.who?.subagents ?? 'native'
+    const pointer = spawnPointer(mode)
+    return pointer === undefined ? next(e) : { deny: pointer }
+  })
+  on('agent.offer', ($, e, next) => {
+    const mode = state.who?.subagents ?? 'native'
+    return mode === 'native' ? next(e) : { isOffered: false }
   })
 
   // The system prompt: who this pane is, from the broker, as one session
@@ -176,7 +235,8 @@ export const register: Register = on => {
     // The typed control plane: each atrium_* call is one `atrium ctl` run
     // with the pane's own token, and the reply is what the model reads.
     const name = String(e.tool).slice(TOOL_PREFIX.length)
-    const { tool: _tool, tool_use_id: _id, consent: _consent, ...input } = e as Record<string, unknown>
+    const { tool: _tool, tool_use_id: toolUseId, consent: _consent, ...input } = e as Record<string, unknown>
+    if (name === 'subagent') return runSubagent($, input, typeof toolUseId === 'string' ? toolUseId : undefined)
     const argv = argvFor(name, input)
     if (argv instanceof Error) return { deny: `atrium_${name}: ${argv.message}` }
     const reply = await ctl($, argv)

@@ -126,6 +126,10 @@ pub struct ModInfo {
     pub caps: Vec<String>,
     /// When the hello arrived (wall-clock ms).
     pub since_ms: u64,
+    /// The pane that spawned this one, as the broker knew it at the hello.
+    /// Kept so a parent can still read the answer of a pane that has exited
+    /// (a `claude -p` subagent answers and leaves in the same instant).
+    pub parent: Option<usize>,
 }
 
 /// One `report`'s payload, as the request carries it. Every field is optional;
@@ -172,6 +176,7 @@ impl ModState {
     pub fn hello(
         &mut self,
         pane: usize,
+        parent: Option<usize>,
         version: &str,
         engine: Option<&str>,
         caps: &[String],
@@ -187,9 +192,15 @@ impl ModState {
             engine: engine.map(|e| clip(&text_safe(e), VERSION_CAP)),
             caps: accepted.clone(),
             since_ms: now_ms,
+            parent,
         };
         self.panes.entry(pane).or_default().0 = Some(info);
         accepted
+    }
+
+    /// The parent a pane's mod was spawned under, as recorded at its hello.
+    pub fn parent_of(&self, pane: usize) -> Option<usize> {
+        self.info(pane).and_then(|i| i.parent)
     }
 
     /// Record a `report`. Fields given replace what was held; fields absent
@@ -293,6 +304,57 @@ impl ModState {
     }
 }
 
+/// How a session runs the model's subagents, for the mod's `agent.spawn`
+/// hook: `panes` (the default: a visible pane beside the caller, its answer
+/// collected), `native` (the engine's own, invisible), or `deny` (refused
+/// with a pointer to `atrium_spawn`). A fleet sets it with `subagents`;
+/// `subagents_keep` leaves the pane open after its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subagents {
+    Panes,
+    Native,
+    Deny,
+}
+
+impl Subagents {
+    /// The fleet key's values.
+    pub fn parse(s: &str) -> Option<Subagents> {
+        match s.trim() {
+            "panes" => Some(Subagents::Panes),
+            "native" => Some(Subagents::Native),
+            "deny" => Some(Subagents::Deny),
+            _ => None,
+        }
+    }
+
+    /// The word `whoami` carries.
+    pub fn label(self) -> &'static str {
+        match self {
+            Subagents::Panes => "panes",
+            Subagents::Native => "native",
+            Subagents::Deny => "deny",
+        }
+    }
+}
+
+static SESSION_SUBAGENTS: std::sync::OnceLock<(Subagents, bool)> = std::sync::OnceLock::new();
+
+/// Record the session's subagent policy (a fleet's `subagents` and
+/// `subagents_keep`). First call wins, like the fleet's deny rules.
+pub fn set_session_subagents(mode: Subagents, keep: bool) {
+    let _ = SESSION_SUBAGENTS.set((mode, keep));
+}
+
+/// The session's subagent policy as `whoami` reports it: `(mode, keep)`,
+/// `panes` and `false` unless a fleet said otherwise.
+pub fn session_subagents() -> (String, bool) {
+    let (mode, keep) = SESSION_SUBAGENTS
+        .get()
+        .copied()
+        .unwrap_or((Subagents::Panes, false));
+    (mode.label().to_string(), keep)
+}
+
 /// `s` with every control character and line separator replaced by a space.
 /// A report's text is shown in panels and typed nowhere, but an embedded
 /// escape or newline would still corrupt a frame or a log line. The list is
@@ -333,6 +395,17 @@ mod tests {
     }
 
     #[test]
+    fn subagent_policies_round_trip_and_default_to_panes() {
+        for m in [Subagents::Panes, Subagents::Native, Subagents::Deny] {
+            assert_eq!(Subagents::parse(m.label()), Some(m));
+        }
+        assert_eq!(Subagents::parse("tasks"), None);
+        let (mode, keep) = session_subagents();
+        assert!(["panes", "native", "deny"].contains(&mode.as_str()));
+        let _ = keep;
+    }
+
+    #[test]
     fn every_status_label_round_trips() {
         for s in ModStatus::ALL {
             assert_eq!(ModStatus::parse(s.label()), Some(s), "{s:?}");
@@ -346,6 +419,7 @@ mod tests {
         let mut m = ModState::default();
         let got = m.hello(
             3,
+            Some(0),
             "0.1.0",
             Some("2.1.288"),
             &caps(&["inbox", "bogus", "status", "status"]),
@@ -363,12 +437,14 @@ mod tests {
         assert_eq!(info.version, "0.1.0");
         assert_eq!(info.engine.as_deref(), Some("2.1.288"));
         assert_eq!(info.since_ms, 1_000);
+        assert_eq!(m.parent_of(3), Some(0));
+        assert_eq!(m.parent_of(4), None);
     }
 
     #[test]
     fn a_second_hello_replaces_the_info_and_keeps_the_reports() {
         let mut m = ModState::default();
-        m.hello(1, "0.1.0", None, &caps(&["status"]), 10);
+        m.hello(1, None, "0.1.0", None, &caps(&["status"]), 10);
         m.report(
             1,
             &Report {
@@ -377,9 +453,14 @@ mod tests {
             },
             20,
         );
-        m.hello(1, "0.2.0", None, &caps(&["status", "inbox"]), 30);
+        m.hello(1, Some(7), "0.2.0", None, &caps(&["status", "inbox"]), 30);
         assert_eq!(m.info(1).map(|i| i.version.as_str()), Some("0.2.0"));
         assert!(m.has_cap(1, "inbox"));
+        assert_eq!(
+            m.parent_of(1),
+            Some(7),
+            "a respawned pane's hello names its parent anew"
+        );
         assert_eq!(m.report_for(1).and_then(|r| r.context_pct), Some(40));
     }
 
@@ -528,7 +609,7 @@ mod tests {
     #[test]
     fn forget_drops_the_pane_entirely() {
         let mut m = ModState::default();
-        m.hello(5, "0.1.0", None, &caps(&["status"]), 1);
+        m.hello(5, None, "0.1.0", None, &caps(&["status"]), 1);
         m.report(
             5,
             &Report {

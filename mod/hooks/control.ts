@@ -19,6 +19,24 @@ const fields = (description: string) => ({
 /** The tools, in the order they are registered. Names are `atrium_<verb>`. */
 export const TOOLS: readonly Spec[] = [
   {
+    name: 'subagent',
+    description:
+      'Run a subagent as a visible atrium pane beside this one: spawns a claude, gives it the task, waits for its answer and returns it. Use this where you would use the Agent tool; the human can watch, steer and kill the pane. Set keep to leave the pane open afterwards.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        description: str('A short (3-5 word) description of the task; becomes the pane\'s role.'),
+        prompt: str('The task for the subagent, in full.'),
+        keep: { type: 'boolean', description: 'Leave the pane open after its answer (default: close it).' },
+        headless: {
+          type: 'boolean',
+          description: 'Run the child as `claude -p` with the task on its command line: it answers once and exits by itself (default: an interactive claude that is sent the task).',
+        },
+      },
+      required: ['description', 'prompt'],
+    },
+  },
+  {
     name: 'spawn',
     description:
       'Open a visible teammate pane in atrium running claude (or another allowed command), tagged with a role. Returns {pane, role, session}. Prefer this over the Agent tool here: every teammate is a pane the human can watch, send to and kill.',
@@ -215,6 +233,8 @@ export function argvFor(name: string, input: Input): string[] | Error {
       }
       case 'bus_topics':
         return ['bus', 'topics']
+      case 'subagent':
+        return new Error('subagent is run by the mod, not mapped to one ctl verb')
       default:
         return new Error(`no such tool: ${name}`)
     }

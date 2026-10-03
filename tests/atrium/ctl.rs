@@ -156,6 +156,48 @@ fn ctl_hello_and_report_drive_the_panes_status() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// A pane's reported answer is read back with `ctl answer`, and `ctl wait`
+/// polls for it: a wait that starts after the answer returns at once, one for
+/// a newer seq times out with a clear error. (The caller is its own subtree.)
+#[test]
+fn ctl_answer_and_wait_collect_a_panes_reported_answer() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl answer 0\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"answer\":null", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"seq\":null,\"answer\":null"),
+        "nothing reported yet: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl report answer=all done here\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"seq\":1}", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl wait 0 --for answer --timeout 10\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(
+        &mut p,
+        b"\"answer\":\"all done here\"",
+        Duration::from_secs(20),
+    );
+    assert!(
+        contains(&out, b"\"seq\":1,\"answer\":\"all done here\""),
+        "wait did not return the answer: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl wait 0 --for answer --after 1 --timeout 1\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"err\":\"timeout", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"err\":\"timeout after 1s"),
+        "a newer answer never came: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the

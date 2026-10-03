@@ -63,6 +63,10 @@ teammates:
   kill <target>                   stop a teammate and drop its pane
   respawn <target> [--worktree W] restart a teammate's agent as a fresh session, in place
   audit [<N>]                     the last N control-plane requests and their outcomes
+  answer <target>                 a pane's last answer and status, as its mod reported them
+  wait <target> [--for answer|idle|exit] [--timeout S] [--after SEQ]
+                                  poll until the pane answers (seq past SEQ), is idle, or is gone
+  hello | report | whoami         what a pane's mod speaks (see mod/README.md)
 
 board — durable team state (the source of truth):
   board set <key> <field=value...>   record current truth (status, owner, blocker, url)

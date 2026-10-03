@@ -47,7 +47,7 @@ mod tests;
 #[cfg(test)]
 mod testutil;
 
-pub use client::{build_request, ctl_cmd, UsageError};
+pub use client::{build_request, ctl_cmd, parse_wait, wait_done, UsageError, WaitFor, WaitSpec};
 pub use launch::{parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG};
 pub use policy::{
     delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, parse_allow_list,
@@ -56,13 +56,13 @@ pub use policy::{
 };
 pub use render::{hyperlink, is_url, status_glyph, status_sgr};
 pub use reply::{
-    humanize_idle, reply_audit, reply_board_claim, reply_board_del, reply_board_entry,
-    reply_board_list, reply_board_release, reply_bus_feed, reply_bus_published, reply_bus_resolved,
-    reply_bus_subscribed, reply_bus_topics, reply_err, reply_hello, reply_killed, reply_list,
-    reply_reported, reply_sent, reply_spawned, reply_status_one, reply_whoami, zero_sub_warning,
-    ListNode, Reply, TreeNode, IDLE_RENDER_MIN_MS,
+    humanize_idle, reply_answer, reply_audit, reply_board_claim, reply_board_del,
+    reply_board_entry, reply_board_list, reply_board_release, reply_bus_feed, reply_bus_published,
+    reply_bus_resolved, reply_bus_subscribed, reply_bus_topics, reply_err, reply_hello,
+    reply_killed, reply_list, reply_reported, reply_sent, reply_spawned, reply_status_one,
+    reply_whoami, zero_sub_warning, ListNode, Reply, TreeNode, IDLE_RENDER_MIN_MS,
 };
 pub use request::{
-    parse_request, AgentId, AuditReq, BoardOp, BusOp, Cmd, HelloReq, KillReq, ReportReq, Request,
-    RespawnReq, SendReq, SpawnReq, StatusReq, MAX_TTL_MS,
+    parse_request, AgentId, AnswerReq, AuditReq, BoardOp, BusOp, Cmd, HelloReq, KillReq, ReportReq,
+    Request, RespawnReq, SendReq, SpawnReq, StatusReq, MAX_TTL_MS,
 };

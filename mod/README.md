@@ -27,6 +27,14 @@ is:
   `NotebookEdit` anywhere else is refused with the owner named, by real path,
   and a toast says so. Off when nothing is owned or the pane is in plan mode.
 
+- **Subagents as panes**: `atrium_subagent {description, prompt}` spawns a
+  claude pane beside this one, sends it the task, waits for the answer its own
+  mod reports (`atrium ctl wait --for answer`), closes the pane unless `keep`,
+  and returns the answer. Under the session's `subagents: panes` policy (the
+  default; a fleet may say `native` or `deny`) the model's Agent tool is
+  refused with a pointer to it and its agent types are hidden, so every
+  subagent is a tile the human can watch, send to and kill.
+
 Each piece is a capability the mod offers in `hello` (`status`, `answer`,
 `context`, `tools`, `guard`); the broker's `accepted` list switches it on.
 

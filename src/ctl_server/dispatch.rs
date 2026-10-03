@@ -126,7 +126,14 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
     }
 
     let (action, detail) = req.cmd.audit_label();
+    let is_answer = matches!(req.cmd, Cmd::Answer(_));
     let reply = dispatch_ctl(req, caller, privileged, cx);
+    // `wait` polls `answer` twice a second until one exists: a poll that found
+    // nothing is not an action and would flood the ring. The read that found
+    // an answer is recorded, as any read of the model's output should be.
+    if is_answer && matches!(reply, ctl::Reply::Answer { seq: None, .. }) {
+        return reply;
+    }
     let (ok, note) = audit_outcome(&reply);
     cx.audit.record(caller, action, &detail, ok, &note);
     reply
@@ -159,7 +166,63 @@ pub(crate) fn dispatch_ctl(
         Cmd::Hello(h) => hello(h, caller, cx),
         Cmd::Report(r) => report(r, caller, cx),
         Cmd::Whoami => whoami(caller, cx),
+        Cmd::Answer(a) => answer(a, caller, privileged, cx),
     }
+}
+
+/// `ctl answer`: a pane's last reported answer and status, for the ancestor
+/// that spawned it. Subtree-scoped like `send`: the model's output of a pane
+/// goes up the tree it was spawned into and nowhere else.
+fn answer(
+    a: ctl::AnswerReq,
+    caller: Option<AgentId>,
+    privileged: bool,
+    cx: &CtlSession<'_>,
+) -> ctl::Reply {
+    let windows = &*cx.windows;
+    let candidates = ctl_candidates(windows);
+    let id = match ctl::resolve_target(&a.target, &candidates) {
+        Ok(id) => id,
+        Err(e) => {
+            // A pane that answered and left (a `claude -p` subagent) is gone
+            // from the tree but its report is kept: its parent, as recorded at
+            // the pane's own hello, may still read the answer. Nobody else.
+            let gone = a
+                .target
+                .parse::<usize>()
+                .ok()
+                .filter(|n| cx.mods.info(*n).is_some());
+            let Some(n) = gone else {
+                return ctl::reply_err(&e);
+            };
+            let may = privileged
+                || (caller.map(|c| c.0).is_some() && cx.mods.parent_of(n) == caller.map(|c| c.0));
+            if !may {
+                return ctl::reply_err(&format!(
+                    "pane {n} has exited; only the pane that spawned it may read its answer"
+                ));
+            }
+            let report = cx.mods.report_for(n);
+            return ctl::reply_answer(
+                AgentId(n),
+                report.and_then(|r| r.status.map(|(s, _)| s.label())),
+                report.and_then(|r| r.answer.as_ref().map(|(t, s)| (t.as_str(), *s))),
+            );
+        }
+    };
+    if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+        return deny;
+    }
+    let status = cx
+        .mods
+        .status_for(id.0, atrium::session_store::now_ms())
+        .map(|s| s.label());
+    let report = cx.mods.report_for(id.0);
+    ctl::reply_answer(
+        id,
+        status,
+        report.and_then(|r| r.answer.as_ref().map(|(t, s)| (t.as_str(), *s))),
+    )
 }
 
 /// `ctl hello`: the caller's mod announces itself. The pane is the token's,
@@ -168,8 +231,12 @@ fn hello(h: ctl::HelloReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> 
     let Some(me) = caller else {
         return ctl::reply_err("hello needs an authenticated pane (ATRIUM_TOKEN)");
     };
+    let parent = pane_by_agent(cx.windows, me)
+        .and_then(|p| p.parent)
+        .map(|p| p.0);
     let accepted = cx.mods.hello(
         me.0,
+        parent,
         &h.version,
         h.engine.as_deref(),
         &h.caps,
@@ -235,6 +302,10 @@ fn whoami(caller: Option<AgentId>, cx: &CtlSession<'_>) -> ctl::Reply {
         None => Value::Null,
     };
     fields.push(("mod".to_string(), modv));
+    // How this session runs subagents, for the mod's agent.spawn hook.
+    let (subagents, keep) = atrium::modstate::session_subagents();
+    fields.push(("subagents".to_string(), s(subagents.as_str())));
+    fields.push(("subagents_keep".to_string(), Value::Bool(keep)));
     // The item briefed to this role, if the lead recorded one on the board.
     let item = p.role.as_deref().and_then(|role| {
         cx.board.list().into_iter().find(|(_, e)| {

@@ -36,6 +36,7 @@ pub const FILES: &[(&str, &str)] = &[
     ("hooks/control.ts", include_str!("../mod/hooks/control.ts")),
     ("hooks/role.ts", include_str!("../mod/hooks/role.ts")),
     ("hooks/guard.ts", include_str!("../mod/hooks/guard.ts")),
+    ("hooks/agents.ts", include_str!("../mod/hooks/agents.ts")),
     ("README.md", include_str!("../mod/README.md")),
 ];
 

@@ -45,6 +45,19 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     let args = &filtered[..];
     let color = !no_color && should_color();
 
+    // `wait` is a client-side loop over `answer`/`status`: the server stays
+    // one request, one reply, and a waiter that dies takes nothing with it.
+    if args.first().map(String::as_str) == Some("wait") {
+        return match parse_wait(args) {
+            Ok(spec) => wait_cmd(&address, caller, &spec),
+            Err(msg) => {
+                eprintln!("atrium ctl: {msg}");
+                eprint!("{}", crate::help::CTL);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let request = match build_request(args, caller) {
         Ok(r) => r,
         Err(msg) => {
@@ -89,6 +102,170 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             eprintln!("atrium ctl: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What `wait` waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFor {
+    /// A reported answer with a seq past `after`.
+    Answer,
+    /// The pane at its prompt, idle, ended or errored: nothing running.
+    Idle,
+    /// The pane gone (its `status` refused: no such pane).
+    Exit,
+}
+
+/// A parsed `wait <target> [--for answer|idle|exit] [--timeout <secs>] [--after <seq>]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitSpec {
+    pub target: String,
+    pub what: WaitFor,
+    pub timeout_s: u64,
+    /// For `answer`: the seq already read; the wait ends on a newer one.
+    pub after: u64,
+}
+
+/// The default `--timeout`, in seconds.
+pub const WAIT_DEFAULT_TIMEOUT_S: u64 = 300;
+/// The longest `--timeout` accepted, in seconds: one hour.
+pub const WAIT_MAX_TIMEOUT_S: u64 = 3600;
+/// How often `wait` asks again.
+const WAIT_POLL_MS: u64 = 500;
+
+/// Parse a `wait` argv. Pure and unit-tested.
+pub fn parse_wait(args: &[String]) -> Result<WaitSpec, String> {
+    let target = value_at(args, 1, "wait needs a target (pane id or role)")?.clone();
+    let mut spec = WaitSpec {
+        target,
+        what: WaitFor::Answer,
+        timeout_s: WAIT_DEFAULT_TIMEOUT_S,
+        after: 0,
+    };
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--for" => {
+                let w = value_at(args, i + 1, "--for needs answer, idle or exit")?;
+                spec.what = match w.as_str() {
+                    "answer" => WaitFor::Answer,
+                    "idle" => WaitFor::Idle,
+                    "exit" => WaitFor::Exit,
+                    other => {
+                        return Err(format!(
+                            "--for: unknown {other:?} (use answer, idle or exit)"
+                        ))
+                    }
+                };
+                i += 2;
+            }
+            "--timeout" => {
+                let t = value_at(args, i + 1, "--timeout needs a number of seconds")?;
+                spec.timeout_s = parse_whole(t)
+                    .map_err(|()| "--timeout must be a whole number of seconds".to_string())?
+                    .filter(|n| *n >= 1 && *n <= WAIT_MAX_TIMEOUT_S)
+                    .ok_or_else(|| {
+                        format!("--timeout {t} must be 1..{WAIT_MAX_TIMEOUT_S} seconds")
+                    })?;
+                i += 2;
+            }
+            "--after" => {
+                let a = value_at(args, i + 1, "--after needs a seq")?;
+                spec.after = parse_whole(a)
+                    .map_err(|()| "--after must be a whole number".to_string())?
+                    .ok_or_else(|| format!("--after {a} is too large"))?;
+                i += 2;
+            }
+            other => return Err(format!("wait: unexpected argument {other:?}")),
+        }
+    }
+    Ok(spec)
+}
+
+/// Does `reply` (one `answer` or `status` reply, as JSON text) end the wait?
+/// Pure: the loop is tested through this.
+pub fn wait_done(spec: &WaitSpec, reply: &str) -> bool {
+    let Ok(v) = json::parse(reply) else {
+        return false;
+    };
+    let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    match spec.what {
+        WaitFor::Answer => {
+            ok && v
+                .get("seq")
+                .and_then(Value::as_i64)
+                .is_some_and(|s| s >= 0 && (s as u64) > spec.after)
+        }
+        WaitFor::Idle => {
+            ok && matches!(
+                v.get("status").and_then(Value::as_str),
+                Some("waiting-prompt") | Some("idle") | Some("ended") | Some("errored")
+            )
+        }
+        // A refused status for a pane that was there is the exit: the reply
+        // names no such pane.
+        WaitFor::Exit => !ok,
+    }
+}
+
+/// The `wait` loop: ask every [`WAIT_POLL_MS`] until [`wait_done`] or the
+/// timeout, printing the last reply (or a timeout error) as the result.
+fn wait_cmd(address: &str, caller: Option<usize>, spec: &WaitSpec) -> ExitCode {
+    let verb = match spec.what {
+        WaitFor::Answer => "answer",
+        WaitFor::Idle | WaitFor::Exit => "status",
+    };
+    let request = match build_request(&[verb.to_string(), spec.target.clone()], caller) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("atrium ctl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(spec.timeout_s);
+    loop {
+        match crate::ipc::request(address, &request) {
+            Ok(reply) => {
+                if wait_done(spec, &reply) {
+                    println!("{reply}");
+                    return ExitCode::SUCCESS;
+                }
+            }
+            Err(e) => {
+                // The channel itself is gone: for `exit` that is the answer.
+                if spec.what == WaitFor::Exit {
+                    println!(
+                        "{}",
+                        super::reply_err(&format!("atrium is gone: {e}")).to_json()
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                eprintln!("atrium ctl: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "{}",
+                super::reply_err(&format!(
+                    "timeout after {}s waiting for {} of {}",
+                    spec.timeout_s,
+                    verb_label(spec.what),
+                    spec.target
+                ))
+                .to_json()
+            );
+            return ExitCode::FAILURE;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(WAIT_POLL_MS));
+    }
+}
+
+fn verb_label(w: WaitFor) -> &'static str {
+    match w {
+        WaitFor::Answer => "an answer",
+        WaitFor::Idle => "idle",
+        WaitFor::Exit => "exit",
     }
 }
 
@@ -217,11 +394,16 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         Some("whoami") => {
             pairs.push(("cmd", s("whoami")));
         }
+        Some("answer") => {
+            pairs.push(("cmd", s("answer")));
+            let target = value_at(args, 1, "answer needs a target (pane id or role)")?;
+            pairs.push(("target", Value::String(target.clone())));
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
                 "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | \
-                 respawn | hello | report | whoami"
+                 respawn | hello | report | whoami | answer | wait"
                     .to_string(),
             )
         }

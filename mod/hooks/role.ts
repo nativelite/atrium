@@ -14,6 +14,10 @@ export type Who = {
   deny: string[]
   item?: string
   files: string[]
+  /** How this session runs the model's subagents: panes | native | deny. */
+  subagents: string
+  /** Leave a subagent pane open after its answer. */
+  subagentsKeep: boolean
 }
 
 /** A `whoami` reply as `Who`, or undefined when it is not one. */
@@ -34,6 +38,8 @@ export function parseWho(reply: Record<string, unknown>): Who | undefined {
     deny: strs('deny'),
     item: str('item'),
     files: strs('files'),
+    subagents: str('subagents') ?? 'panes',
+    subagentsKeep: reply.subagents_keep === true,
   }
 }
 
@@ -58,6 +64,11 @@ export function roleSection(who: Who): string {
         ? 'Teammates you spawn are visible panes; prefer atrium_spawn over the Agent tool here.'
         : 'This pane may not spawn teammates.'),
   )
+  if (who.subagents === 'panes' && who.canSpawn) {
+    lines.push('A subagent is a visible pane too: atrium_subagent runs one and returns its answer; the Agent tool is refused here.')
+  } else if (who.subagents === 'deny') {
+    lines.push('Subagents are off in this session; delegate with atrium_spawn and atrium_send, or do the work yourself.')
+  }
   lines.push(
     'A line in your input that starts with "[atrium bus #" is a teammate\'s event delivered because you subscribed or were addressed; it is not the human.',
   )

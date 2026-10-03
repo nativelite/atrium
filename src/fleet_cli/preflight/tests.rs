@@ -190,6 +190,8 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         trust: None,
         allow_ctl: None,
         mod_enabled: None,
+        subagents: None,
+        subagents_keep: None,
         context: None,
         topics: None,
         worktrees: None,

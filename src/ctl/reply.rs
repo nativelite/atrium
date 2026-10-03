@@ -107,6 +107,14 @@ pub enum Reply {
     },
     /// `{"ok":true,<field>:...}` — `whoami`'s facts, flat.
     Whoami(Vec<(String, Value)>),
+    /// `{"ok":true,"pane":N,"status":S|null,"seq":n|null,"answer":text|null}` —
+    /// a pane's last reported answer.
+    Answer {
+        pane: AgentId,
+        status: Option<String>,
+        seq: Option<u64>,
+        answer: Option<String>,
+    },
 }
 
 /// An owned org-chart node inside [`Reply::Tree`]; built from a [`TreeNode`].
@@ -266,6 +274,18 @@ impl Reply {
                 pairs.extend(fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
                 obj(pairs)
             }
+            Reply::Answer {
+                pane,
+                status,
+                seq,
+                answer,
+            } => obj(vec![
+                ok,
+                ("pane", i(pane.0)),
+                ("status", opt_s(status)),
+                ("seq", seq.map(u).unwrap_or(Value::Null)),
+                ("answer", opt_s(answer)),
+            ]),
             Reply::Tree(nodes) => obj(vec![
                 ok,
                 (
@@ -321,6 +341,17 @@ pub fn reply_reported(pane: AgentId, seq: Option<u64>) -> Reply {
 /// `{"ok":true,...}` — `whoami`'s facts as flat fields beside `ok`.
 pub fn reply_whoami(fields: Vec<(String, Value)>) -> Reply {
     Reply::Whoami(fields)
+}
+
+/// `{"ok":true,"pane":N,"status":...,"seq":...,"answer":...}` — a pane's last
+/// reported answer, with its status, for `answer` and `wait`.
+pub fn reply_answer(pane: AgentId, status: Option<&str>, answer: Option<(&str, u64)>) -> Reply {
+    Reply::Answer {
+        pane,
+        status: status.map(str::to_string),
+        seq: answer.map(|(_, s)| s),
+        answer: answer.map(|(t, _)| t.to_string()),
+    }
 }
 
 /// `{"ok":true,"key":<key>,"entry":<entry|null>}` — a board `get`/`set` result.

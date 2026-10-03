@@ -78,6 +78,16 @@ pub enum Cmd {
     /// What is the caller: its pane, role, parent, mode, deny rules, mod and
     /// the board item briefed to its role.
     Whoami,
+    /// A pane's last reported answer and status, for an ancestor that spawned
+    /// it as a subagent. Subtree-scoped like `send`.
+    Answer(AnswerReq),
+}
+
+/// An `answer` request's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerReq {
+    /// Pane id (numeric) or role label.
+    pub target: String,
 }
 
 impl Cmd {
@@ -97,6 +107,9 @@ impl Cmd {
             // A mod's reports write broker state, and `whoami` answers about
             // the caller, which an unauthenticated request does not have.
             Cmd::Hello(_) | Cmd::Report(_) | Cmd::Whoami => false,
+            // An answer is the model's output: only a token-matched ancestor
+            // may read it.
+            Cmd::Answer(_) => false,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }
@@ -206,6 +219,7 @@ impl Cmd {
                 ),
             ),
             Cmd::Whoami => ("whoami", String::new()),
+            Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
         }
     }
 }
@@ -546,6 +560,14 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             Cmd::Report(r)
         }
         Some("whoami") => Cmd::Whoami,
+        Some("answer") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "answer needs a target".to_string())?
+                .to_string();
+            Cmd::Answer(AnswerReq { target })
+        }
         Some("board") => {
             let key = || -> Result<String, String> {
                 v.get("key")

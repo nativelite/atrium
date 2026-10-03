@@ -391,6 +391,14 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     atrium::trust::set_fleet_deny(fleet.deny.clone());
     // And whether its claude panes load the mod.
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
+    // And how its claude panes run the model's subagents.
+    if let Some(mode) = fleet
+        .subagents
+        .as_deref()
+        .and_then(atrium::modstate::Subagents::parse)
+    {
+        atrium::modstate::set_session_subagents(mode, fleet.subagents_keep.unwrap_or(false));
+    }
     // Record the fleet's memory ceiling for the session guard.
     if let Some(mb) = fleet.memory_mb {
         atrium::memguard::set_fleet_mb(mb);
