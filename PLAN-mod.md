@@ -8,6 +8,7 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N1 broker verbs + modstate | `41bec29` | `cargo test --lib -- ctl modstate`; e2e `ctl_hello_and_report_drive_the_panes_status`; clippy and the 1.70 build clean |
 | N2 mod skeleton + status | `9389ebd` | `claude plugin validate mod` clean; `claude plugin test mod` 9 pass; strict `tsc` against the engine's declarations clean; live: a real `claude -p --plugin-dir mod` inside an `--allow-ctl` pane produced `hello`, `report status=working`, `waiting-approval`, `waiting-prompt`, `context=3 answer_len=4`, `ended` in the audit log, and `ctl status` then read `ended` |
 | N3 fleet + config keys, `atrium mod install`, env injection | `f645cf7` | `cargo test --lib -- config fleet modfiles` and `--bin atrium -- preflight`; e2e `mod_install_writes_the_plugin_and_status_reports_it` and `a_claude_pane_is_told_where_the_mod_is_and_which_atrium_to_call` (a shell shim as a claude alias records the env it got); `claude plugin validate` on an installed copy; clippy and 1.70 clean |
+| N4 status precedence + chrome | `20c8b89` | precedence landed in N1; `cargo test --lib -- tile overview modstate vendors` and `--bin atrium -- overview tile`; clippy and 1.70 clean |
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
 N7, where it is first needed; `inbox --wait` stays in N5. The mod offers only
