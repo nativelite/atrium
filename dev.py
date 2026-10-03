@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
@@ -55,6 +56,8 @@ ABUS_MANIFEST = ROOT.parent / "abus" / "Cargo.toml"
 #: this repo's README promised a hand-copy path, so anyone following the docs
 #: ran fleets with a skill half the size of the real one.
 SKILLS = ROOT / "skills"
+#: The plugin of function hooks a pane's claude loads (PLAN-mod.md).
+MOD_DIR = ROOT / "mod"
 MARKETPLACE_SKILLS = ROOT.parent / "marketplace" / "atrium" / "skills"
 
 #: Wall-clock budget for one `cargo test` invocation. Generous on purpose: this
@@ -325,13 +328,29 @@ def drift() -> int:
     return run(PY, "docs/build.py", "--check") or _skills_drift()
 
 
+def mods() -> int:
+    """`claude plugin validate` and `claude plugin test` over `mod/`, the plugin
+    of function hooks a pane's claude loads (PLAN-mod.md). Gated only where a
+    `claude` is on PATH: the mod is TypeScript the engine itself checks and
+    runs, and there is nothing else to check it with."""
+    claude = shutil.which("claude")
+    if claude is None:
+        print("mod: no `claude` on PATH, skipping validate/test of mod/")
+        return 0
+    return run(claude, "plugin", "validate", str(MOD_DIR), timeout=120) or run(
+        claude, "plugin", "test", str(MOD_DIR), timeout=300
+    )
+
+
 def check() -> int:
     # guard (cheap) → drift (cheap) → fmt (cheap, fail fast on style drift) →
-    # lint (a compile, no run) → test (expensive).
-    return guard() or drift() or fmt() or lint() or test()
+    # mods (the engine checks the mod; seconds) → lint (a compile, no run) →
+    # test (expensive).
+    return guard() or drift() or fmt() or mods() or lint() or test()
 
 
 COMMANDS = {
+    "mods": mods,
     "test": test,
     "build": build,
     "fmt": fmt,
