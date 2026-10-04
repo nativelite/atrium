@@ -9,18 +9,18 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N2 mod skeleton + status | `9389ebd` | `claude plugin validate mod` clean; `claude plugin test mod` 9 pass; strict `tsc` against the engine's declarations clean; live: a real `claude -p --plugin-dir mod` inside an `--allow-ctl` pane produced `hello`, `report status=working`, `waiting-approval`, `waiting-prompt`, `context=3 answer_len=4`, `ended` in the audit log, and `ctl status` then read `ended` |
 | N3 fleet + config keys, `atrium mod install`, env injection | `f645cf7` | `cargo test --lib -- config fleet modfiles` and `--bin atrium -- preflight`; e2e `mod_install_writes_the_plugin_and_status_reports_it` and `a_claude_pane_is_told_where_the_mod_is_and_which_atrium_to_call` (a shell shim as a claude alias records the env it got); `claude plugin validate` on an installed copy; clippy and 1.70 clean |
 | N4 status precedence + chrome | `20c8b89` | precedence landed in N1; `cargo test --lib -- tile overview modstate vendors` and `--bin atrium -- overview tile`; clippy and 1.70 clean |
+| N5 inbox transport (native delivery) | `f0bf9b9` | queue unit test; e2e `ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them`; 21 `claude plugin test` cases; live: a `ctl send` to a real claude pane was collected by its mod via `inbox` and answered "delivered natively", with no typing |
 | N6 typed tools + role section + guard | `cae7a88` | 15 `claude plugin test` cases; `claude plugin validate` lists exactly the intended hooks and calls; live: a real claude called `atrium_list` with no dialog and answered its pane number from the role section |
 | N7 visible subagents | `a7d7b2e` | `ctl answer`/`wait` unit and e2e tests; 20 `claude plugin test` cases; live: a real claude's `atrium_subagent` opened a second real claude as a tile, which answered, was closed, and the parent replied "child said pong." |
 | N9 docs, skills, changelog | `b6f9b4f` | README, the four deep docs, both delegation skills, CHANGELOG; `python docs/build.py` and the drift check clean. The e2e half landed with each item. Not done: the marketplace plugin's copy of the skills and the mod (that repo) |
 
-Not started: **N5** (the inbox transport: deliveries through the engine's own
-prompt queue instead of pty keystrokes; the one change to the broker's I/O
-model, a long-lived client per pane) and **N8** (the `respawn_at` decision and
-the in-pane board view; the overview's context and cost columns landed with
-N4). Until N5, a subagent's task is typed into its pane as one line.
+Not started: **N8** (the `respawn_at` decision and the in-pane board view;
+the overview's context and cost columns landed with N4).
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
-N7 and is a client-side poll, so the server stays one request, one reply; the
+N7 and is a client-side poll, and `inbox` is a poll too (every 1.5 s from the
+mod) rather than a held connection, so the server stays one request, one
+reply; the
 `claude -p` child option is closed by the spawn policy (a teammate may choose
 no claude flag beyond model, effort and resume), so a subagent pane is always
 an interactive claude that is sent its task; the mod offers only the caps it
