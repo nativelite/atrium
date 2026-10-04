@@ -5,6 +5,7 @@ use super::panes::{
 };
 use super::reply::{audit_outcome, audit_reply, current_subs, reply_tree};
 use super::respawn::respawn;
+use super::sends::take_for;
 use super::sends::{queue_send, PendingSend, SendOrigin, MAX_PENDING_PER_TARGET};
 use super::spawn::spawn;
 use super::wake::bus_wakes;
@@ -126,12 +127,17 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
     }
 
     let (action, detail) = req.cmd.audit_label();
-    let is_answer = matches!(req.cmd, Cmd::Answer(_));
+    let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox);
     let reply = dispatch_ctl(req, caller, privileged, cx);
-    // `wait` polls `answer` twice a second until one exists: a poll that found
-    // nothing is not an action and would flood the ring. The read that found
-    // an answer is recorded, as any read of the model's output should be.
-    if is_answer && matches!(reply, ctl::Reply::Answer { seq: None, .. }) {
+    // `wait` polls `answer` twice a second until one exists, and a mod polls
+    // `inbox` every second or two: a poll that found nothing is not an action
+    // and would flood the ring. The read that found something is recorded.
+    let found_nothing = match &reply {
+        ctl::Reply::Answer { seq: None, .. } => true,
+        ctl::Reply::Inbox(items) => items.is_empty(),
+        _ => false,
+    };
+    if is_poll && found_nothing {
         return reply;
     }
     let (ok, note) = audit_outcome(&reply);
@@ -167,7 +173,33 @@ pub(crate) fn dispatch_ctl(
         Cmd::Report(r) => report(r, caller, cx),
         Cmd::Whoami => whoami(caller, cx),
         Cmd::Answer(a) => answer(a, caller, privileged, cx),
+        Cmd::Inbox => inbox(caller, cx),
     }
+}
+
+/// `ctl inbox`: hand the caller's mod its queued deliveries. Only a pane whose
+/// mod declared `inbox` is served (its queue is otherwise the pty path's, and
+/// a send must land exactly once); the items leave the queue as they go.
+fn inbox(caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
+    let Some(me) = caller else {
+        return ctl::reply_err("inbox needs an authenticated pane (ATRIUM_TOKEN)");
+    };
+    if !cx.mods.has_cap(me.0, "inbox") {
+        return ctl::reply_err(
+            "this pane's mod did not declare inbox in its hello; deliveries are typed into it",
+        );
+    }
+    let items = take_for(cx.pending, me)
+        .into_iter()
+        .map(|(origin, text)| {
+            let kind = match origin {
+                SendOrigin::Ctl => "send",
+                SendOrigin::BusWake => "wake",
+            };
+            (kind.to_string(), text)
+        })
+        .collect();
+    ctl::reply_inbox(items)
 }
 
 /// `ctl answer`: a pane's last reported answer and status, for the ancestor

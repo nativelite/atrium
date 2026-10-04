@@ -156,6 +156,7 @@ pub(crate) fn flush_sends(
     pending: &mut Vec<PendingSend>,
     windows: &mut [Window],
     world: &atrium::vendors::AgentState,
+    mods: &atrium::modstate::ModState,
 ) -> bool {
     if pending.is_empty() {
         return false;
@@ -163,6 +164,12 @@ pub(crate) fn flush_sends(
     let now = Instant::now();
     let mut wrote = false;
     pending.retain_mut(|ps| {
+        // A pane whose mod takes its own deliveries (`ctl inbox`) is never typed
+        // into: the item waits in the queue for the mod to collect it, and the
+        // engine's own prompt queue decides when it starts a turn.
+        if ps.written == 0 && mods.has_cap(ps.target.0, "inbox") {
+            return true;
+        }
         match ps.text_written_at {
             None => {
                 // Decide readiness from the target's live status, an open
@@ -224,6 +231,26 @@ pub(crate) fn flush_sends(
         }
     });
     wrote
+}
+
+/// Hand `target` every delivery queued for it that the pty path has not begun
+/// to type, oldest first, removing them from the queue: what `ctl inbox` gives
+/// a pane's mod. A send already partly written stays on the pty path, so no
+/// text ever lands twice.
+pub(crate) fn take_for(
+    pending: &mut Vec<PendingSend>,
+    target: AgentId,
+) -> Vec<(SendOrigin, String)> {
+    let mut taken = Vec::new();
+    pending.retain(|ps| {
+        if ps.target == target && ps.written == 0 {
+            taken.push((ps.origin, ps.text.clone()));
+            false
+        } else {
+            true
+        }
+    });
+    taken
 }
 
 #[cfg(test)]

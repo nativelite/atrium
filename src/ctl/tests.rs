@@ -779,3 +779,20 @@ fn wait_ends_on_a_newer_answer_an_idle_status_or_a_gone_pane() {
     ));
     assert!(wait_done(&exit, r#"{"ok":false,"err":"no such pane 3"}"#));
 }
+
+#[test]
+fn inbox_builds_parses_needs_a_token_and_refuses_a_target() {
+    let line = build_request(&v(&["inbox"]), Some(2)).unwrap();
+    assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Inbox));
+    assert!(!Cmd::Inbox.is_read_only());
+    let err = parse_request(r#"{"cmd":"inbox","target":"3"}"#).unwrap_err();
+    assert!(err.contains("caller only"), "{err}");
+    let reply = reply_inbox(vec![
+        ("send".to_string(), "do x".to_string()),
+        ("wake".to_string(), "[atrium bus #1 fyi] y".to_string()),
+    ]);
+    assert_eq!(
+        reply.to_json(),
+        r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"}]}"#
+    );
+}

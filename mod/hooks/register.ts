@@ -12,7 +12,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { WAIT_SLICES, WAIT_SLICE_S, reportedAnswer, slug, spawnPointer, spawnedPane, subagentPrompt } from './agents'
 import { TOOLS, TOOL_PREFIX, argvFor, isAtriumTool } from './control'
-import { acceptedCaps, parseReply } from './ctl'
+import { INBOX_POLL_MS, acceptedCaps, inboxItems, parseReply } from './ctl'
 import type { Reply } from './ctl'
 import { guardVerdict, isAbsolute, join, pathOf, splitParent } from './guard'
 import { ROLE_SECTION_ID, parseWho, roleSection } from './role'
@@ -60,8 +60,40 @@ type State = {
   accepted: ReadonlySet<string>
   reporter: Reporter | undefined
   who: Who | undefined
+  /** The inbox poll, while the session is interactive and the cap was accepted. */
+  inbox: { cancel: () => void } | undefined
+  inboxBusy: boolean
 }
-const state: State = { status: undefined, accepted: new Set(), reporter: undefined, who: undefined }
+const state: State = {
+  status: undefined,
+  accepted: new Set(),
+  reporter: undefined,
+  who: undefined,
+  inbox: undefined,
+  inboxBusy: false,
+}
+
+/**
+ * Native delivery: take the pane's queued sends and wakes from the broker and
+ * submit each through the engine's own prompt queue, which starts a turn only
+ * when the session is idle and never folds one into a running turn. atrium
+ * types nothing into a pane whose mod does this. One poll at a time.
+ */
+async function pollInbox($: EngineInterface): Promise<void> {
+  if (state.inboxBusy) return
+  state.inboxBusy = true
+  try {
+    const reply = await ctl($, ['inbox'])
+    for (const item of inboxItems(reply)) {
+      // Resolves when the turn starts, which may be a while: do not wait.
+      void $.prompt.submit({ text: item.text, asUser: true }).catch(err => {
+        $.ui.log(`atrium: delivery not submitted: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+      })
+    }
+  } finally {
+    state.inboxBusy = false
+  }
+}
 
 /** Re-read what the broker says this pane is (its item and files can change). */
 async function refreshWho($: EngineInterface): Promise<void> {
@@ -161,6 +193,12 @@ export const register: Register = on => {
       if (!reply.ok) $.ui.log(`atrium: report refused: ${reply.err ?? 'no reply'}`, { to: 'debug' })
     })
     await refreshWho($)
+    if (state.accepted.has('inbox') && e.isInteractive) {
+      state.inbox?.cancel()
+      state.inbox = $.clock.every(INBOX_POLL_MS, () => {
+        void pollInbox($)
+      })
+    }
     if (state.accepted.has('tools')) {
       for (const t of TOOLS) {
         await $.tool.register(t).catch(err => {
@@ -270,6 +308,8 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     say(transition(state.status, { kind: 'session.end', reason: e.reason }))
+    state.inbox?.cancel()
+    state.inbox = undefined
     // The process may be leaving: let the last report land first.
     await state.reporter?.idle()
     return next(e)

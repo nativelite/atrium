@@ -28,6 +28,25 @@ export function parseReply(ran: Ran): Reply {
   return { ok: false, err: `not a ctl reply: ${line.slice(0, 120)}` }
 }
 
+/** One delivery `ctl inbox` handed over: a `send`'s text, or a bus wake's framed line. */
+export type InboxItem = { kind: 'send' | 'wake'; text: string }
+
+/** The items of an `inbox` reply, in order; none for anything else. */
+export function inboxItems(reply: Reply): InboxItem[] {
+  const items = reply.items
+  if (reply.ok !== true || !Array.isArray(items)) return []
+  const out: InboxItem[] = []
+  for (const it of items) {
+    if (it === null || typeof it !== 'object') continue
+    const { kind, text } = it as Record<string, unknown>
+    if ((kind === 'send' || kind === 'wake') && typeof text === 'string' && text.trim() !== '') out.push({ kind, text })
+  }
+  return out
+}
+
+/** How often the mod asks for its deliveries, in milliseconds. */
+export const INBOX_POLL_MS = 1500
+
 /** The `accepted` list of a `hello` reply, as strings only. */
 export function acceptedCaps(reply: Reply): ReadonlySet<string> {
   const got = reply.accepted

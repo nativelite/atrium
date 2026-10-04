@@ -19,10 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minutes; `errored` draws the border red with a `!` badge and the overview
   shows `ctx 41% $0.12` per agent. `atrium mod status` says what is installed;
   `"mod": false` in `config.json` or a fleet keeps it out.
-- **New ctl verbs** `hello`, `report`, `whoami`, `answer` and `wait`: the first
-  three are what the mod speaks and are about the caller only (a `target` is
-  refused); `answer` reads a pane's last reported answer up the spawn tree,
-  and `wait` polls for it, for idle, or for exit.
+- **New ctl verbs** `hello`, `report`, `whoami`, `inbox`, `answer` and `wait`:
+  the first four are what the mod speaks and are about the caller only (a
+  `target` is refused); `answer` reads a pane's last reported answer up the
+  spawn tree, and `wait` polls for it, for idle, or for exit.
+- **Native delivery.** A pane whose mod declared `inbox` is never typed into:
+  `ctl send`s and bus wakes wait in the queue until the mod collects them and
+  submits each through the engine's own prompt queue, which starts a turn only
+  when the session is idle. A task may span lines; a pane without the mod
+  keeps the pty path.
 - **Typed control-plane tools.** With the mod, a claude pane has
   `atrium_spawn`, `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`,
   `atrium_board_*` and `atrium_bus_*` as tools; each call is one `atrium ctl`

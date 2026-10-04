@@ -27,6 +27,12 @@ is:
   `NotebookEdit` anywhere else is refused with the owner named, by real path,
   and a toast says so. Off when nothing is owned or the pane is in plan mode.
 
+- **Native delivery**: with the `inbox` cap, atrium never types into the
+  pane. A `ctl send` or a bus wake waits in the broker's queue until the mod
+  collects it (`atrium ctl inbox`, polled every 1.5 s while the session is
+  interactive) and submits it through the engine's own prompt queue, which
+  starts a turn only when the session is idle. No draft race, no dialog race,
+  and a task may span lines.
 - **Subagents as panes**: `atrium_subagent {description, prompt}` spawns a
   claude pane beside this one, sends it the task, waits for the answer its own
   mod reports (`atrium ctl wait --for answer`), closes the pane unless `keep`,

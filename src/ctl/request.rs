@@ -81,6 +81,10 @@ pub enum Cmd {
     /// A pane's last reported answer and status, for an ancestor that spawned
     /// it as a subagent. Subtree-scoped like `send`.
     Answer(AnswerReq),
+    /// The caller's queued deliveries (`send`s and bus wakes), handed over and
+    /// removed from the queue: the mod submits them through the engine's own
+    /// prompt queue instead of atrium typing them. About the caller only.
+    Inbox,
 }
 
 /// An `answer` request's payload.
@@ -110,6 +114,8 @@ impl Cmd {
             // An answer is the model's output: only a token-matched ancestor
             // may read it.
             Cmd::Answer(_) => false,
+            // Taking deliveries empties the caller's queue.
+            Cmd::Inbox => false,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }
@@ -220,6 +226,7 @@ impl Cmd {
             ),
             Cmd::Whoami => ("whoami", String::new()),
             Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
+            Cmd::Inbox => ("inbox", String::new()),
         }
     }
 }
@@ -560,6 +567,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             Cmd::Report(r)
         }
         Some("whoami") => Cmd::Whoami,
+        Some("inbox") => {
+            refuse_target(&v, "inbox")?;
+            Cmd::Inbox
+        }
         Some("answer") => {
             let target = v
                 .get("target")

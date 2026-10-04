@@ -198,6 +198,51 @@ fn ctl_answer_and_wait_collect_a_panes_reported_answer() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// A pane whose mod declared `inbox` is never typed into: its sends and wakes
+/// wait in the queue until `ctl inbox` hands them over, oldest first, and a
+/// second `inbox` is empty. A pane without that cap is refused the verb.
+#[test]
+fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
+        .unwrap();
+    // A space-free needle: the pane repaints word by word with cursor moves
+    // between words, so a phrase with a space never appears contiguously.
+    let out = read_until(&mut p, b"\"err\":\"this", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"err\":\"this"),
+        "without the cap the verb is refused: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl hello mod=0.1.0 caps=status,inbox\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    // Queued for this very pane; the pty path would have typed it within ~2 s.
+    p.write(format!("\"{atrium}\" ctl send 0 inbox-marker-one\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"queued\"", Duration::from_secs(20));
+    std::thread::sleep(Duration::from_millis(2500));
+    p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"items\":[", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"{\"kind\":\"send\",\"text\":\"inbox-marker-one\"}"),
+        "the send was handed over, not typed: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"items\":[]", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"items\":[]"),
+        "taken once: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the

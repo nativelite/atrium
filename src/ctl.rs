@@ -59,8 +59,9 @@ pub use reply::{
     humanize_idle, reply_answer, reply_audit, reply_board_claim, reply_board_del,
     reply_board_entry, reply_board_list, reply_board_release, reply_bus_feed, reply_bus_published,
     reply_bus_resolved, reply_bus_subscribed, reply_bus_topics, reply_err, reply_hello,
-    reply_killed, reply_list, reply_reported, reply_sent, reply_spawned, reply_status_one,
-    reply_whoami, zero_sub_warning, ListNode, Reply, TreeNode, IDLE_RENDER_MIN_MS,
+    reply_inbox, reply_killed, reply_list, reply_reported, reply_sent, reply_spawned,
+    reply_status_one, reply_whoami, zero_sub_warning, ListNode, Reply, TreeNode,
+    IDLE_RENDER_MIN_MS,
 };
 pub use request::{
     parse_request, AgentId, AnswerReq, AuditReq, BoardOp, BusOp, Cmd, HelloReq, KillReq, ReportReq,

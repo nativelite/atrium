@@ -138,3 +138,47 @@ fn a_coalesced_wake_stops_growing_at_the_limit_and_points_at_the_feed() {
     assert!(pending[0].text.chars().count() < WAKE_COALESCE_CHARS + 64);
     assert_eq!(pending[0].text.matches("+more").count(), 1);
 }
+
+/// `ctl inbox` takes a pane's queued deliveries, oldest first, sends and
+/// wakes alike, and leaves every other pane's and anything the pty path has
+/// begun to type.
+#[test]
+fn take_for_hands_a_pane_its_untyped_deliveries_and_nothing_else() {
+    let mut pending = Vec::new();
+    assert!(queue_send(
+        &mut pending,
+        AgentId(1),
+        "first".to_string(),
+        SendOrigin::Ctl
+    ));
+    assert!(queue_send(
+        &mut pending,
+        AgentId(2),
+        "other".to_string(),
+        SendOrigin::Ctl
+    ));
+    assert!(queue_send(
+        &mut pending,
+        AgentId(1),
+        "[atrium bus #1 fyi] second".to_string(),
+        SendOrigin::BusWake
+    ));
+    pending[0].written = 2; // the pty path began typing this one
+    let taken = take_for(&mut pending, AgentId(1));
+    assert_eq!(
+        taken,
+        vec![(
+            SendOrigin::BusWake,
+            "[atrium bus #1 fyi] second".to_string()
+        )]
+    );
+    assert_eq!(
+        pending.len(),
+        2,
+        "the partly typed send and the other pane's stay"
+    );
+    assert!(take_for(&mut pending, AgentId(3)).is_empty());
+    pending[0].written = 0;
+    assert_eq!(take_for(&mut pending, AgentId(1)).len(), 1);
+    assert_eq!(pending.len(), 1);
+}

@@ -173,7 +173,12 @@ impl RunState<'_> {
         self.serve_ctl();
 
         // 1c. flush any queued `ctl send`s whose target is now idle (Decision 4).
-        if flush_sends(&mut self.pending_sends, &mut self.windows, &self.world) {
+        if flush_sends(
+            &mut self.pending_sends,
+            &mut self.windows,
+            &self.world,
+            &self.mods,
+        ) {
             self.force_repaint = true;
         }
 

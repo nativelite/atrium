@@ -115,6 +115,9 @@ pub enum Reply {
         seq: Option<u64>,
         answer: Option<String>,
     },
+    /// `{"ok":true,"items":[{"kind":"send"|"wake","text":...},...]}` — the
+    /// caller's deliveries, taken.
+    Inbox(Vec<(String, String)>),
 }
 
 /// An owned org-chart node inside [`Reply::Tree`]; built from a [`TreeNode`].
@@ -274,6 +277,18 @@ impl Reply {
                 pairs.extend(fields.iter().map(|(k, v)| (k.as_str(), v.clone())));
                 obj(pairs)
             }
+            Reply::Inbox(items) => obj(vec![
+                ok,
+                (
+                    "items",
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|(kind, text)| obj(vec![("kind", s(kind)), ("text", s(text))]))
+                            .collect(),
+                    ),
+                ),
+            ]),
             Reply::Answer {
                 pane,
                 status,
@@ -341,6 +356,11 @@ pub fn reply_reported(pane: AgentId, seq: Option<u64>) -> Reply {
 /// `{"ok":true,...}` — `whoami`'s facts as flat fields beside `ok`.
 pub fn reply_whoami(fields: Vec<(String, Value)>) -> Reply {
     Reply::Whoami(fields)
+}
+
+/// `{"ok":true,"items":[...]}` — the caller's deliveries, each `send` or `wake`.
+pub fn reply_inbox(items: Vec<(String, String)>) -> Reply {
+    Reply::Inbox(items)
 }
 
 /// `{"ok":true,"pane":N,"status":...,"seq":...,"answer":...}` — a pane's last

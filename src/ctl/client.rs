@@ -394,6 +394,9 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         Some("whoami") => {
             pairs.push(("cmd", s("whoami")));
         }
+        Some("inbox") => {
+            pairs.push(("cmd", s("inbox")));
+        }
         Some("answer") => {
             pairs.push(("cmd", s("answer")));
             let target = value_at(args, 1, "answer needs a target (pane id or role)")?;
@@ -403,7 +406,7 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         None => {
             return Err(
                 "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | \
-                 respawn | hello | report | whoami | answer | wait"
+                 respawn | hello | report | whoami | answer | wait | inbox"
                     .to_string(),
             )
         }

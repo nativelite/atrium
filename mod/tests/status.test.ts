@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import { ANSWER_CAP, Reporter, clipAnswer, toArgs, transition } from '../hooks/status'
 import type { Status } from '../hooks/status'
-import { acceptedCaps, parseReply } from '../hooks/ctl'
+import { acceptedCaps, inboxItems, parseReply } from '../hooks/ctl'
 
 test('a start is at-the-prompt when a person is there, working otherwise', async () => {
   expect(transition(undefined, { kind: 'start', interactive: true })).toEqual({ status: 'waiting-prompt' })
@@ -107,4 +107,23 @@ test('a reply is read off the last stdout line, and anything else is a refusal',
   const odd = parseReply({ exitCode: 0, stdout: '[1,2]', stderr: '' })
   expect(odd.ok).toBe(false)
   expect([...acceptedCaps({ ok: true })]).toEqual([])
+})
+
+test('inbox items are read in order and anything malformed is skipped', async () => {
+  const items = inboxItems({
+    ok: true,
+    items: [
+      { kind: 'send', text: 'do x' },
+      { kind: 'wake', text: '[atrium bus #3 fyi from "builder" on "work"] item=M1 status=done' },
+      { kind: 'send', text: '   ' },
+      { kind: 'other', text: 'no' },
+      'junk',
+    ],
+  })
+  expect(items).toEqual([
+    { kind: 'send', text: 'do x' },
+    { kind: 'wake', text: '[atrium bus #3 fyi from "builder" on "work"] item=M1 status=done' },
+  ])
+  expect(inboxItems({ ok: false, err: 'did not declare inbox' })).toEqual([])
+  expect(inboxItems({ ok: true })).toEqual([])
 })
