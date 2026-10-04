@@ -12,10 +12,11 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N5 inbox transport (native delivery) | `f0bf9b9` | queue unit test; e2e `ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them`; 21 `claude plugin test` cases; live: a `ctl send` to a real claude pane was collected by its mod via `inbox` and answered "delivered natively", with no typing |
 | N6 typed tools + role section + guard | `cae7a88` | 15 `claude plugin test` cases; `claude plugin validate` lists exactly the intended hooks and calls; live: a real claude called `atrium_list` with no dialog and answered its pane number from the role section |
 | N7 visible subagents | `a7d7b2e` | `ctl answer`/`wait` unit and e2e tests; 20 `claude plugin test` cases; live: a real claude's `atrium_subagent` opened a second real claude as a tile, which answered, was closed, and the parent replied "child said pong." |
+| N8 telemetry decision + in-pane UI | `d1a9c41` | crossing-rule and fleet-key unit tests; 25 `claude plugin test` cases; `claude plugin validate` lists the state contract; live: `/atrium` drew its header, sections and buttons inside a real interactive claude |
 | N9 docs, skills, changelog | `b6f9b4f` | README, the four deep docs, both delegation skills, CHANGELOG; `python docs/build.py` and the drift check clean. The e2e half landed with each item. Not done: the marketplace plugin's copy of the skills and the mod (that repo) |
 
-Not started: **N8** (the `respawn_at` decision and the in-pane board view;
-the overview's context and cost columns landed with N4).
+Every item of Part I has landed. Part II and Part III are the next
+candidates, in the order of attack §9 of Part II gives.
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
 N7 and is a client-side poll, and `inbox` is a poll too (every 1.5 s from the
