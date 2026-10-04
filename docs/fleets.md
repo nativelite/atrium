@@ -105,6 +105,7 @@ The file is read **read-only**. atrium never writes it.
 | `allow_ctl` | optional | Bring [the control plane](control-plane.md) up, as `--allow-ctl` does. |
 | `mod` | optional | `false` keeps [the mod](control-plane.md#the-mod-typed-tools-the-role-section-and-subagent-panes) out of this fleet's claude panes; absent or `true` injects it when `atrium mod install` has been run. The config's `"mod": false` fills an absent key. |
 | `subagents` | optional | How the model's subagents run in claude panes: `panes` (visible panes beside the caller, the default), `native` (the engine's own, invisible) or `deny`. |
+| `respawn_at` | optional | A context-window fill, in percent, at which a claude pane that is at its prompt gets one `decision_needed` posted to its parent on the `atrium` topic ("checkpoint and respawn it?"), with the parent woken. Never a respawn by itself. Needs the mod. |
 | `subagents_keep` | optional | `true` leaves a subagent pane open after its answer was collected (default: closed). |
 | `trust` | optional | The trust posture the whole fleet runs at. |
 | `context` | optional | Shared knowledge and memory backend for the fleet (see [Shared context](#shared-context)). |

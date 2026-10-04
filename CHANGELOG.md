@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   section to the system prompt from `whoami` (pane, role, parent, mode, item,
   owned files, worktree, whether it may spawn) and refuses an `Edit`, `Write`
   or `NotebookEdit` outside the item's files, by real path, naming the owner.
+- **The `/atrium` pane, the decisions band, and `respawn_at`.** Inside Claude
+  Code, `/atrium` opens a pane with the open decisions (resolve buttons with
+  hotkeys), the board and the last bus events; a band above the prompt counts
+  open decisions. Fleet key `respawn_at: <pct>`: a pane whose context fill
+  crosses it while idle gets one decision posted to its parent on the `atrium`
+  topic, never a respawn by itself.
 - **Subagents as visible panes.** `atrium_subagent` spawns a claude pane beside
   the caller, sends it the task, waits for the answer its mod reports, closes
   the pane unless kept, and returns the answer; the model's Agent tool is

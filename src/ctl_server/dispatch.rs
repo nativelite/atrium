@@ -282,8 +282,73 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     let Some(me) = caller else {
         return ctl::reply_err("report needs an authenticated pane (ATRIUM_TOKEN)");
     };
-    let seq = cx.mods.report(me.0, &r, atrium::session_store::now_ms());
+    let now = atrium::session_store::now_ms();
+    let seq = cx.mods.report(me.0, &r, now);
+    // The fleet's `respawn_at`: a pane whose context fill crossed it while idle
+    // gets one decision posted to its parent, never a respawn by itself.
+    if let Some(threshold) = atrium::modstate::session_respawn_at() {
+        if cx.mods.respawn_crossing(me.0, threshold, now) {
+            post_respawn_decision(me, threshold, now, cx);
+        }
+    }
     ctl::reply_reported(me, seq)
+}
+
+/// One `decision_needed` on the `atrium` topic, addressed to the pane's parent
+/// (the human when it has none), with the pane and its fill named, and the
+/// parent woken as any addressed pane is. A publish the bus refuses (a full
+/// ring, the rate cap) is audited and dropped: the next crossing asks again.
+fn post_respawn_decision(pane: AgentId, threshold: u8, now: u64, cx: &mut CtlSession<'_>) {
+    let (windows, bus, pending) = (&*cx.windows, &mut *cx.bus, &mut *cx.pending);
+    let Some(p) = pane_by_agent(windows, pane) else {
+        return;
+    };
+    let me = pane_label(pane, p.role.as_deref());
+    let pct = cx
+        .mods
+        .report_for(pane.0)
+        .and_then(|r| r.context_pct)
+        .unwrap_or(threshold);
+    let mut fields = vec![
+        ("pane".to_string(), pane.0.to_string()),
+        (
+            "msg".to_string(),
+            format!(
+                "{me} is at {pct}% context (respawn_at {threshold}%): checkpoint and respawn it?"
+            ),
+        ),
+    ];
+    if let Some(parent) = p.parent.and_then(|id| pane_by_agent(windows, id)) {
+        fields.push((
+            "to".to_string(),
+            pane_label(parent.agent_id, parent.role.as_deref()),
+        ));
+    }
+    let detail = format!("pane={pane} pct={pct}");
+    match bus.publish(
+        "atrium",
+        atrium::bus::Kind::DecisionNeeded,
+        None,
+        &fields,
+        now,
+    ) {
+        Ok(e) => {
+            let candidates = ctl_candidates(windows);
+            let parents = ctl_parents(windows);
+            let wakes = bus_wakes(&e, "atrium", None, true, &candidates, &parents, |label| {
+                bus.subscriptions(label)
+                    .is_some_and(|t| t.contains(&e.topic) || t.contains("*"))
+            });
+            for (tid, text) in wakes {
+                queue_send(pending, tid, text, SendOrigin::BusWake);
+            }
+            cx.audit.record(None, "respawn-decision", &detail, true, "");
+        }
+        Err(msg) => {
+            cx.audit
+                .record(None, "respawn-decision", &detail, false, &msg);
+        }
+    }
 }
 
 /// `ctl whoami`: what the caller is, from the broker's own records: its pane,

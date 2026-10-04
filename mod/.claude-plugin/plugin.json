@@ -2,5 +2,6 @@
   "name": "atrium",
   "version": "0.1.0",
   "author": { "name": "nativelite" },
+  "types": "./types/index.d.ts",
   "description": "Tells the atrium broker what this pane's engine knows for certain: its status, usage and answers."
 }

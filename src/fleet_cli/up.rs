@@ -391,6 +391,8 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     atrium::trust::set_fleet_deny(fleet.deny.clone());
     // And whether its claude panes load the mod.
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
+    // And when an idle pane's parent is asked to checkpoint and respawn it.
+    atrium::modstate::set_session_respawn_at(fleet.respawn_at);
     // And how its claude panes run the model's subagents.
     if let Some(mode) = fleet
         .subagents

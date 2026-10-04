@@ -9,7 +9,9 @@
 // only ever speak for the pane it runs in. Outside atrium (no ATRIUM_CTL) it
 // does nothing at all.
 
-import type { EngineInterface, Register } from 'claude-code'
+import { atom, read, update } from 'claude-code'
+import type { EngineInterface, Register, RenderElement } from 'claude-code'
+import { fit, parseView } from './view'
 import { WAIT_SLICES, WAIT_SLICE_S, reportedAnswer, slug, spawnPointer, spawnedPane, subagentPrompt } from './agents'
 import { TOOLS, TOOL_PREFIX, argvFor, isAtriumTool } from './control'
 import { INBOX_POLL_MS, acceptedCaps, inboxItems, parseReply } from './ctl'
@@ -51,6 +53,13 @@ async function placed($: EngineInterface, path: string): Promise<string | undefi
   return dir?.realPath === undefined ? undefined : join(dir.realPath, name)
 }
 
+/** The `/atrium` pane: its id, and the state its drawing reads. */
+const PANE = 'atrium'
+const view = atom({ plugin: 'atrium', key: 'view' } as const, null)
+/** How often the pane refreshes while open, and the band while it is not. */
+const VIEW_OPEN_MS = 3000
+const VIEW_IDLE_MS = 30000
+
 /**
  * What this session's mod holds. The module's variables start over on a hot
  * reload, and `session.start` fires again then, so a reload is a fresh hello.
@@ -63,6 +72,10 @@ type State = {
   /** The inbox poll, while the session is interactive and the cap was accepted. */
   inbox: { cancel: () => void } | undefined
   inboxBusy: boolean
+  viewTimer: { cancel: () => void } | undefined
+  viewBusy: boolean
+  /** The last refresh, to pace the idle (pane closed) cadence on the open timer. */
+  viewAt: number
 }
 const state: State = {
   status: undefined,
@@ -71,6 +84,37 @@ const state: State = {
   who: undefined,
   inbox: undefined,
   inboxBusy: false,
+  viewTimer: undefined,
+  viewBusy: false,
+  viewAt: 0,
+}
+
+/** Fetch the board and the feed from the broker into the pane's state. */
+async function refreshView($: EngineInterface): Promise<void> {
+  if (state.viewBusy) return
+  state.viewBusy = true
+  try {
+    const [board, feed] = await Promise.all([ctl($, ['board', 'list']), ctl($, ['bus', 'feed', '--since', '0'])])
+    const now = await $.clock.now()
+    state.viewAt = now
+    await update($, view, () => parseView(board, feed, now))
+  } finally {
+    state.viewBusy = false
+  }
+}
+
+/** Refresh on the timer: every tick while the pane is open, rarely while it is not. */
+async function refreshViewOnTick($: EngineInterface): Promise<void> {
+  const open = (await $.ui.panes()).some(p => p.id === PANE && p.isShown)
+  const now = await $.clock.now()
+  if (open || now - state.viewAt >= VIEW_IDLE_MS) await refreshView($)
+}
+
+/** Resolve a decision from the pane, then redraw. */
+async function resolveDecision($: EngineInterface, seq: number): Promise<void> {
+  const reply = await ctl($, ['bus', 'resolve', String(seq)])
+  if (!reply.ok) $.ui.toast(`atrium: cannot resolve #${seq}: ${reply.err ?? 'no reply'}`)
+  await refreshView($)
 }
 
 /**
@@ -193,6 +237,16 @@ export const register: Register = on => {
       if (!reply.ok) $.ui.log(`atrium: report refused: ${reply.err ?? 'no reply'}`, { to: 'debug' })
     })
     await refreshWho($)
+    if (e.isInteractive) {
+      await $.command.register({
+        name: 'atrium',
+        description: 'Open the atrium pane: the board, the open decisions and the bus feed of this session.',
+      })
+      state.viewTimer?.cancel()
+      state.viewTimer = $.clock.every(VIEW_OPEN_MS, () => {
+        void refreshViewOnTick($)
+      })
+    }
     if (state.accepted.has('inbox') && e.isInteractive) {
       state.inbox?.cancel()
       state.inbox = $.clock.every(INBOX_POLL_MS, () => {
@@ -208,6 +262,74 @@ export const register: Register = on => {
     }
     say(transition(state.status, { kind: 'start', interactive: e.isInteractive }))
     return started
+  })
+
+  on('command.run', { command: 'atrium' }, async $ => {
+    await $.ui.open({ id: PANE, title: 'atrium', focus: true, closeOnEscape: true })
+    await refreshView($)
+    return { text: 'atrium pane opened.' }
+  })
+
+  // The pane: the open decisions first (each with a resolve button), then the
+  // board, then the last feed lines. Drawn from state; the timer refreshes it.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const v = await read($, view)
+    const width = Math.max(20, e.props.bodyColumns - 2)
+    const who = state.who
+    const head = `atrium · pane ${who?.pane ?? '?'}${who?.role === undefined ? '' : ` · ${who.role}`}${who?.item === undefined ? '' : ` · ${who.item}`}`
+    const rows: unknown[] = [
+      h(Box, { flexDirection: 'row' }, [
+        h(Text, { bold: true }, head),
+        h(Text, { dimColor: true }, '  '),
+        h(Button, { key: 'refresh', label: 'refresh', hotkey: 'r', onPress: () => void refreshView($) }),
+        h(Text, { dimColor: true }, ' '),
+        h(Button, { key: 'close', label: 'close', hotkey: 'c', role: 'dismiss', onPress: () => void $.ui.close({ id: PANE }) }),
+      ]),
+    ]
+    if (v === null) {
+      rows.push(h(Text, { dimColor: true }, 'fetching…'))
+      return h(Box, { flexDirection: 'column' }, rows) as RenderElement
+    }
+    if (v.error !== undefined) rows.push(h(Text, { color: 'red' }, fit(v.error, width)))
+    rows.push(h(Text, { dimColor: true }, `─ decisions (${v.decisions.length}) ─`))
+    v.decisions.slice(0, 9).forEach((d, i) => {
+      rows.push(
+        h(Box, { flexDirection: 'row' }, [
+          h(Text, { color: 'yellow', bold: true }, `#${d.seq} `),
+          h(Text, {}, fit(`${d.from} on ${d.topic}${d.to === '' ? '' : ` → ${d.to}`}: ${d.msg}`, width - 20)),
+          h(Text, {}, ' '),
+          h(Button, { key: `resolve-${d.seq}`, label: 'resolve', hotkey: String(i + 1), onPress: () => void resolveDecision($, d.seq) }),
+        ]),
+      )
+    })
+    rows.push(h(Text, { dimColor: true }, `─ board (${v.board.length}) ─`))
+    for (const b of v.board.slice(0, 30)) {
+      rows.push(
+        h(Box, { flexDirection: 'row' }, [
+          h(Text, { bold: true }, fit(b.key, 16).padEnd(17)),
+          h(Text, {}, fit(b.fields, width - 17)),
+        ]),
+      )
+    }
+    rows.push(h(Text, { dimColor: true }, `─ feed (last ${v.feed.length}) ─`))
+    for (const f of v.feed) {
+      rows.push(h(Text, { dimColor: f.kind !== 'decision_needed' }, fit(`#${f.seq} ${f.kind === 'decision_needed' ? '!' : '·'} ${f.from} on ${f.topic}: ${f.line}`, width)))
+    }
+    return h(Box, { flexDirection: 'column' }, rows) as RenderElement
+  })
+
+  // The band above the prompt: how many decisions are open, and the pane to
+  // open. Quiet when there are none, or a survey is up.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const v = await read($, view)
+    if (v === null || v.decisions.length === 0 || e.props.hasSurvey) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const n = v.decisions.length
+    return h(Box, { flexDirection: 'row' }, [
+      h(Text, { color: 'yellow' }, `◆ ${n} decision${n === 1 ? '' : 's'} open on the atrium bus `),
+      h(Button, { key: 'open-atrium', label: '/atrium', onPress: () => void $.ui.open({ id: PANE, title: 'atrium', focus: true, closeOnEscape: true }) }),
+    ]) as RenderElement
   })
 
   // The model's own subagents: under `panes` (the default) the Agent tool is
@@ -310,6 +432,8 @@ export const register: Register = on => {
     say(transition(state.status, { kind: 'session.end', reason: e.reason }))
     state.inbox?.cancel()
     state.inbox = undefined
+    state.viewTimer?.cancel()
+    state.viewTimer = undefined
     // The process may be leaving: let the last report land first.
     await state.reporter?.idle()
     return next(e)

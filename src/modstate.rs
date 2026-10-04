@@ -167,6 +167,9 @@ pub struct PaneReport {
 pub struct ModState {
     panes: HashMap<usize, (Option<ModInfo>, PaneReport)>,
     answer_seq: u64,
+    /// Panes whose context crossed `respawn_at` and were flagged; cleared when
+    /// the fill drops back under, so one crossing is one decision.
+    respawn_flagged: std::collections::HashSet<usize>,
 }
 
 impl ModState {
@@ -264,6 +267,33 @@ impl ModState {
     /// process whose mod will say hello again.
     pub fn forget(&mut self, pane: usize) {
         self.panes.remove(&pane);
+        self.respawn_flagged.remove(&pane);
+    }
+
+    /// True exactly once when a pane's reported context fill reaches
+    /// `threshold` while the pane is at its prompt or idle (a respawn mid-turn
+    /// would lose work): the moment to ask its parent to checkpoint and
+    /// respawn it. Flagged until the fill drops back under the threshold.
+    pub fn respawn_crossing(&mut self, pane: usize, threshold: u8, now_ms: u64) -> bool {
+        let Some(pct) = self.report_for(pane).and_then(|r| r.context_pct) else {
+            return false;
+        };
+        if pct < threshold {
+            self.respawn_flagged.remove(&pane);
+            return false;
+        }
+        if self.respawn_flagged.contains(&pane) {
+            return false;
+        }
+        let idle = matches!(
+            self.status_for(pane, now_ms),
+            Some(ModStatus::WaitingPrompt) | Some(ModStatus::Idle)
+        );
+        if !idle {
+            return false;
+        }
+        self.respawn_flagged.insert(pane);
+        true
     }
 
     /// Lay the fresh reported statuses over a snapshot of the inferred ones, so
@@ -338,6 +368,18 @@ impl Subagents {
 }
 
 static SESSION_SUBAGENTS: std::sync::OnceLock<(Subagents, bool)> = std::sync::OnceLock::new();
+static SESSION_RESPAWN_AT: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+
+/// Record the fleet's `respawn_at` for the session. First call wins.
+pub fn set_session_respawn_at(pct: Option<u8>) {
+    let _ = SESSION_RESPAWN_AT.set(pct);
+}
+
+/// The context fill at which an idle pane's parent is asked to checkpoint and
+/// respawn it; `None` (the default) never asks.
+pub fn session_respawn_at() -> Option<u8> {
+    SESSION_RESPAWN_AT.get().copied().flatten()
+}
 
 /// Record the session's subagent policy (a fleet's `subagents` and
 /// `subagents_keep`). First call wins, like the fleet's deny rules.
@@ -392,6 +434,51 @@ mod tests {
 
     fn caps(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_respawn_crossing_fires_once_per_crossing_and_only_when_idle() {
+        let mut m = ModState::default();
+        let at = |m: &mut ModState, pct: u8, status: ModStatus, t: u64| {
+            m.report(
+                1,
+                &Report {
+                    status: Some(status),
+                    context_pct: Some(pct),
+                    ..Report::default()
+                },
+                t,
+            );
+        };
+        at(&mut m, 70, ModStatus::WaitingPrompt, 1);
+        assert!(!m.respawn_crossing(1, 80, 1), "under the threshold");
+        at(&mut m, 85, ModStatus::Working, 2);
+        assert!(!m.respawn_crossing(1, 80, 2), "over, but mid-turn");
+        at(&mut m, 85, ModStatus::WaitingPrompt, 3);
+        assert!(m.respawn_crossing(1, 80, 3), "over and idle: once");
+        assert!(!m.respawn_crossing(1, 80, 3), "not again while over");
+        at(&mut m, 90, ModStatus::Idle, 4);
+        assert!(!m.respawn_crossing(1, 80, 4));
+        at(&mut m, 20, ModStatus::WaitingPrompt, 5);
+        assert!(
+            !m.respawn_crossing(1, 80, 5),
+            "dropped back: cleared, not fired"
+        );
+        at(&mut m, 81, ModStatus::WaitingPrompt, 6);
+        assert!(
+            m.respawn_crossing(1, 80, 6),
+            "a second crossing fires again"
+        );
+        assert!(
+            !m.respawn_crossing(2, 80, 6),
+            "a pane that reported nothing"
+        );
+        m.forget(1);
+        at(&mut m, 81, ModStatus::WaitingPrompt, 7);
+        assert!(
+            m.respawn_crossing(1, 80, 7),
+            "forgotten: a fresh process starts clean"
+        );
     }
 
     #[test]

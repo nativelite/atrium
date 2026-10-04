@@ -63,6 +63,10 @@ pub struct Fleet {
     pub subagents: Option<String>,
     /// Leave a subagent pane open after its answer was collected.
     pub subagents_keep: Option<bool>,
+    /// Context-window fill (percent, 1..=100) at which a pane that is idle gets
+    /// one decision posted to its parent: "checkpoint and respawn?". Never a
+    /// respawn by itself ([`crate::modstate::ModState::respawn_crossing`]).
+    pub respawn_at: Option<u8>,
     /// Optional context-mode configuration for the whole fleet. Absent → no
     /// context injection; present → [`crate::context::parse_block`] resolves the
     /// provider and share level tolerantly (unknown values warn to stderr and
@@ -308,6 +312,17 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         }
         None => None,
     };
+    let respawn_at = match get("respawn_at") {
+        Some(v) => Some(
+            v.as_i64()
+                .filter(|n| (1..=100).contains(n))
+                .map(|n| n as u8)
+                .ok_or_else(|| {
+                    format!("fleet {name:?}: \"respawn_at\" must be a percentage 1..100")
+                })?,
+        ),
+        None => None,
+    };
     let subagents_keep =
         match get("subagents_keep") {
             Some(v) => Some(v.as_bool().ok_or_else(|| {
@@ -441,6 +456,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         mod_enabled,
         subagents,
         subagents_keep,
+        respawn_at,
         identity,
         context,
         topics,

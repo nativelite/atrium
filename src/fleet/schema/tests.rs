@@ -547,6 +547,22 @@ fn context_block_unknown_share_degrades_to_knowledge() {
 }
 
 #[test]
+fn respawn_at_is_a_percentage_and_anything_else_is_a_clear_error() {
+    let f = parse(
+        r#"{ "fleets": { "a": { "respawn_at": 80, "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+    )
+    .unwrap();
+    assert_eq!(f.get("a").unwrap().respawn_at, Some(80));
+    for bad in ["0", "101", "\"80\"", "true"] {
+        let err = parse(&format!(
+            r#"{{ "fleets": {{ "a": {{ "respawn_at": {bad}, "agents": [{{ "name": "x", "cmd": ["claude"] }}] }} }} }}"#
+        ))
+        .unwrap_err();
+        assert!(err.contains("respawn_at"), "{bad}: {err}");
+    }
+}
+
+#[test]
 fn a_fleet_can_turn_the_mod_off_and_a_non_bool_is_a_clear_error() {
     let f = parse(
         r#"{ "fleets": { "a": { "mod": false, "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
