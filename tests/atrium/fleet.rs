@@ -354,12 +354,15 @@ fn the_posture_and_the_verdict_are_the_last_lines_before_the_prompt() {
     );
     // Deduplicated: eight agents naming ONE sibling checkout is one line.
     assert_eq!(err.matches("OUTSIDE").count(), 1, "{err}");
-    // And the banner as a whole still fits a terminal.
+    // And the banner as a whole still fits a terminal: the file line, OUTSIDE,
+    // the other dirs, identities, the posture, who may spawn, the mod line (a
+    // claude fleet always has one: installed, or the warning this lab's empty
+    // config dir produces), GRANTS and the Enter prompt.
     assert!(
         err.lines()
             .filter(|l| l.starts_with("atrium fleet:"))
             .count()
-            <= 8,
+            <= 9,
         "banner too tall: {err}"
     );
 }
