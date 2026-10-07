@@ -127,7 +127,7 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
     }
 
     let (action, detail) = req.cmd.audit_label();
-    let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox);
+    let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox | Cmd::Asked(_));
     let reply = dispatch_ctl(req, caller, privileged, cx);
     // `wait` polls `answer` twice a second until one exists, and a mod polls
     // `inbox` every second or two: a poll that found nothing is not an action
@@ -135,6 +135,7 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
     let found_nothing = match &reply {
         ctl::Reply::Answer { seq: None, .. } => true,
         ctl::Reply::Inbox(items) => items.is_empty(),
+        ctl::Reply::Asked { reply: None, .. } => true,
         _ => false,
     };
     if is_poll && found_nothing {
@@ -174,7 +175,113 @@ pub(crate) fn dispatch_ctl(
         Cmd::Whoami => whoami(caller, cx),
         Cmd::Answer(a) => answer(a, caller, privileged, cx),
         Cmd::Inbox => inbox(caller, cx),
+        Cmd::Ask(a) => ask(a, caller, privileged, cx),
+        Cmd::Asked(a) => asked(a, caller, privileged, cx),
+        Cmd::Who(w) => who(w, cx),
     }
+}
+
+/// `ctl ask`: queue a question for a pane's mod, which answers it from a fork
+/// of the pane's own context, without interrupting its turn. Subtree-scoped
+/// like `send`; the target's mod must have declared `ask`. The reply is read
+/// with `asked` (the `ask` client loop does that).
+fn ask(
+    a: ctl::AskReq,
+    caller: Option<AgentId>,
+    privileged: bool,
+    cx: &mut CtlSession<'_>,
+) -> ctl::Reply {
+    let windows = &*cx.windows;
+    let candidates = ctl_candidates(windows);
+    let id = match ctl::resolve_target(&a.target, &candidates) {
+        Ok(id) => id,
+        Err(e) => return ctl::reply_err(&e),
+    };
+    if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+        return deny;
+    }
+    if !cx.mods.has_cap(id.0, "ask") || !cx.mods.has_cap(id.0, "inbox") {
+        return ctl::reply_err(&format!(
+            "pane {id} cannot be asked: its mod declared no ask capability (no mod, or an older one)"
+        ));
+    }
+    let now = atrium::session_store::now_ms();
+    match cx.mods.ask(id.0, caller.map(|c| c.0), &a.text, now) {
+        Ok(ask_id) => ctl::reply_asked(id, ask_id, None),
+        Err(e) => ctl::reply_err(&e),
+    }
+}
+
+/// `ctl asked`: the reply to an ask, once the pane's mod reported it. The
+/// same scope as `ask`; a pane that answered and left stays readable by its
+/// parent, as `answer` does.
+fn asked(
+    a: ctl::AskedReq,
+    caller: Option<AgentId>,
+    privileged: bool,
+    cx: &CtlSession<'_>,
+) -> ctl::Reply {
+    let windows = &*cx.windows;
+    let candidates = ctl_candidates(windows);
+    let id = match ctl::resolve_target(&a.target, &candidates) {
+        Ok(id) => {
+            if let Some(deny) = scope_denied(windows, caller, privileged, id) {
+                return deny;
+            }
+            id
+        }
+        Err(e) => {
+            let gone = a
+                .target
+                .parse::<usize>()
+                .ok()
+                .filter(|n| cx.mods.info(*n).is_some() || cx.mods.reply_for(a.id).is_some());
+            let Some(n) = gone else {
+                return ctl::reply_err(&e);
+            };
+            let may =
+                privileged || (caller.is_some() && cx.mods.parent_of(n) == caller.map(|c| c.0));
+            if !may {
+                return ctl::reply_err(&format!(
+                    "pane {n} has exited; only the pane that spawned it may read its replies"
+                ));
+            }
+            AgentId(n)
+        }
+    };
+    match cx.mods.reply_for(a.id) {
+        Some(r) if r.pane == id.0 => ctl::reply_asked(id, a.id, Some(&r.text)),
+        Some(_) => ctl::reply_err(&format!("ask #{} was not put to pane {id}", a.id)),
+        None if cx.mods.ask_pending(a.id) => ctl::reply_asked(id, a.id, None),
+        None => ctl::reply_err(&format!(
+            "no such ask #{} for pane {id} (never asked, or its reply expired)",
+            a.id
+        )),
+    }
+}
+
+/// `ctl who`: every pane whose mod reported an edit of `path`, with when, and
+/// whether the pane is still here.
+fn who(w: ctl::WhoReq, cx: &CtlSession<'_>) -> ctl::Reply {
+    let windows = &*cx.windows;
+    let panes = cx
+        .mods
+        .who(&w.path)
+        .into_iter()
+        .map(|(pane, key, t)| {
+            let live = pane_by_agent(windows, AgentId(pane));
+            ctl::WhoEntry {
+                pane: AgentId(pane),
+                role: live.and_then(|p| p.role.clone()),
+                key: key.to_string(),
+                path: t.path.clone(),
+                first_ms: t.first_ms,
+                last_ms: t.last_ms,
+                live: live.is_some(),
+            }
+        })
+        .collect();
+    ctl::reply_who(&w.path, panes)
 }
 
 /// `ctl inbox`: hand the caller's mod its queued deliveries. Only a pane whose
@@ -189,16 +296,29 @@ fn inbox(caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
             "this pane's mod did not declare inbox in its hello; deliveries are typed into it",
         );
     }
-    let items = take_for(cx.pending, me)
+    let mut items: Vec<ctl::InboxItem> = take_for(cx.pending, me)
         .into_iter()
         .map(|(origin, text)| {
             let kind = match origin {
                 SendOrigin::Ctl => "send",
                 SendOrigin::BusWake => "wake",
             };
-            (kind.to_string(), text)
+            ctl::InboxItem {
+                kind: kind.to_string(),
+                text,
+                id: None,
+            }
         })
         .collect();
+    // Questions ride the same poll; the mod answers them from a fork, never
+    // as a prompt.
+    if cx.mods.has_cap(me.0, "ask") {
+        items.extend(cx.mods.take_asks(me.0).into_iter().map(|a| ctl::InboxItem {
+            kind: "ask".to_string(),
+            text: a.text,
+            id: Some(a.id),
+        }));
+    }
     ctl::reply_inbox(items)
 }
 
@@ -284,6 +404,29 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     };
     let now = atrium::session_store::now_ms();
     let seq = cx.mods.report(me.0, &r, now);
+    // A reply to a queued question: accepted only from the pane it was put to.
+    if let Some((id, text)) = &r.ask {
+        if !cx.mods.reply(me.0, *id, text, now) {
+            return ctl::reply_err(&format!(
+                "ask #{id} was not put to pane {me}, or is already answered"
+            ));
+        }
+    }
+    // Files edited, keyed by the pane's worktree (its cwd when it has none),
+    // so two worktrees' copies of one file collide. The first time two live
+    // panes share a key, one decision goes to the nearest pane above both.
+    if !r.touched.is_empty() {
+        let root = pane_by_agent(cx.windows, me)
+            .and_then(|p| p.worktree.clone().or_else(|| p.cwd.clone()));
+        cx.mods.touch(me.0, &r.touched, root.as_deref(), now);
+        let live: Vec<usize> = ctl_candidates(cx.windows)
+            .iter()
+            .map(|(id, _)| id.0)
+            .collect();
+        for c in cx.mods.collisions_new(&live) {
+            post_collision_decision(&c, now, cx);
+        }
+    }
     // The fleet's `respawn_at`: a pane whose context fill crossed it while idle
     // gets one decision posted to its parent, never a respawn by itself.
     if let Some(threshold) = atrium::modstate::session_respawn_at() {
@@ -292,6 +435,95 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
         }
     }
     ctl::reply_reported(me, seq)
+}
+
+/// The nearest pane above every one of `panes` (a lead over its builders),
+/// or `None` when they share no ancestor (the human decides).
+fn common_ancestor(windows: &[Window], panes: &[usize]) -> Option<AgentId> {
+    let parents = ctl_parents(windows);
+    let parent_of = |id: AgentId| parents.iter().find(|(i, _)| *i == id).and_then(|(_, p)| *p);
+    let first = AgentId(*panes.first()?);
+    let mut cur = parent_of(first);
+    for _ in 0..4096 {
+        let candidate = cur?;
+        if panes
+            .iter()
+            .all(|p| atrium::ctl::in_subtree(AgentId(*p), candidate, &parents))
+        {
+            return Some(candidate);
+        }
+        cur = parent_of(candidate);
+    }
+    None
+}
+
+/// One `decision_needed` on the `atrium` topic for a collision: the file and
+/// the panes named, addressed to the nearest pane above them all, which is
+/// woken as any addressed pane is. Posted once per collision
+/// ([`atrium::modstate::ModState::collisions_new`]).
+fn post_collision_decision(c: &atrium::modstate::Collision, now: u64, cx: &mut CtlSession<'_>) {
+    let (windows, bus, pending) = (&*cx.windows, &mut *cx.bus, &mut *cx.pending);
+    let names: Vec<String> = c
+        .panes
+        .iter()
+        .map(|p| {
+            pane_label(
+                AgentId(*p),
+                pane_by_agent(windows, AgentId(*p)).and_then(|q| q.role.as_deref()),
+            )
+        })
+        .collect();
+    let mut fields = vec![
+        ("kind".to_string(), "collision".to_string()),
+        ("file".to_string(), c.key.clone()),
+        (
+            "panes".to_string(),
+            c.panes
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            "msg".to_string(),
+            format!(
+                "{} are both editing {}: the merge will conflict; who owns it?",
+                names.join(" and "),
+                c.key
+            ),
+        ),
+    ];
+    if let Some(lead) = common_ancestor(windows, &c.panes).and_then(|id| pane_by_agent(windows, id))
+    {
+        fields.push((
+            "to".to_string(),
+            pane_label(lead.agent_id, lead.role.as_deref()),
+        ));
+    }
+    let detail = format!("file={} panes={}", c.key, names.join(","));
+    match bus.publish(
+        "atrium",
+        atrium::bus::Kind::DecisionNeeded,
+        None,
+        &fields,
+        now,
+    ) {
+        Ok(e) => {
+            let candidates = ctl_candidates(windows);
+            let parents = ctl_parents(windows);
+            let wakes = bus_wakes(&e, "atrium", None, true, &candidates, &parents, |label| {
+                bus.subscriptions(label)
+                    .is_some_and(|t| t.contains(&e.topic) || t.contains("*"))
+            });
+            for (tid, text) in wakes {
+                queue_send(pending, tid, text, SendOrigin::BusWake);
+            }
+            cx.audit.record(None, "collision", &detail, true, "");
+        }
+        Err(msg) => {
+            cx.audit.record(None, "collision", &detail, false, &msg);
+        }
+    }
 }
 
 /// One `decision_needed` on the `atrium` topic, addressed to the pane's parent
@@ -403,6 +635,11 @@ fn whoami(caller: Option<AgentId>, cx: &CtlSession<'_>) -> ctl::Reply {
     let (subagents, keep) = atrium::modstate::session_subagents();
     fields.push(("subagents".to_string(), s(subagents.as_str())));
     fields.push(("subagents_keep".to_string(), Value::Bool(keep)));
+    // Whether the mod may spend a small model call on captions.
+    fields.push((
+        "captions".to_string(),
+        Value::Bool(atrium::modstate::session_captions()),
+    ));
     // The item briefed to this role, if the lead recorded one on the board.
     let item = p.role.as_deref().and_then(|role| {
         cx.board.list().into_iter().find(|(_, e)| {
@@ -469,7 +706,14 @@ fn status(
             let idle = pane
                 .map(|p| atrium::ipc::idle_ms(p.last_activity, std::time::Instant::now()))
                 .unwrap_or(0);
-            ctl::reply_status_one(id, status, idle)
+            // The caption rides along while the status is fresh: what the
+            // pane is doing, for a lead's `atrium_status` as for the overview.
+            let doing = cx
+                .mods
+                .status_for(id.0, atrium::session_store::now_ms())
+                .and_then(|_| cx.mods.report_for(id.0))
+                .and_then(|r| r.doing.as_ref().map(|(d, _)| d.as_str()));
+            ctl::reply_status_one(id, status, idle, doing)
         }
     }
 }

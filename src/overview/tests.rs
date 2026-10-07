@@ -19,7 +19,66 @@ fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> Overv
         errored: false,
         context_pct: None,
         cost_usd: None,
+        agent_id: 0,
+        doing: None,
+        colliding: false,
     }
+}
+
+/// A collision lists the file and both panes by label, counts in the header,
+/// marks each colliding row with a bolt, and the caption replaces the
+/// transcript's last action on the row.
+#[test]
+fn overview_panel_shows_collisions_and_captions() {
+    let bus = atrium::bus::Bus::new();
+    let nodes = vec![
+        OverviewNode {
+            label: "dev_1".into(),
+            agent_id: 1,
+            colliding: true,
+            doing: Some("editing filter.rs".into()),
+            action: "Read src/old.rs".into(),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+        OverviewNode {
+            label: "dev_2".into(),
+            agent_id: 2,
+            colliding: true,
+            action: "Bash cargo test".into(),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+    ];
+    let collisions = vec![atrium::modstate::Collision {
+        key: "src/filter.rs".into(),
+        panes: vec![1, 2],
+    }];
+    let r = strip_csi(&render_overview_panel(
+        &[],
+        &bus,
+        &nodes,
+        &collisions,
+        0,
+        24,
+        120,
+    ));
+    assert!(r.contains("1 collision"), "{r}");
+    assert!(r.contains("src/filter.rs  edited by dev_1, dev_2"), "{r}");
+    assert!(
+        r.contains("— editing filter.rs"),
+        "the caption is the action: {r}"
+    );
+    assert!(!r.contains("Read src/old.rs"), "{r}");
+    assert!(
+        r.contains("— Bash cargo test"),
+        "no caption: the last action: {r}"
+    );
+    assert_eq!(
+        r.matches('\u{26A1}').count(),
+        4,
+        "header, the collision line, a bolt on each row: {r}"
+    );
+    let r = strip_csi(&render_overview_panel(&[], &bus, &nodes, &[], 0, 24, 120));
+    assert!(!r.contains("collision"), "{r}");
 }
 
 /// An errored agent that also reported its usage.
@@ -71,13 +130,13 @@ fn overview_panel_shows_errored_context_and_cost() {
             ..ov_node(0, Some(agsess::Status::Working), false)
         },
     ];
-    let r = strip_csi(&render_overview_panel(&[], &bus, &nodes, 0, 24, 120));
+    let r = strip_csi(&render_overview_panel(&[], &bus, &nodes, &[], 0, 24, 120));
     assert!(r.contains("1 errored"), "{r}");
     assert!(r.contains("$0.12"), "{r}");
     assert!(r.contains("ctx 41% $0.12"), "{r}");
     assert!(r.contains("ctx 7%"), "{r}");
     let plain = vec![ov_node(0, Some(agsess::Status::Working), false)];
-    let r = strip_csi(&render_overview_panel(&[], &bus, &plain, 0, 24, 120));
+    let r = strip_csi(&render_overview_panel(&[], &bus, &plain, &[], 0, 24, 120));
     assert!(
         !r.contains("errored") && !r.contains("ctx ") && !r.contains('$'),
         "{r}"
@@ -160,14 +219,14 @@ fn overview_panel_shows_window_headers_only_when_multiple_fleets() {
     let bus = atrium::bus::Bus::new();
     // One window: no "window 1" group header.
     let one = vec![ov_node(0, None, false), ov_node(0, None, false)];
-    let r1 = strip_csi(&render_overview_panel(&[], &bus, &one, 0, 24, 100));
+    let r1 = strip_csi(&render_overview_panel(&[], &bus, &one, &[], 0, 24, 100));
     assert!(
         !r1.contains("window 1"),
         "single fleet must not show a group header"
     );
     // Two windows: both group headers appear.
     let two = vec![ov_node(0, None, false), ov_node(1, None, false)];
-    let r2 = strip_csi(&render_overview_panel(&[], &bus, &two, 0, 24, 100));
+    let r2 = strip_csi(&render_overview_panel(&[], &bus, &two, &[], 0, 24, 100));
     assert!(r2.contains("window 1"), "multi-fleet must group window 1");
     assert!(r2.contains("window 2"), "multi-fleet must group window 2");
 }

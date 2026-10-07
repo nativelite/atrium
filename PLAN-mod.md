@@ -15,8 +15,21 @@ Status: building, 2026-10-03. Designed against `b826f79`; the item table in
 | N8 telemetry decision + in-pane UI | `d1a9c41` | crossing-rule and fleet-key unit tests; 25 `claude plugin test` cases; `claude plugin validate` lists the state contract; live: `/atrium` drew its header, sections and buttons inside a real interactive claude |
 | N9 docs, skills, changelog | `b6f9b4f` | README, the four deep docs, both delegation skills, CHANGELOG; `python docs/build.py` and the drift check clean. The e2e half landed with each item. Not done: the marketplace plugin's copy of the skills and the mod (that repo) |
 
-Every item of Part I has landed. Part II and Part III are the next
-candidates, in the order of attack §9 of Part II gives.
+Every item of Part I has landed. Part II is being built in the order of
+attack §9 of Part II gives; the `see` group (R1, R3, R4) is done:
+
+| item | commit | proof |
+|---|---|---|
+| R1 captions, R3 ask, R4 collision radar | (this commit) | `cargo test --lib -- modstate ctl vendors` and `--bin atrium -- overview tile ask_panel overlay`; e2e `ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once` and `ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait`; 31 `claude plugin test` cases, `claude plugin validate` lists `turn.step`, `$.model.complete` and `$.model.fork`, strict `tsc` clean; live, with a real Claude Code 2.1.292: `ctl ask 0` from a shell pane returned the pane's own words from a fork ("I wrote `/tmp/atrium-live/touch.txt` containing "hi", then ran `sleep 25`…"), `ctl who /tmp/atrium-live/touch.txt` named pane 0 from its real `Write`, `Ctrl+A ?` opened the overlay and drew the reply, and `ctl status 0` read `doing` as `reading PLAN-mod.md`, `reading modstate.rs`, … while the overview row showed `— reading PLAN-mod.md`, cleared at the prompt |
+
+Deviations in the `see` group: R1's caption is two-tier, a free one from
+every tool call (always on) and the model-made one from the streamed text
+(`captions: false` turns that one off); R3's `ask` rides the `inbox` poll and
+is a client-side wait over `asked`, like `wait`; R4 reports at every edit that
+ran, not at `turn.complete`, so a collision shows while the turn is still
+going, and the decision goes to the nearest common ancestor of the colliding
+panes (the human when they share none). `MultiEdit` is not a tool in the
+engine of the day; `NotebookEdit` is covered instead.
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
 N7 and is a client-side poll, and `inbox` is a poll too (every 1.5 s from the

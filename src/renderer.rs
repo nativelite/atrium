@@ -31,6 +31,8 @@ pub(crate) struct Scene<'a> {
     pub(crate) windows: &'a mut [Window],
     pub(crate) active: usize,
     pub(crate) views: &'a mut Views,
+    /// The keyboard's last ask, for the ask overlay.
+    pub(crate) ask: Option<&'a crate::ask_panel::AskState>,
     /// The drag selection in progress, with the window it started in.
     pub(crate) selection: &'a Option<(usize, Selection)>,
     /// The command prompt's line while it is open.
@@ -116,7 +118,7 @@ pub(crate) struct Renderer {
     /// is cleared several times a second (every ctl request forces a repaint),
     /// which reads as paint corruption and makes text selection impossible (the
     /// clear wipes the drag). Sentinel start so the first frame counts as a change.
-    last_view: (usize, bool, usize, bool, bool, bool, u16, u16),
+    last_view: (usize, bool, usize, bool, bool, bool, bool, u16, u16),
 }
 
 impl Renderer {
@@ -132,7 +134,17 @@ impl Renderer {
             last_pane_output: Instant::now(),
             prev_master: None,
             tiled_buf: None,
-            last_view: (usize::MAX, false, usize::MAX, false, false, false, 0, 0),
+            last_view: (
+                usize::MAX,
+                false,
+                usize::MAX,
+                false,
+                false,
+                false,
+                false,
+                0,
+                0,
+            ),
         }
     }
 
@@ -163,6 +175,7 @@ impl Renderer {
             windows,
             active,
             views,
+            ask,
             selection,
             prompt,
             coord,
@@ -195,6 +208,7 @@ impl Renderer {
             views.board,
             views.overview,
             views.log,
+            views.ask,
             rows,
             cols,
         );
@@ -208,8 +222,16 @@ impl Renderer {
             if force_repaint {
                 let nodes = overview_nodes(windows, world);
                 frame.extend_from_slice(
-                    render_overview_panel(windows, bus, &nodes, views.overview_sel, rows, cols)
-                        .as_bytes(),
+                    render_overview_panel(
+                        windows,
+                        bus,
+                        &nodes,
+                        world.collisions(),
+                        views.overview_sel,
+                        rows,
+                        cols,
+                    )
+                    .as_bytes(),
                 );
             }
         } else if views.board {
@@ -228,6 +250,18 @@ impl Renderer {
                     )
                     .as_bytes(),
                 );
+            }
+        } else if views.ask {
+            // The ask overlay: the question and, once it lands, the reply.
+            // Re-rendered on a repaint (the loop forces one when the reply
+            // arrives).
+            if force_repaint {
+                match ask {
+                    Some(a) => frame.extend_from_slice(
+                        crate::ask_panel::render_ask_panel(a, rows, cols).as_bytes(),
+                    ),
+                    None => views.ask = false,
+                }
             }
         } else if views.log {
             // The activity log overlay: a live time-ordered merge of bus + board

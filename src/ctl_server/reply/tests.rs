@@ -16,7 +16,7 @@ fn audit_outcome_names_the_salient_ids_from_the_typed_reply() {
         (true, "pane=3".to_string())
     );
     assert_eq!(
-        audit_outcome(&ctl::reply_status_one(AgentId(2), None, 0)),
+        audit_outcome(&ctl::reply_status_one(AgentId(2), None, 0, None)),
         (true, "pane=2".to_string())
     );
     assert_eq!(

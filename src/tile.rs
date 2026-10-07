@@ -71,6 +71,10 @@ impl PaneState {
     }
 }
 
+/// The fewest title columns a caption is drawn in; under it the caption is
+/// left out rather than cut to a fragment.
+pub const CAPTION_MIN_COLS: usize = 12;
+
 /// A bound agent's attention status, attached to a pane as a second, orthogonal
 /// axis to [`PaneState`] (§4.1 of the 0.3 design). Populated only for unfocused,
 /// bound agent panes; carries **status only** — never any transcript text.
@@ -81,6 +85,9 @@ pub struct AgentMark {
     /// ([`crate::vendors::AgentState::errored_for`]). Outranks `status`: the
     /// prompt is free, but the agent needs the human.
     pub errored: bool,
+    /// The pane edited a file another live pane edited too
+    /// ([`crate::vendors::AgentState::colliding_for`]): a `⚡` in the title.
+    pub colliding: bool,
 }
 
 /// One pane to composite: its emulated screen, its rect in master coords, its
@@ -111,6 +118,10 @@ pub struct PaneView<'a> {
     /// Cached from `Pane::painted` so `compose_into` avoids scanning the screen
     /// on every frame; a pane that has ever painted stays `true` forever.
     pub painted: bool,
+    /// The caption the pane's mod reported (what it is doing, in a few
+    /// words), drawn dim after the title when columns remain. Never any
+    /// transcript text: the mod composes it from the tool it is running.
+    pub caption: Option<&'a str>,
 }
 
 impl PaneView<'_> {
@@ -167,6 +178,19 @@ impl PaneView<'_> {
             Some(agsess::Status::WaitingApproval) => "? ",
             Some(agsess::Status::Working) => "~ ",
             _ => "",
+        }
+    }
+
+    /// The collision marker after the badge: `⚡ ` when another live pane
+    /// edits a file this one edits too. Unfocused panes only, like the badge.
+    fn collision_badge(&self) -> &'static str {
+        if matches!(self.state, PaneState::Focused | PaneState::Exited) {
+            return "";
+        }
+        if self.agent.is_some_and(|a| a.colliding) {
+            "\u{26A1} "
+        } else {
+            ""
         }
     }
 }
@@ -371,7 +395,13 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
             Some(role) if !role.is_empty() => crate::fleet::sanitize(role),
             _ => p.title.to_string(),
         };
-        let label = format!(" {}:{} {}", p.index, name, p.title_badge());
+        let label = format!(
+            " {}:{} {}{}",
+            p.index,
+            name,
+            p.title_badge(),
+            p.collision_badge()
+        );
         // Available label columns: everything between the two corners.
         let avail = cn.saturating_sub(2);
         let start = c0 + 1;
@@ -395,6 +425,27 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
                     master.set(r0, start + col, Cell::new(ch, tag_style));
                 }
                 col += 1;
+            }
+        }
+        // The caption, dim, in the columns left; a few words or nothing, so
+        // a narrow tile never shows a cut word.
+        if let (Some(caption), false) = (p.caption, p.focused()) {
+            let room = avail.saturating_sub(col);
+            if room >= CAPTION_MIN_COLS && !caption.is_empty() {
+                let text: String = caption.chars().take(room.saturating_sub(2)).collect();
+                let dim = Style {
+                    dim: true,
+                    ..Style::default()
+                };
+                for ch in format!("{text} ").chars() {
+                    if col >= avail {
+                        break;
+                    }
+                    if r0 < rows && start + col < cols {
+                        master.set(r0, start + col, Cell::new(ch, dim));
+                    }
+                    col += 1;
+                }
             }
         }
     }
@@ -443,6 +494,11 @@ mod tests {
         s
     }
 
+    /// The visible text of one composed row.
+    fn row_text(m: &Screen, r: usize) -> String {
+        (0..m.cols()).map(|c| m.cell(r, c).ch).collect()
+    }
+
     fn view<'a>(
         screen: &'a Screen,
         rect: Rect,
@@ -460,6 +516,7 @@ mod tests {
             identity: None,
             role: None,
             painted: !screen_is_blank(screen),
+            caption: None,
         }
     }
 
@@ -481,11 +538,84 @@ mod tests {
             agent: Some(AgentMark {
                 status,
                 errored: false,
+                colliding: false,
             }),
             identity: None,
             role: None,
             painted: !screen_is_blank(screen),
+            caption: None,
         }
+    }
+
+    /// A colliding, working agent pane shows `⚡` after its badge, and its
+    /// caption dim after the title when the tile is wide enough; a focused
+    /// pane shows neither, and a narrow tile drops the caption whole.
+    #[test]
+    fn a_colliding_pane_wears_a_bolt_and_its_caption_when_there_is_room() {
+        let inner = filled(3, 40, ' ');
+        let wide = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 48,
+        };
+        let mut view = agent_view(
+            &inner,
+            wide,
+            2,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::Working,
+        );
+        view.agent = Some(AgentMark {
+            status: agsess::Status::Working,
+            errored: false,
+            colliding: true,
+        });
+        view.caption = Some("running the filter tests");
+        let m = compose(5, 48, &[view], 0);
+        let top = row_text(&m, 0);
+        assert!(top.contains("2:claude ~ \u{26A1} "), "{top:?}");
+        assert!(top.contains("running the filter tests"), "{top:?}");
+        let mut focused = agent_view(
+            &inner,
+            wide,
+            2,
+            "claude",
+            PaneState::Focused,
+            agsess::Status::Working,
+        );
+        focused.agent = Some(AgentMark {
+            status: agsess::Status::Working,
+            errored: false,
+            colliding: true,
+        });
+        focused.caption = Some("running the filter tests");
+        let m = compose(5, 48, &[focused], 0);
+        let top = row_text(&m, 0);
+        assert!(
+            !top.contains('\u{26A1}') && !top.contains("running"),
+            "{top:?}"
+        );
+        let narrow = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 18,
+        };
+        let small = filled(3, 10, ' ');
+        let mut view = agent_view(
+            &small,
+            narrow,
+            2,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::Working,
+        );
+        view.caption = Some("running the filter tests");
+        let m = compose(5, 18, &[view], 0);
+        let top = row_text(&m, 0);
+        assert!(!top.contains("run"), "no fragment of a caption: {top:?}");
     }
 
     /// An errored agent pane is red with a `!` badge when unfocused, and
@@ -509,6 +639,7 @@ mod tests {
         view.agent = Some(AgentMark {
             status: agsess::Status::WaitingPrompt,
             errored: true,
+            colliding: false,
         });
         let m = compose(5, 20, &[view], 0);
         assert_eq!(
@@ -535,6 +666,7 @@ mod tests {
         focused.agent = Some(AgentMark {
             status: agsess::Status::WaitingPrompt,
             errored: true,
+            colliding: false,
         });
         let m = compose(5, 20, &[focused], 0);
         assert_ne!(m.cell(0, 0).style.fg, crate::theme::ERRORED);
@@ -561,6 +693,7 @@ mod tests {
             identity: Some(identity),
             role: None,
             painted: !screen_is_blank(screen),
+            caption: None,
         }
     }
 

@@ -66,6 +66,7 @@ pub(crate) fn render_tiled(
                         .map(|status| AgentMark {
                             status,
                             errored: world.errored_for(p.session_id.as_deref()),
+                            colliding: world.colliding_for(p.session_id.as_deref()),
                         })
                 };
                 let index = w.panes.iter().position(|q| q.id == *id).unwrap_or(0) + 1;
@@ -79,6 +80,11 @@ pub(crate) fn render_tiled(
                     identity: p.identity.as_deref(),
                     role: p.role.as_deref(),
                     painted: p.painted,
+                    caption: if *id == focus {
+                        None
+                    } else {
+                        world.doing_for(p.session_id.as_deref())
+                    },
                 }
             })
         })

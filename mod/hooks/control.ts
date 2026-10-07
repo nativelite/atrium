@@ -123,7 +123,46 @@ export const TOOLS: readonly Spec[] = [
     description: 'The active topics and how many panes subscribe to each.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'ask',
+    description:
+      "Ask a teammate pane a question without interrupting it: its mod answers from a fork of the pane's own context (no tools, its turn untouched). Waits for the reply (default 120 s). Use it to learn what a teammate is doing, needs, or is blocked on.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        target: str('Pane id or role.'),
+        question: str('The question, in one or two sentences.'),
+        timeout_s: { type: 'integer', description: 'How long to wait for the reply (1..600; default 120).' },
+      },
+      required: ['target', 'question'],
+    },
+  },
+  {
+    name: 'asked',
+    description: 'Read the reply to an earlier atrium_ask by its id (an ask that timed out may answer later).',
+    inputSchema: { type: 'object', properties: { target: str('Pane id or role.'), id: { type: 'integer', description: 'The ask id.' } }, required: ['target', 'id'] },
+  },
+  {
+    name: 'who',
+    description: 'Which panes edited a file, with when and whether each is still live. A path relative to a worktree (src/x.rs) finds it in every worktree. Ask before you edit a shared file, and before a merge.',
+    inputSchema: { type: 'object', properties: { path: str('A file path, real or worktree-relative.') }, required: ['path'] },
+  },
 ]
+
+/** The default wait of `ctl ask`, in seconds, as the broker's client spells it. */
+export const ASK_DEFAULT_TIMEOUT_S = 120
+
+/**
+ * How long the `atrium ctl` run for `argv` may take: a plain verb answers at
+ * once; `ask` waits for the reply, so its run gets the ask's own timeout and
+ * a margin.
+ */
+export function ctlTimeoutFor(argv: readonly string[]): number {
+  if (argv[0] !== 'ask') return 10_000
+  const i = argv.indexOf('--timeout')
+  const t = i >= 0 ? Number(argv[i + 1]) : ASK_DEFAULT_TIMEOUT_S
+  return ((Number.isFinite(t) && t > 0 ? t : ASK_DEFAULT_TIMEOUT_S) + 30) * 1000
+}
 
 /** The prefix a plugin tool's full name carries: `mcp__<plugin>__`. */
 export const TOOL_PREFIX = 'mcp__atrium__'
@@ -229,6 +268,19 @@ export function argvFor(name: string, input: Input): string[] | Error {
       }
       case 'bus_topics':
         return ['bus', 'topics']
+      case 'ask': {
+        const args = ['ask', need(input, 'target')]
+        const t = whole(input, 'timeout_s')
+        if (t !== undefined) args.push('--timeout', t)
+        return [...args, need(input, 'question')]
+      }
+      case 'asked': {
+        const id = whole(input, 'id')
+        if (id === undefined) throw new Error('id is required')
+        return ['asked', need(input, 'target'), id]
+      }
+      case 'who':
+        return ['who', need(input, 'path')]
       case 'subagent':
         return new Error('subagent is run by the mod, not mapped to one ctl verb')
       default:

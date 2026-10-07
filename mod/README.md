@@ -14,7 +14,8 @@ It also gives the model the control plane as typed tools and tells it who it
 is:
 
 - **`atrium_*` tools** (`spawn`, `send`, `status`, `list`, `kill`,
-  `board_set|get|list|claim|release`, `bus_pub|feed|resolve|topics`): each
+  `board_set|get|list|claim|release`, `bus_pub|feed|resolve|topics`, `ask`,
+  `asked`, `who`): each
   call is one `atrium ctl` run with the pane's token, and the reply is what the
   model reads. The shell verbs are the same, so the skills stay true. An ask for
   one of these tools is answered by the mod, never a dialog; a deny from a rule
@@ -37,6 +38,22 @@ is:
   with the session's open decisions (each with a resolve button and a hotkey),
   the board, and the last bus events, refreshed every 3 s while open. A band
   above the prompt counts the open decisions and opens the pane.
+- **Captions**: every tool call reports what the pane is doing in a few
+  words (`running cargo test --lib ctl`, `editing filter.rs`), free; and,
+  unless the fleet says `captions: false`, a six-word caption from the
+  model's own streamed text, by one small `haiku` call at most every twenty
+  seconds (`turn.step`). The overview and the tile border show it; the turn's
+  end clears it.
+- **The collision radar**: the real path of every `Edit`, `Write` and
+  `NotebookEdit` that ran is reported (`touched=`); the broker keys it by the
+  pane's worktree, lights `⚡` on every pane editing a file another live pane
+  edits, and posts one `collision` decision to the lead. `atrium_who {path}`
+  asks who has a file.
+- **Asks**: a question queued with `atrium ctl ask` (or `Ctrl+A ?`, or
+  `atrium_ask` from another pane) rides the inbox as an `ask` item; the mod
+  answers it with `$.model.fork`, one tool-less completion over this
+  session's own transcript, so the turn is untouched and nothing leaves the
+  pane, and reports the reply (`report ask=<id> reply=…`).
 - **Subagents as panes**: `atrium_subagent {description, prompt}` spawns a
   claude pane beside this one, sends it the task, waits for the answer its own
   mod reports (`atrium ctl wait --for answer`), closes the pane unless `keep`,
@@ -46,7 +63,8 @@ is:
   subagent is a tile the human can watch, send to and kill.
 
 Each piece is a capability the mod offers in `hello` (`status`, `answer`,
-`context`, `tools`, `guard`); the broker's `accepted` list switches it on.
+`context`, `tools`, `guard`, `inbox`, `ask`); the broker's `accepted` list
+switches it on.
 
 Load it for one session:
 

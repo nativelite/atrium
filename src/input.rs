@@ -69,6 +69,10 @@ pub enum Action {
     /// of the bus, board changes, and each agent's latest action, so you can
     /// reconstruct what the whole fleet did, in order. (`l` is focus-right.)
     ToggleLog,
+    /// **Ask** the focused pane what it is doing — `Ctrl+A ?`. The question
+    /// goes to the pane's mod, which answers it from a fork of the pane's own
+    /// context without interrupting its turn; the reply opens as an overlay.
+    AskFocused,
     /// A left-button press at 1-based terminal cell (`col`, `row`) — only
     /// emitted while mouse mode is on. Used to focus the pane under the cursor.
     MouseClick {
@@ -240,6 +244,10 @@ impl PrefixScanner {
                         b'a' => {
                             flush(&mut run, &mut actions);
                             actions.push(Action::ToggleLog);
+                        }
+                        b'?' => {
+                            flush(&mut run, &mut actions);
+                            actions.push(Action::AskFocused);
                         }
                         b'h' => push_move(Dir::Left, &mut run, &mut actions, &mut flush),
                         b'j' => push_move(Dir::Down, &mut run, &mut actions, &mut flush),
@@ -504,6 +512,14 @@ mod scroll_tests {
     fn prefix_o_toggles_the_overview() {
         let mut s = PrefixScanner::new();
         assert_eq!(s.feed(&[PREFIX, b'o']), vec![Action::ToggleOverview]);
+    }
+
+    #[test]
+    fn prefix_question_mark_asks_the_focused_pane() {
+        let mut s = PrefixScanner::new();
+        assert_eq!(s.feed(&[PREFIX, b'?']), vec![Action::AskFocused]);
+        // A bare `?` is text for the pane.
+        assert_eq!(s.feed(b"?"), vec![Action::Forward(b"?".to_vec())]);
     }
 
     #[test]

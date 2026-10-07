@@ -13,7 +13,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement } from 'claude-code'
 import { fit, parseView } from './view'
 import { WAIT_SLICES, WAIT_SLICE_S, reportedAnswer, slug, spawnPointer, spawnedPane, subagentPrompt } from './agents'
-import { TOOLS, TOOL_PREFIX, argvFor, isAtriumTool } from './control'
+import { ASK_REPLY_CAP, askPrompt, askReplyText, captionDue, captionRequest, clipCaption, toolCaption } from './caption'
+import { TOOLS, TOOL_PREFIX, argvFor, ctlTimeoutFor, isAtriumTool } from './control'
 import { INBOX_POLL_MS, acceptedCaps, inboxItems, parseReply } from './ctl'
 import type { Reply } from './ctl'
 import { guardVerdict, isAbsolute, join, pathOf, splitParent } from './guard'
@@ -76,6 +77,8 @@ type State = {
   viewBusy: boolean
   /** The last refresh, to pace the idle (pane closed) cadence on the open timer. */
   viewAt: number
+  /** When the last model-made caption was requested. */
+  captionAt: number
 }
 const state: State = {
   status: undefined,
@@ -87,6 +90,73 @@ const state: State = {
   viewTimer: undefined,
   viewBusy: false,
   viewAt: 0,
+  captionAt: 0,
+}
+
+/** Report `fields` when the broker accepted the status cap. */
+function report(fields: Record<string, string | string[]>): void {
+  if (state.reporter === undefined || !state.accepted.has('status')) return
+  state.reporter.push(fields)
+}
+
+/** Report the real path of a file this pane just edited (collision radar). */
+async function touch($: EngineInterface, path: string | undefined): Promise<void> {
+  if (path === undefined) return
+  const real = await placed($, isAbsolute(path) ? path : join(await $.session.cwd(), path))
+  if (real !== undefined) report({ touched: [real] })
+}
+
+/**
+ * The guard, then the edit, then the touch report: one body for the three
+ * editing tools. A refused edit touches nothing.
+ */
+async function editCall(
+  $: EngineInterface,
+  e: Record<string, unknown>,
+  next: (e: Record<string, unknown>) => Promise<unknown>,
+): Promise<unknown> {
+  const path = pathOf(e)
+  const reason = await guard($, path)
+  if (reason !== undefined) return { deny: reason }
+  const done = await next(e)
+  if (done !== null && typeof done === 'object' && !('deny' in done)) void touch($, path)
+  return done
+}
+
+/**
+ * A caption from the model's own words: one small, cheap completion over the
+ * last few hundred characters of a step's text, at most once in
+ * `CAPTION_MIN_MS`, only when the fleet allows it (`captions`).
+ */
+async function captionFromText($: EngineInterface, text: string): Promise<void> {
+  if (state.who?.captions === false || state.reporter === undefined || !state.accepted.has('status')) return
+  const now = await $.clock.now()
+  if (!captionDue(state.captionAt, now, Array.from(text).length)) return
+  state.captionAt = now
+  const { system, prompt } = captionRequest(text)
+  try {
+    const r = await $.model.complete({ model: 'haiku', system, prompt, maxTokens: 24, effort: 'low', timeoutMs: 10_000 })
+    if (r.isAnswered && r.text.trim() !== '') report({ doing: clipCaption(r.text) })
+  } catch (err) {
+    $.ui.log(`atrium: caption not made: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+  }
+}
+
+/**
+ * Answer a queued question from a fork of this session's own context: no
+ * tools, the turn untouched, the transcript never leaving the pane. The reply
+ * goes straight to the broker, outside the coalescing reporter, so two
+ * questions in flight never merge.
+ */
+async function answerAsk($: EngineInterface, id: number, question: string): Promise<void> {
+  let text: string
+  try {
+    text = askReplyText(await $.model.fork({ prompt: askPrompt(question) }))
+  } catch (err) {
+    text = `(no reply: ${err instanceof Error ? err.message : String(err)})`
+  }
+  const reply = await ctl($, ['report', `ask=${id}`, `reply=${Array.from(text).slice(0, ASK_REPLY_CAP).join('')}`])
+  if (!reply.ok) $.ui.log(`atrium: ask #${id} reply refused: ${reply.err ?? 'no reply'}`, { to: 'debug' })
 }
 
 /** Fetch the board and the feed from the broker into the pane's state. */
@@ -129,6 +199,10 @@ async function pollInbox($: EngineInterface): Promise<void> {
   try {
     const reply = await ctl($, ['inbox'])
     for (const item of inboxItems(reply)) {
+      if (item.kind === 'ask') {
+        void answerAsk($, item.id, item.text)
+        continue
+      }
       // Resolves when the turn starts, which may be a while: do not wait.
       void $.prompt.submit({ text: item.text, asUser: true }).catch(err => {
         $.ui.log(`atrium: delivery not submitted: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
@@ -356,18 +430,28 @@ export const register: Register = on => {
   })
 
   // The file guard: an edit outside the item's files is refused, with the
-  // owner named, before the tool runs.
-  on('tool.call', { tool: 'Edit' }, async ($, e, next) => {
-    const reason = await guard($, pathOf(e as Record<string, unknown>))
-    return reason === undefined ? next(e) : { deny: reason }
-  })
-  on('tool.call', { tool: 'Write' }, async ($, e, next) => {
-    const reason = await guard($, pathOf(e as Record<string, unknown>))
-    return reason === undefined ? next(e) : { deny: reason }
-  })
-  on('tool.call', { tool: 'NotebookEdit' }, async ($, e, next) => {
-    const reason = await guard($, pathOf(e as Record<string, unknown>))
-    return reason === undefined ? next(e) : { deny: reason }
+  // owner named, before the tool runs; an edit that ran reports its real
+  // path, which is the collision radar's evidence.
+  on('tool.call', { tool: 'Edit' }, ($, e, next) =>
+    editCall($, e as Record<string, unknown>, x => next(x as typeof e)) as ReturnType<typeof next>,
+  )
+  on('tool.call', { tool: 'Write' }, ($, e, next) =>
+    editCall($, e as Record<string, unknown>, x => next(x as typeof e)) as ReturnType<typeof next>,
+  )
+  on('tool.call', { tool: 'NotebookEdit' }, ($, e, next) =>
+    editCall($, e as Record<string, unknown>, x => next(x as typeof e)) as ReturnType<typeof next>,
+  )
+
+  // The caption from the model's own words, off each step's streamed text.
+  // The chunks pass through untouched; the step's result stands.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e)
+    let text = ''
+    for await (const c of next(e)) {
+      if (c.kind === 'text') text += c.text
+      yield c
+    }
+    void captionFromText($, text)
   })
 
   on('turn.start', ($, e, next) => {
@@ -390,15 +474,18 @@ export const register: Register = on => {
 
   on('tool.call', async ($, e, next) => {
     say(transition(state.status, { kind: 'tool.call', tool: String(e.tool) }))
+    const { tool: _tool, tool_use_id: toolUseId, consent: _consent, ...input } = e as Record<string, unknown>
+    // The free caption: what this call says the pane is doing.
+    const caption = toolCaption(String(e.tool), input)
+    if (caption !== undefined) report({ doing: caption })
     if (!isAtriumTool(String(e.tool))) return next(e)
     // The typed control plane: each atrium_* call is one `atrium ctl` run
     // with the pane's own token, and the reply is what the model reads.
     const name = String(e.tool).slice(TOOL_PREFIX.length)
-    const { tool: _tool, tool_use_id: toolUseId, consent: _consent, ...input } = e as Record<string, unknown>
     if (name === 'subagent') return runSubagent($, input, typeof toolUseId === 'string' ? toolUseId : undefined)
     const argv = argvFor(name, input)
     if (argv instanceof Error) return { deny: `atrium_${name}: ${argv.message}` }
-    const reply = await ctl($, argv)
+    const reply = await ctl($, argv, ctlTimeoutFor(argv))
     return { result: JSON.stringify(reply) }
   })
 
@@ -406,6 +493,8 @@ export const register: Register = on => {
     const done = await next(e)
     const agent = e.agentId !== undefined
     say(transition(state.status, { kind: 'turn.complete', reason: e.reason, agent }))
+    // The turn is over: the caption no longer says what the pane is doing.
+    if (!agent) report({ doing: '' })
     if (!agent && e.reason === 'answer' && state.accepted.has('answer') && state.reporter !== undefined) {
       const text = done.text.trim()
       if (text !== '') state.reporter.push({ answer: clipAnswer(text) })

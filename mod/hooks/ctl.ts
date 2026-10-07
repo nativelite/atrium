@@ -28,8 +28,12 @@ export function parseReply(ran: Ran): Reply {
   return { ok: false, err: `not a ctl reply: ${line.slice(0, 120)}` }
 }
 
-/** One delivery `ctl inbox` handed over: a `send`'s text, or a bus wake's framed line. */
-export type InboxItem = { kind: 'send' | 'wake'; text: string }
+/**
+ * One item `ctl inbox` handed over: a `send`'s text or a bus wake's framed
+ * line (each a prompt to submit), or an `ask` (a question to answer from a
+ * fork, with the id its reply names).
+ */
+export type InboxItem = { kind: 'send' | 'wake'; text: string } | { kind: 'ask'; text: string; id: number }
 
 /** The items of an `inbox` reply, in order; none for anything else. */
 export function inboxItems(reply: Reply): InboxItem[] {
@@ -38,8 +42,10 @@ export function inboxItems(reply: Reply): InboxItem[] {
   const out: InboxItem[] = []
   for (const it of items) {
     if (it === null || typeof it !== 'object') continue
-    const { kind, text } = it as Record<string, unknown>
-    if ((kind === 'send' || kind === 'wake') && typeof text === 'string' && text.trim() !== '') out.push({ kind, text })
+    const { kind, text, id } = it as Record<string, unknown>
+    if (typeof text !== 'string' || text.trim() === '') continue
+    if (kind === 'send' || kind === 'wake') out.push({ kind, text })
+    else if (kind === 'ask' && typeof id === 'number' && Number.isInteger(id) && id > 0) out.push({ kind, text, id })
   }
   return out
 }

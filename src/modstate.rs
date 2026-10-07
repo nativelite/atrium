@@ -24,12 +24,24 @@
 //! `errored` and `ended` are states the transcript inference cannot see. The
 //! chrome has no colour for them yet; [`ModStatus::as_agsess`] says what the
 //! border shows meanwhile, and `ctl status`/`ctl list` carry the real label.
+//!
+//! # Sight (Part II of `PLAN-mod.md`)
+//!
+//! Three more things a mod reports, all about itself: a **caption** (`doing`,
+//! six words on what the pane is doing right now), the real paths it
+//! **touched** with an edit (from which the broker computes **collisions**:
+//! two panes editing the same file on different worktrees), and the **reply**
+//! to a question the broker queued for it (`ctl ask`, answered by a fork of
+//! the pane's own context, without interrupting its turn). The ask queue
+//! lives here too, so the rules are unit-tested with the rest.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// The capabilities a mod may declare and the broker will act on. Anything
 /// else in a `hello` is dropped from `accepted` and never consulted.
-pub const CAPS: &[&str] = &["status", "inbox", "answer", "context", "tools", "guard"];
+pub const CAPS: &[&str] = &[
+    "status", "inbox", "answer", "context", "tools", "guard", "ask",
+];
 
 /// A status report older than this is ignored and the inferred status is used
 /// again. Two minutes: the mod reports on every turn boundary and tool call,
@@ -45,6 +57,29 @@ pub const VERSION_CAP: usize = 64;
 
 /// The most of a `reason` the broker keeps.
 pub const REASON_CAP: usize = 200;
+
+/// The most of a caption (`doing`) the broker keeps: six words, roughly.
+pub const DOING_CAP: usize = 80;
+
+/// The most touched paths the broker remembers per pane; past it a new path
+/// is dropped (a pane that edits hundreds of files is a build, not a worker).
+pub const TOUCH_CAP: usize = 256;
+
+/// The most of a question (`ctl ask`) the broker queues.
+pub const ASK_CAP: usize = 2_000;
+
+/// The most of an ask's reply the broker keeps.
+pub const ASK_REPLY_CAP: usize = 4_000;
+
+/// Unanswered questions one pane may hold; the next `ask` is refused.
+pub const ASK_QUEUE: usize = 8;
+
+/// How long an ask's reply stays readable after it arrived.
+pub const ASK_REPLY_TTL_MS: u64 = 600_000;
+
+/// The question `Ctrl+A ?` asks the focused pane.
+pub const ASK_DEFAULT_QUESTION: &str =
+    "What are you doing right now, what do you need, and what, if anything, is blocking you?";
 
 /// A status as a mod reports it: the four the transcript inference also
 /// knows, plus two only the engine can see.
@@ -146,6 +181,16 @@ pub struct Report {
     pub turns: Option<u64>,
     /// The text of the last completed turn's answer.
     pub answer: Option<String>,
+    /// The caption: what the pane is doing right now, in a few words. An
+    /// empty string clears it (the turn ended).
+    pub doing: Option<String>,
+    /// Real paths the pane edited since its last report. Recorded by
+    /// [`ModState::touch`], which needs the pane's root; [`ModState::report`]
+    /// ignores this field.
+    pub touched: Vec<String>,
+    /// The reply to a queued question: the ask's id and the text. Recorded by
+    /// [`ModState::reply`]; [`ModState::report`] ignores this field.
+    pub ask: Option<(u64, String)>,
 }
 
 /// What the broker remembers of one pane's reports.
@@ -160,6 +205,63 @@ pub struct PaneReport {
     /// The last answer and its sequence number (monotonic across all panes, so
     /// a waiter can tell a new answer from the one it already read).
     pub answer: Option<(String, u64)>,
+    /// The caption and when it was reported.
+    pub doing: Option<(String, u64)>,
+}
+
+/// One file a pane edited: its real path and when it was first and last
+/// touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Touch {
+    pub path: String,
+    pub first_ms: u64,
+    pub last_ms: u64,
+}
+
+/// One file two or more live panes edited: the key both touches share (a
+/// path relative to each pane's worktree, or an absolute one) and the panes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collision {
+    pub key: String,
+    pub panes: Vec<usize>,
+}
+
+/// A question queued for a pane's mod (`ctl ask`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ask {
+    pub id: u64,
+    pub text: String,
+    /// The pane that asked; `None` is the human.
+    pub from: Option<usize>,
+    pub at_ms: u64,
+}
+
+/// A pane's reply to an ask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskReply {
+    pub pane: usize,
+    pub text: String,
+    pub at_ms: u64,
+}
+
+/// The key a touched path is remembered under: relative to `root` (the
+/// pane's worktree, or its cwd) when it lies inside it, else the path itself.
+/// Two worktrees of one repo hold the same relative paths, and an edit to
+/// `src/x.rs` in each is the merge conflict the radar exists to catch; a
+/// shared absolute path outside both collides on its own name.
+pub fn touch_key(path: &str, root: Option<&str>) -> String {
+    let path = path.trim();
+    if let Some(root) = root.map(str::trim).filter(|r| !r.is_empty()) {
+        let root = root.trim_end_matches(['/', '\\']);
+        if let Some(rest) = path.strip_prefix(root) {
+            if let Some(rel) = rest.strip_prefix(['/', '\\']) {
+                if !rel.is_empty() {
+                    return rel.replace('\\', "/");
+                }
+            }
+        }
+    }
+    path.to_string()
 }
 
 /// The broker's memory of every pane's mod, keyed by agent id.
@@ -169,7 +271,19 @@ pub struct ModState {
     answer_seq: u64,
     /// Panes whose context crossed `respawn_at` and were flagged; cleared when
     /// the fill drops back under, so one crossing is one decision.
-    respawn_flagged: std::collections::HashSet<usize>,
+    respawn_flagged: HashSet<usize>,
+    /// What each pane edited, by touch key ([`touch_key`]).
+    touched: HashMap<usize, HashMap<String, Touch>>,
+    /// Collision keys already announced; cleared when a key stops colliding,
+    /// so one collision is one decision.
+    collision_flagged: HashSet<String>,
+    /// Questions queued per pane, oldest first.
+    asks: HashMap<usize, VecDeque<Ask>>,
+    /// Every ask id ever issued and the pane it was issued to, so a reply is
+    /// accepted only from that pane and `asked` can tell pending from unknown.
+    issued: HashMap<u64, usize>,
+    replies: HashMap<u64, AskReply>,
+    ask_seq: u64,
 }
 
 impl ModState {
@@ -209,8 +323,14 @@ impl ModState {
     /// Record a `report`. Fields given replace what was held; fields absent
     /// are kept. Text is scrubbed of control characters and capped. Returns
     /// the sequence number of the answer, when the report carried one.
+    /// `touched` and `ask` are not recorded here: see [`ModState::touch`] and
+    /// [`ModState::reply`], which the server calls with what they need.
     pub fn report(&mut self, pane: usize, r: &Report, now_ms: u64) -> Option<u64> {
         let slot = &mut self.panes.entry(pane).or_default().1;
+        if let Some(d) = r.doing.as_deref() {
+            let d = clip(text_safe(d).trim(), DOING_CAP);
+            slot.doing = (!d.is_empty()).then_some((d, now_ms));
+        }
         if let Some(s) = r.status {
             slot.status = Some((s, now_ms));
             // A reason belongs to the status it came with; a status reported
@@ -264,10 +384,194 @@ impl ModState {
     }
 
     /// Drop everything about a pane: it exited, or was respawned as a new
-    /// process whose mod will say hello again.
+    /// process whose mod will say hello again. Replies it already gave stay
+    /// readable until they expire; questions it never took are dropped.
     pub fn forget(&mut self, pane: usize) {
         self.panes.remove(&pane);
         self.respawn_flagged.remove(&pane);
+        self.touched.remove(&pane);
+        if let Some(q) = self.asks.remove(&pane) {
+            for a in q {
+                self.issued.remove(&a.id);
+            }
+        }
+    }
+
+    /// Record the real paths `pane` edited. `root` is the pane's worktree or
+    /// cwd, which keys the touch ([`touch_key`]). A path past [`TOUCH_CAP`]
+    /// distinct keys is dropped.
+    pub fn touch(&mut self, pane: usize, paths: &[String], root: Option<&str>, now_ms: u64) {
+        let map = self.touched.entry(pane).or_default();
+        for raw in paths {
+            let path = text_safe(raw.trim());
+            if path.is_empty() {
+                continue;
+            }
+            let key = touch_key(&path, root);
+            if let Some(t) = map.get_mut(&key) {
+                t.last_ms = now_ms;
+                t.path = path;
+            } else if map.len() < TOUCH_CAP {
+                map.insert(
+                    key,
+                    Touch {
+                        path,
+                        first_ms: now_ms,
+                        last_ms: now_ms,
+                    },
+                );
+            }
+        }
+    }
+
+    /// What `pane` touched, by key, oldest first touch first.
+    pub fn touches_of(&self, pane: usize) -> Vec<(&str, &Touch)> {
+        let mut v: Vec<(&str, &Touch)> = self
+            .touched
+            .get(&pane)
+            .map(|m| m.iter().map(|(k, t)| (k.as_str(), t)).collect())
+            .unwrap_or_default();
+        v.sort_by_key(|(k, t)| (t.first_ms, k.to_string()));
+        v
+    }
+
+    /// Who touched `path`: every pane whose touch key or real path is `path`
+    /// or ends with `/path`, so `ctl who src/x.rs` finds the file in every
+    /// worktree. Sorted by pane.
+    pub fn who(&self, path: &str) -> Vec<(usize, &str, &Touch)> {
+        let q = path.trim().trim_end_matches('/');
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let tail = format!("/{q}");
+        let hit = |s: &str| s == q || s.ends_with(&tail);
+        let mut v: Vec<(usize, &str, &Touch)> = self
+            .touched
+            .iter()
+            .flat_map(|(pane, m)| {
+                m.iter()
+                    .filter(move |(k, t)| hit(k) || hit(&t.path))
+                    .map(move |(k, t)| (*pane, k.as_str(), t))
+            })
+            .collect();
+        v.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        v
+    }
+
+    /// Every key two or more of the `live` panes touched, sorted by key, the
+    /// panes sorted within.
+    pub fn collisions(&self, live: &[usize]) -> Vec<Collision> {
+        let mut by_key: HashMap<&str, Vec<usize>> = HashMap::new();
+        for pane in live {
+            if let Some(m) = self.touched.get(pane) {
+                for k in m.keys() {
+                    let v = by_key.entry(k.as_str()).or_default();
+                    if !v.contains(pane) {
+                        v.push(*pane);
+                    }
+                }
+            }
+        }
+        let mut out: Vec<Collision> = by_key
+            .into_iter()
+            .filter(|(_, panes)| panes.len() >= 2)
+            .map(|(key, mut panes)| {
+                panes.sort_unstable();
+                Collision {
+                    key: key.to_string(),
+                    panes,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        out
+    }
+
+    /// The collisions among `live` panes not yet announced: each is returned
+    /// once, until it stops being a collision (a pane left) and starts again.
+    pub fn collisions_new(&mut self, live: &[usize]) -> Vec<Collision> {
+        let all = self.collisions(live);
+        let keys: HashSet<&str> = all.iter().map(|c| c.key.as_str()).collect();
+        self.collision_flagged.retain(|k| keys.contains(k.as_str()));
+        let mut fresh = Vec::new();
+        for c in all {
+            if self.collision_flagged.insert(c.key.clone()) {
+                fresh.push(c);
+            }
+        }
+        fresh
+    }
+
+    /// Queue a question for `pane`'s mod. Refused when the pane already holds
+    /// [`ASK_QUEUE`] unanswered questions. Returns the ask's id.
+    pub fn ask(
+        &mut self,
+        pane: usize,
+        from: Option<usize>,
+        text: &str,
+        now_ms: u64,
+    ) -> Result<u64, String> {
+        self.replies
+            .retain(|_, r| now_ms.saturating_sub(r.at_ms) <= ASK_REPLY_TTL_MS);
+        let text = clip(text_safe(text).trim(), ASK_CAP);
+        if text.is_empty() {
+            return Err("ask needs a question".to_string());
+        }
+        let pending = self
+            .issued
+            .iter()
+            .filter(|(id, p)| **p == pane && !self.replies.contains_key(*id))
+            .count();
+        if pending >= ASK_QUEUE {
+            return Err(format!(
+                "pane {pane} already has {ASK_QUEUE} unanswered questions"
+            ));
+        }
+        self.ask_seq += 1;
+        let id = self.ask_seq;
+        self.asks.entry(pane).or_default().push_back(Ask {
+            id,
+            text,
+            from,
+            at_ms: now_ms,
+        });
+        self.issued.insert(id, pane);
+        Ok(id)
+    }
+
+    /// Hand `pane`'s queued questions to its mod, emptying the queue.
+    pub fn take_asks(&mut self, pane: usize) -> Vec<Ask> {
+        self.asks
+            .get_mut(&pane)
+            .map(|q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+
+    /// Record `pane`'s reply to ask `id`. Only the pane the question was
+    /// issued to may answer it, and only once; anything else is refused.
+    pub fn reply(&mut self, pane: usize, id: u64, text: &str, now_ms: u64) -> bool {
+        if self.issued.get(&id) != Some(&pane) || self.replies.contains_key(&id) {
+            return false;
+        }
+        self.replies.insert(
+            id,
+            AskReply {
+                pane,
+                text: clip(text_safe(text).trim(), ASK_REPLY_CAP),
+                at_ms: now_ms,
+            },
+        );
+        true
+    }
+
+    /// The reply to ask `id`, once it arrived and until it expires.
+    pub fn reply_for(&self, id: u64) -> Option<&AskReply> {
+        self.replies.get(&id)
+    }
+
+    /// Is ask `id` issued and still unanswered?
+    pub fn ask_pending(&self, id: u64) -> bool {
+        self.issued.contains_key(&id) && !self.replies.contains_key(&id)
     }
 
     /// True exactly once when a pane's reported context fill reaches
@@ -308,6 +612,13 @@ impl ModState {
         now_ms: u64,
     ) {
         world.clear_status_overrides();
+        let live: Vec<usize> = panes.iter().map(|(p, _)| *p).collect();
+        let collisions = self.collisions(&live);
+        let colliding: HashSet<usize> = collisions
+            .iter()
+            .flat_map(|c| c.panes.iter().copied())
+            .collect();
+        world.set_collisions(collisions);
         for (pane, session) in panes {
             let Some(id) = session.as_deref() else {
                 continue;
@@ -328,6 +639,8 @@ impl ModState {
                     reason: r.and_then(|r| r.reason.clone()),
                     context_pct: r.and_then(|r| r.context_pct),
                     cost_usd: r.and_then(|r| r.cost_usd),
+                    doing: r.and_then(|r| r.doing.as_ref().map(|(d, _)| d.clone())),
+                    colliding: colliding.contains(pane),
                 },
             );
         }
@@ -368,6 +681,18 @@ impl Subagents {
 }
 
 static SESSION_SUBAGENTS: std::sync::OnceLock<(Subagents, bool)> = std::sync::OnceLock::new();
+static SESSION_CAPTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record the fleet's `captions` for the session. First call wins.
+pub fn set_session_captions(on: bool) {
+    let _ = SESSION_CAPTIONS.set(on);
+}
+
+/// May a pane's mod spend a small model call on its caption? On unless a
+/// fleet said `captions: false`; the tool-derived caption is free and always on.
+pub fn session_captions() -> bool {
+    SESSION_CAPTIONS.get().copied().unwrap_or(true)
+}
 static SESSION_RESPAWN_AT: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
 
 /// Record the fleet's `respawn_at` for the session. First call wins.
@@ -687,6 +1012,171 @@ mod tests {
     }
 
     #[test]
+    fn touch_keys_are_relative_inside_the_root_and_absolute_outside() {
+        assert_eq!(touch_key("/wt/a/src/x.rs", Some("/wt/a")), "src/x.rs");
+        assert_eq!(touch_key("/wt/a/src/x.rs", Some("/wt/a/")), "src/x.rs");
+        assert_eq!(
+            touch_key("/wt/ab/src/x.rs", Some("/wt/a")),
+            "/wt/ab/src/x.rs"
+        );
+        assert_eq!(touch_key("/etc/hosts", Some("/wt/a")), "/etc/hosts");
+        assert_eq!(touch_key("/wt/a", Some("/wt/a")), "/wt/a");
+        assert_eq!(touch_key("/x/y.rs", None), "/x/y.rs");
+        assert_eq!(
+            touch_key("C:\\wt\\a\\src\\x.rs", Some("C:\\wt\\a")),
+            "src/x.rs"
+        );
+    }
+
+    #[test]
+    fn touches_collide_across_worktrees_and_are_announced_once() {
+        let mut m = ModState::default();
+        m.touch(1, &["/wt/a/src/x.rs".to_string()], Some("/wt/a"), 10);
+        m.touch(2, &["/wt/b/src/y.rs".to_string()], Some("/wt/b"), 11);
+        assert!(m.collisions(&[1, 2]).is_empty(), "different files");
+        m.touch(
+            2,
+            &["/wt/b/src/x.rs".to_string(), "".to_string()],
+            Some("/wt/b"),
+            12,
+        );
+        let c = m.collisions(&[1, 2]);
+        assert_eq!(
+            c,
+            vec![Collision {
+                key: "src/x.rs".to_string(),
+                panes: vec![1, 2]
+            }]
+        );
+        assert!(
+            m.collisions(&[1]).is_empty(),
+            "a dead pane collides with nobody"
+        );
+        assert_eq!(m.collisions_new(&[1, 2]).len(), 1, "announced");
+        assert!(m.collisions_new(&[1, 2]).is_empty(), "once");
+        m.touch(1, &["/wt/a/src/x.rs".to_string()], Some("/wt/a"), 13);
+        assert!(
+            m.collisions_new(&[1, 2]).is_empty(),
+            "a repeat touch is the same collision"
+        );
+        assert!(m.collisions_new(&[1]).is_empty(), "pane 2 gone: cleared");
+        assert_eq!(m.collisions_new(&[1, 2]).len(), 1, "back: announced again");
+        let t = m.touches_of(1);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].0, "src/x.rs");
+        assert_eq!((t[0].1.first_ms, t[0].1.last_ms), (10, 13));
+        let who = m.who("src/x.rs");
+        assert_eq!(who.iter().map(|w| w.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            m.who("x.rs").len(),
+            2,
+            "a suffix on a path boundary matches"
+        );
+        assert_eq!(
+            m.who("/wt/b/src/x.rs").len(),
+            1,
+            "the real path finds its pane"
+        );
+        assert!(m.who("c/x.rs").is_empty(), "not a path boundary");
+        assert!(m.who("").is_empty());
+        m.forget(2);
+        assert!(m.who("src/x.rs").len() == 1);
+    }
+
+    #[test]
+    fn a_pane_remembers_at_most_touch_cap_files() {
+        let mut m = ModState::default();
+        let paths: Vec<String> = (0..TOUCH_CAP + 5).map(|i| format!("/r/f{i}")).collect();
+        m.touch(1, &paths, Some("/r"), 1);
+        assert_eq!(m.touches_of(1).len(), TOUCH_CAP);
+        m.touch(1, &["/r/f0".to_string()], Some("/r"), 2);
+        assert_eq!(
+            m.touches_of(1)[0].1.last_ms,
+            2,
+            "a known file is still updated"
+        );
+    }
+
+    #[test]
+    fn asks_are_queued_taken_once_answered_only_by_their_pane_and_capped() {
+        let mut m = ModState::default();
+        let id = m.ask(3, Some(0), "  what now?\n", 100).expect("queued");
+        assert_eq!(id, 1);
+        assert!(m.ask(3, None, "   ", 100).is_err(), "an empty question");
+        assert!(m.ask_pending(1));
+        assert!(m.reply_for(1).is_none());
+        assert!(
+            !m.reply(4, 1, "not mine", 101),
+            "another pane cannot answer"
+        );
+        let taken = m.take_asks(3);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].text, "what now?");
+        assert_eq!(taken[0].from, Some(0));
+        assert!(m.take_asks(3).is_empty(), "taken once");
+        assert!(m.reply(3, 1, " fine\x1b[0m ", 102));
+        assert!(!m.reply(3, 1, "again", 103), "answered once");
+        assert_eq!(m.reply_for(1).map(|r| r.text.as_str()), Some("fine [0m"));
+        assert!(!m.ask_pending(1));
+        assert!(!m.ask_pending(99), "never issued");
+        for i in 0..ASK_QUEUE {
+            m.ask(5, None, &format!("q{i}"), 200)
+                .expect("under the cap");
+        }
+        assert!(m.ask(5, None, "one more", 200).is_err(), "capped");
+        m.forget(5);
+        assert!(
+            m.ask(5, None, "fresh", 201).is_ok(),
+            "forgotten: a fresh process starts clean"
+        );
+        assert!(!m.ask_pending(2), "its old questions are gone");
+        // Replies expire.
+        assert!(m.reply_for(1).is_some());
+        m.ask(6, None, "tick", 102 + ASK_REPLY_TTL_MS + 1)
+            .expect("queued");
+        assert!(m.reply_for(1).is_none(), "expired on the next ask");
+    }
+
+    #[test]
+    fn a_caption_is_kept_trimmed_and_cleared_by_an_empty_one() {
+        let mut m = ModState::default();
+        m.report(
+            1,
+            &Report {
+                doing: Some("  running the\tfilter tests  ".to_string()),
+                ..Report::default()
+            },
+            5,
+        );
+        assert_eq!(
+            m.report_for(1).and_then(|r| r.doing.clone()),
+            Some(("running the filter tests".to_string(), 5))
+        );
+        m.report(
+            1,
+            &Report {
+                doing: Some("x".repeat(DOING_CAP + 9)),
+                ..Report::default()
+            },
+            6,
+        );
+        assert_eq!(
+            m.report_for(1)
+                .and_then(|r| r.doing.as_ref().map(|(d, _)| d.chars().count())),
+            Some(DOING_CAP)
+        );
+        m.report(
+            1,
+            &Report {
+                doing: Some(String::new()),
+                ..Report::default()
+            },
+            7,
+        );
+        assert_eq!(m.report_for(1).and_then(|r| r.doing.clone()), None);
+    }
+
+    #[test]
     fn text_safe_replaces_every_unsafe_character() {
         let s = "a\u{2028}b\u{202E}c\u{200B}d\u{FEFF}e\u{85}f\x7fg";
         assert_eq!(text_safe(s), "a b c d e f g");
@@ -769,6 +1259,29 @@ mod tests {
         );
         assert!(world.errored_for(Some("s2")), "and the facts say errored");
         assert!(!world.errored_for(Some("s1")));
+        assert!(world.collisions().is_empty());
+        assert!(!world.mod_facts_for(Some("s1")).is_some_and(|f| f.colliding));
+        m.touch(1, &["/w/a/f.rs".to_string()], Some("/w/a"), 1_000);
+        m.touch(2, &["/w/b/f.rs".to_string()], Some("/w/b"), 1_000);
+        m.report(
+            1,
+            &Report {
+                doing: Some("editing f.rs".to_string()),
+                ..Report::default()
+            },
+            1_000,
+        );
+        m.overlay(&mut world, &panes, 1_000 + REPORT_STALE_MS);
+        assert_eq!(world.collisions().len(), 1);
+        assert_eq!(world.collisions()[0].panes, vec![1, 2]);
+        assert!(world.mod_facts_for(Some("s1")).is_some_and(|f| f.colliding));
+        assert!(world.mod_facts_for(Some("s2")).is_some_and(|f| f.colliding));
+        assert_eq!(
+            world
+                .mod_facts_for(Some("s1"))
+                .and_then(|f| f.doing.as_deref()),
+            Some("editing f.rs")
+        );
         assert_eq!(
             world.mod_facts_for(Some("s3")).map(|f| f.status),
             Some(ModStatus::Ended),

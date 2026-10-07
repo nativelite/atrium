@@ -66,6 +66,11 @@ teammates:
   answer <target>                 a pane's last answer and status, as its mod reported them
   wait <target> [--for answer|idle|exit] [--timeout S] [--after SEQ]
                                   poll until the pane answers (seq past SEQ), is idle, or is gone
+  ask <target> [--timeout S] <question...>
+                                  ask a pane's mod a question, answered from a fork of its own
+                                  context without interrupting it; waits for the reply (120 s)
+  asked <target> <id>             read the reply to an earlier ask
+  who <path>                      which panes edited a file (their mods report every edit)
   hello | report | whoami | inbox what a pane's mod speaks (see mod/README.md)
 
 board — durable team state (the source of truth):

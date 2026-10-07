@@ -393,6 +393,8 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
     // And when an idle pane's parent is asked to checkpoint and respawn it.
     atrium::modstate::set_session_respawn_at(fleet.respawn_at);
+    // And whether the mod may spend a small model call on captions.
+    atrium::modstate::set_session_captions(fleet.captions.unwrap_or(true));
     // And how its claude panes run the model's subagents.
     if let Some(mode) = fleet
         .subagents

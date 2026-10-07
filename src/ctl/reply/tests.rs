@@ -20,11 +20,17 @@ fn reply_bus_topics_shape_is_topic_and_subs() {
 
 #[test]
 fn reply_status_one_carries_idle_ms_additively() {
-    let json = reply_status_one(AgentId(2), Some("working"), 7_000);
+    let json = reply_status_one(AgentId(2), Some("working"), 7_000, None);
     let v = json::parse(&json.to_json()).unwrap();
     assert_eq!(v.get("pane").and_then(Value::as_i64), Some(2));
     assert_eq!(v.get("status").and_then(Value::as_str), Some("working"));
     assert_eq!(v.get("idle_ms").and_then(Value::as_i64), Some(7_000));
+    assert!(v.get("doing").is_none(), "no caption, no key");
+    let with = reply_status_one(AgentId(2), Some("working"), 0, Some("running the tests"));
+    assert_eq!(
+        with.to_json(),
+        r#"{"ok":true,"pane":2,"status":"working","idle_ms":0,"doing":"running the tests"}"#
+    );
 }
 
 // ---- W1: zero-subscriber warning is STDERR-only, never in stdout -----

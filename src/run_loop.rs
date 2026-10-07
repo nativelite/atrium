@@ -107,6 +107,8 @@ struct RunState<'a> {
     /// What each pane's mod reported; laid over `world` by
     /// [`RunState::lay_mod_reports`].
     mods: atrium::modstate::ModState,
+    /// The question `Ctrl+A ?` last put to a pane, and its reply once given.
+    ask: Option<crate::ask_panel::AskState>,
     /// What `Ctrl+A c`, splits and the command prompt launch under; its `job`
     /// is the session job.
     launch: Launch<'a>,
@@ -228,6 +230,7 @@ impl RunState<'_> {
                 windows: &mut self.windows,
                 active: self.active,
                 views: &mut self.views,
+                ask: self.ask.as_ref(),
                 selection: &self.selection,
                 prompt: self.prompt.as_deref(),
                 coord: Coord {
@@ -309,6 +312,25 @@ impl RunState<'_> {
             .collect();
         self.mods
             .overlay(&mut self.world, &panes, atrium::session_store::now_ms());
+        self.collect_ask_reply();
+    }
+
+    /// Copy the reply to the keyboard's ask into the overlay when it lands,
+    /// or say that the pane left without answering.
+    fn collect_ask_reply(&mut self) {
+        let Some(ask) = self.ask.as_mut().filter(|a| a.reply.is_none()) else {
+            return;
+        };
+        if let Some(r) = self.mods.reply_for(ask.id) {
+            ask.reply = Some(r.text.clone());
+        } else if !self.mods.ask_pending(ask.id) {
+            ask.reply = Some("(no reply: the pane left before answering)".to_string());
+        } else {
+            return;
+        }
+        if self.views.ask {
+            self.force_repaint = true;
+        }
     }
 
     fn reap_panes(&mut self) -> Flow {

@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { TOOLS, TOOL_PREFIX, argvFor, isAtriumTool } from '../hooks/control'
+import { TOOLS, TOOL_PREFIX, argvFor, ctlTimeoutFor, isAtriumTool } from '../hooks/control'
 import { guardVerdict, isAbsolute, join, pathOf, splitParent } from '../hooks/guard'
 import { parseWho, roleSection } from '../hooks/role'
 
@@ -12,6 +12,20 @@ test('every tool has a name, a description and an object schema, and is recognis
   }
   expect(isAtriumTool('mcp__atrium__nope')).toBe(false)
   expect(isAtriumTool('Bash')).toBe(false)
+})
+
+test('ask, asked and who map to ctl argv, and an ask run waits for its reply', async () => {
+  expect(argvFor('ask', { target: 'dev_1', question: 'what are you doing?' })).toEqual(['ask', 'dev_1', 'what are you doing?'])
+  expect(argvFor('ask', { target: '3', question: 'q', timeout_s: 30 })).toEqual(['ask', '3', '--timeout', '30', 'q'])
+  expect(argvFor('ask', { target: '3' })).toBeInstanceOf(Error)
+  expect(argvFor('asked', { target: '3', id: 7 })).toEqual(['asked', '3', '7'])
+  expect(argvFor('asked', { target: '3' })).toBeInstanceOf(Error)
+  expect(argvFor('who', { path: 'src/x.rs' })).toEqual(['who', 'src/x.rs'])
+  expect(argvFor('who', {})).toBeInstanceOf(Error)
+  expect(ctlTimeoutFor(['list'])).toBe(10_000)
+  expect(ctlTimeoutFor(['ask', '3', 'q'])).toBe(150_000)
+  expect(ctlTimeoutFor(['ask', '3', '--timeout', '30', 'q'])).toBe(60_000)
+  expect(ctlTimeoutFor(['ask', '3', '--timeout', 'x', 'q'])).toBe(150_000)
 })
 
 test('spawn, send, status, list and kill map to ctl argv', async () => {
@@ -67,6 +81,10 @@ test('whoami is read into a Who, and the role section says what the pane is', as
   expect(text).toContain('worktree "attention"')
   expect(text).toContain('may not spawn')
   expect(text).toContain('[atrium bus #')
+  expect(text).toContain('atrium_ask')
+  expect(text).toContain('atrium_who')
+  expect(who?.captions).toBe(true)
+  expect(parseWho({ ok: true, pane: 1, depth: 0, mode: 'plan', can_spawn: false, deny: [], files: [], captions: false })?.captions).toBe(false)
   const lead = parseWho({ ok: true, pane: 0, depth: 0, mode: 'automode', can_spawn: true, deny: [], files: [] })!
   const leadText = roleSection(lead)
   expect(leadText).toContain('pane 0, depth 0, spawned by the human')

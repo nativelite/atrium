@@ -122,11 +122,11 @@ fn every_reply_serializes_byte_identically_to_the_pre_enum_builders() {
         ("audit_none", reply_audit(vec![], None, 0).to_string()),
         (
             "status_one",
-            reply_status_one(AgentId(2), Some("working"), 7_000).to_string(),
+            reply_status_one(AgentId(2), Some("working"), 7_000, None).to_string(),
         ),
         (
             "status_one_none",
-            reply_status_one(AgentId(2), None, 0).to_string(),
+            reply_status_one(AgentId(2), None, 0, None).to_string(),
         ),
         (
             "list",

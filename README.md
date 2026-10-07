@@ -139,6 +139,7 @@ Then drive it with the **`Ctrl+A`** prefix (press `Ctrl+A`, release, then a key)
 | `b` | the board + bus dashboard |
 | `o` | the overview: a mission-control panel of the agent tree, colored by status |
 | `a` | the activity log: a scrollable, time-ordered merge of bus, board, and agent actions |
+| `?` | ask the focused agent what it is doing, what it needs and what blocks it; its mod answers from a fork of its own context, without interrupting it, and the reply opens as an overlay ([needs the mod](#install-the-mod)) |
 | `m` | toggle mouse capture (off by default: native selection). On: click focuses a tile, drag selects text within that tile and copies it on release (OSC 52, plus the system clipboard on Windows), wheel scrolls |
 | `x` / `q` | kill the focused pane / quit atrium |
 | `Ctrl+A` | send a literal `Ctrl+A` through to the pane |
@@ -281,7 +282,12 @@ as **typed tools** (`atrium_spawn`, `atrium_send`, `atrium_board_set`,
 `atrium_bus_pub`, …), is told in its system prompt which pane, role and item it
 is, and runs the model's own **subagents as visible panes**: an Agent call
 becomes `atrium_subagent`, a tile beside the caller whose answer is collected
-when it is done.
+when it is done. It also gives the fleet **sight**: every pane carries a
+caption of what it is doing (`running cargo test --lib ctl`), two panes editing
+the same file wear `⚡` and raise one `collision` decision (`atrium ctl who
+<path>` says who has a file), and `atrium ctl ask <pane> "<question>"`, or
+`Ctrl+A ?` on a tile, asks a pane what it is doing **without interrupting it**:
+its mod answers from a fork of its own context.
 
 **Trust** governs how hands-off it runs. `--trust <plan|accept|automode|skip>`
 sets the posture for spawned agents *and* the ceiling they're capped at. A

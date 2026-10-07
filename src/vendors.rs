@@ -324,6 +324,7 @@ impl VendorWorlds {
         AgentState {
             overrides: Default::default(),
             mod_facts: Default::default(),
+            collisions: Vec::new(),
             sessions: self
                 .worlds
                 .iter()
@@ -380,6 +381,9 @@ pub struct AgentState {
     /// (`errored`), its reason, the context fill and the cost. Laid and
     /// cleared with `overrides`.
     mod_facts: std::collections::HashMap<String, ModFacts>,
+    /// Files two or more live panes edited, as the overlay computed them
+    /// ([`crate::modstate::ModState::collisions`]); keyed by agent id.
+    collisions: Vec<crate::modstate::Collision>,
 }
 
 /// What a pane's mod reported beyond the four inferred statuses: the chrome
@@ -391,6 +395,10 @@ pub struct ModFacts {
     pub reason: Option<String>,
     pub context_pct: Option<u8>,
     pub cost_usd: Option<f64>,
+    /// The caption: what the pane is doing right now, in a few words.
+    pub doing: Option<String>,
+    /// The pane edited a file another live pane edited too.
+    pub colliding: bool,
 }
 
 impl AgentState {
@@ -413,6 +421,28 @@ impl AgentState {
     pub fn clear_status_overrides(&mut self) {
         self.overrides.clear();
         self.mod_facts.clear();
+        self.collisions.clear();
+    }
+
+    /// Record the live collisions the overlay computed.
+    pub fn set_collisions(&mut self, collisions: Vec<crate::modstate::Collision>) {
+        self.collisions = collisions;
+    }
+
+    /// Files two or more live panes edited, by agent id.
+    pub fn collisions(&self) -> &[crate::modstate::Collision] {
+        &self.collisions
+    }
+
+    /// The caption a pane's mod reported, when fresh.
+    pub fn doing_for(&self, session_id: Option<&str>) -> Option<&str> {
+        self.mod_facts_for(session_id)
+            .and_then(|f| f.doing.as_deref())
+    }
+
+    /// Is the pane editing a file another live pane edits too?
+    pub fn colliding_for(&self, session_id: Option<&str>) -> bool {
+        self.mod_facts_for(session_id).is_some_and(|f| f.colliding)
     }
 
     /// Record what the pane's mod reported beyond its status.

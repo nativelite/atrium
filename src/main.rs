@@ -33,6 +33,7 @@ use std::sync::{Mutex, OnceLock};
 use atrium::ctl::AgentId;
 use std::time::{Duration, Instant};
 
+mod ask_panel;
 mod config_cli;
 mod ctl_server;
 mod fleet_cli;

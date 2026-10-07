@@ -3,13 +3,13 @@
 // so every rule is tested by `claude plugin test` with nothing mocked.
 
 /** This mod's version, sent in `hello`. */
-export const MOD_VERSION = '0.1.0'
+export const MOD_VERSION = '0.2.0'
 
 /**
  * The capabilities this version implements, offered in `hello`. The broker
  * keeps the ones it knows (`modstate::CAPS`) and answers with `accepted`.
  */
-export const CAPS = ['status', 'answer', 'context', 'tools', 'guard', 'inbox'] as const
+export const CAPS = ['status', 'answer', 'context', 'tools', 'guard', 'inbox', 'ask'] as const
 
 /** The most of an answer sent to the broker; it caps again on its side. */
 export const ANSWER_CAP = 16 * 1024
@@ -85,12 +85,33 @@ export function clipAnswer(text: string): string {
   return Array.from(text).slice(0, ANSWER_CAP).join('')
 }
 
-/** The fields of one `report`, as `k=v` tokens on the command line. */
-export type Fields = Record<string, string>
+/**
+ * The fields of one `report`, as `k=v` tokens on the command line. A list
+ * field (`touched`) is one token per element, so a path survives whole.
+ */
+export type Fields = Record<string, string | string[]>
 
-/** `{ status: 'working' }` as `['status=working']`. */
+/** `{ status: 'working', touched: ['/a', '/b'] }` as `['status=working', 'touched=/a', 'touched=/b']`. */
 export function toArgs(fields: Fields): string[] {
-  return Object.entries(fields).map(([k, v]) => `${k}=${v}`)
+  const out: string[] = []
+  for (const [k, v] of Object.entries(fields)) {
+    if (Array.isArray(v)) {
+      for (const x of v) out.push(`${k}=${x}`)
+    } else {
+      out.push(`${k}=${v}`)
+    }
+  }
+  return out
+}
+
+/** `later` over `earlier`: a later value wins, and two lists join without repeats. */
+export function mergeFields(earlier: Fields | undefined, later: Fields): Fields {
+  const out: Fields = { ...(earlier ?? {}) }
+  for (const [k, v] of Object.entries(later)) {
+    const have = out[k]
+    out[k] = Array.isArray(v) && Array.isArray(have) ? [...have, ...v.filter(x => !have.includes(x))] : v
+  }
+  return out
 }
 
 /**
@@ -111,7 +132,7 @@ export class Reporter {
 
   /** Queue `fields`; starts a send at once when none is in flight. */
   push(fields: Fields): void {
-    this.pending = { ...(this.pending ?? {}), ...fields }
+    this.pending = mergeFields(this.pending, fields)
     if (this.inflight === undefined) this.drain()
   }
 

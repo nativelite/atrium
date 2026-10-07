@@ -57,6 +57,17 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             }
         };
     }
+    // `ask` queues the question, then polls `asked` for the reply the same way.
+    if args.first().map(String::as_str) == Some("ask") {
+        return match parse_ask(args) {
+            Ok(spec) => ask_cmd(&address, caller, &spec),
+            Err(msg) => {
+                eprintln!("atrium ctl: {msg}");
+                eprint!("{}", crate::help::CTL);
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let request = match build_request(args, caller) {
         Ok(r) => r,
@@ -261,6 +272,146 @@ fn wait_cmd(address: &str, caller: Option<usize>, spec: &WaitSpec) -> ExitCode {
     }
 }
 
+/// A parsed `ask <target> [--timeout <secs>] <question...>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskSpec {
+    pub target: String,
+    pub text: String,
+    pub timeout_s: u64,
+}
+
+/// The default `ask --timeout`, in seconds: a fork answers in well under a
+/// minute; a pane whose mod is gone never does.
+pub const ASK_DEFAULT_TIMEOUT_S: u64 = 120;
+/// The longest `ask --timeout` accepted: ten minutes.
+pub const ASK_MAX_TIMEOUT_S: u64 = 600;
+
+/// Parse an `ask` argv. Pure and unit-tested. The question is every token
+/// after the target and the flags, space-joined, so it needs no quoting.
+pub fn parse_ask(args: &[String]) -> Result<AskSpec, String> {
+    let target = value_at(args, 1, "ask needs a target (pane id or role)")?.clone();
+    let mut timeout_s = ASK_DEFAULT_TIMEOUT_S;
+    let mut words: Vec<&str> = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout" if words.is_empty() => {
+                let t = value_at(args, i + 1, "--timeout needs a number of seconds")?;
+                timeout_s = parse_whole(t)
+                    .map_err(|()| "--timeout must be a whole number of seconds".to_string())?
+                    .filter(|n| *n >= 1 && *n <= ASK_MAX_TIMEOUT_S)
+                    .ok_or_else(|| {
+                        format!("--timeout {t} must be 1..{ASK_MAX_TIMEOUT_S} seconds")
+                    })?;
+                i += 2;
+            }
+            w => {
+                words.push(w);
+                i += 1;
+            }
+        }
+    }
+    let text = words.join(" ");
+    if text.trim().is_empty() {
+        return Err("ask needs a question after the target".to_string());
+    }
+    Ok(AskSpec {
+        target,
+        text,
+        timeout_s,
+    })
+}
+
+/// Does `reply` (one `asked` reply, as JSON text) carry the answer? A refused
+/// reply ends the wait too: the pane is gone, or the ask is not ours.
+pub fn ask_done(reply: &str) -> bool {
+    let Ok(v) = json::parse(reply) else {
+        return false;
+    };
+    let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    !ok || v.get("reply").and_then(Value::as_str).is_some()
+}
+
+/// The `ask` loop: queue the question, then poll `asked` every
+/// [`WAIT_POLL_MS`] until the reply or the timeout.
+fn ask_cmd(address: &str, caller: Option<usize>, spec: &AskSpec) -> ExitCode {
+    let queued = match build_request(
+        &["ask".to_string(), spec.target.clone(), spec.text.clone()],
+        caller,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("atrium ctl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let first = match crate::ipc::request(address, &queued) {
+        Ok(reply) => reply,
+        Err(e) => {
+            eprintln!("atrium ctl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let parsed = json::parse(&first).ok();
+    let id = parsed
+        .as_ref()
+        .filter(|v| v.get("ok").and_then(Value::as_bool) == Some(true))
+        .and_then(|v| v.get("id").and_then(Value::as_i64))
+        .filter(|n| *n > 0);
+    let Some(id) = id else {
+        println!("{first}");
+        return ExitCode::FAILURE;
+    };
+    let pane = parsed
+        .as_ref()
+        .and_then(|v| v.get("pane").and_then(Value::as_i64))
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| spec.target.clone());
+    let poll = match build_request(&["asked".to_string(), pane, id.to_string()], caller) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("atrium ctl: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(spec.timeout_s);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(WAIT_POLL_MS));
+        match crate::ipc::request(address, &poll) {
+            Ok(reply) => {
+                if ask_done(&reply) {
+                    let ok = json::parse(&reply)
+                        .ok()
+                        .and_then(|v| v.get("ok").and_then(Value::as_bool))
+                        .unwrap_or(false);
+                    println!("{reply}");
+                    return if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    };
+                }
+            }
+            Err(e) => {
+                eprintln!("atrium ctl: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            println!(
+                "{}",
+                super::reply_err(&format!(
+                    "timeout after {}s waiting for {} to answer ask #{id}; read it later with \
+                     atrium ctl asked {} {id}",
+                    spec.timeout_s, spec.target, spec.target
+                ))
+                .to_json()
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+}
+
 fn verb_label(w: WaitFor) -> &'static str {
     match w {
         WaitFor::Answer => "an answer",
@@ -402,11 +553,40 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
             let target = value_at(args, 1, "answer needs a target (pane id or role)")?;
             pairs.push(("target", Value::String(target.clone())));
         }
+        Some("ask") => {
+            // `ctl_cmd` runs `ask` as a loop; this is the queueing request
+            // it starts with: `ask <target> <question>` (already joined).
+            pairs.push(("cmd", s("ask")));
+            let target = value_at(args, 1, "ask needs a target (pane id or role)")?;
+            let text = args[2.min(args.len())..].join(" ");
+            if text.trim().is_empty() {
+                return Err("ask needs a question after the target".to_string());
+            }
+            pairs.push(("target", Value::String(target.clone())));
+            pairs.push(("text", Value::String(text)));
+        }
+        Some("asked") => {
+            pairs.push(("cmd", s("asked")));
+            let target = value_at(args, 1, "asked needs a target (pane id or role)")?;
+            let id = value_at(args, 2, "asked needs the ask's id")?;
+            let n = parse_whole(id)
+                .map_err(|()| format!("asked: the id must be a number, got {id:?}"))?
+                .and_then(|n| i64::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or_else(|| format!("asked: bad id {id:?}"))?;
+            pairs.push(("target", Value::String(target.clone())));
+            pairs.push(("id", Value::Number(Number::Int(n))));
+        }
+        Some("who") => {
+            pairs.push(("cmd", s("who")));
+            let path = value_at(args, 1, "who needs a path")?;
+            pairs.push(("path", Value::String(path.clone())));
+        }
         Some(other) => return Err(format!("unknown subcommand {other:?}")),
         None => {
             return Err(
                 "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | \
-                 respawn | hello | report | whoami | answer | wait | inbox"
+                 respawn | hello | report | whoami | answer | wait | inbox | ask | asked | who"
                     .to_string(),
             )
         }
@@ -556,26 +736,49 @@ fn hello_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     Ok(())
 }
 
-/// `report [status=<s>] [reason=<r>] [context=<pct>] [cost=<usd>] [turns=<n>] [answer=<text...>]`
+/// `report [status=<s>] [reason=<r>] [context=<pct>] [cost=<usd>] [turns=<n>] [answer=<text...>]
+/// [doing=<caption>] [touched=<path>]... [ask=<id> reply=<text>]`
 /// — a pane's mod reporting about itself. Numbers are typed on the wire so the
-/// server never parses text it did not ask for.
+/// server never parses text it did not ask for. `touched` may repeat: one
+/// real path per token, so a path with a comma or a space survives.
 fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("report")));
     let mut fields: Vec<(String, String)> = Vec::new();
+    let mut touched: Vec<Value> = Vec::new();
     for a in &args[1.min(args.len())..] {
+        if let Some(path) = a.strip_prefix("touched=") {
+            if !path.trim().is_empty() {
+                touched.push(Value::String(path.to_string()));
+            }
+            continue;
+        }
         absorb_field_token(&mut fields, a).map_err(|e| format!("report: {e}"))?;
     }
-    if fields.is_empty() {
+    if fields.is_empty() && touched.is_empty() {
         return Err(
-            "report needs at least one field=value (status, reason, context, cost, turns, answer)"
+            "report needs at least one field=value (status, reason, context, cost, turns, \
+             answer, doing, touched, ask+reply)"
                 .to_string(),
         );
+    }
+    if !touched.is_empty() {
+        pairs.push(("touched", Value::Array(touched)));
     }
     for (k, val) in fields {
         match k.as_str() {
             "status" => pairs.push(("status", Value::String(val))),
             "reason" => pairs.push(("reason", Value::String(val))),
             "answer" => pairs.push(("answer", Value::String(val))),
+            "doing" => pairs.push(("doing", Value::String(val))),
+            "reply" => pairs.push(("reply", Value::String(val))),
+            "ask" => {
+                let n = parse_whole(&val)
+                    .map_err(|()| format!("report: ask must be the ask's id, got {val:?}"))?
+                    .and_then(|n| i64::try_from(n).ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| format!("report: bad ask id {val:?}"))?;
+                pairs.push(("ask", Value::Number(Number::Int(n))));
+            }
             "context" => {
                 let n = parse_whole(&val)
                     .map_err(|()| format!("report: context must be a whole number, got {val:?}"))?
@@ -596,12 +799,15 @@ fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                     .parse()
                     .ok()
                     .filter(|c: &f64| c.is_finite() && *c >= 0.0)
-                    .ok_or_else(|| format!("report: cost must be a non-negative number, got {val:?}"))?;
+                    .ok_or_else(|| {
+                        format!("report: cost must be a non-negative number, got {val:?}")
+                    })?;
                 pairs.push(("cost", Value::Number(Number::Float(c))));
             }
             other => {
                 return Err(format!(
-                    "report: unknown field {other:?} (use status, reason, context, cost, turns, answer)"
+                    "report: unknown field {other:?} (use status, reason, context, cost, turns, \
+                     answer, doing, touched, ask, reply)"
                 ))
             }
         }

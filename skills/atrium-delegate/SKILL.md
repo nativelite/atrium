@@ -38,9 +38,11 @@ A fresh teammate per part keeps every session small.
 
 When atrium's mod is loaded you also have these as tools: `atrium_spawn`,
 `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`, the `atrium_board_*`
-and `atrium_bus_*` tools, and `atrium_subagent`, which runs a subagent as a
-visible pane and returns its answer. The tools and the shell verbs are the same
-control plane; use whichever you have.
+and `atrium_bus_*` tools, `atrium_subagent`, which runs a subagent as a
+visible pane and returns its answer, `atrium_ask`, which asks a teammate a
+question without interrupting it, and `atrium_who`, which says which panes
+edited a file. The tools and the shell verbs are the same control plane; use
+whichever you have.
 
 A teammate starts **blank** — a fresh agent that cannot see this conversation,
 your goal, or your work in progress. Every `send` must be fully self-contained:
@@ -59,6 +61,8 @@ Teammates leave artifacts on the shared filesystem (files, edits, commits) — t
 do NOT return a value to you.
 
     atrium ctl status [<role>]   # which teammates are working vs idle
+    atrium ctl ask <role> "<question>"   # what is it doing, what does it need? (answered from a fork; never interrupts)
+    atrium ctl who <path>        # which panes edited a file: check before touching a shared one
     atrium ctl kill <role>       # reap a teammate once you have collected its part
 
 Tell each teammate in its brief to post `atrium ctl bus pub <topic> --to <your
@@ -72,6 +76,7 @@ running.
 
     atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl ask <target> [--timeout S] <question...> | asked <target> <id> | who <path>
     atrium ctl bus pub <topic> [--to <role>[,...]] <field=value...> | bus sub <topic...>
 
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles

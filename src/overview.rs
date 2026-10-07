@@ -23,6 +23,12 @@ pub(crate) struct OverviewNode {
     /// Context-window fill and cost so far, as the pane's mod reported them.
     pub(crate) context_pct: Option<u8>,
     pub(crate) cost_usd: Option<f64>,
+    /// The pane's global agent id, which collisions name.
+    pub(crate) agent_id: usize,
+    /// The caption the pane's mod reported: what it is doing, in a few words.
+    pub(crate) doing: Option<String>,
+    /// The pane edits a file another live pane edits too.
+    pub(crate) colliding: bool,
 }
 
 /// Collect every pane, across all windows, as an overview node in spawn-tree
@@ -60,6 +66,9 @@ pub(crate) fn overview_nodes(
                 errored: world.errored_for(p.session_id.as_deref()),
                 context_pct: facts.and_then(|f| f.context_pct),
                 cost_usd: facts.and_then(|f| f.cost_usd),
+                agent_id: p.agent_id.0,
+                doing: facts.and_then(|f| f.doing.clone()),
+                colliding: facts.is_some_and(|f| f.colliding),
             });
         }
     }
@@ -187,6 +196,7 @@ pub(crate) fn render_overview_panel(
     windows: &[Window],
     bus: &atrium::bus::Bus,
     nodes: &[OverviewNode],
+    collisions: &[atrium::modstate::Collision],
     sel: usize,
     rows: u16,
     cols: u16,
@@ -221,7 +231,7 @@ pub(crate) fn render_overview_panel(
          \x1b[38;2;95;240;140m\u{25CF} {working} working\x1b[0m   \
          \x1b[38;2;255;200;70m\u{0021} {waiting} waiting\x1b[0m   \
          \x1b[38;2;150;152;165m\u{00B7} {idle} idle\x1b[0m   \
-         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}{}{}\x1b[0m\x1b[K",
+         \x1b[38;2;255;95;95m\u{2717} {exited} exited\x1b[0m{}{}{}{}\x1b[0m\x1b[K",
         nodes.len(),
         if errored == 0 {
             String::new()
@@ -232,6 +242,15 @@ pub(crate) fn render_overview_panel(
             format!("   \x1b[2m${cost:.2}\x1b[0m")
         } else {
             String::new()
+        },
+        if collisions.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "   \x1b[1;38;2;255;200;70m\u{26A1} {} collision{}\x1b[0m",
+                collisions.len(),
+                if collisions.len() == 1 { "" } else { "s" }
+            )
         },
         if decisions.is_empty() {
             String::new()
@@ -266,6 +285,39 @@ pub(crate) fn render_overview_panel(
             out.push_str(&format!(
                 "\x1b[{row};1H  \x1b[1;38;5;11m\u{0021}\x1b[0m \x1b[1m{}\x1b[0m  {summary}  \x1b[2m(from {from})\x1b[0m\x1b[K",
                 e.topic
+            ));
+            row += 1;
+        }
+        out.push_str(&format!(
+            "\x1b[{row};1H\x1b[38;5;238m{}\x1b[0m",
+            "\u{2500}".repeat(cols as usize)
+        ));
+        row += 1;
+    }
+
+    // Collisions next: a file two live panes are both editing, with the panes
+    // named, so the integrator sees the merge conflict before it merges.
+    if !collisions.is_empty() {
+        let label_of = |id: usize| {
+            nodes
+                .iter()
+                .find(|n| n.agent_id == id)
+                .map(|n| n.label.clone())
+                .unwrap_or_else(|| format!("pane {}", id + 1))
+        };
+        for c in collisions.iter().take(3) {
+            if row >= footer_row {
+                break;
+            }
+            let who = c
+                .panes
+                .iter()
+                .map(|p| label_of(*p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "\x1b[{row};1H  \x1b[1;38;2;255;200;70m\u{26A1}\x1b[0m \x1b[1m{}\x1b[0m  \x1b[2medited by\x1b[0m {who}\x1b[K",
+                truncate(&c.key, 60)
             ));
             row += 1;
         }
@@ -356,10 +408,17 @@ pub(crate) fn render_overview_panel(
                         .as_deref()
                         .map(|x| format!("  \x1b[2m\u{00B7}{x}\x1b[0m"))
                         .unwrap_or_default();
-                    let action = if n.action.is_empty() {
-                        String::new()
+                    // The caption the mod reported beats the transcript's
+                    // last action: it says what the pane is doing now.
+                    let action = match n.doing.as_deref().filter(|d| !d.is_empty()) {
+                        Some(doing) => format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(doing, 60)),
+                        None if n.action.is_empty() => String::new(),
+                        None => format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60)),
+                    };
+                    let bolt = if n.colliding && !n.exited {
+                        " \x1b[1;38;2;255;200;70m\u{26A1}\x1b[0m"
                     } else {
-                        format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60))
+                        ""
                     };
                     let cursor = if selected {
                         "\x1b[1;38;5;37m\u{25B8}\x1b[0m"
@@ -373,7 +432,7 @@ pub(crate) fn render_overview_panel(
                         format!(" \x1b[2m{}\x1b[0m", n.vtag)
                     };
                     let line = format!(
-                        "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{vtag_str}{ident}{usage}{action}",
+                        "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{bolt}{vtag_str}{ident}{usage}{action}",
                         truncate(&n.label, 16),
                     );
                     if selected {

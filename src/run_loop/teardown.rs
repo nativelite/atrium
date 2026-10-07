@@ -9,6 +9,7 @@ impl RunState<'_> {
         let RunState {
             term: _,
             mods: _,
+            ask: _,
             mut out,
             rows: _,
             cols: _,

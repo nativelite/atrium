@@ -183,6 +183,17 @@ you do not poll for it. Read the checkpoint it names (`board get <item>`,
 `git show --stat <sha>`) and integrate. `bus feed` is the record when you need
 to catch up; `atrium ctl audit` reviews what you delegated and how it resolved.
 
+Two more eyes, when every teammate's claude carries atrium's mod:
+
+    atrium ctl ask <role> "what are you doing, and what blocks you?"   # answered from a fork of its context; its turn is not interrupted
+    atrium ctl who <path>                                               # which teammates edited a file, across worktrees
+
+A `[atrium bus #… decision_needed … kind=collision file=<path> panes=…]` line
+means two teammates are editing the same file on different worktrees: the merge
+will conflict. Decide who owns it now (re-brief one, or split the file) and
+`bus resolve` it. Run `atrium ctl who` on the files an item touches before you
+integrate it.
+
 ## The board — shared source of truth
 
 Coordinate through the **board**, the durable shared state for the team, instead

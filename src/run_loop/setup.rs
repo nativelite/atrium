@@ -267,6 +267,7 @@ impl<'a> RunState<'a> {
             selection,
             outer_mouse_off,
             views,
+            ask: None,
             prompt,
             buf,
             force_repaint,

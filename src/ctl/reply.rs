@@ -92,6 +92,9 @@ pub enum Reply {
         pane: AgentId,
         status: Option<String>,
         idle_ms: u64,
+        /// The caption the pane's mod reported, when fresh; the key is left
+        /// out otherwise, so the wire is unchanged for a pane without one.
+        doing: Option<String>,
     },
     Tree(Vec<ListNode>),
     /// `{"ok":true,"pane":N,"accepted":[...]}` — the caps a `hello` was granted.
@@ -115,9 +118,46 @@ pub enum Reply {
         seq: Option<u64>,
         answer: Option<String>,
     },
-    /// `{"ok":true,"items":[{"kind":"send"|"wake","text":...},...]}` — the
-    /// caller's deliveries, taken.
-    Inbox(Vec<(String, String)>),
+    /// `{"ok":true,"items":[{"kind":"send"|"wake"|"ask","text":...[,"id":N]},...]}`
+    /// — the caller's deliveries and queued questions, taken.
+    Inbox(Vec<InboxItem>),
+    /// `{"ok":true,"pane":N,"id":K,"reply":text|null}` — an `ask` queued (no
+    /// reply yet) or `asked` (the reply once the pane's mod gave it).
+    Asked {
+        pane: AgentId,
+        id: u64,
+        reply: Option<String>,
+    },
+    /// `{"ok":true,"path":P,"panes":[{"pane":N,"role":R,"key":K,"path":P,"first_ms":..,"last_ms":..,"live":bool},...]}`
+    /// — who touched a file.
+    Who {
+        path: String,
+        panes: Vec<WhoEntry>,
+    },
+}
+
+/// One `inbox` item: a `send`'s text, a bus wake's framed line, or an `ask`'s
+/// question with the id its reply must name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxItem {
+    pub kind: String,
+    pub text: String,
+    pub id: Option<u64>,
+}
+
+/// One pane in a `who` reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhoEntry {
+    pub pane: AgentId,
+    pub role: Option<String>,
+    /// The touch key (relative to the pane's worktree when inside it).
+    pub key: String,
+    /// The real path the pane edited.
+    pub path: String,
+    pub first_ms: u64,
+    pub last_ms: u64,
+    /// Is the pane still in the tree?
+    pub live: bool,
 }
 
 /// An owned org-chart node inside [`Reply::Tree`]; built from a [`TreeNode`].
@@ -251,12 +291,19 @@ impl Reply {
                 pane,
                 status,
                 idle_ms,
-            } => obj(vec![
-                ok,
-                ("pane", i(pane.0)),
-                ("status", opt_s(status)),
-                ("idle_ms", u(*idle_ms)),
-            ]),
+                doing,
+            } => {
+                let mut pairs = vec![
+                    ok,
+                    ("pane", i(pane.0)),
+                    ("status", opt_s(status)),
+                    ("idle_ms", u(*idle_ms)),
+                ];
+                if let Some(d) = doing {
+                    pairs.push(("doing", s(d)));
+                }
+                obj(pairs)
+            }
             Reply::Hello { pane, accepted } => obj(vec![
                 ok,
                 ("pane", i(pane.0)),
@@ -284,7 +331,42 @@ impl Reply {
                     Value::Array(
                         items
                             .iter()
-                            .map(|(kind, text)| obj(vec![("kind", s(kind)), ("text", s(text))]))
+                            .map(|it| {
+                                let mut pairs = vec![("kind", s(&it.kind)), ("text", s(&it.text))];
+                                if let Some(id) = it.id {
+                                    pairs.push(("id", u(id)));
+                                }
+                                obj(pairs)
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+            Reply::Asked { pane, id, reply } => obj(vec![
+                ok,
+                ("pane", i(pane.0)),
+                ("id", u(*id)),
+                ("reply", opt_s(reply)),
+            ]),
+            Reply::Who { path, panes } => obj(vec![
+                ok,
+                ("path", s(path)),
+                (
+                    "panes",
+                    Value::Array(
+                        panes
+                            .iter()
+                            .map(|w| {
+                                obj(vec![
+                                    ("pane", i(w.pane.0)),
+                                    ("role", opt_s(&w.role)),
+                                    ("key", s(&w.key)),
+                                    ("path", s(&w.path)),
+                                    ("first_ms", u(w.first_ms)),
+                                    ("last_ms", u(w.last_ms)),
+                                    ("live", Value::Bool(w.live)),
+                                ])
+                            })
                             .collect(),
                     ),
                 ),
@@ -358,9 +440,27 @@ pub fn reply_whoami(fields: Vec<(String, Value)>) -> Reply {
     Reply::Whoami(fields)
 }
 
-/// `{"ok":true,"items":[...]}` — the caller's deliveries, each `send` or `wake`.
-pub fn reply_inbox(items: Vec<(String, String)>) -> Reply {
+/// `{"ok":true,"items":[...]}` — the caller's deliveries (`send`, `wake`) and
+/// queued questions (`ask`, with the id the reply names).
+pub fn reply_inbox(items: Vec<InboxItem>) -> Reply {
     Reply::Inbox(items)
+}
+
+/// `{"ok":true,"pane":N,"id":K,"reply":...}` — an ask queued or answered.
+pub fn reply_asked(pane: AgentId, id: u64, reply: Option<&str>) -> Reply {
+    Reply::Asked {
+        pane,
+        id,
+        reply: reply.map(str::to_string),
+    }
+}
+
+/// `{"ok":true,"path":P,"panes":[...]}` — who touched a file.
+pub fn reply_who(path: &str, panes: Vec<WhoEntry>) -> Reply {
+    Reply::Who {
+        path: path.to_string(),
+        panes,
+    }
 }
 
 /// `{"ok":true,"pane":N,"status":...,"seq":...,"answer":...}` — a pane's last
@@ -581,11 +681,17 @@ pub fn reply_audit(entries: Vec<Value>, oldest: Option<u64>, latest: u64) -> Rep
 /// status. `idle_ms` is the same **additive** u64-millisecond field as on
 /// [`reply_list`] nodes (`0` when active); the baseline `{pane,status}` keys are
 /// unchanged.
-pub fn reply_status_one(pane: AgentId, status: Option<&str>, idle_ms: u64) -> Reply {
+pub fn reply_status_one(
+    pane: AgentId,
+    status: Option<&str>,
+    idle_ms: u64,
+    doing: Option<&str>,
+) -> Reply {
     Reply::StatusOne {
         pane,
         status: status.map(str::to_string),
         idle_ms,
+        doing: doing.map(str::to_string),
     }
 }
 

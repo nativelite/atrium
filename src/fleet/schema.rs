@@ -63,6 +63,9 @@ pub struct Fleet {
     pub subagents: Option<String>,
     /// Leave a subagent pane open after its answer was collected.
     pub subagents_keep: Option<bool>,
+    /// `captions: false` keeps the mod from spending a small model call on
+    /// each pane's caption; the caption derived from tool calls stays.
+    pub captions: Option<bool>,
     /// Context-window fill (percent, 1..=100) at which a pane that is idle gets
     /// one decision posted to its parent: "checkpoint and respawn?". Never a
     /// respawn by itself ([`crate::modstate::ModState::respawn_crossing`]).
@@ -330,6 +333,13 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
             })?),
             None => None,
         };
+    let captions = match get("captions") {
+        Some(v) => Some(
+            v.as_bool()
+                .ok_or_else(|| format!("fleet {name:?}: \"captions\" must be true or false"))?,
+        ),
+        None => None,
+    };
     let trust = match get("trust") {
         Some(v) => Some(
             v.as_str()
@@ -456,6 +466,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         mod_enabled,
         subagents,
         subagents_keep,
+        captions,
         respawn_at,
         identity,
         context,

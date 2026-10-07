@@ -787,12 +787,165 @@ fn inbox_builds_parses_needs_a_token_and_refuses_a_target() {
     assert!(!Cmd::Inbox.is_read_only());
     let err = parse_request(r#"{"cmd":"inbox","target":"3"}"#).unwrap_err();
     assert!(err.contains("caller only"), "{err}");
+    let item = |kind: &str, text: &str, id: Option<u64>| InboxItem {
+        kind: kind.to_string(),
+        text: text.to_string(),
+        id,
+    };
     let reply = reply_inbox(vec![
-        ("send".to_string(), "do x".to_string()),
-        ("wake".to_string(), "[atrium bus #1 fyi] y".to_string()),
+        item("send", "do x", None),
+        item("wake", "[atrium bus #1 fyi] y", None),
+        item("ask", "what now?", Some(3)),
     ]);
     assert_eq!(
         reply.to_json(),
-        r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"}]}"#
+        r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"},{"kind":"ask","text":"what now?","id":3}]}"#
+    );
+}
+
+#[test]
+fn report_carries_captions_touches_and_ask_replies() {
+    let line = build_request(
+        &v(&[
+            "report",
+            "doing=running the tests",
+            "touched=/w/a/src/x.rs",
+            "touched=/w/a/My Files/y,z.rs",
+            "touched=",
+        ]),
+        Some(2),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Report(r) => {
+            assert_eq!(r.doing.as_deref(), Some("running the tests"));
+            assert_eq!(
+                r.touched,
+                vec![
+                    "/w/a/src/x.rs".to_string(),
+                    "/w/a/My Files/y,z.rs".to_string()
+                ],
+                "one path per token: spaces and commas survive; an empty one is dropped"
+            );
+            assert_eq!(r.ask, None);
+        }
+        other => panic!("expected report, got {other:?}"),
+    }
+    let line = build_request(&v(&["report", "ask=7", "reply=fine, thanks"]), Some(2)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Report(r) => assert_eq!(r.ask, Some((7, "fine, thanks".to_string()))),
+        other => panic!("expected report, got {other:?}"),
+    }
+    // A caption alone is a report; an empty one clears it.
+    let line = build_request(&v(&["report", "doing="]), Some(2)).unwrap();
+    assert!(
+        matches!(parse_request(&line).unwrap().cmd, Cmd::Report(r) if r.doing.as_deref() == Some(""))
+    );
+    // A reply must name its ask, and the id must be one.
+    assert!(build_request(&v(&["report", "ask=x", "reply=y"]), Some(2)).is_err());
+    assert!(build_request(&v(&["report", "ask=0", "reply=y"]), Some(2)).is_err());
+    let err = parse_request(r#"{"cmd":"report","reply":"y"}"#).unwrap_err();
+    assert!(err.contains("names its ask"), "{err}");
+    let err = parse_request(r#"{"cmd":"report","touched":[1]}"#).unwrap_err();
+    assert!(err.contains("touched"), "{err}");
+    let line = parse_request(r#"{"cmd":"report","touched":"/one"}"#).unwrap();
+    assert!(matches!(line.cmd, Cmd::Report(r) if r.touched == vec!["/one".to_string()]));
+}
+
+#[test]
+fn ask_asked_and_who_build_parse_and_label() {
+    let line = build_request(
+        &v(&["ask", "dev_1", "what", "are", "you", "doing?"]),
+        Some(0),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Ask(a) => {
+            assert_eq!(a.target, "dev_1");
+            assert_eq!(a.text, "what are you doing?");
+            assert!(!Cmd::Ask(a.clone()).is_read_only());
+            let (action, detail) = Cmd::Ask(a).audit_label();
+            assert_eq!((action, detail.as_str()), ("ask", "target=dev_1 len=19"));
+        }
+        other => panic!("expected ask, got {other:?}"),
+    }
+    assert!(
+        build_request(&v(&["ask", "dev_1"]), Some(0)).is_err(),
+        "no question"
+    );
+    assert!(build_request(&v(&["ask", "dev_1", "  "]), Some(0)).is_err());
+    let line = build_request(&v(&["asked", "3", "12"]), Some(0)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Asked(a) => {
+            assert_eq!((a.target.as_str(), a.id), ("3", 12));
+            assert!(!Cmd::Asked(a.clone()).is_read_only());
+            assert_eq!(Cmd::Asked(a).audit_label().1, "target=3 id=12");
+        }
+        other => panic!("expected asked, got {other:?}"),
+    }
+    assert!(build_request(&v(&["asked", "3", "0"]), Some(0)).is_err());
+    assert!(build_request(&v(&["asked", "3"]), Some(0)).is_err());
+    let line = build_request(&v(&["who", "src/x.rs"]), None).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Who(w) => {
+            assert_eq!(w.path, "src/x.rs");
+            assert!(Cmd::Who(w.clone()).is_read_only(), "structure, like list");
+            assert_eq!(Cmd::Who(w).audit_label().1, "path=src/x.rs");
+        }
+        other => panic!("expected who, got {other:?}"),
+    }
+    assert!(build_request(&v(&["who"]), None).is_err());
+    assert!(parse_request(r#"{"cmd":"who","path":" "}"#).is_err());
+}
+
+#[test]
+fn ask_parses_its_flags_and_ends_on_a_reply_or_a_refusal() {
+    let spec = parse_ask(&v(&["ask", "dev_1", "--timeout", "30", "what", "now"])).unwrap();
+    assert_eq!(
+        spec,
+        AskSpec {
+            target: "dev_1".to_string(),
+            text: "what now".to_string(),
+            timeout_s: 30
+        }
+    );
+    let spec = parse_ask(&v(&["ask", "3", "is --timeout a flag here?"])).unwrap();
+    assert_eq!(
+        spec.text, "is --timeout a flag here?",
+        "a flag after the question starts is text"
+    );
+    assert_eq!(spec.timeout_s, ASK_DEFAULT_TIMEOUT_S);
+    assert!(parse_ask(&v(&["ask", "3", "--timeout", "0", "q"])).is_err());
+    assert!(parse_ask(&v(&["ask", "3", "--timeout", "9999", "q"])).is_err());
+    assert!(parse_ask(&v(&["ask", "3"])).is_err());
+    assert!(parse_ask(&v(&["ask"])).is_err());
+    assert!(
+        !ask_done(r#"{"ok":true,"pane":3,"id":1,"reply":null}"#),
+        "pending"
+    );
+    assert!(ask_done(r#"{"ok":true,"pane":3,"id":1,"reply":"fine"}"#));
+    assert!(
+        ask_done(r#"{"ok":false,"err":"no such ask"}"#),
+        "a refusal ends it"
+    );
+    assert!(!ask_done("not json"));
+    let reply = reply_asked(AgentId(3), 1, None).to_json();
+    assert_eq!(reply, r#"{"ok":true,"pane":3,"id":1,"reply":null}"#);
+    let who = reply_who(
+        "src/x.rs",
+        vec![WhoEntry {
+            pane: AgentId(2),
+            role: Some("dev_1".to_string()),
+            key: "src/x.rs".to_string(),
+            path: "/w/a/src/x.rs".to_string(),
+            first_ms: 5,
+            last_ms: 9,
+            live: true,
+        }],
+    )
+    .to_json();
+    assert_eq!(
+        who,
+        r#"{"ok":true,"path":"src/x.rs","panes":[{"pane":2,"role":"dev_1","key":"src/x.rs","path":"/w/a/src/x.rs","first_ms":5,"last_ms":9,"live":true}]}"#
     );
 }

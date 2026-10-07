@@ -192,6 +192,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         mod_enabled: None,
         subagents: None,
         subagents_keep: None,
+        captions: None,
         respawn_at: None,
         context: None,
         topics: None,

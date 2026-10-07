@@ -243,6 +243,139 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// Two panes that report an edit of the same file collide: `ctl who` names
+/// both (the worker by role), the broker posts one `collision` decision on
+/// the `atrium` topic, and a trailing part of the path finds the file too.
+#[test]
+fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl bus sub atrium\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"subscribed\":[", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl hello mod=0.2.0 caps=status\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl report touched=/tmp/collide/x.rs\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"{\"ok\":true,\"pane\":0}", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl who x.rs\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"panes\":[", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"pane\":0") && !contains(&out, b"\"pane\":1"),
+        "one pane so far: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // A worker in its own window reports the same file with its own token.
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20));
+    p.write(b"\x012").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    p.write(format!("\"{atrium}\" ctl hello mod=0.2.0 caps=status\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl report touched=/tmp/collide/x.rs\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"{\"ok\":true,\"pane\":1}", Duration::from_secs(20));
+    p.write(b"\x011").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    p.write(format!("\"{atrium}\" ctl who /tmp/collide/x.rs\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"role\":\"dev_1\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"pane\":0")
+            && contains(&out, b"\"pane\":1")
+            && contains(&out, b"\"live\":true"),
+        "both panes, the worker by role: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl bus feed --json --since 0\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"kind\":\"collision\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"kind\":\"collision\"")
+            && contains(&out, b"\"file\":\"/tmp/collide/x.rs\""),
+        "one collision decision on the atrium topic: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// `ctl ask` queues a question that rides the target's inbox as an `ask`
+/// item, its mod reports the reply as `report ask=<id> reply=<text>`, and the
+/// waiting `ask` prints it; `asked` reads it again. A pane whose mod declared
+/// no `ask` is refused outright.
+#[cfg(unix)]
+#[test]
+fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl ask 0 anyone-home\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"err\":\"pane", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"err\":\"pane"),
+        "without the cap the ask is refused: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl hello mod=0.2.0 caps=status,inbox,ask\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    let out_file = std::env::temp_dir().join(format!("atrium-ask-{}.out", std::process::id()));
+    let _ = std::fs::remove_file(&out_file);
+    p.write(
+        format!(
+            "\"{atrium}\" ctl ask 0 --timeout 60 are-you-there > \"{}\" &\r\n",
+            out_file.display()
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"id\":1}", Duration::from_secs(20));
+    assert!(
+        contains(
+            &out,
+            b"{\"kind\":\"ask\",\"text\":\"are-you-there\",\"id\":1}"
+        ),
+        "the question rides the inbox: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(format!("\"{atrium}\" ctl report ask=1 reply=yes-here\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"{\"ok\":true,\"pane\":0}", Duration::from_secs(20));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut got = String::new();
+    while std::time::Instant::now() < deadline {
+        got = std::fs::read_to_string(&out_file).unwrap_or_default();
+        if got.contains("\"reply\":\"yes-here\"") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    assert!(
+        got.contains("{\"ok\":true,\"pane\":0,\"id\":1,\"reply\":\"yes-here\"}"),
+        "the waiting ask printed the reply: {got:?}"
+    );
+    let _ = std::fs::remove_file(&out_file);
+    p.write(format!("\"{atrium}\" ctl asked 0 1\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"reply\":\"yes-here\"", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"reply\":\"yes-here\""),
+        "asked reads it again: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the

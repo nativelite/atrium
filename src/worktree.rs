@@ -527,6 +527,7 @@ mod tests {
             mod_enabled: None,
             subagents: None,
             subagents_keep: None,
+            captions: None,
             respawn_at: None,
             context: None,
             topics: None,

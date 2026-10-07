@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { ANSWER_CAP, Reporter, clipAnswer, toArgs, transition } from '../hooks/status'
+import { ANSWER_CAP, CAPS, Reporter, clipAnswer, mergeFields, toArgs, transition } from '../hooks/status'
 import type { Status } from '../hooks/status'
 import { acceptedCaps, inboxItems, parseReply } from '../hooks/ctl'
 
@@ -53,10 +53,38 @@ test('answers are clipped and fields become k=v tokens', async () => {
   expect(clipAnswer('short')).toBe('short')
   expect(toArgs({ status: 'working', reason: 'Bash' })).toEqual(['status=working', 'reason=Bash'])
   expect(toArgs({ answer: 'a=b c' })).toEqual(['answer=a=b c'])
+  expect(toArgs({ touched: ['/a/x.rs', '/a/My Files/y,z.rs'], doing: '' })).toEqual(['touched=/a/x.rs', 'touched=/a/My Files/y,z.rs', 'doing='])
+  expect([...CAPS]).toContain('ask')
+})
+
+test('merging reports: a later value wins and touched lists join without repeats', async () => {
+  expect(mergeFields({ status: 'working', touched: ['/a'] }, { status: 'idle', touched: ['/a', '/b'] })).toEqual({
+    status: 'idle',
+    touched: ['/a', '/b'],
+  })
+  expect(mergeFields(undefined, { doing: 'x' })).toEqual({ doing: 'x' })
+  expect(mergeFields({ doing: 'x' }, { doing: '' })).toEqual({ doing: '' })
+  const sent: Record<string, string | string[]>[] = []
+  let release: () => void = () => undefined
+  const r = new Reporter(fields => {
+    sent.push(fields)
+    return new Promise<void>(resolve => {
+      release = resolve
+    })
+  })
+  r.push({ touched: ['/one'] })
+  r.push({ touched: ['/two'] })
+  r.push({ touched: ['/one'], doing: 'editing two' })
+  release()
+  await Promise.resolve()
+  await Promise.resolve()
+  expect(sent).toEqual([{ touched: ['/one'] }, { touched: ['/two', '/one'], doing: 'editing two' }])
+  release()
+  await r.idle()
 })
 
 test('the reporter sends one at a time and merges what arrives meanwhile', async () => {
-  const sent: Record<string, string>[] = []
+  const sent: Record<string, string | string[]>[] = []
   let release: () => void = () => undefined
   const r = new Reporter(fields => {
     sent.push(fields)
@@ -84,7 +112,7 @@ test('a failed send is dropped and the next one still goes', async () => {
   const sent: string[] = []
   let fail = true
   const r = new Reporter(async fields => {
-    sent.push(fields.status ?? '?')
+    sent.push(String(fields.status ?? '?'))
     if (fail) throw new Error('channel gone')
   })
   r.push({ status: 'working' })
@@ -117,12 +145,16 @@ test('inbox items are read in order and anything malformed is skipped', async ()
       { kind: 'wake', text: '[atrium bus #3 fyi from "builder" on "work"] item=M1 status=done' },
       { kind: 'send', text: '   ' },
       { kind: 'other', text: 'no' },
+      { kind: 'ask', text: 'what now?', id: 4 },
+      { kind: 'ask', text: 'no id' },
+      { kind: 'ask', text: 'bad id', id: 0 },
       'junk',
     ],
   })
   expect(items).toEqual([
     { kind: 'send', text: 'do x' },
     { kind: 'wake', text: '[atrium bus #3 fyi from "builder" on "work"] item=M1 status=done' },
+    { kind: 'ask', text: 'what now?', id: 4 },
   ])
   expect(inboxItems({ ok: false, err: 'did not declare inbox' })).toEqual([])
   expect(inboxItems({ ok: true })).toEqual([])

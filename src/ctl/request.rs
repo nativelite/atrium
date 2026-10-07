@@ -85,6 +85,39 @@ pub enum Cmd {
     /// removed from the queue: the mod submits them through the engine's own
     /// prompt queue instead of atrium typing them. About the caller only.
     Inbox,
+    /// Queue a question for a pane's mod, which answers it from a fork of the
+    /// pane's own context without interrupting its turn. Subtree-scoped like
+    /// `send`; the reply is read with `asked`.
+    Ask(AskReq),
+    /// The reply to an `ask`, once the pane's mod reported it. Subtree-scoped.
+    Asked(AskedReq),
+    /// Who touched a file: every pane whose mod reported an edit of it.
+    Who(WhoReq),
+}
+
+/// An `ask` request's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskReq {
+    /// Pane id (numeric) or role label.
+    pub target: String,
+    /// The question.
+    pub text: String,
+}
+
+/// An `asked` request's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskedReq {
+    pub target: String,
+    /// The ask's id, as the `ask` reply named it.
+    pub id: u64,
+}
+
+/// A `who` request's payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhoReq {
+    /// A path: real, or relative to a worktree, or a trailing part of one
+    /// (`src/x.rs` finds the file in every worktree).
+    pub path: String,
 }
 
 /// An `answer` request's payload.
@@ -116,6 +149,11 @@ impl Cmd {
             Cmd::Answer(_) => false,
             // Taking deliveries empties the caller's queue.
             Cmd::Inbox => false,
+            // A question is queued into a pane; its reply is the model's
+            // output: both for a token-matched caller in the pane's tree.
+            Cmd::Ask(_) | Cmd::Asked(_) => false,
+            // Who touched a file is structure, like the tree.
+            Cmd::Who(_) => true,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }
@@ -227,6 +265,13 @@ impl Cmd {
             Cmd::Whoami => ("whoami", String::new()),
             Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
             Cmd::Inbox => ("inbox", String::new()),
+            // The question's length, never its text.
+            Cmd::Ask(a) => (
+                "ask",
+                format!("target={} len={}", a.target, a.text.chars().count()),
+            ),
+            Cmd::Asked(a) => ("asked", format!("target={} id={}", a.target, a.id)),
+            Cmd::Who(w) => ("who", format!("path={}", w.path)),
         }
     }
 }
@@ -550,6 +595,32 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 ),
             };
             let answer = v.get("answer").and_then(Value::as_str).map(str::to_string);
+            let doing = v.get("doing").and_then(Value::as_str).map(str::to_string);
+            let touched = match v.get("touched") {
+                None => Vec::new(),
+                Some(Value::String(one)) => vec![one.clone()],
+                Some(Value::Array(items)) => items
+                    .iter()
+                    .map(|it| it.as_str().map(str::to_string))
+                    .collect::<Option<Vec<String>>>()
+                    .ok_or_else(|| "touched must be an array of paths".to_string())?,
+                Some(_) => return Err("touched must be an array of paths".to_string()),
+            };
+            let ask = match (v.get("ask"), v.get("reply")) {
+                (None, None) => None,
+                (Some(id), Some(reply)) => {
+                    let id = id
+                        .as_i64()
+                        .filter(|n| *n > 0)
+                        .map(|n| n as u64)
+                        .ok_or_else(|| "ask must be the id the ask reply named".to_string())?;
+                    let reply = reply
+                        .as_str()
+                        .ok_or_else(|| "reply must be text".to_string())?;
+                    Some((id, reply.to_string()))
+                }
+                _ => return Err("a reply names its ask: report ask=<id> reply=<text>".to_string()),
+            };
             let r = ReportReq {
                 status,
                 reason,
@@ -557,14 +628,55 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 cost_usd,
                 turns,
                 answer,
+                doing,
+                touched,
+                ask,
             };
             if r == ReportReq::default() {
                 return Err(
-                    "report needs at least one of status, reason, context, cost, turns or answer"
+                    "report needs at least one of status, reason, context, cost, turns, answer, \
+                     doing, touched or ask+reply"
                         .to_string(),
                 );
             }
             Cmd::Report(r)
+        }
+        Some("ask") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "ask needs a target".to_string())?
+                .to_string();
+            let text = v
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| "ask needs a question".to_string())?
+                .to_string();
+            Cmd::Ask(AskReq { target, text })
+        }
+        Some("asked") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "asked needs a target".to_string())?
+                .to_string();
+            let id = v
+                .get("id")
+                .and_then(Value::as_i64)
+                .filter(|n| *n > 0)
+                .map(|n| n as u64)
+                .ok_or_else(|| "asked needs the ask's id".to_string())?;
+            Cmd::Asked(AskedReq { target, id })
+        }
+        Some("who") => {
+            let path = v
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|p| !p.trim().is_empty())
+                .ok_or_else(|| "who needs a path".to_string())?
+                .to_string();
+            Cmd::Who(WhoReq { path })
         }
         Some("whoami") => Cmd::Whoami,
         Some("inbox") => {

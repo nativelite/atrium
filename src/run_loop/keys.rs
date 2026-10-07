@@ -162,6 +162,7 @@ impl RunState<'_> {
                 self.renderer.reset();
                 self.force_repaint = true;
             }
+            Action::AskFocused => self.ask_focused(),
             Action::ToggleMouse => self.toggle_mouse(),
             Action::MouseClick { .. }
             | Action::MouseDrag { .. }
@@ -190,6 +191,57 @@ impl RunState<'_> {
             }
         }
         Flow::Continue
+    }
+
+    /// `Ctrl+A ?`: put the standing question to the focused pane's mod and
+    /// open the overlay that shows its reply. A pane without a mod that
+    /// answers asks is told so in the bar; nothing is typed into it.
+    fn ask_focused(&mut self) {
+        let w = &self.windows[self.active];
+        let Some(p) = w.pane(w.tree.focus()) else {
+            return;
+        };
+        let id = p.agent_id;
+        let label = crate::ctl_server::pane_label(id, p.role.as_deref());
+        if !self.mods.has_cap(id.0, "ask") || !self.mods.has_cap(id.0, "inbox") {
+            self.flash = Some((
+                format!(
+                    "{label} has no mod that answers asks (atrium mod install, then restart it)"
+                ),
+                Instant::now(),
+            ));
+            self.force_repaint = true;
+            return;
+        }
+        let question = atrium::modstate::ASK_DEFAULT_QUESTION;
+        let now = atrium::session_store::now_ms();
+        match self.mods.ask(id.0, None, question, now) {
+            Ok(ask_id) => {
+                self.ctl_audit.record(
+                    None,
+                    "ask",
+                    &format!("target={id} len={}", question.chars().count()),
+                    true,
+                    &format!("id={ask_id}"),
+                );
+                self.ask = Some(crate::ask_panel::AskState {
+                    pane: id.0,
+                    label,
+                    id: ask_id,
+                    question: question.to_string(),
+                    reply: None,
+                    since: Instant::now(),
+                });
+                self.views.open_ask();
+                let _ = write!(self.out, "\x1b[?25h");
+                self.renderer.reset();
+                self.force_repaint = true;
+            }
+            Err(e) => {
+                self.flash = Some((format!("cannot ask {label}: {e}"), Instant::now()));
+                self.force_repaint = true;
+            }
+        }
     }
 
     /// `Ctrl+A m`: turn atrium's mouse capture on or off.

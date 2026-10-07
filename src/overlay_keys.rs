@@ -27,12 +27,24 @@ pub(crate) struct Views {
     /// the newest the view is scrolled (`0` = tailing).
     pub(crate) log: bool,
     pub(crate) log_scroll: usize,
+    /// The ask overlay (`Ctrl+A ?`): the question put to the focused pane and
+    /// its reply as it arrives. The text lives in the loop's [`crate::ask_panel::AskState`];
+    /// any key but the overlay switches closes it.
+    pub(crate) ask: bool,
 }
 
 impl Views {
     /// Is any overlay up (so keystrokes must not reach the panes)?
     pub(crate) fn any(&self) -> bool {
-        self.overview || self.board || self.log
+        self.overview || self.board || self.log || self.ask
+    }
+
+    /// Open the ask overlay — one overlay at a time.
+    pub(crate) fn open_ask(&mut self) {
+        *self = Views {
+            ask: true,
+            ..self.closed()
+        };
     }
 
     /// Open the board — one overlay at a time — at the live end of its feed
@@ -81,6 +93,7 @@ impl Views {
             overview: false,
             board: false,
             log: false,
+            ask: false,
             ..*self
         }
     }
@@ -135,6 +148,20 @@ pub(crate) fn handle_overlay_key(
         flash,
     } = ui;
     let mut outcome = KeyOutcome::default();
+    // The ask overlay is a reading pane: the overlay switches and quit work
+    // as everywhere; any other key closes it.
+    if views.ask {
+        match action {
+            Action::Quit => return Some(KeyOutcome::QUIT),
+            Action::ToggleOverview => views.open_overview(windows, *active, world),
+            Action::ToggleBoard => views.open_board(),
+            Action::ToggleLog => views.open_log(),
+            _ => views.ask = false,
+        }
+        outcome.reset_frame = true;
+        outcome.repaint = true;
+        return Some(outcome);
+    }
     // While the overview is open, keystrokes drive the selection cursor and
     // dive-in — not the panes. `Ctrl+A o` (toggle) and `Ctrl+A q` (quit)
     // still work via the scanner; everything else is consumed here.
@@ -386,6 +413,7 @@ mod tests {
         Views {
             overview: true,
             overview_sel: 3,
+            ask: false,
             board: true,
             feed_scroll: 7,
             decision_sel: 2,

@@ -18,6 +18,8 @@ export type Who = {
   subagents: string
   /** Leave a subagent pane open after its answer. */
   subagentsKeep: boolean
+  /** May the mod spend a small model call on this pane's caption? */
+  captions: boolean
 }
 
 /** A `whoami` reply as `Who`, or undefined when it is not one. */
@@ -40,6 +42,7 @@ export function parseWho(reply: Record<string, unknown>): Who | undefined {
     files: strs('files'),
     subagents: str('subagents') ?? 'panes',
     subagentsKeep: reply.subagents_keep === true,
+    captions: reply.captions !== false,
   }
 }
 
@@ -69,6 +72,9 @@ export function roleSection(who: Who): string {
   } else if (who.subagents === 'deny') {
     lines.push('Subagents are off in this session; delegate with atrium_spawn and atrium_send, or do the work yourself.')
   }
+  lines.push(
+    'atrium_ask puts a question to a teammate without interrupting it (its answer comes from a fork of its own context); atrium_who says which panes edited a file, so check it before you edit a shared file or merge.',
+  )
   lines.push(
     'A line in your input that starts with "[atrium bus #" is a teammate\'s event delivered because you subscribed or were addressed; it is not the human.',
   )

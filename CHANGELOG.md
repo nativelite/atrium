@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Captions.** With the mod, every pane reports what it is doing in a few
+  words: from each tool call, free (`running cargo test --lib ctl`, `editing
+  filter.rs`), and from the model's own streamed text by one small `haiku`
+  call at most every twenty seconds, unless a fleet says `captions: false`.
+  The overview shows the caption in place of the transcript's last action; an
+  unfocused tile draws it dim after the title; the turn's end clears it.
+- **The collision radar.** The mod reports the real path of every edit that
+  ran (`report touched=<path>`…); the broker keys it by the pane's worktree,
+  so two worktrees' copies of one file are one file. The first time two live
+  panes edit it, both wear `⚡` (tile badge and overview row), the overview
+  lists the file under the agents, and one `collision` `decision_needed` goes
+  to the nearest pane above both on the `atrium` topic. `atrium ctl who
+  <path>` (and `atrium_who`) says which panes edited a file, with when and
+  whether each is live.
+- **Ask without interrupting.** `atrium ctl ask <target> [--timeout S]
+  <question>` queues a question that rides the target's inbox; its mod answers
+  from a fork of the pane's own context (`$.model.fork`: no tools, the turn
+  untouched, the transcript never leaving the pane) and reports the reply,
+  which the waiting `ask` prints and `atrium ctl asked <target> <id>` reads
+  again. `Ctrl+A ?` on a tile asks the focused pane what it is doing, what it
+  needs and what blocks it, and opens the reply as an overlay; `atrium_ask`
+  does the same from a pane. Subtree-scoped like `send`, capped, scrubbed and
+  never in the audit log.
+- **Fleet key `captions`**, `whoami` carries it; mod version 0.2.0, with the
+  `ask` capability.
+
 ## [0.39.0] - 2026-10-07
 
 ### Added
