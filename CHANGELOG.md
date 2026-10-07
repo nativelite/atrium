@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-10-07
+
 ### Added
 - **The mod: a Claude Code plugin in every claude pane.** `atrium mod install`
   writes a plugin of function hooks out of atrium's binary; every claude pane
@@ -1785,7 +1787,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.39.0...HEAD
+[0.39.0]: https://github.com/nativelite/atrium/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/nativelite/atrium/compare/v0.37.2...v0.38.0
 [0.37.2]: https://github.com/nativelite/atrium/compare/v0.37.1...v0.37.2
 [0.37.1]: https://github.com/nativelite/atrium/compare/v0.37.0...v0.37.1
