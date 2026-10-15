@@ -65,6 +65,32 @@ cargo install --path .
 Requires a recent stable Rust toolchain. Windows is the reference platform
 (ConPTY); macOS and Linux run too (see [Design and scope](#design-and-scope)).
 
+### Prerequisite: a linker
+
+atrium has no third-party crates and no build script, but like every Rust
+program it is linked by the platform's C toolchain, which `rustup` does not
+install. Without one the build ends with ``linker `cc` not found`` (or
+`link.exe` / `gcc` not found) after every crate compiled fine. Install it once:
+
+| Platform | Install |
+|---|---|
+| Windows (default `-msvc` toolchain) | [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload (what `rustup-init` asks for), then open a new terminal |
+| Windows (`-gnu` toolchain) | MinGW-w64 `gcc` on `PATH` (for example `pacman -S mingw-w64-ucrt-x86_64-gcc` in MSYS2) |
+| WSL / Ubuntu / Debian | `sudo apt install build-essential` |
+| Fedora | `sudo dnf install gcc` |
+| macOS | `xcode-select --install` |
+
+The error names `cc` only on a Unix toolchain, so seeing it on a Windows
+machine means the build ran inside WSL (install `build-essential` there), or a
+`linker = "cc"` left in `~/.cargo/config.toml` or `RUSTFLAGS` overrides the
+Windows default: remove it. `cargo install` keeps the failed build in a
+temporary directory, so re-running it after the toolchain is in place starts
+clean.
+
+A build from a clone also needs the nativelite crates `Cargo.toml` names by
+path (`../abus`, `../pty-rs`, …) checked out beside the atrium directory;
+`cargo install atrium` from crates.io needs none of that.
+
 ### Set up the coordination skills
 
 The control plane and fleets rely on three Claude Code skills that teach a hosted

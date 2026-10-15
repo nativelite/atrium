@@ -34,6 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fleet key `captions`**, `whoami` carries it; mod version 0.2.0, with the
   `ask` capability.
 
+### Fixed
+- **Install docs name the linker prerequisite.** `cargo install atrium` on a
+  machine with a Rust toolchain but no C toolchain ends in ``linker `cc` not
+  found`` (`link.exe` / `gcc` on Windows) after every crate compiled; the
+  README's install section now says what to install per platform, why the
+  `cc` spelling on a Windows machine means WSL or a stray linker override, and
+  that a build from a clone needs the sibling nativelite crates beside it.
+
 ## [0.39.0] - 2026-10-07
 
 ### Added
