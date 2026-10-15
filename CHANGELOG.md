@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ask` capability.
 
 ### Fixed
+- **Manual splits tile into a grid.** `Ctrl+A "` / `%` halved only the focused
+  pane, so every pane added by hand with one key joined a single `1×N` strip
+  (five `"` presses: five full-width slivers), while `-n 4` and `ctl spawn
+  --here` laid the same panes out 2×2. A split now re-tiles the whole window
+  into the balanced near-square grid `--here` already uses, biased by the key
+  (`"` grows a column, `%` a row): two panes keep the plain split the key
+  names, three make a line, four a 2×2, six a 2×3. Focus still lands on the
+  new pane.
 - **Install docs name the linker prerequisite.** `cargo install atrium` on a
   machine with a Rust toolchain but no C toolchain ends in ``linker `cc` not
   found`` (`link.exe` / `gcc` on Windows) after every crate compiled; the

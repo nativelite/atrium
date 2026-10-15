@@ -39,7 +39,8 @@ pub enum Action {
     KillPane,
     /// Switch to pane index (0-based; from digits 1-9).
     SwitchTo(usize),
-    /// Split the focused pane horizontally (stacked) — `Ctrl+A "`.
+    /// Add a pane stacked below — `Ctrl+A "`. The window re-tiles into a
+    /// balanced grid biased tall (two → one above the other, four → 2×2).
     SplitH,
     /// Split the focused pane vertically (side by side) — `Ctrl+A %`.
     SplitV,

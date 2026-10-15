@@ -111,43 +111,66 @@ impl Tree {
     /// `0..n` ids). This re-tiles a window into a clean grid after
     /// `ctl spawn --here` grows it, so N `--here` workers sit in a ~square
     /// arrangement instead of the degenerate `1×N` line a naïve "split beside the
-    /// caller every time" produces.
-    ///
-    /// `rows = floor(sqrt(n))` (biased toward wider grids — reads better in a
-    /// terminal and suits side-by-side `--here` tiling), then the panes are spread
-    /// **evenly** across those rows: the first `n % rows` rows take one extra, the
-    /// rest the base share, so row sizes differ by at most one. Because the layout
-    /// splits space proportionally to leaf count, near-equal row sizes give
-    /// near-equal row heights — so there is **no thin stub row** for
-    /// non-rectangular counts (13 → three rows of 5/4/4, all comparable height;
-    /// not 4/4/4/1 with a sliver). Perfect counts still tile exactly (12 → 3×4,
-    /// 9 → 3×3, 4 → 2×2). Focus is set to `ids[0]`; callers move it as needed. An
-    /// empty slice falls back to a single leaf so this never panics.
+    /// caller every time" produces. Biased toward **wider** grids (reads better
+    /// in a terminal and suits side-by-side `--here` tiling): the
+    /// [`Dir::Vertical`] case of [`grid_from_ids_along`](Tree::grid_from_ids_along).
     pub fn grid_from_ids(ids: &[usize]) -> Self {
+        Self::grid_from_ids_along(ids, Dir::Vertical)
+    }
+
+    /// [`grid_from_ids`](Tree::grid_from_ids) with the bias chosen by the
+    /// direction a manual split grows in. `Dir::Vertical` (side by side, `%`)
+    /// lays the panes out in **rows**, `rows = floor(sqrt(n))`, so the grid is as
+    /// wide as it is tall or wider; `Dir::Horizontal` (stacked, `"`) is the
+    /// transpose: **columns**, `cols = floor(sqrt(n))`, so it is as tall or
+    /// taller. Either way two panes keep the plain split the key names (`"` →
+    /// one above the other, `%` → side by side), three make one line of three in
+    /// that direction, and four make a 2×2: a window grown by hand with one key
+    /// never degrades into a `1×N` strip, exactly as `ctl spawn --here` and
+    /// `-n` never do.
+    ///
+    /// The panes are spread **evenly** across the lines: the first `n % lines`
+    /// lines take one extra, the rest the base share, so line sizes differ by at
+    /// most one. Because the layout splits space proportionally to leaf count,
+    /// near-equal line sizes give near-equal line thickness — so there is **no
+    /// thin stub line** for non-rectangular counts (13 → three rows of 5/4/4,
+    /// all comparable height; not 4/4/4/1 with a sliver). Perfect counts still
+    /// tile exactly (12 → 3×4, 9 → 3×3, 4 → 2×2). Ids fill line by line in the
+    /// order given, so the last id lands at the end of the last line (bottom
+    /// right). Focus is set to `ids[0]`; callers move it as needed. An empty
+    /// slice falls back to a single leaf so this never panics.
+    pub fn grid_from_ids_along(ids: &[usize], dir: Dir) -> Self {
         if ids.is_empty() {
             return Tree::new(0);
         }
         let n = ids.len();
-        // rows = floor(sqrt(n)), computed without floats (no rounding surprises).
-        let mut rows = 1;
-        while (rows + 1) * (rows + 1) <= n {
-            rows += 1;
+        // lines = floor(sqrt(n)), computed without floats (no rounding surprises).
+        let mut lines = 1;
+        while (lines + 1) * (lines + 1) <= n {
+            lines += 1;
         }
-        // Even spread: `rem` rows of `base + 1`, then `rows - rem` of `base`.
-        let base = n / rows;
-        let rem = n % rows;
-        let mut row_nodes = Vec::with_capacity(rows);
+        // A line runs *across* the split direction and the lines are joined
+        // *along* it: side by side → rows of panes stacked; stacked → columns of
+        // panes side by side.
+        let (within, across) = match dir {
+            Dir::Vertical => (Dir::Vertical, Dir::Horizontal),
+            Dir::Horizontal => (Dir::Horizontal, Dir::Vertical),
+        };
+        // Even spread: `rem` lines of `base + 1`, then `lines - rem` of `base`.
+        let base = n / lines;
+        let rem = n % lines;
+        let mut line_nodes = Vec::with_capacity(lines);
         let mut start = 0;
-        for r in 0..rows {
-            let take = base + usize::from(r < rem);
-            let row = &ids[start..start + take];
-            row_nodes.push(Self::join(
-                Dir::Vertical,
-                row.iter().map(|&id| Node::Leaf(id)).collect(),
+        for l in 0..lines {
+            let take = base + usize::from(l < rem);
+            let line = &ids[start..start + take];
+            line_nodes.push(Self::join(
+                within,
+                line.iter().map(|&id| Node::Leaf(id)).collect(),
             ));
             start += take;
         }
-        let root = Self::join(Dir::Horizontal, row_nodes);
+        let root = Self::join(across, line_nodes);
         Tree {
             root,
             focus: ids[0],
@@ -880,5 +903,108 @@ mod tests {
         let t = Tree::grid_from_ids(&[]);
         assert_eq!(t.len(), 1);
         assert!(t.is_single());
+    }
+
+    /// A pane's rect by id, for geometry assertions on a built grid.
+    fn rect_of(t: &Tree, id: usize, outer: Rect) -> Rect {
+        t.rects(outer)
+            .into_iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, r)| r)
+            .expect("pane is in the tree")
+    }
+
+    // `"` (stacked) grows a column, not a row: two panes sit one above the
+    // other, three make one column of three, and four fold into a 2×2 — the
+    // transpose of the `%` case at every count.
+    // RED-when-broken: building rows regardless of `dir` makes the three-pane
+    // column a 1×3 row (every rect has `row == 0`).
+    #[test]
+    fn grid_from_ids_along_stacked_grows_a_column_until_it_can_square() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let two = Tree::grid_from_ids_along(&[0, 1], Dir::Horizontal);
+        let (a, b) = (rect_of(&two, 0, outer), rect_of(&two, 1, outer));
+        assert_eq!((a.col, a.cols), (0, 120), "two stacked: full width");
+        assert_eq!((b.col, b.cols), (0, 120), "two stacked: full width");
+        assert_eq!(b.row, a.row + a.rows, "pane 1 sits below pane 0");
+
+        let three = Tree::grid_from_ids_along(&[0, 1, 2], Dir::Horizontal);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&three, id, outer)).collect();
+        assert!(
+            rs.iter().all(|r| r.col == 0 && r.cols == 120),
+            "three stacked: one column, got {rs:?}"
+        );
+        assert_eq!(rs[1].row, rs[0].rows, "pane 1 below pane 0");
+        assert_eq!(rs[2].row, rs[0].rows + rs[1].rows, "pane 2 below pane 1");
+        assert!(
+            rs.iter().all(|r| (9..=11).contains(&r.rows)),
+            "three stacked: even thirds, got {rs:?}"
+        );
+
+        let four = Tree::grid_from_ids_along(&[0, 1, 2, 3], Dir::Horizontal);
+        let rs: Vec<Rect> = (0..4).map(|id| rect_of(&four, id, outer)).collect();
+        // Column-major: 0 over 1 on the left, 2 over 3 on the right.
+        assert_eq!((rs[0].row, rs[0].col), (0, 0));
+        assert_eq!((rs[1].row, rs[1].col), (15, 0));
+        assert_eq!((rs[2].row, rs[2].col), (0, 60));
+        assert_eq!((rs[3].row, rs[3].col), (15, 60));
+        assert!(rs.iter().all(|r| r.rows == 15 && r.cols == 60), "{rs:?}");
+    }
+
+    // The side-by-side bias is the transpose: the same counts give a row of
+    // two, a row of three, and the same 2×2 (row-major).
+    #[test]
+    fn grid_from_ids_along_side_by_side_grows_a_row_until_it_can_square() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let three = Tree::grid_from_ids_along(&[0, 1, 2], Dir::Vertical);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&three, id, outer)).collect();
+        assert!(
+            rs.iter().all(|r| r.row == 0 && r.rows == 30),
+            "three side by side: one row, got {rs:?}"
+        );
+        assert_eq!(rs[1].col, rs[0].cols);
+        assert_eq!(rs[2].col, rs[0].cols + rs[1].cols);
+        // Same tree as the default builder.
+        assert_eq!(three, Tree::grid_from_ids(&[0, 1, 2]));
+
+        let four = Tree::grid_from_ids_along(&[0, 1, 2, 3], Dir::Vertical);
+        let rs: Vec<Rect> = (0..4).map(|id| rect_of(&four, id, outer)).collect();
+        assert_eq!((rs[0].row, rs[0].col), (0, 0));
+        assert_eq!((rs[1].row, rs[1].col), (0, 60));
+        assert_eq!((rs[2].row, rs[2].col), (15, 0));
+        assert_eq!((rs[3].row, rs[3].col), (15, 60));
+    }
+
+    // A stacked grid of a prime count spreads its columns evenly with no stub
+    // column, mirroring the row case: 5 → columns of 3 and 2, both full height.
+    #[test]
+    fn grid_from_ids_along_stacked_prime_count_has_no_stub_column() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 100,
+        };
+        let five = Tree::grid_from_ids_along(&[0, 1, 2, 3, 4], Dir::Horizontal);
+        let rs: Vec<Rect> = (0..5).map(|id| rect_of(&five, id, outer)).collect();
+        // Left column: 0, 1, 2; right column: 3, 4.
+        assert!(rs[..3].iter().all(|r| r.col == 0), "{rs:?}");
+        assert!(rs[3..].iter().all(|r| r.col == rs[0].cols), "{rs:?}");
+        assert_eq!(rs[0].rows + rs[1].rows + rs[2].rows, 30);
+        assert_eq!(rs[3].rows + rs[4].rows, 30);
+        // Columns split by leaf count, 3:2 — the wider one is the fuller one.
+        assert_eq!(rs[0].cols, 60);
+        assert_eq!(rs[3].cols, 40);
+        assert_eq!(five.focus(), 0);
     }
 }
