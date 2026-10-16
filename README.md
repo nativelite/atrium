@@ -65,6 +65,32 @@ cargo install --path .
 Requires a recent stable Rust toolchain. Windows is the reference platform
 (ConPTY); macOS and Linux run too (see [Design and scope](#design-and-scope)).
 
+### Prerequisite: a linker
+
+atrium has no third-party crates and no build script, but like every Rust
+program it is linked by the platform's C toolchain, which `rustup` does not
+install. Without one the build ends with ``linker `cc` not found`` (or
+`link.exe` / `gcc` not found) after every crate compiled fine. Install it once:
+
+| Platform | Install |
+|---|---|
+| Windows (default `-msvc` toolchain) | [Build Tools for Visual Studio](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the **Desktop development with C++** workload (what `rustup-init` asks for), then open a new terminal |
+| Windows (`-gnu` toolchain) | MinGW-w64 `gcc` on `PATH` (for example `pacman -S mingw-w64-ucrt-x86_64-gcc` in MSYS2) |
+| WSL / Ubuntu / Debian | `sudo apt install build-essential` |
+| Fedora | `sudo dnf install gcc` |
+| macOS | `xcode-select --install` |
+
+The error names `cc` only on a Unix toolchain, so seeing it on a Windows
+machine means the build ran inside WSL (install `build-essential` there), or a
+`linker = "cc"` left in `~/.cargo/config.toml` or `RUSTFLAGS` overrides the
+Windows default: remove it. `cargo install` keeps the failed build in a
+temporary directory, so re-running it after the toolchain is in place starts
+clean.
+
+A build from a clone also needs the nativelite crates `Cargo.toml` names by
+path (`../abus`, `../pty-rs`, …) checked out beside the atrium directory;
+`cargo install atrium` from crates.io needs none of that.
+
 ### Set up the coordination skills
 
 The control plane and fleets rely on three Claude Code skills that teach a hosted
@@ -133,7 +159,7 @@ Then drive it with the **`Ctrl+A`** prefix (press `Ctrl+A`, release, then a key)
 | `!` | new shell pane |
 | `:` | command prompt: type any program (`wsl`, `pwsh`, `claude`) to open it in a new pane |
 | `1`–`9` / `n` / `p` | switch / cycle windows |
-| `"` / `%` | split the focused pane stacked / side-by-side |
+| `"` / `%` | add a pane below / beside; the window re-tiles into a balanced grid each time (two → a plain split, three → a line, four → 2x2, six → 2x3), biased tall for `"` and wide for `%` |
 | `h` `j` `k` `l` / arrows | move focus between tiles |
 | `z` | zoom the focused pane to full-screen and back |
 | `b` | the board + bus dashboard |
@@ -164,8 +190,11 @@ atrium has two levels:
 
 - A **window** is a full-screen workspace. `Ctrl+A c` makes one; `1`–`9` / `n` / `p`
   switch between them.
-- Inside a window, `Ctrl+A "` / `%` **split** the focused pane into tiles; `hjkl`
-  or arrows move focus; `Ctrl+A z` **zooms** a tile to full-screen and back.
+- Inside a window, `Ctrl+A "` / `%` **split** the focused pane into tiles, and
+  every split re-tiles the window into a balanced grid, so pressing one key N
+  times gives the same near-square layout `-n N` does rather than a `1×N`
+  strip; `hjkl` or arrows move focus; `Ctrl+A z` **zooms** a tile to
+  full-screen and back.
 
 A single (or zoomed) pane renders in **passthrough**: its raw terminal output
 goes straight to your real terminal, so a TUI like Claude Code looks pixel-exact.

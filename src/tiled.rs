@@ -96,6 +96,14 @@ pub(crate) fn render_tiled(
 
 /// Split the focused pane, spawning a new pane sized to what its half will be.
 /// On spawn failure the split is abandoned and the reason lands in the bar.
+///
+/// The window is then re-tiled as a whole into a balanced grid over every pane
+/// it holds, biased by the key's direction (`"` grows a column, `%` a row),
+/// rather than the focused leaf alone being halved. A plain `tree.split` each
+/// time left every pane the key added in one `1×N` strip — five `"` presses
+/// made five full-width slivers — while `-n 4` and `ctl spawn --here` gave the
+/// same panes a 2×2. Two panes still get the plain split the key names, three
+/// one line of three, and four a 2×2; focus lands on the new pane.
 pub(crate) fn split_focused(
     w: &mut Window,
     dir: layout::Dir,
@@ -125,7 +133,9 @@ pub(crate) fn split_focused(
         Ok(pane) => {
             w.panes.push(pane);
             w.next_id += 1;
-            w.tree.split(dir, new_id);
+            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
+            w.tree = Tree::grid_from_ids_along(&ids, dir);
+            w.tree.focus_pane(new_id);
             w.zoomed = false; // a fresh split is always tiled
         }
         Err(e) => {

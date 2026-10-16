@@ -31,9 +31,10 @@ fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
-/// A 2x2 grid: split vertical, split the right column horizontally, focus the
-/// left column and split it horizontally — four live panes. Echo a unique
-/// marker in each and assert all four reach the composited frame.
+/// A 2x2 grid: `%`, then `"` twice (each split re-tiles the whole window into
+/// a balanced grid, so three panes are one line and four are a 2×2) — four
+/// live panes. Echo a unique marker in each and assert all four reach the
+/// composited frame.
 #[test]
 fn two_by_two_grid_has_four_live_panes() {
     let mut p = spawn_atrium_shell(30, 120);
@@ -41,16 +42,16 @@ fn two_by_two_grid_has_four_live_panes() {
     // first shell is proven live.
     p.write(b"echo atrium-q1\r\n").unwrap();
     read_until(&mut p, b"atrium-q1", Duration::from_secs(15));
-    // Build the square: % (vertical) then " (horizontal on the right), then move
-    // focus back to the left column with h and " to split it.
+    // Build the square: % (two side by side), " (three, re-tiled into one
+    // column), h (a no-op in a single column), and " again (four: a 2×2).
     p.write(b"\x01%").unwrap(); // now two columns, focus right
     p.write(b"echo atrium-q2\r\n").unwrap();
     read_until(&mut p, b"atrium-q2", Duration::from_secs(15));
-    p.write(b"\x01\"").unwrap(); // split right column -> focus bottom-right
+    p.write(b"\x01\"").unwrap(); // three panes -> one column, focus the new one
     p.write(b"echo atrium-q3\r\n").unwrap();
     read_until(&mut p, b"atrium-q3", Duration::from_secs(15));
-    p.write(b"\x01h").unwrap(); // focus back to the left column
-    p.write(b"\x01\"").unwrap(); // split it -> focus bottom-left
+    p.write(b"\x01h").unwrap(); // nothing to the left of a column: focus stays
+    p.write(b"\x01\"").unwrap(); // four panes -> 2x2, focus the new one
     p.write(b"echo atrium-q4\r\n").unwrap();
     // Collect everything for a few seconds and assert all four markers appeared.
     let out = read_until(&mut p, b"atrium-q4", Duration::from_secs(15));
