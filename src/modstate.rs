@@ -486,7 +486,11 @@ impl ModState {
             .flat_map(|(pane, m)| {
                 m.iter()
                     .filter(|(k, t)| {
-                        let q = if windows_spelled(&t.path) { lower.as_str() } else { q };
+                        let q = if windows_spelled(&t.path) {
+                            lower.as_str()
+                        } else {
+                            q
+                        };
                         hit(k, q) || hit(&norm_path(&t.path), q)
                     })
                     .map(move |(k, t)| (*pane, k.as_str(), t))
@@ -1084,7 +1088,10 @@ mod tests {
     #[test]
     fn touch_keys_compare_windows_paths_as_the_filesystem_does() {
         assert_eq!(touch_key("C:/wt/a/src/x.rs", Some("C:\\wt\\a")), "src/x.rs");
-        assert_eq!(touch_key("c:\\WT\\A\\src\\x.rs", Some("C:\\wt\\a")), "src/x.rs");
+        assert_eq!(
+            touch_key("c:\\WT\\A\\src\\x.rs", Some("C:\\wt\\a")),
+            "src/x.rs"
+        );
         assert_eq!(
             touch_key("\\\\?\\C:\\wt\\a\\src\\x.rs", Some("C:\\wt\\a")),
             "src/x.rs"

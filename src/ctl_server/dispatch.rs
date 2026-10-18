@@ -274,8 +274,7 @@ fn who(
     let windows = &*cx.windows;
     let parents = ctl_parents(windows);
     let visible = |pane: usize| {
-        privileged
-            || caller.is_some_and(|c| atrium::ctl::in_subtree(AgentId(pane), c, &parents))
+        privileged || caller.is_some_and(|c| atrium::ctl::in_subtree(AgentId(pane), c, &parents))
     };
     let panes = cx
         .mods

@@ -1154,7 +1154,8 @@ mod tests {
         let mut ids: Vec<usize> = vec![0];
         for new in 1..4 {
             let focus = *ids.last().unwrap();
-            let t = Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, focus, new, Dir::Horizontal);
+            let t =
+                Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, focus, new, Dir::Horizontal);
             ids = t.ids();
         }
         assert_eq!(ids, vec![0, 1, 2, 3]);
