@@ -31,9 +31,9 @@ fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
-/// A 2x2 grid: `%`, then `"` twice (each split re-tiles the whole window into
-/// a balanced grid, so three panes are one line and four are a 2×2) — four
-/// live panes. Echo a unique marker in each and assert all four reach the
+/// A 2x2 grid: `%`, then `"` twice (each key re-tiles the whole window into a
+/// balanced grid with the new pane next to the focused one, so three panes are
+/// one line and four are a 2×2) — four live panes. Echo a unique marker in each and assert all four reach the
 /// composited frame.
 #[test]
 fn two_by_two_grid_has_four_live_panes() {

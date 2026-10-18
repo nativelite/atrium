@@ -833,6 +833,7 @@ fn resume_session(
         panes,
         tree,
         zoomed: false,
+        grid_dir: layout::Dir::Vertical,
         next_id: max_id + 1,
     };
     run(

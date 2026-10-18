@@ -46,10 +46,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pane, so every pane added by hand with one key joined a single `1×N` strip
   (five `"` presses: five full-width slivers), while `-n 4` and `ctl spawn
   --here` laid the same panes out 2×2. A split now re-tiles the whole window
-  into the balanced near-square grid `--here` already uses, biased by the key
-  (`"` grows a column, `%` a row): two panes keep the plain split the key
-  names, three make a line, four a 2×2, six a 2×3. Focus still lands on the
-  new pane.
+  into the balanced near-square grid `--here` already uses, with the new pane
+  **where the key pointed**: `%` in the next slot of the focused pane's line,
+  `"` in its slot of the next line (not appended bottom-right, as the first
+  cut of this fix and `--here` did). The window keeps the orientation the
+  first key gave it (`"` columns, `%` rows), so a later key reflows the grid
+  instead of transposing it; `ctl spawn --here` puts the worker beside its
+  caller the same way. Two panes keep the plain split the key names, three
+  make a line, four a 2×2, six a 2×3. Focus still lands on the new pane.
 - **Install docs name the linker prerequisite.** `cargo install atrium` on a
   machine with a Rust toolchain but no C toolchain ends in ``linker `cc` not
   found`` (`link.exe` / `gcc` on Windows) after every crate compiled; the

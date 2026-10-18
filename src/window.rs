@@ -124,6 +124,12 @@ pub(crate) struct Window {
     pub(crate) tree: Tree,
     pub(crate) zoomed: bool,
     pub(crate) next_id: usize,
+    /// The grid's orientation when a pane is added by hand or by `ctl spawn
+    /// --here`: rows (`Dir::Vertical`, the `-n`/`--here` shape) or columns
+    /// (`Dir::Horizontal`). Set by the key that first grows a single pane —
+    /// `"` makes columns, `%` rows — and kept, so later additions reflow the
+    /// grid instead of transposing it.
+    pub(crate) grid_dir: layout::Dir,
 }
 
 impl Window {

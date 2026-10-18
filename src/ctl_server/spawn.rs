@@ -163,16 +163,28 @@ pub(crate) fn spawn_worker_here(
     ) {
         Ok(mut pane) => {
             let reply = adopt_worker(&mut pane, sp, caller, new_depth, note);
+            // Re-tile the window into a balanced near-square grid over all its
+            // panes (keeping their stable ids) with the worker BESIDE the caller,
+            // rather than splitting the caller alone or appending bottom-right.
+            // A plain `split_pane` each time stacks every `--here` worker into
+            // one column, so N of them degrade to an unusable `1×N` strip;
+            // re-gridding keeps 2→1×2, 4→2×2, 6→2×3, 12→3×4, … balanced, in the
+            // window's own orientation (rows, for a window `--here` started).
+            // Focus lands on the fresh worker.
+            let anchor = w
+                .panes
+                .iter()
+                .find(|p| p.agent_id == caller_id)
+                .map(|p| p.id)
+                .unwrap_or(w.tree.focus());
+            if w.panes.len() == 1 {
+                w.grid_dir = layout::Dir::Vertical;
+            }
+            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
             w.panes.push(pane);
             w.next_id += 1;
-            // Re-tile the WHOLE window into a balanced near-square grid over all
-            // its panes (keeping their stable ids), rather than just splitting the
-            // caller side-by-side. A plain `split_pane` each time stacks every
-            // `--here` worker into one column, so N of them degrade to an
-            // unusable `1×N` strip; re-gridding keeps 2→1×2, 4→2×2, 6→2×3,
-            // 12→3×4, … balanced. Focus lands on the fresh worker.
-            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
-            w.tree = Tree::grid_from_ids(&ids);
+            w.tree =
+                Tree::grid_from_ids_inserting(&ids, w.grid_dir, anchor, new_id, layout::Dir::Vertical);
             w.tree.focus_pane(new_id);
             w.zoomed = false;
             // Resize the whole window so both the caller and the fresh worker get

@@ -20,6 +20,7 @@ pub(crate) fn spawn_window(
         panes: vec![pane],
         tree: Tree::new(0),
         zoomed: false,
+        grid_dir: layout::Dir::Vertical,
         next_id: 1,
     })
 }
@@ -120,6 +121,7 @@ pub(crate) fn spawn_window_grid(
         panes,
         tree,
         zoomed: false,
+        grid_dir: layout::Dir::Vertical,
         next_id: n,
     })
 }

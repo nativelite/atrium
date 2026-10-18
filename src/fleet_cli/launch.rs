@@ -251,6 +251,7 @@ pub(crate) fn spawn_fleet_window(
         panes,
         tree,
         zoomed: false,
+        grid_dir: layout::Dir::Vertical,
         next_id: fleet.agents.len(),
     })
 }

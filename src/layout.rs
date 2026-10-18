@@ -144,11 +144,7 @@ impl Tree {
             return Tree::new(0);
         }
         let n = ids.len();
-        // lines = floor(sqrt(n)), computed without floats (no rounding surprises).
-        let mut lines = 1;
-        while (lines + 1) * (lines + 1) <= n {
-            lines += 1;
-        }
+        let lines = Self::grid_lines(n);
         // A line runs *across* the split direction and the lines are joined
         // *along* it: side by side → rows of panes stacked; stacked → columns of
         // panes side by side.
@@ -175,6 +171,64 @@ impl Tree {
             root,
             focus: ids[0],
         }
+    }
+
+    /// How many lines a balanced grid of `n` panes has: `floor(sqrt(n))`,
+    /// computed without floats (no rounding surprises), at least 1.
+    fn grid_lines(n: usize) -> usize {
+        let mut lines = 1;
+        while (lines + 1) * (lines + 1) <= n {
+            lines += 1;
+        }
+        lines
+    }
+
+    /// [`grid_from_ids_along`](Tree::grid_from_ids_along) over `ids` plus
+    /// `new_id`, with the new pane put **next to `anchor`** rather than at the
+    /// end. `grid_dir` is the grid's own orientation (how the window was first
+    /// grown: `Dir::Vertical` rows, `Dir::Horizontal` columns) and `toward` the
+    /// key's: when they agree the new pane takes the next slot of the anchor's
+    /// own line (to its right in a grid of rows, below it in a grid of
+    /// columns); otherwise it takes the anchor's slot in the next line (directly
+    /// below in rows, directly beside in columns), or the end when the anchor
+    /// is in the last line. Every other pane keeps its order, so the window
+    /// reflows only as far as the new count forces it, and a pane added by
+    /// hand appears where the hand pointed. An `anchor` not in `ids` appends.
+    /// Focus is left on the first pane; callers move it.
+    pub fn grid_from_ids_inserting(
+        ids: &[usize],
+        grid_dir: Dir,
+        anchor: usize,
+        new_id: usize,
+        toward: Dir,
+    ) -> Self {
+        let n = ids.len() + 1;
+        let pos = match ids.iter().position(|&id| id == anchor) {
+            None => ids.len(),
+            Some(f) if toward == grid_dir => f + 1,
+            Some(f) => {
+                // The length of the line holding `f` in the new grid (`f` keeps
+                // its index, since the insert lands after it): the same offset
+                // one line on is `f + len`.
+                let lines = Self::grid_lines(n);
+                let (base, rem) = (n / lines, n % lines);
+                let mut start = 0;
+                let mut len = base;
+                for l in 0..lines {
+                    len = base + usize::from(l < rem);
+                    if f < start + len {
+                        break;
+                    }
+                    start += len;
+                }
+                (f + len).min(ids.len())
+            }
+        };
+        let mut order = Vec::with_capacity(n);
+        order.extend_from_slice(&ids[..pos]);
+        order.push(new_id);
+        order.extend_from_slice(&ids[pos..]);
+        Self::grid_from_ids_along(&order, grid_dir)
     }
 
     /// Fold `nodes` (non-empty) into a single left-leaning line of `dir` splits —
@@ -1006,5 +1060,103 @@ mod tests {
         assert_eq!(rs[0].cols, 60);
         assert_eq!(rs[3].cols, 40);
         assert_eq!(five.focus(), 0);
+    }
+
+    // A pane added by hand lands NEXT TO the focused pane, not at the end of
+    // the grid: `%` in a grid of rows puts it in the next slot of the focused
+    // pane's row, `"` in the same slot of the row below. Nobody else changes
+    // order, so the window reflows only as far as the new count forces it.
+    // RED-when-broken: appending puts the new pane bottom-right regardless of
+    // where the focus is.
+    #[test]
+    fn grid_insert_puts_the_new_pane_beside_or_below_the_anchor() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        // A 2×2 of rows (0 1 / 2 3); focus on 0.
+        let ids = [0, 1, 2, 3];
+        // `%`: beside 0 → 0 is followed by 9 in the first row.
+        let beside = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, 0, 9, Dir::Vertical);
+        assert_eq!(beside.ids(), vec![0, 9, 1, 2, 3]);
+        let (a, b) = (rect_of(&beside, 0, outer), rect_of(&beside, 9, outer));
+        assert_eq!(b.row, a.row, "same row");
+        assert_eq!(b.col, a.col + a.cols, "immediately to the right");
+        // `"`: below 1 → 1's slot in the second row (5 panes: rows of 3 and 2).
+        let below = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, 1, 9, Dir::Horizontal);
+        assert_eq!(below.ids(), vec![0, 1, 2, 3, 9]);
+        let (a, b) = (rect_of(&below, 1, outer), rect_of(&below, 9, outer));
+        assert_eq!(b.row, a.row + a.rows, "in the row below");
+        // Rows of 3 and 2 do not share cell edges; the slot under 1 overlaps it.
+        assert!(
+            b.col < a.col + a.cols && a.col < b.col + b.cols,
+            "under pane 1: {a:?} vs {b:?}"
+        );
+        // `"` from the last row has no row below: the pane goes to the end.
+        let end = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, 3, 9, Dir::Horizontal);
+        assert_eq!(end.ids(), vec![0, 1, 2, 3, 9]);
+        // An anchor that is not in the grid appends too.
+        let gone = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, 7, 9, Dir::Vertical);
+        assert_eq!(gone.ids(), vec![0, 1, 2, 3, 9]);
+        // Nothing yet: a single leaf.
+        assert_eq!(
+            Tree::grid_from_ids_inserting(&[], Dir::Vertical, 0, 9, Dir::Vertical).ids(),
+            vec![9]
+        );
+    }
+
+    // The same, transposed, in a grid of columns (grown with `"`): `"` is the
+    // next slot down the focused pane's column, `%` the same slot in the
+    // column to the right.
+    #[test]
+    fn grid_insert_in_a_grid_of_columns_is_the_transpose() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        // Column-major 2×2: 0 over 1 on the left, 2 over 3 on the right.
+        let ids = [0, 1, 2, 3];
+        let below = Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, 0, 9, Dir::Horizontal);
+        assert_eq!(below.ids(), vec![0, 9, 1, 2, 3]);
+        let (a, b) = (rect_of(&below, 0, outer), rect_of(&below, 9, outer));
+        assert_eq!((b.col, b.row), (a.col, a.row + a.rows), "directly below 0");
+        let beside = Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, 1, 9, Dir::Vertical);
+        assert_eq!(beside.ids(), vec![0, 1, 2, 3, 9]);
+        let (a, b) = (rect_of(&beside, 1, outer), rect_of(&beside, 9, outer));
+        assert_eq!(b.col, a.col + a.cols, "in the next column");
+        assert!(
+            b.row < a.row + a.rows && a.row < b.row + b.rows,
+            "beside pane 1: {a:?} vs {b:?}"
+        );
+    }
+
+    // Growing a window one key at a time from a single pane, with the focus
+    // riding the new pane as it does live: `%` ×3 is a row-major 2×2 and `"`
+    // ×3 its column-major transpose, each new pane next to the last.
+    #[test]
+    fn grid_insert_grown_from_one_pane_with_one_key_is_a_square() {
+        let mut ids: Vec<usize> = vec![0];
+        for new in 1..4 {
+            let focus = *ids.last().unwrap();
+            let t = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, focus, new, Dir::Vertical);
+            ids = t.ids();
+        }
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(
+            Tree::grid_from_ids_along(&ids, Dir::Vertical),
+            Tree::grid_from_ids(&[0, 1, 2, 3]),
+            "the grid `-n 4` makes"
+        );
+        let mut ids: Vec<usize> = vec![0];
+        for new in 1..4 {
+            let focus = *ids.last().unwrap();
+            let t = Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, focus, new, Dir::Horizontal);
+            ids = t.ids();
+        }
+        assert_eq!(ids, vec![0, 1, 2, 3]);
     }
 }

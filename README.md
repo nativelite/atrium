@@ -159,7 +159,7 @@ Then drive it with the **`Ctrl+A`** prefix (press `Ctrl+A`, release, then a key)
 | `!` | new shell pane |
 | `:` | command prompt: type any program (`wsl`, `pwsh`, `claude`) to open it in a new pane |
 | `1`–`9` / `n` / `p` | switch / cycle windows |
-| `"` / `%` | add a pane below / beside; the window re-tiles into a balanced grid each time (two → a plain split, three → a line, four → 2x2, six → 2x3), biased tall for `"` and wide for `%` |
+| `"` / `%` | add a pane below / beside the focused one; the window re-tiles into a balanced grid each time (two → a plain split, three → a line, four → 2x2, six → 2x3), in the orientation the first key chose (`"` columns, `%` rows) |
 | `h` `j` `k` `l` / arrows | move focus between tiles |
 | `z` | zoom the focused pane to full-screen and back |
 | `b` | the board + bus dashboard |
@@ -190,11 +190,11 @@ atrium has two levels:
 
 - A **window** is a full-screen workspace. `Ctrl+A c` makes one; `1`–`9` / `n` / `p`
   switch between them.
-- Inside a window, `Ctrl+A "` / `%` **split** the focused pane into tiles, and
-  every split re-tiles the window into a balanced grid, so pressing one key N
-  times gives the same near-square layout `-n N` does rather than a `1×N`
-  strip; `hjkl` or arrows move focus; `Ctrl+A z` **zooms** a tile to
-  full-screen and back.
+- Inside a window, `Ctrl+A "` / `%` **add a tile** below / beside the focused
+  one, and every addition re-tiles the window into a balanced grid, so pressing
+  one key N times gives the same near-square layout `-n N` does rather than a
+  `1×N` strip, with each new tile where the key pointed; `hjkl` or arrows move
+  focus; `Ctrl+A z` **zooms** a tile to full-screen and back.
 
 A single (or zoomed) pane renders in **passthrough**: its raw terminal output
 goes straight to your real terminal, so a TUI like Claude Code looks pixel-exact.
