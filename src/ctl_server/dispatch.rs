@@ -405,19 +405,20 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     let now = atrium::session_store::now_ms();
     let seq = cx.mods.report(me.0, &r, now);
     // A reply to a queued question: accepted only from the pane it was put to.
-    if let Some((id, text)) = &r.ask {
-        if !cx.mods.reply(me.0, *id, text, now) {
-            return ctl::reply_err(&format!(
-                "ask #{id} was not put to pane {me}, or is already answered"
-            ));
-        }
-    }
-    // Files edited, keyed by the pane's worktree (its cwd when it has none),
-    // so two worktrees' copies of one file collide. The first time two live
-    // panes share a key, one decision goes to the nearest pane above both.
+    // A refusal is the reply, but the rest of the report — a status, a
+    // caption, the files edited — is applied first, as it would be alone.
+    let refused_ask = match &r.ask {
+        Some((id, text)) if !cx.mods.reply(me.0, *id, text, now) => Some(format!(
+            "ask #{id} was not put to pane {me}, or is already answered"
+        )),
+        _ => None,
+    };
+    // Files edited, keyed by the pane's worktree, so two worktrees' copies of
+    // one file collide; a pane with no worktree keys by the absolute path (not
+    // its cwd: two unrelated repos' `README.md` are two files). The first time
+    // two live panes share a key, one decision goes to the nearest pane above.
     if !r.touched.is_empty() {
-        let root = pane_by_agent(cx.windows, me)
-            .and_then(|p| p.worktree.clone().or_else(|| p.cwd.clone()));
+        let root = pane_by_agent(cx.windows, me).and_then(|p| p.worktree.clone());
         cx.mods.touch(me.0, &r.touched, root.as_deref(), now);
         let live: Vec<usize> = ctl_candidates(cx.windows)
             .iter()
@@ -434,7 +435,10 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
             post_respawn_decision(me, threshold, now, cx);
         }
     }
-    ctl::reply_reported(me, seq)
+    match refused_ask {
+        Some(err) => ctl::reply_err(&err),
+        None => ctl::reply_reported(me, seq),
+    }
 }
 
 /// The nearest pane above every one of `panes` (a lead over its builders),

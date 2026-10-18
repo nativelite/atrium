@@ -245,23 +245,53 @@ pub struct AskReply {
 }
 
 /// The key a touched path is remembered under: relative to `root` (the
-/// pane's worktree, or its cwd) when it lies inside it, else the path itself.
-/// Two worktrees of one repo hold the same relative paths, and an edit to
-/// `src/x.rs` in each is the merge conflict the radar exists to catch; a
-/// shared absolute path outside both collides on its own name.
+/// pane's worktree) when it lies inside it, else the path itself in one
+/// spelling ([`norm_path`]). Two worktrees of one repo hold the same relative
+/// paths, and an edit to `src/x.rs` in each is the merge conflict the radar
+/// exists to catch; a shared absolute path outside both collides on its own
+/// name. A pane with no worktree keys by the absolute path alone — never by
+/// its cwd, under which two unrelated repos' `README.md` would be one file.
 pub fn touch_key(path: &str, root: Option<&str>) -> String {
-    let path = path.trim();
+    let path = norm_path(path.trim());
     if let Some(root) = root.map(str::trim).filter(|r| !r.is_empty()) {
-        let root = root.trim_end_matches(['/', '\\']);
+        let root = norm_path(root);
+        let root = root.trim_end_matches('/');
         if let Some(rest) = path.strip_prefix(root) {
-            if let Some(rel) = rest.strip_prefix(['/', '\\']) {
+            if let Some(rel) = rest.strip_prefix('/') {
                 if !rel.is_empty() {
-                    return rel.replace('\\', "/");
+                    return rel.to_string();
                 }
             }
         }
     }
-    path.to_string()
+    path
+}
+
+/// A path as the filesystem it came from compares it: `\\?\` (and
+/// `\\?\UNC\`) stripped, every `\` a `/`, and a path Windows wrote — a drive
+/// letter or a `\\host` — lowercased, since that filesystem does not tell
+/// `C:\Wt` from `c:/wt`. A unix path keeps its case: `/wt/A` and `/wt/a` are
+/// two directories.
+pub fn norm_path(p: &str) -> String {
+    let s = if let Some(rest) = p.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else {
+        p.strip_prefix("\\\\?\\").unwrap_or(p).to_string()
+    };
+    let windows = windows_spelled(&s);
+    let s = s.replace('\\', "/");
+    if windows {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// Did Windows write this path: a drive letter, or a `\\host` / `//host`?
+fn windows_spelled(p: &str) -> bool {
+    let b = p.as_bytes();
+    let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':';
+    drive || p.starts_with("\\\\") || p.starts_with("//")
 }
 
 /// The broker's memory of every pane's mod, keyed by agent id.
@@ -398,9 +428,9 @@ impl ModState {
             .retain(|id, p| *p != pane || replies.contains_key(id));
     }
 
-    /// Record the real paths `pane` edited. `root` is the pane's worktree or
-    /// cwd, which keys the touch ([`touch_key`]). A path past [`TOUCH_CAP`]
-    /// distinct keys is dropped.
+    /// Record the real paths `pane` edited. `root` is the pane's worktree,
+    /// which keys the touch ([`touch_key`]); `None` keys by the path itself. A
+    /// path past [`TOUCH_CAP`] distinct keys is dropped.
     pub fn touch(&mut self, pane: usize, paths: &[String], root: Option<&str>, now_ms: u64) {
         let map = self.touched.entry(pane).or_default();
         for raw in paths {
@@ -438,20 +468,27 @@ impl ModState {
 
     /// Who touched `path`: every pane whose touch key or real path is `path`
     /// or ends with `/path`, so `ctl who src/x.rs` finds the file in every
-    /// worktree. Sorted by pane.
+    /// worktree — compared in one spelling ([`norm_path`]), so any spelling of
+    /// a Windows path finds it. Sorted by pane.
     pub fn who(&self, path: &str) -> Vec<(usize, &str, &Touch)> {
-        let q = path.trim().trim_end_matches('/');
+        let q = norm_path(path.trim());
+        let q = q.trim_end_matches('/');
         if q.is_empty() {
             return Vec::new();
         }
-        let tail = format!("/{q}");
-        let hit = |s: &str| s == q || s.ends_with(&tail);
+        // A touch Windows wrote is keyed lowercase; a query against it is too,
+        // so `Src\Main.rs` finds `src/main.rs` while `/wt/A` stays `/wt/A`.
+        let lower = q.to_lowercase();
+        let hit = |s: &str, q: &str| s == q || s.ends_with(&format!("/{q}"));
         let mut v: Vec<(usize, &str, &Touch)> = self
             .touched
             .iter()
             .flat_map(|(pane, m)| {
                 m.iter()
-                    .filter(move |(k, t)| hit(k) || hit(&t.path))
+                    .filter(|(k, t)| {
+                        let q = if windows_spelled(&t.path) { lower.as_str() } else { q };
+                        hit(k, q) || hit(&norm_path(&t.path), q)
+                    })
                     .map(move |(k, t)| (*pane, k.as_str(), t))
             })
             .collect();
@@ -1036,6 +1073,37 @@ mod tests {
             touch_key("C:\\wt\\a\\src\\x.rs", Some("C:\\wt\\a")),
             "src/x.rs"
         );
+    }
+
+    // Windows spells one path many ways — `C:\Wt\a`, `c:/wt/a`, `\\?\C:\wt\a` —
+    // and the mod's real path need not match the worktree's spelling. The key
+    // compares them as the filesystem does; a path that missed its root by
+    // spelling alone used to stay absolute, so two worktrees never collided.
+    #[test]
+    fn touch_keys_compare_windows_paths_as_the_filesystem_does() {
+        assert_eq!(touch_key("C:/wt/a/src/x.rs", Some("C:\\wt\\a")), "src/x.rs");
+        assert_eq!(touch_key("c:\\WT\\A\\src\\x.rs", Some("C:\\wt\\a")), "src/x.rs");
+        assert_eq!(
+            touch_key("\\\\?\\C:\\wt\\a\\src\\x.rs", Some("C:\\wt\\a")),
+            "src/x.rs"
+        );
+        // Outside the root the key is the path in one spelling, so two panes
+        // reporting the same file differently collide.
+        assert_eq!(
+            touch_key("C:\\Shared\\Notes.md", Some("C:\\wt\\a")),
+            touch_key("c:/shared/notes.md", None)
+        );
+        assert_eq!(touch_key("\\\\?\\C:\\x\\y.rs", None), "c:/x/y.rs");
+        // A unix path keeps its case: `/wt/A` and `/wt/a` are two directories.
+        assert_eq!(touch_key("/wt/A/src/x.rs", Some("/wt/a")), "/wt/A/src/x.rs");
+        // `who` finds a Windows file by any spelling of it; the real path is kept.
+        let mut m = ModState::default();
+        let real = "C:\\wt\\a\\Src\\Main.rs";
+        m.touch(1, &[real.to_string()], Some("C:\\wt\\a"), 1);
+        assert_eq!(m.who("src/main.rs").len(), 1);
+        assert_eq!(m.who("Src\\Main.rs").len(), 1);
+        assert_eq!(m.who("c:/wt/a/src/main.rs").len(), 1);
+        assert_eq!(m.who(real)[0].2.path, real);
     }
 
     #[test]

@@ -42,6 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused every later `ask` for good. An expired reply now takes its ask with
   it (`asked` says so instead of waiting forever), and a pane's exit or
   respawn drops its in-flight questions along with the queued ones.
+- **Collision keys compare paths as the filesystem does.** A touch was keyed
+  relative to the pane's worktree *or its cwd*, so two panes in unrelated
+  repos both editing `README.md` wore `⚡` and raised a `collision`; and the
+  prefix check was spelled-exact, so a mod's `C:/wt/a/src/x.rs` under a
+  worktree recorded as `C:\wt` (or a `\?\` path, or another drive-letter
+  case) kept its absolute key and two worktrees never collided on Windows. A
+  pane with no worktree now keys by the absolute path alone, and every path is
+  compared in one spelling: `\` as `/`, `\?\` stripped, and a path Windows
+  wrote lowercased; `ctl who` finds a Windows file by any spelling. A `report`
+  whose `ask` reply is refused still records its other fields and touches.
 - **Manual splits tile into a grid.** `Ctrl+A "` / `%` halved only the focused
   pane, so every pane added by hand with one key joined a single `1×N` strip
   (five `"` presses: five full-width slivers), while `-n 4` and `ctl spawn
