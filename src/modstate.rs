@@ -385,16 +385,17 @@ impl ModState {
 
     /// Drop everything about a pane: it exited, or was respawned as a new
     /// process whose mod will say hello again. Replies it already gave stay
-    /// readable until they expire; questions it never took are dropped.
+    /// readable until they expire; every question it never answered — queued,
+    /// or taken by a mod that died with it in flight — is dropped, so the
+    /// next process under this pane id starts with a clear queue.
     pub fn forget(&mut self, pane: usize) {
         self.panes.remove(&pane);
         self.respawn_flagged.remove(&pane);
         self.touched.remove(&pane);
-        if let Some(q) = self.asks.remove(&pane) {
-            for a in q {
-                self.issued.remove(&a.id);
-            }
-        }
+        self.asks.remove(&pane);
+        let replies = &self.replies;
+        self.issued
+            .retain(|id, p| *p != pane || replies.contains_key(id));
     }
 
     /// Record the real paths `pane` edited. `root` is the pane's worktree or
@@ -511,8 +512,17 @@ impl ModState {
         text: &str,
         now_ms: u64,
     ) -> Result<u64, String> {
-        self.replies
-            .retain(|_, r| now_ms.saturating_sub(r.at_ms) <= ASK_REPLY_TTL_MS);
+        // An expired reply takes its ask with it: the id stops counting as
+        // unanswered, and a late `reply` to it is refused like any unknown id.
+        let replies = &mut self.replies;
+        let issued = &mut self.issued;
+        replies.retain(|id, r| {
+            let keep = now_ms.saturating_sub(r.at_ms) <= ASK_REPLY_TTL_MS;
+            if !keep {
+                issued.remove(id);
+            }
+            keep
+        });
         let text = clip(text_safe(text).trim(), ASK_CAP);
         if text.is_empty() {
             return Err("ask needs a question".to_string());
@@ -1135,6 +1145,61 @@ mod tests {
         m.ask(6, None, "tick", 102 + ASK_REPLY_TTL_MS + 1)
             .expect("queued");
         assert!(m.reply_for(1).is_none(), "expired on the next ask");
+    }
+
+    #[test]
+    fn an_expired_reply_frees_its_slot_and_is_not_pending_again() {
+        let mut m = ModState::default();
+        // Fill the cap and answer every question.
+        let ids: Vec<u64> = (0..ASK_QUEUE)
+            .map(|i| m.ask(3, None, &format!("q{i}"), 100).expect("queued"))
+            .collect();
+        for a in m.take_asks(3) {
+            assert!(m.reply(3, a.id, "done", 101));
+        }
+        assert!(
+            m.ask(3, None, "more", 102).is_ok(),
+            "answered: slots are free"
+        );
+        // Long after the replies expired, the pane must still take questions:
+        // an expired reply is not an unanswered question.
+        let later = 101 + ASK_REPLY_TTL_MS + 1;
+        for i in 0..ASK_QUEUE - 1 {
+            m.ask(3, None, &format!("late{i}"), later)
+                .unwrap_or_else(|e| panic!("late{i}: {e}"));
+        }
+        assert!(!m.ask_pending(ids[0]), "expired: not pending");
+        assert!(m.reply_for(ids[0]).is_none(), "expired: no reply");
+        assert!(
+            !m.reply(3, ids[0], "again", later),
+            "expired: cannot be re-answered"
+        );
+    }
+
+    #[test]
+    fn forget_drops_asks_the_mod_took_but_never_answered() {
+        let mut m = ModState::default();
+        for i in 0..ASK_QUEUE {
+            m.ask(3, None, &format!("q{i}"), 100).expect("queued");
+        }
+        let taken = m.take_asks(3);
+        assert_eq!(taken.len(), ASK_QUEUE);
+        assert!(m.reply(3, taken[0].id, "one answer", 101));
+        // The mod died (or the pane respawned) with the rest in flight.
+        m.forget(3);
+        assert!(!m.ask_pending(taken[1].id), "in flight: gone with the pane");
+        assert!(
+            m.reply_for(taken[0].id).is_some(),
+            "a reply already given stays readable"
+        );
+        assert!(
+            m.ask(3, None, "fresh", 102).is_ok(),
+            "the respawned pane starts with a clear queue"
+        );
+        assert!(
+            !m.reply(3, taken[1].id, "late", 103),
+            "a dropped ask cannot be answered"
+        );
     }
 
     #[test]

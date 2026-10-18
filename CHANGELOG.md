@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ask` capability.
 
 ### Fixed
+- **An ask's slot comes back.** A pane holds at most eight unanswered
+  questions, but an answered ask counted as unanswered again once its reply
+  expired (ten minutes), and a question the mod had taken but never answered
+  stayed pending across a respawn: a pane asked eight times over a session
+  refused every later `ask` for good. An expired reply now takes its ask with
+  it (`asked` says so instead of waiting forever), and a pane's exit or
+  respawn drops its in-flight questions along with the queued ones.
 - **Manual splits tile into a grid.** `Ctrl+A "` / `%` halved only the focused
   pane, so every pane added by hand with one key joined a single `1×N` strip
   (five `"` presses: five full-width slivers), while `-n 4` and `ctl spawn
