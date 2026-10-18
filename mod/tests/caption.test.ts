@@ -13,8 +13,15 @@ import {
 } from '../hooks/caption'
 
 test('a tool call captions itself from its name and the one fact that matters', async () => {
-  expect(toolCaption('Bash', { command: 'cargo test --lib ctl\necho done' })).toBe('running cargo test --lib ctl')
+  expect(toolCaption('Bash', { command: 'cargo test --lib ctl\necho done' })).toBe('running cargo test')
   expect(toolCaption('Bash', {})).toBe('running a command')
+  // A command line's flags, assignments, quoted text and paths stay in the pane.
+  expect(toolCaption('Bash', { command: 'git commit -m "token=abc"' })).toBe('running git commit')
+  expect(toolCaption('Bash', { command: 'FOO=bar curl -H "Authorization: x" https://h/' })).toBe('running curl')
+  expect(toolCaption('Bash', { command: 'python tools/dep_guard.py' })).toBe('running python dep_guard.py')
+  expect(toolCaption('Bash', { command: 'cd /home/me/secret-project && cargo test' })).toBe('running cd secret-project')
+  expect(toolCaption('Bash', { command: 'export KEY=abc' })).toBe('running export')
+  expect(toolCaption('Bash', { command: 'KEY=abc' })).toBe('running a command')
   expect(toolCaption('Edit', { file_path: '/w/a/src/filter.rs' })).toBe('editing filter.rs')
   expect(toolCaption('Write', { file_path: 'C:\\w\\a\\src\\x.rs' })).toBe('editing x.rs')
   expect(toolCaption('NotebookEdit', { notebook_path: '/n/b.ipynb' })).toBe('editing b.ipynb')

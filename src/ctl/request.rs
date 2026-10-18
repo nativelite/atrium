@@ -152,8 +152,9 @@ impl Cmd {
             // A question is queued into a pane; its reply is the model's
             // output: both for a token-matched caller in the pane's tree.
             Cmd::Ask(_) | Cmd::Asked(_) => false,
-            // Who touched a file is structure, like the tree.
-            Cmd::Who(_) => true,
+            // Who touched a file names every edited path of every pane: for
+            // a token-matched caller, and only over its own subtree.
+            Cmd::Who(_) => false,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }

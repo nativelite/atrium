@@ -83,8 +83,8 @@ test('whoami is read into a Who, and the role section says what the pane is', as
   expect(text).toContain('[atrium bus #')
   expect(text).toContain('atrium_ask')
   expect(text).toContain('atrium_who')
-  expect(who?.captions).toBe(true)
-  expect(parseWho({ ok: true, pane: 1, depth: 0, mode: 'plan', can_spawn: false, deny: [], files: [], captions: false })?.captions).toBe(false)
+  expect(who?.captions).toBe(false)
+  expect(parseWho({ ok: true, pane: 1, depth: 0, mode: 'plan', can_spawn: false, deny: [], files: [], captions: true })?.captions).toBe(true)
   const lead = parseWho({ ok: true, pane: 0, depth: 0, mode: 'automode', can_spawn: true, deny: [], files: [] })!
   const leadText = roleSection(lead)
   expect(leadText).toContain('pane 0, depth 0, spawned by the human')

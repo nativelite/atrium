@@ -39,8 +39,8 @@ is:
   the board, and the last bus events, refreshed every 3 s while open. A band
   above the prompt counts the open decisions and opens the pane.
 - **Captions**: every tool call reports what the pane is doing in a few
-  words (`running cargo test --lib ctl`, `editing filter.rs`), free; and,
-  unless the fleet says `captions: false`, a six-word caption from the
+  words (`running cargo test`, `editing filter.rs`), free; and,
+  when the fleet says `captions: true`, a six-word caption from the
   model's own streamed text, by one small `haiku` call at most every twenty
   seconds (`turn.step`). The overview and the tile border show it; the turn's
   end clears it.

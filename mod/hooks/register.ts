@@ -126,10 +126,10 @@ async function editCall(
 /**
  * A caption from the model's own words: one small, cheap completion over the
  * last few hundred characters of a step's text, at most once in
- * `CAPTION_MIN_MS`, only when the fleet allows it (`captions`).
+ * `CAPTION_MIN_MS`, only when the fleet asked for it (`captions: true`).
  */
 async function captionFromText($: EngineInterface, text: string): Promise<void> {
-  if (state.who?.captions === false || state.reporter === undefined || !state.accepted.has('status')) return
+  if (state.who?.captions !== true || state.reporter === undefined || !state.accepted.has('status')) return
   const now = await $.clock.now()
   if (!captionDue(state.captionAt, now, Array.from(text).length)) return
   state.captionAt = now

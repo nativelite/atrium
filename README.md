@@ -312,7 +312,7 @@ as **typed tools** (`atrium_spawn`, `atrium_send`, `atrium_board_set`,
 is, and runs the model's own **subagents as visible panes**: an Agent call
 becomes `atrium_subagent`, a tile beside the caller whose answer is collected
 when it is done. It also gives the fleet **sight**: every pane carries a
-caption of what it is doing (`running cargo test --lib ctl`), two panes editing
+caption of what it is doing (`running cargo test`), two panes editing
 the same file wear `⚡` and raise one `collision` decision (`atrium ctl who
 <path>` says who has a file), and `atrium ctl ask <pane> "<question>"`, or
 `Ctrl+A ?` on a tile, asks a pane what it is doing **without interrupting it**:

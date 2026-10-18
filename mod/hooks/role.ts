@@ -42,7 +42,7 @@ export function parseWho(reply: Record<string, unknown>): Who | undefined {
     files: strs('files'),
     subagents: str('subagents') ?? 'panes',
     subagentsKeep: reply.subagents_keep === true,
-    captions: reply.captions !== false,
+    captions: reply.captions === true,
   }
 }
 

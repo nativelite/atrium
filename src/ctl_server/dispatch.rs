@@ -177,7 +177,7 @@ pub(crate) fn dispatch_ctl(
         Cmd::Inbox => inbox(caller, cx),
         Cmd::Ask(a) => ask(a, caller, privileged, cx),
         Cmd::Asked(a) => asked(a, caller, privileged, cx),
-        Cmd::Who(w) => who(w, cx),
+        Cmd::Who(w) => who(w, caller, privileged, cx),
     }
 }
 
@@ -262,12 +262,26 @@ fn asked(
 
 /// `ctl who`: every pane whose mod reported an edit of `path`, with when, and
 /// whether the pane is still here.
-fn who(w: ctl::WhoReq, cx: &CtlSession<'_>) -> ctl::Reply {
+/// `ctl who`: which panes edited a file. Subtree-scoped like `status`: a
+/// caller sees the panes in its own tree (a pane that has left the fleet is
+/// nobody's), the operator every pane that ever reported.
+fn who(
+    w: ctl::WhoReq,
+    caller: Option<AgentId>,
+    privileged: bool,
+    cx: &CtlSession<'_>,
+) -> ctl::Reply {
     let windows = &*cx.windows;
+    let parents = ctl_parents(windows);
+    let visible = |pane: usize| {
+        privileged
+            || caller.is_some_and(|c| atrium::ctl::in_subtree(AgentId(pane), c, &parents))
+    };
     let panes = cx
         .mods
         .who(&w.path)
         .into_iter()
+        .filter(|(pane, _, _)| visible(*pane))
         .map(|(pane, key, t)| {
             let live = pane_by_agent(windows, AgentId(pane));
             ctl::WhoEntry {

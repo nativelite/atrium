@@ -63,8 +63,9 @@ pub struct Fleet {
     pub subagents: Option<String>,
     /// Leave a subagent pane open after its answer was collected.
     pub subagents_keep: Option<bool>,
-    /// `captions: false` keeps the mod from spending a small model call on
-    /// each pane's caption; the caption derived from tool calls stays.
+    /// `captions: true` lets the mod spend a small model call on each pane's
+    /// caption, over the model's own recent words; off by default. The caption
+    /// derived from tool calls is free and always on.
     pub captions: Option<bool>,
     /// Context-window fill (percent, 1..=100) at which a pane that is idle gets
     /// one decision posted to its parent: "checkpoint and respawn?". Never a

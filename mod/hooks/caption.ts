@@ -30,9 +30,32 @@ export function clipCaption(s: string): string {
 }
 
 /**
+ * The program a command line runs and its subcommand — `cargo test`,
+ * `git commit`, `python dev.py check` — and nothing after. A command line
+ * carries flags, assignments, quoted text, tokens and paths; a caption, which
+ * the whole fleet reads in `ctl status` and the overview, carries only what
+ * the pane is doing. Leading `VAR=value` are skipped, a path is its last
+ * component, and the words stop at the first flag, assignment, quote,
+ * operator or URL; at most three.
+ */
+export function commandWords(line: string): string {
+  const toks = line.trim().split(/\s+/)
+  let i = 0
+  while (i < toks.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(toks[i])) i++
+  const out: string[] = []
+  for (; i < toks.length && out.length < 3; i++) {
+    const t = toks[i]
+    if (t.startsWith('-') || /[=:"'`$|&;<>()]/.test(t)) break
+    out.push(basename(t))
+  }
+  return out.join(' ')
+}
+
+/**
  * What a tool call says the pane is doing, in a few words, free of charge:
- * `running cargo test --lib ctl`, `editing filter.rs`, `reading main.rs`.
- * Nothing from a conversation: the command, a file's name, a pattern.
+ * `running cargo test`, `editing filter.rs`, `reading main.rs`. Nothing from
+ * a conversation and nothing a command line carries: the program and its
+ * subcommand, a file's name, a pattern.
  */
 export function toolCaption(tool: string, input: Record<string, unknown>): string | undefined {
   const file = str(input.file_path) ?? str(input.notebook_path) ?? str(input.path)
@@ -41,7 +64,8 @@ export function toolCaption(tool: string, input: Record<string, unknown>): strin
       const cmd = str(input.command)
       if (cmd === undefined) return 'running a command'
       const first = cmd.split('\n').find(l => l.trim() !== '') ?? cmd
-      return clipCaption(`running ${first}`)
+      const words = commandWords(first)
+      return words === '' ? 'running a command' : clipCaption(`running ${words}`)
     }
     case 'Edit':
     case 'MultiEdit':

@@ -889,7 +889,10 @@ fn ask_asked_and_who_build_parse_and_label() {
     match parse_request(&line).unwrap().cmd {
         Cmd::Who(w) => {
             assert_eq!(w.path, "src/x.rs");
-            assert!(Cmd::Who(w.clone()).is_read_only(), "structure, like list");
+            assert!(
+                !Cmd::Who(w.clone()).is_read_only(),
+                "a token-matched caller's own subtree, like status"
+            );
             assert_eq!(Cmd::Who(w).audit_label().1, "path=src/x.rs");
         }
         other => panic!("expected who, got {other:?}"),

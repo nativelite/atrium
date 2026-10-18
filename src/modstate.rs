@@ -735,10 +735,12 @@ pub fn set_session_captions(on: bool) {
     let _ = SESSION_CAPTIONS.set(on);
 }
 
-/// May a pane's mod spend a small model call on its caption? On unless a
-/// fleet said `captions: false`; the tool-derived caption is free and always on.
+/// May a pane's mod spend a small model call on its caption, over the model's
+/// own recent words? Only when a fleet said `captions: true`: that is text
+/// leaving the pane for a second model call, and a cost, so the default is
+/// off. The tool-derived caption is free and always on.
 pub fn session_captions() -> bool {
-    SESSION_CAPTIONS.get().copied().unwrap_or(true)
+    SESSION_CAPTIONS.get().copied().unwrap_or(false)
 }
 static SESSION_RESPAWN_AT: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
 

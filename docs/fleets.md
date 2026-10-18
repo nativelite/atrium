@@ -107,7 +107,7 @@ The file is read **read-only**. atrium never writes it.
 | `subagents` | optional | How the model's subagents run in claude panes: `panes` (visible panes beside the caller, the default), `native` (the engine's own, invisible) or `deny`. |
 | `respawn_at` | optional | A context-window fill, in percent, at which a claude pane that is at its prompt gets one `decision_needed` posted to its parent on the `atrium` topic ("checkpoint and respawn it?"), with the parent woken. Never a respawn by itself. Needs the mod. |
 | `subagents_keep` | optional | `true` leaves a subagent pane open after its answer was collected (default: closed). |
-| `captions` | optional | `false` keeps the mod from spending a small model call on each pane's caption (the six-word summary of its own words); the caption from tool calls stays, free. Default `true`. |
+| `captions` | optional | `true` lets the mod spend a small model call on each pane's caption (a six-word summary of the model's own recent words, at most every twenty seconds); that text leaves the pane for the call, so the default is `false`. The caption from tool calls (`running cargo test`, `editing filter.rs`) is free and always on. |
 | `trust` | optional | The trust posture the whole fleet runs at. |
 | `context` | optional | Shared knowledge and memory backend for the fleet (see [Shared context](#shared-context)). |
 | `topics` | optional | The fleet's canonical bus-topic vocabulary (an array of strings): the topics its agents coordinate on. See [the control plane](control-plane.md). |

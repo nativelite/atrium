@@ -9,9 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Captions.** With the mod, every pane reports what it is doing in a few
-  words: from each tool call, free (`running cargo test --lib ctl`, `editing
+  words: from each tool call, free (`running cargo test`, `editing
   filter.rs`), and from the model's own streamed text by one small `haiku`
-  call at most every twenty seconds, unless a fleet says `captions: false`.
+  call at most every twenty seconds, when a fleet says `captions: true`.
   The overview shows the caption in place of the transcript's last action; an
   unfocused tile draws it dim after the title; the turn's end clears it.
 - **The collision radar.** The mod reports the real path of every edit that
@@ -34,6 +34,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Fleet key `captions`**, `whoami` carries it; mod version 0.2.0, with the
   `ask` capability.
 
+### Changed
+- **Captions carry less, and the model-made one is opt-in.** The caption a
+  tool call makes named the whole first line of a `Bash` command — flags,
+  `KEY=value` assignments, quoted text, paths — in `ctl status`, the overview
+  and the tile title, for the whole fleet to read. It now names the program
+  and its subcommand only (`running cargo test`, `running git commit`,
+  `running python dep_guard.py`): no flags, assignments, quotes, operators or
+  URLs, a path as its last component, three words at most. And the six-word
+  caption from the model's own streamed text — a second model call the text
+  leaves the pane for — is now off unless the fleet says `captions: true`
+  (it was on unless `captions: false`); the tool caption is free and always
+  on.
+- **`ctl who` is subtree-scoped.** It was classed read-only like `list`, so
+  any caller, token or none, could list every pane's edited paths. It now
+  needs a pane token, and a caller sees only the panes in its own tree, as
+  `status` and `ask` do; the operator sees every pane.
 ### Fixed
 - **An ask's slot comes back.** A pane holds at most eight unanswered
   questions, but an answered ask counted as unanswered again once its reply
@@ -46,10 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relative to the pane's worktree *or its cwd*, so two panes in unrelated
   repos both editing `README.md` wore `⚡` and raised a `collision`; and the
   prefix check was spelled-exact, so a mod's `C:/wt/a/src/x.rs` under a
-  worktree recorded as `C:\wt` (or a `\?\` path, or another drive-letter
+  worktree recorded as `C:\wt\a` (or a `\\?\` path, or another drive-letter
   case) kept its absolute key and two worktrees never collided on Windows. A
   pane with no worktree now keys by the absolute path alone, and every path is
-  compared in one spelling: `\` as `/`, `\?\` stripped, and a path Windows
+  compared in one spelling: `\` as `/`, `\\?\` stripped, and a path Windows
   wrote lowercased; `ctl who` finds a Windows file by any spelling. A `report`
   whose `ask` reply is refused still records its other fields and touches.
 - **Manual splits tile into a grid.** `Ctrl+A "` / `%` halved only the focused
