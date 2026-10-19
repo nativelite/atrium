@@ -165,6 +165,8 @@ atrium ctl send lead "Coordinate this across a team, one teammate per part: <the
 
 or, from your own pane, just say "coordinate this across a team: …" and let the skill surface.
 
+**With codex.** codex reads the same `SKILL.md` format. Copy the three directories into `~/.agents/skills/` (all your projects) or a repo's `.agents/skills/` (that repo), or add the plugin marketplace with `codex plugin marketplace add nativelite/marketplace`. A codex pane does not need the skills to know ctl exists: with the control plane on, atrium gives it the same directive it gives claude, as `-c developer_instructions`. Its commands reach the control socket through its sandbox as described in [codex panes](trust-and-security.md#codex-panes).
+
 ## See also
 
 - [README](../README.md): atrium overview and the full feature set.

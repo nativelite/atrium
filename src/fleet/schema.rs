@@ -211,9 +211,26 @@ impl Agent {
     ///
     /// Order: `cmd… [--add-dir d1 d2…] [--append-system-prompt P] [--model M]
     /// [--effort E]`.
+    ///
+    /// A codex agent gets codex's spelling of the same fields: `--add-dir`
+    /// once per directory (codex's takes one value, so a second directory was
+    /// read as its prompt) and the effort as `-c model_reasoning_effort="E"`
+    /// (codex has no `--effort` and exits on it). The prompt stays
+    /// `--append-system-prompt P` here for every agent: it is atrium's own
+    /// marker, which the spawn path folds with atrium's directive and, for
+    /// codex, turns into `-c developer_instructions`.
     pub fn args(&self, add_dirs: &[String]) -> Vec<String> {
+        let codex = self.cmd.first().is_some_and(|c| {
+            crate::vendors::vendor_for_stem(&crate::bind::command_stem(c))
+                == Some(agsess::Vendor::Codex)
+        });
         let mut v = self.cmd.clone();
-        if !add_dirs.is_empty() {
+        if codex {
+            for d in add_dirs {
+                v.push("--add-dir".to_string());
+                v.push(d.clone());
+            }
+        } else if !add_dirs.is_empty() {
             v.push("--add-dir".to_string());
             for d in add_dirs {
                 v.push(d.clone());
@@ -228,8 +245,15 @@ impl Agent {
             v.push(m.clone());
         }
         if let Some(e) = &self.effort {
-            v.push("--effort".to_string());
-            v.push(e.clone());
+            if codex {
+                v.extend(crate::vendors::codex_config(
+                    "model_reasoning_effort",
+                    &crate::vendors::toml_string(e),
+                ));
+            } else {
+                v.push("--effort".to_string());
+                v.push(e.clone());
+            }
         }
         // The kickoff is the trailing **positional** prompt, after every flag, so
         // the agent (claude) treats it as the first user message and starts.

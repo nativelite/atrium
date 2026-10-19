@@ -111,6 +111,17 @@ cp -r skills/atrium-delegate skills/atrium-coordinate skills/atrium-fleet ~/.cla
 #          into %USERPROFILE%\.claude\skills\
 ```
 
+Codex reads the same marketplace and the same skill format:
+
+```
+codex plugin marketplace add nativelite/marketplace
+codex plugin add atrium@nativelite
+```
+
+or copy the three folders into `~/.agents/skills/`. A codex pane also gets
+atrium's ctl directive from atrium itself; how its sandbox reaches the control
+plane is in [codex panes](docs/trust-and-security.md#codex-panes).
+
 - **`atrium-delegate`**: an agent hands off a substantial *independent* piece of
   work when it genuinely pays, and does small or dependent work inline.
 - **`atrium-coordinate`**: casts an agent as a coordinator that splits a task

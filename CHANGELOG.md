@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A sandboxed codex pane can reach atrium ctl, and nothing else new.**
+  codex's sandbox counts a connection to a unix socket as network and has
+  none, so a codex pane at `plan`, `accept` or `automode` could not run
+  `atrium ctl` (`Operation not permitted`), whatever it was told. With the
+  control plane on, such a pane now launches under a codex permission
+  profile, `atrium_ctl`: codex's own `:workspace` (`:read-only` for `plan`)
+  with the network routed through codex's proxy in `limited` mode, no domain
+  allowed, and one unix socket allowed, this session's `ATRIUM_CTL`. Measured
+  with codex 0.163.0 on macOS: `ctl whoami` and `ctl status` work from the
+  pane; another unix socket, HTTPS and raw TCP are refused; writes stay in the
+  workspace. On by default. It needs codex's experimental `network_proxy`
+  feature, probed once per program per session; a codex without it keeps the
+  plain `--sandbox` and the bar says why. Not on Windows, where the endpoint
+  is a named pipe that codex's allowance doesn't cover; the bar says so there
+  too ([codex panes](docs/trust-and-security.md#codex-panes)).
+
+### Fixed
+- **A codex fleet agent with a `prompt` or `effort` launches.** Both were
+  passed as claude's `--append-system-prompt` / `--effort`, which codex exits
+  on (`unexpected argument`), and `add_dirs` as one `--add-dir` with several
+  directories, where codex read the second as its prompt. A codex agent now
+  gets codex's spelling: one `--add-dir` per directory, `-c
+  model_reasoning_effort`, and its `prompt` folded with atrium's ctl directive
+  and worktree norms into one `-c developer_instructions` (a TOML string, so a
+  prompt that reads like `true` stays text).
+- **A codex pane is told about ctl.** The directive that teaches an agent
+  `atrium ctl` and the worktree norms reached claude panes only; a codex pane
+  in a ctl session or a worktree got neither. It now gets both, in its
+  developer message.
+
 ## [0.40.1] - 2026-10-19
 
 ### Changed

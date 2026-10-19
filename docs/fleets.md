@@ -161,10 +161,10 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 | `cmd` | required | Command and args, for example `["claude"]`. |
 | `identity` | `--identity` | Overrides the fleet-level `identity` for this agent. |
 | `cwd` | spawn directory | The agent is spawned here, so its `CLAUDE.md` auto-loads. Resolved relative to the fleet file's directory; absolute paths are used as-is. |
-| `add_dirs` | `claude --add-dir …` | Extra trees the agent may read. |
-| `prompt` | `--append-system-prompt` | Extra system-prompt text. |
+| `add_dirs` | `claude --add-dir …` | Extra trees the agent may read (codex: one `--add-dir` per tree, which codex makes writable). |
+| `prompt` | `--append-system-prompt` | Extra system-prompt text (codex: folded with atrium's own text into `-c developer_instructions`). |
 | `model` | `--model` | The model to run. |
-| `effort` | `--effort` | The reasoning effort. |
+| `effort` | `--effort` | The reasoning effort (codex: `-c model_reasoning_effort`). |
 | `can_spawn` | `ctl spawn` capability | May this agent create teammates? **Defaults to `false`.** |
 | `trust` | `--trust` for this pane | Overrides the fleet-level `trust` for this one agent, capped at the fleet/session ceiling (a per-agent posture can de-escalate, never elevate). See [trust and security](trust-and-security.md). |
 | `worktree` | worktree group | The worktree group this agent joins. Agents sharing a name co-develop one worktree and branch; distinct names are isolated. See [worktrees](worktrees.md). |
@@ -175,6 +175,8 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 If a fleet turns the control plane on (`allow_ctl`) and coordinates by spawning teammates, set `"can_spawn": true` on its **lead** — a coordinator without it comes up unable to create the teammates it manages, and the denial only surfaces on its first `ctl spawn`. atrium warns at launch when a ctl-enabled fleet has no spawn-capable agent, but the fix is in the roster.
 
 Each agent still gets its own `--session-id`, so the agent-aware chrome binds each pane independently.
+
+**A codex agent** takes the same fields, spelled the way codex takes them: codex has no `--append-system-prompt` or `--effort` and exits on either, and its `--add-dir` takes one directory. atrium writes the codex form for an agent whose `cmd` is codex, so one roster can mix the two. Its `prompt`, the ctl directive and the worktree norms reach it as `-c developer_instructions="…"`, which codex puts in its developer message. `deny` still binds claude agents only. With the control plane on, a codex agent at `plan`, `accept` or `automode` is also let reach atrium's control socket from inside its sandbox, and nothing else: see [codex panes](trust-and-security.md#codex-panes).
 
 ## Designate a lead
 

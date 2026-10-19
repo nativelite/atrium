@@ -246,3 +246,102 @@ fn the_codex_probe_trusts_only_a_help_that_names_the_flag() {
     assert!(!codex_has_no_daemon(&dir.join("absent").to_string_lossy()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- codex instructions and sandbox --------------------------------------
+
+/// Codex exits on `--append-system-prompt`, so a codex command never keeps it:
+/// a fleet agent's prompt and atrium's block become one
+/// `-c developer_instructions`, a TOML string, even with no block.
+#[test]
+fn a_codex_prompt_becomes_one_developer_instructions_override() {
+    let cmd = args(&[
+        "codex",
+        "--append-system-prompt",
+        "ROLE \"quoted\"",
+        "--model",
+        "m",
+        "go",
+    ]);
+    assert_eq!(
+        fold_codex_instructions(cmd.clone(), Some("BLOCK")),
+        args(&[
+            "codex",
+            "--model",
+            "m",
+            "go",
+            "-c",
+            r#"developer_instructions="ROLE \"quoted\"\n\nBLOCK""#,
+        ])
+    );
+    assert_eq!(
+        fold_codex_instructions(cmd, None),
+        args(&[
+            "codex",
+            "--model",
+            "m",
+            "go",
+            "-c",
+            r#"developer_instructions="ROLE \"quoted\"""#,
+        ])
+    );
+    // Nothing to say: the command is left as it was.
+    let bare = args(&["codex", "go"]);
+    assert_eq!(fold_codex_instructions(bare.clone(), None), bare);
+}
+
+/// A sandboxed codex pane given the ctl socket launches with the ctl profile
+/// in place of `--sandbox`; without it, with the plain sandbox as before. No
+/// claude flag reaches either.
+#[test]
+fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
+    let cmd = args(&["codex", "--append-system-prompt", "ROLE", "go"]);
+    let mode = atrium::ctl::TrustMode::Edits;
+    let opened = agent_args(&cmd, "codex", mode, &[], None, Some("/t/a.sock")).join(" ");
+    assert!(
+        opened.contains(r#"default_permissions="atrium_ctl""#),
+        "{opened}"
+    );
+    assert!(
+        opened.contains(r#"unix_sockets={"/t/a.sock"="allow"}"#),
+        "{opened}"
+    );
+    assert!(!opened.contains("--sandbox"), "{opened}");
+    let plain = agent_args(&cmd, "codex", mode, &[], None, None).join(" ");
+    assert!(plain.contains("--sandbox workspace-write"), "{plain}");
+    assert!(!plain.contains("atrium_ctl"), "{plain}");
+    for a in [&opened, &plain] {
+        assert!(!a.contains("--append-system-prompt"), "{a}");
+        assert!(!a.contains("--disallowedTools"), "{a}");
+        assert!(a.contains(r#"developer_instructions="ROLE""#), "{a}");
+    }
+}
+
+/// The network-proxy probe reads `codex features list` and wants a row named
+/// for the feature, not a mention of it in some other row.
+#[cfg(unix)]
+#[test]
+fn the_network_proxy_probe_wants_the_features_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("atrium-codex-proxy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = |name: &str, out: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\nprintf '{out}'\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+    let has = fake(
+        "codex-has",
+        "js_repl        stable        true\\nnetwork_proxy  experimental  false\\n",
+    );
+    let lacks = fake(
+        "codex-lacks",
+        "respect_network_proxy  under development  false\\n",
+    );
+    assert!(codex_has_network_proxy(&has));
+    assert!(!codex_has_network_proxy(&lacks));
+    assert!(!codex_has_network_proxy(
+        &dir.join("absent").to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}

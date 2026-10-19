@@ -254,6 +254,22 @@ pub fn codex_trust_args(mode: TrustMode) -> Vec<String> {
     }
 }
 
+/// [`codex_trust_args`] for a pane whose commands must reach atrium's control
+/// socket at `ctl`: the same approvals, with the sandbox given as
+/// [`crate::vendors::codex_ctl_sandbox`] (the same confinement, plus that one
+/// socket) instead of `--sandbox`. `None` where the posture has no sandbox to
+/// open (`Skip`, `Off`), so the caller keeps [`codex_trust_args`].
+pub fn codex_ctl_trust_args(mode: TrustMode, ctl: &str) -> Option<Vec<String>> {
+    let base = match mode {
+        TrustMode::Edits | TrustMode::Auto => ":workspace",
+        TrustMode::Plan => ":read-only",
+        TrustMode::Skip | TrustMode::Off => return None,
+    };
+    let mut v = vec!["--ask-for-approval".to_string(), "never".to_string()];
+    v.extend(crate::vendors::codex_ctl_sandbox(base, ctl));
+    Some(v)
+}
+
 /// The per-project key claude sets when the folder-trust dialog is accepted.
 const KEY_TRUST: &str = "hasTrustDialogAccepted";
 /// Set alongside it so a freshly-trusted project also skips onboarding.
@@ -724,6 +740,30 @@ mod tests {
                 "{m:?}"
             );
         }
+    }
+
+    /// A ctl pane keeps its posture's approvals and confinement, gets the ctl
+    /// profile in place of `--sandbox` (codex refuses both), and `Skip`/`Off`,
+    /// which have no sandbox to open, are left to the plain args.
+    #[test]
+    fn codex_ctl_trust_args_swap_the_sandbox_for_the_ctl_profile() {
+        let joined = |m| codex_ctl_trust_args(m, "/t/a.sock").map(|v| v.join(" "));
+        for m in [TrustMode::Edits, TrustMode::Auto] {
+            let a = joined(m).unwrap();
+            assert!(a.starts_with("--ask-for-approval never -c "), "{a}");
+            assert!(
+                a.contains(r#"permissions.atrium_ctl.extends=":workspace""#),
+                "{a}"
+            );
+            assert!(!a.contains("--sandbox"), "{a}");
+        }
+        let plan = joined(TrustMode::Plan).unwrap();
+        assert!(
+            plan.contains(r#"permissions.atrium_ctl.extends=":read-only""#),
+            "{plan}"
+        );
+        assert_eq!(joined(TrustMode::Skip), None);
+        assert_eq!(joined(TrustMode::Off), None);
     }
 
     #[test]

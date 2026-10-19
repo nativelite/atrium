@@ -219,15 +219,29 @@ pub(crate) fn combine_system_prompt(norms: Option<&str>, ctl: Option<&str>) -> O
 /// fleet. The existing payloads come first, in order, then `block`. With no
 /// `block` the command is returned untouched.
 pub(crate) fn fold_system_prompt(command: Vec<String>, block: Option<&str>) -> Vec<String> {
-    const FLAG: &str = "--append-system-prompt";
     let Some(block) = block else {
         return command;
     };
+    let (mut out, mut payloads) = take_system_prompts(command);
+    payloads.push(block.to_string());
+    out.push(SYSTEM_PROMPT_FLAG.to_string());
+    out.push(payloads.join("\n\n"));
+    out
+}
+
+/// Claude's flag for text appended to its system prompt, and atrium's own
+/// marker for a fleet agent's `prompt` whatever the vendor.
+const SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
+
+/// Split `command` into the args without any [`SYSTEM_PROMPT_FLAG`] and the
+/// payloads those flags carried, in order (`--append-system-prompt P` or
+/// `--append-system-prompt=P`).
+fn take_system_prompts(command: Vec<String>) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::with_capacity(command.len() + 2);
     let mut payloads: Vec<String> = Vec::new();
     let mut args = command.into_iter().peekable();
     while let Some(a) = args.next() {
-        if a == FLAG && args.peek().is_some() {
+        if a == SYSTEM_PROMPT_FLAG && args.peek().is_some() {
             payloads.extend(args.next());
         } else if let Some(p) = a.strip_prefix("--append-system-prompt=") {
             payloads.push(p.to_string());
@@ -235,9 +249,23 @@ pub(crate) fn fold_system_prompt(command: Vec<String>, block: Option<&str>) -> V
             out.push(a);
         }
     }
-    payloads.push(block.to_string());
-    out.push(FLAG.to_string());
-    out.push(payloads.join("\n\n"));
+    (out, payloads)
+}
+
+/// [`fold_system_prompt`] for codex, which has no `--append-system-prompt` and
+/// exits on it: the payloads (a fleet agent's `prompt`) and `block` (the ctl
+/// directive and worktree norms) become one `-c developer_instructions="…"`,
+/// which codex puts in its developer message. Unlike claude's fold this runs
+/// with no `block` too, because a codex command must never keep the flag.
+pub(crate) fn fold_codex_instructions(command: Vec<String>, block: Option<&str>) -> Vec<String> {
+    let (mut out, mut payloads) = take_system_prompts(command);
+    payloads.extend(block.map(str::to_string));
+    if !payloads.is_empty() {
+        out.extend(atrium::vendors::codex_config(
+            "developer_instructions",
+            &atrium::vendors::toml_string(&payloads.join("\n\n")),
+        ));
+    }
     out
 }
 
@@ -300,7 +328,8 @@ pub(crate) fn spawn_pane_full(
     // another pane's. Off the daemon, its commands see this pane's env.
     // The pane keeps `command` as written, so a respawn probes again.
     let daemonless;
-    let launch = if atrium::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex) {
+    let is_codex = atrium::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex);
+    let launch = if is_codex {
         let supported = codex_has_no_daemon(&command[0]);
         if !supported {
             *flash = Some((
@@ -315,7 +344,19 @@ pub(crate) fn spawn_pane_full(
     } else {
         command
     };
-    let base = agent_args(launch, &title, mode, deny, extra_norms);
+    // codex's sandbox counts a unix-socket connect as network and has none, so
+    // with ctl on a sandboxed codex pane is opened to this session's socket and
+    // nothing else. A codex without the network proxy keeps its plain sandbox,
+    // and the bar says what that costs.
+    let sandboxed = matches!(
+        mode,
+        atrium::ctl::TrustMode::Edits | atrium::ctl::TrustMode::Auto | atrium::ctl::TrustMode::Plan
+    );
+    let codex_ctl = match CTL_ADDRESS.get() {
+        Some(addr) if is_codex && sandboxed => codex_ctl_socket(&command[0], addr, flash),
+        _ => None,
+    };
+    let base = agent_args(launch, &title, mode, deny, extra_norms, codex_ctl);
     // A trusted claude launch also pre-accepts claude's folder-trust dialog.
     if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
         ensure_folder_trust(cwd, &title, flash);
@@ -442,13 +483,15 @@ fn is_trusted_launch(title: &str, mode: atrium::ctl::TrustMode) -> bool {
 
 /// The agent's launch argv before the session id: `command` plus the trust
 /// flags for `mode`, the deny list and the folded system prompt, each for the
-/// vendors that take them.
+/// vendors that take them. `codex_ctl` is the control socket a sandboxed codex
+/// pane is opened to ([`codex_ctl_socket`]), `None` to keep its plain sandbox.
 fn agent_args(
     command: &[String],
     title: &str,
     mode: atrium::ctl::TrustMode,
     deny: &[String],
     extra_norms: Option<&str>,
+    codex_ctl: Option<&str>,
 ) -> Vec<String> {
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
@@ -500,7 +543,8 @@ fn agent_args(
             // `is_codex` (not a bare `else`) so that if the claude/codex stem sets
             // ever overlap or a third vendor is added, codex flags reach ONLY a
             // codex pane — never silently some other agent's command.
-            v.extend(atrium::trust::codex_trust_args(mode));
+            let ctl = codex_ctl.and_then(|a| atrium::trust::codex_ctl_trust_args(mode, a));
+            v.extend(ctl.unwrap_or_else(|| atrium::trust::codex_trust_args(mode)));
         }
         v
     } else {
@@ -526,8 +570,9 @@ fn agent_args(
     // the `--allowedTools` list cleanly rather than being read as one of its values.
     // Combine any worktree-specific norms with the ctl directive into a SINGLE
     // --append-system-prompt block via combine_system_prompt. Claude is last-wins
-    // on this flag — two separate pushes silently drop the first.
-    if is_claude {
+    // on this flag — two separate pushes silently drop the first. codex gets the
+    // same block as its one `-c developer_instructions`, also last-wins.
+    if is_claude || is_codex {
         let ctl = if CTL_ADDRESS.get().is_some() {
             Some(atrium::ctl::AGENT_CTL_DIRECTIVE)
         } else {
@@ -535,7 +580,11 @@ fn agent_args(
         };
         // Folded, not pushed: a fleet agent's own prompt is already in `base`.
         let block = combine_system_prompt(extra_norms, ctl);
-        base = fold_system_prompt(base, block.as_deref());
+        base = if is_claude {
+            fold_system_prompt(base, block.as_deref())
+        } else {
+            fold_codex_instructions(base, block.as_deref())
+        };
     }
     base
 }
@@ -568,14 +617,77 @@ fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(Strin
 /// codex that cannot answer in 2s counts as not having it: the launch then runs
 /// as written, which is what every codex did before.
 fn codex_has_no_daemon(program: &str) -> bool {
+    codex_probe(program, &["--help"], |out| {
+        out.contains(atrium::vendors::CODEX_NO_DAEMON)
+    })
+}
+
+/// Does this codex have the network proxy that enforces a profile's network
+/// rules ([`atrium::vendors::codex_ctl_sandbox`])? Asked, like
+/// [`codex_has_no_daemon`], of its own `codex features list`: a row that starts
+/// with the feature's name. A codex without it keeps the plain `--sandbox`.
+fn codex_has_network_proxy(program: &str) -> bool {
+    codex_probe(program, &["features", "list"], |out| {
+        out.lines()
+            .any(|l| l.split_whitespace().next() == Some(atrium::vendors::CODEX_NETWORK_PROXY))
+    })
+}
+
+/// The control socket a sandboxed codex pane should be let reach, or `None`
+/// (with the reason on the bar) when this codex or platform can't be opened to
+/// it. On unix `addr` is the socket's path and the network proxy enforces the
+/// allowance.
+#[cfg(unix)]
+fn codex_ctl_socket<'a>(
+    program: &str,
+    addr: &'a str,
+    flash: &mut Option<(String, Instant)>,
+) -> Option<&'a str> {
+    if codex_has_network_proxy(program) {
+        return Some(addr);
+    }
+    *flash = Some((
+        "codex has no network_proxy feature: its sandbox blocks atrium ctl in this \
+         pane (update codex, or spawn it with --mode skip)"
+            .to_string(),
+        Instant::now(),
+    ));
+    None
+}
+
+/// Windows: atrium's endpoint is a named pipe, and codex's allowance is for
+/// unix sockets, so there is nothing to open it with yet. The pane keeps its
+/// sandbox, which blocks the pipe, and the bar says so.
+#[cfg(windows)]
+fn codex_ctl_socket<'a>(
+    _program: &str,
+    _addr: &'a str,
+    flash: &mut Option<(String, Instant)>,
+) -> Option<&'a str> {
+    *flash = Some((
+        "codex's sandbox blocks atrium ctl on Windows: this pane's commands can't \
+         reach it (spawn it with --mode skip if it must coordinate)"
+            .to_string(),
+        Instant::now(),
+    ));
+    None
+}
+
+/// Run `program args…` once per program and args per session, capped at 2s,
+/// and cache what `has` says of its stdout. No answer in time, or no program,
+/// counts as `false`.
+fn codex_probe(program: &str, args: &[&str], has: impl Fn(&str) -> bool) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    if let Some(&known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(program) {
+    let key = format!("{program}\0{}", args.join(" "));
+    if let Some(&known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return known;
     }
-    let argv = effective_command(&[program.to_string(), "--help".to_string()]);
+    let mut cmd = vec![program.to_string()];
+    cmd.extend(args.iter().map(|a| a.to_string()));
+    let argv = effective_command(&cmd);
     let known = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
@@ -595,12 +707,12 @@ fn codex_has_no_daemon(program: &str) -> bool {
             }
             let mut out = String::new();
             std::io::Read::read_to_string(child.stdout.as_mut()?, &mut out).ok()?;
-            Some(out.contains(atrium::vendors::CODEX_NO_DAEMON))
+            Some(has(&out))
         })
         .unwrap_or(false);
     seen.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(program.to_string(), known);
+        .insert(key, known);
     known
 }
 

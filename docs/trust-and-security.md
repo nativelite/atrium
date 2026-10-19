@@ -110,6 +110,57 @@ atrium writes only that trust bit, only for the pane's own directory, atomically
 A config it can't parse is left untouched and the pane still launches. That write
 is the one place atrium touches another tool's config, deliberate and opt-in.
 
+## codex panes
+
+codex has no `--permission-mode`. atrium maps each posture to codex's own
+approval and sandbox settings instead:
+
+| Posture | codex gets |
+| --- | --- |
+| `plan` | no approvals asked, read-only sandbox |
+| `accept`, `automode` | no approvals asked, sandbox confined to the workspace |
+| `skip` | `--dangerously-bypass-approvals-and-sandbox` (no sandbox at all) |
+
+codex's coarser model has no per-command allowlist, so `accept` and `automode`
+are the same for it, and `deny` rules (claude's `--disallowedTools`) don't bind
+a codex pane.
+
+**The control socket is let through the sandbox, and nothing else.** codex's
+sandbox counts a connection to a unix socket as network, and both of its
+sandboxes have no network, so a codex pane at `plan`, `accept` or `automode`
+could not run `atrium ctl` at all (`Operation not permitted`). With the control
+plane on, atrium now launches such a pane under a codex permission profile,
+`atrium_ctl`, in place of `--sandbox`. It is codex's own `:workspace` (or
+`:read-only` for `plan`) with one change: the network is on, but routed through
+codex's proxy in `limited` mode with **no domain allowed** and **one** unix
+socket allowed, this session's `ATRIUM_CTL`. Measured with codex 0.163.0 on
+macOS, under that profile:
+
+- `atrium ctl whoami` and `atrium ctl status` work from the codex pane;
+- any other unix socket, HTTPS and raw TCP are refused;
+- writes stay inside the workspace, exactly as before.
+
+This is on by default, because a coordinating codex pane is useless without
+it. What it costs: the pane's commands can talk to this atrium session's
+control plane, with that pane's capability token, the same access a claude
+pane has. The spawn log (`ATRIUM_SPAWN_LOG`) shows the exact arguments.
+
+Limits:
+
+- **It needs codex's `network_proxy` feature**, which codex marks
+  experimental. atrium asks each codex program once per session
+  (`codex features list`); one without it keeps the plain `--sandbox`, and
+  the bar says its commands can't reach ctl. Update codex, or run that pane at
+  `--mode skip`.
+- **Windows is not covered yet.** There atrium's endpoint is a named pipe, and
+  codex's allowance is for unix sockets, so a sandboxed codex pane still
+  can't reach ctl on Windows; the bar says so at spawn.
+- **Linux is untested.** The profile is the same, but only macOS was measured.
+- **codex's own folder-trust dialog is not pre-accepted.** codex asks "Trust
+  this folder?" the first time it runs in a directory and saves the answer in
+  `~/.codex/config.toml`; atrium does not write that file, so a hands-off codex
+  pane in a new directory waits on the dialog until someone answers it.
+
 ## The security model
 
 Giving a hosted agent the power to spawn processes is a real capability. The

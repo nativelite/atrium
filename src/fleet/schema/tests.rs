@@ -282,6 +282,40 @@ fn args_omits_absent_fields() {
     assert_eq!(a.args(&[]), s(&["claude", "--model", "sonnet"]));
 }
 
+/// A codex agent gets codex's spelling: one `--add-dir` per directory and the
+/// effort as a config key, since codex exits on `--effort` and reads a second
+/// bare directory as its prompt. The prompt keeps atrium's marker for the
+/// spawn path to fold, and the kickoff is still last.
+#[test]
+fn args_spell_the_fields_the_codex_way_for_a_codex_agent() {
+    let a = Agent {
+        name: "x".into(),
+        cmd: s(&["codex"]),
+        prompt: Some("be careful".into()),
+        model: Some("gpt-5.6-luna".into()),
+        effort: Some("high".into()),
+        kickoff: Some("start".into()),
+        ..Agent::default()
+    };
+    assert_eq!(
+        a.args(&s(&["/abs/shared", "/abs/specs"])),
+        s(&[
+            "codex",
+            "--add-dir",
+            "/abs/shared",
+            "--add-dir",
+            "/abs/specs",
+            "--append-system-prompt",
+            "be careful",
+            "--model",
+            "gpt-5.6-luna",
+            "-c",
+            r#"model_reasoning_effort="high""#,
+            "start",
+        ])
+    );
+}
+
 #[test]
 fn args_uses_the_resolved_add_dirs_not_the_fields_own() {
     // The builder takes resolved dirs as an argument; a.add_dirs is not read

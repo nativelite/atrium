@@ -146,6 +146,82 @@ pub fn codex_daemonless(command: &[String], supported: bool) -> Vec<String> {
     out
 }
 
+/// `s` as a TOML basic string, quotes included.
+///
+/// Codex parses the value of `-c key=value` as TOML and falls back to the raw
+/// text only when that fails, so a raw value is unpredictable: a prompt that
+/// happens to read `true` or `[1]` becomes a boolean or an array and codex
+/// refuses to start. Quoted, every value is a string.
+pub fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One codex config override: `-c <key>=<value>`, `value` already TOML.
+pub fn codex_config(key: &str, value: &str) -> [String; 2] {
+    ["-c".to_string(), format!("{key}={value}")]
+}
+
+/// The codex permission profile atrium defines for a pane that must reach the
+/// control plane. Named so it can't merge into a profile of the user's own.
+pub const CODEX_CTL_PROFILE: &str = "atrium_ctl";
+
+/// The codex feature that enforces a profile's network rules.
+pub const CODEX_NETWORK_PROXY: &str = "network_proxy";
+
+/// Codex's sandbox args for a pane that must reach atrium's control socket at
+/// `ctl`, for the sandbox `base` (`":workspace"` or `":read-only"`).
+///
+/// Codex's sandbox counts a unix-socket connect as network, and its sandboxes
+/// have no network, so a codex pane at `accept`, `automode` or `plan` could not
+/// run `atrium ctl` at all (measured on macOS, codex 0.163.0: `Operation not
+/// permitted`). This profile is `base` with the network on but routed through
+/// codex's proxy in `limited` mode with no domain allowed, plus one allowed
+/// unix socket: this pane's `ATRIUM_CTL`. Measured under it: the ctl socket
+/// connects; another unix socket, HTTPS and raw TCP are refused; writes stay
+/// confined as in `base`. A profile replaces `--sandbox`, which codex refuses
+/// alongside one; the network proxy is an experimental codex feature, so the
+/// caller checks this codex has it first.
+pub fn codex_ctl_sandbox(base: &str, ctl: &str) -> Vec<String> {
+    let p = CODEX_CTL_PROFILE;
+    let mut v = Vec::new();
+    v.extend(codex_config("default_permissions", &toml_string(p)));
+    v.extend(codex_config(
+        &format!("permissions.{p}.extends"),
+        &toml_string(base),
+    ));
+    v.extend(codex_config(
+        &format!("permissions.{p}.network.enabled"),
+        "true",
+    ));
+    v.extend(codex_config(
+        &format!("permissions.{p}.network.mode"),
+        &toml_string("limited"),
+    ));
+    // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
+    // quotes or not, so the socket path's own dots would break it.
+    v.extend(codex_config(
+        &format!("permissions.{p}.network.unix_sockets"),
+        &format!("{{{}={}}}", toml_string(ctl), toml_string("allow")),
+    ));
+    v.push("--enable".to_string());
+    v.push(CODEX_NETWORK_PROXY.to_string());
+    v
+}
+
 /// The filesystem root under which `vendor` writes session transcripts, if known.
 ///
 /// `ClaudeCode` → [`agsess::default_root`] (verified). For every other vendor:
@@ -790,6 +866,45 @@ mod tests {
         assert_eq!(
             got(&["codex", "fix the queue", "--", "--remote"], true),
             argv(&["codex", "--no-daemon", "fix the queue", "--", "--remote"])
+        );
+    }
+
+    /// A value is always a TOML string, whatever it reads like: codex would
+    /// otherwise take `true` as a boolean and refuse to start.
+    #[test]
+    fn toml_string_quotes_and_escapes_every_value() {
+        assert_eq!(toml_string("true"), r#""true""#);
+        assert_eq!(toml_string(""), r#""""#);
+        assert_eq!(
+            toml_string("say \"hi\"\\ now\nthen\ttab\r"),
+            r#""say \"hi\"\\ now\nthen\ttab\r""#
+        );
+        assert_eq!(toml_string("bell\u{7}"), r#""bell\u0007""#);
+        // Non-ASCII passes through; TOML strings are UTF-8.
+        assert_eq!(toml_string("caf\u{e9} \u{2014}"), "\"caf\u{e9} \u{2014}\"");
+    }
+
+    /// The exact argv codex 0.163.0 was measured with: the ctl socket connects,
+    /// nothing else does. The socket map is an inline table, because codex
+    /// splits a `-c` key on the path's own dots.
+    #[test]
+    fn codex_ctl_sandbox_is_the_measured_profile() {
+        assert_eq!(
+            codex_ctl_sandbox(":workspace", "/var/T/atrium-7.sock"),
+            argv(&[
+                "-c",
+                r#"default_permissions="atrium_ctl""#,
+                "-c",
+                r#"permissions.atrium_ctl.extends=":workspace""#,
+                "-c",
+                "permissions.atrium_ctl.network.enabled=true",
+                "-c",
+                r#"permissions.atrium_ctl.network.mode="limited""#,
+                "-c",
+                r#"permissions.atrium_ctl.network.unix_sockets={"/var/T/atrium-7.sock"="allow"}"#,
+                "--enable",
+                "network_proxy",
+            ])
         );
     }
 

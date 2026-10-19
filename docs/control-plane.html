@@ -99,6 +99,7 @@ atrium ctl audit</code></pre>
 <pre><code>atrium ctl spawn --role lead -- claude
 atrium ctl send lead "Coordinate this across a team, one teammate per part: &lt;the initiative&gt;"</code></pre>
 <p>or, from your own pane, just say "coordinate this across a team: …" and let the skill surface.</p>
+<p><b>With codex.</b> codex reads the same <code>SKILL.md</code> format. Copy the three directories into <code>~/.agents/skills/</code> (all your projects) or a repo's <code>.agents/skills/</code> (that repo), or add the plugin marketplace with <code>codex plugin marketplace add nativelite/marketplace</code>. A codex pane does not need the skills to know ctl exists: with the control plane on, atrium gives it the same directive it gives claude, as <code>-c developer_instructions</code>. Its commands reach the control socket through its sandbox as described in <a href="trust-and-security.html#codex-panes">codex panes</a>.</p>
 <h2>See also</h2>
 <ul><li><a href="https://github.com/nativelite/atrium#readme">README</a>: atrium overview and the full feature set.</li><li><a href="trust-and-security.html">trust and security</a>: the <code>--trust</code> ladder and the ctl security model.</li><li><a href="fleets.html">fleets</a>: saved rosters (<code>atrium fleet up</code>), the persisted org chart.</li><li><a href="identity.html">credential identity</a>: per-pane credentials via <code>--identity</code> and <code>akey</code>.</li></ul>
 </main>
