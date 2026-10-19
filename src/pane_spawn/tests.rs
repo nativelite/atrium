@@ -218,3 +218,31 @@ fn every_pane_gets_the_build_pool() {
     // No pool (disabled, inherited, or failed): nothing is injected.
     assert!(pane_base_env(None, None, None).is_empty());
 }
+
+// -- codex daemon probe ---------------------------------------------------
+
+/// The probe reads the codex's own `--help`: one that advertises
+/// `--no-daemon` has it, one that does not (an older codex) or cannot be run
+/// at all does not, so its launch stays as written.
+#[cfg(unix)]
+#[test]
+fn the_codex_probe_trusts_only_a_help_that_names_the_flag() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("atrium-codex-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = |name: &str, help: &str| {
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\necho '{help}'\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p.to_string_lossy().into_owned()
+    };
+    let new = fake(
+        "codex-new",
+        "      --no-daemon  Run without the shared background server",
+    );
+    let old = fake("codex-old", "  -m, --model <MODEL>");
+    assert!(codex_has_no_daemon(&new));
+    assert!(!codex_has_no_daemon(&old));
+    assert!(!codex_has_no_daemon(&dir.join("absent").to_string_lossy()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
