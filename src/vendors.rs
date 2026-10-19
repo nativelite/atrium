@@ -98,6 +98,54 @@ pub fn vendor_for_stem(stem: &str) -> Option<Vendor> {
     }
 }
 
+/// Codex's flag for running in its own process instead of the shared daemon.
+pub const CODEX_NO_DAEMON: &str = "--no-daemon";
+
+/// A codex launch with [`CODEX_NO_DAEMON`] inserted after the program, when the
+/// launch can take it.
+///
+/// From 0.157 an interactive codex attaches to one per-user background server
+/// (`codex app-server --managed-daemon`), forked by whichever codex started
+/// first, anywhere, and outliving it. The agent's shell commands run as that
+/// server's children with *its* environment, not the pane's. So a codex pane
+/// lost `ATRIUM_CTL`/`ATRIUM_PANE`/`ATRIUM_TOKEN` when the server came from
+/// outside atrium (an editor's codex), and worse, ran as another pane's
+/// capability when it came from an earlier atrium pane — and every codex on the
+/// host, inside atrium or not, then carried that pane's token. Without the
+/// daemon codex runs commands from the process atrium spawned, in the pane's env.
+///
+/// Left as given: a command that already says it, one that targets a remote
+/// server (`--remote`), and the `queue`/`agents` subcommands, which codex
+/// refuses the flag on. `supported` is whether this codex has the flag at all
+/// (older ones fail on an unknown argument); the caller probes, this stays pure.
+pub fn codex_daemonless(command: &[String], supported: bool) -> Vec<String> {
+    let mut out = command.to_vec();
+    if !supported || command.is_empty() {
+        return out;
+    }
+    let rest = &command[1..];
+    let opts = rest.iter().take_while(|a| a.as_str() != "--");
+    let mut skip = false;
+    let mut seen_positional = false;
+    for a in opts {
+        if a == CODEX_NO_DAEMON || a == "--remote" || a.starts_with("--remote=") {
+            skip = true;
+            break;
+        }
+        if !seen_positional && !a.starts_with('-') {
+            seen_positional = true;
+            if a == "queue" || a == "agents" {
+                skip = true;
+                break;
+            }
+        }
+    }
+    if !skip {
+        out.insert(1, CODEX_NO_DAEMON.to_string());
+    }
+    out
+}
+
 /// The filesystem root under which `vendor` writes session transcripts, if known.
 ///
 /// `ClaudeCode` → [`agsess::default_root`] (verified). For every other vendor:
@@ -698,6 +746,52 @@ pub fn vendor_tag(vendor: Vendor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A codex that has the flag runs off the shared daemon, the flag right
+    /// after the program so it precedes any subcommand; one that lacks it, or a
+    /// launch codex refuses it on, is left exactly as given.
+    #[test]
+    fn codex_daemonless_inserts_the_flag_only_where_codex_takes_it() {
+        let got = |a: &[&str], ok| codex_daemonless(&argv(a), ok);
+        assert_eq!(got(&["codex"], true), argv(&["codex", "--no-daemon"]));
+        assert_eq!(
+            got(&["codex", "--model", "o3", "Start here"], true),
+            argv(&["codex", "--no-daemon", "--model", "o3", "Start here"])
+        );
+        assert_eq!(
+            got(&["codex", "resume", "--last"], true),
+            argv(&["codex", "--no-daemon", "resume", "--last"])
+        );
+        // An older codex fails on an unknown flag: untouched.
+        assert_eq!(
+            got(&["codex", "-m", "o3"], false),
+            argv(&["codex", "-m", "o3"])
+        );
+        // Already there, never twice.
+        assert_eq!(
+            got(&["codex", "--no-daemon"], true),
+            argv(&["codex", "--no-daemon"])
+        );
+        // Codex refuses the flag with a remote server and on these subcommands.
+        for a in [
+            &["codex", "--remote", "ws://h:1"][..],
+            &["codex", "--remote=ws://h:1"],
+            &["codex", "queue", "list"],
+            &["codex", "agents"],
+        ] {
+            assert_eq!(got(a, true), argv(a), "{a:?}");
+        }
+        // Only the first positional is a subcommand; a prompt that mentions one
+        // later, or anything after `--`, does not count.
+        assert_eq!(
+            got(&["codex", "fix the queue", "--", "--remote"], true),
+            argv(&["codex", "--no-daemon", "fix the queue", "--", "--remote"])
+        );
+    }
 
     /// The skeleton wiring holds: a fresh `VendorWorlds` always contains the
     /// claude world, `refresh` over (possibly missing) roots does not panic, and

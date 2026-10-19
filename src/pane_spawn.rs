@@ -295,7 +295,27 @@ pub(crate) fn spawn_pane_full(
     // macOS/Linux too — `Path::file_stem` would keep the backslashes there. This
     // title feeds is_claude/is_codex/vendor_tag, so the fix must live here.
     let title = atrium::bind::command_stem(&command[0]);
-    let base = agent_args(command, &title, mode, deny, extra_norms);
+    // codex runs its agent's commands in a shared per-user server unless told
+    // not to, and that server has someone else's environment — no ATRIUM_*, or
+    // another pane's. Off the daemon, its commands see this pane's env.
+    // The pane keeps `command` as written, so a respawn probes again.
+    let daemonless;
+    let launch = if atrium::vendors::vendor_for_stem(&title) == Some(agsess::Vendor::Codex) {
+        let supported = codex_has_no_daemon(&command[0]);
+        if !supported {
+            *flash = Some((
+                "codex has no --no-daemon (older than 0.157?): its commands may run \
+                 without this pane's atrium ctl access"
+                    .to_string(),
+                Instant::now(),
+            ));
+        }
+        daemonless = atrium::vendors::codex_daemonless(command, supported);
+        &daemonless[..]
+    } else {
+        command
+    };
+    let base = agent_args(launch, &title, mode, deny, extra_norms);
     // A trusted claude launch also pre-accepts claude's folder-trust dialog.
     if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
         ensure_folder_trust(cwd, &title, flash);
@@ -541,6 +561,47 @@ fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(Strin
     if let Err(e) = atrium::trust::ensure_trusted_in(config_dir, &dir) {
         *flash = Some((format!("folder-trust: {e}"), Instant::now()));
     }
+}
+
+/// Does this codex take `--no-daemon`? Asked once per program per session, of
+/// its own `--help` (resolved the way the launch will be, shims included). A
+/// codex that cannot answer in 2s counts as not having it: the launch then runs
+/// as written, which is what every codex did before.
+fn codex_has_no_daemon(program: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(Default::default);
+    if let Some(&known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(program) {
+        return known;
+    }
+    let argv = effective_command(&[program.to_string(), "--help".to_string()]);
+    let known = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .and_then(|mut child| {
+            let by = Instant::now() + std::time::Duration::from_secs(2);
+            while matches!(child.try_wait(), Ok(None)) {
+                if Instant::now() >= by {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let mut out = String::new();
+            std::io::Read::read_to_string(child.stdout.as_mut()?, &mut out).ok()?;
+            Some(out.contains(atrium::vendors::CODEX_NO_DAEMON))
+        })
+        .unwrap_or(false);
+    seen.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(program.to_string(), known);
+    known
 }
 
 /// Append the exact command a pane launches to `ATRIUM_SPAWN_LOG`, when set.
