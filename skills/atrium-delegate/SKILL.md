@@ -6,7 +6,7 @@ description: Delegate an independent, substantial part of your work to a teammat
 # Delegating to a teammate agent (atrium ctl)
 
 You are running inside atrium, which lets you spawn teammate agents — each a real
-`claude` in its own visible pane — through the `atrium ctl` command. You MAY hand
+agent CLI (`claude`, or `codex`) in its own visible pane — through the `atrium ctl` command. You MAY hand
 an independent part of your work to a teammate.
 
 **Delegate through `atrium ctl` — NOT your built-in tools.** If you delegate, do it
@@ -36,6 +36,12 @@ A fresh teammate per part keeps every session small.
     atrium ctl spawn --role <short-name> -- claude
     atrium ctl send <short-name> "<the subtask>"
 
+Add `--worktree <name>` to the spawn when the part edits files you are also
+editing: the teammate then works in its own git worktree and branch, and you
+merge its commit. `-- codex` spawns a codex teammate instead; on Windows, or with
+a codex too old to have its `network_proxy` feature, a sandboxed codex pane can't
+run `atrium ctl`, so check its commit rather than waiting for its bus post.
+
 When atrium's mod is loaded you also have these as tools: `atrium_spawn`,
 `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`, the `atrium_board_*`
 and `atrium_bus_*` tools, `atrium_subagent`, which runs a subagent as a
@@ -61,6 +67,7 @@ Teammates leave artifacts on the shared filesystem (files, edits, commits) — t
 do NOT return a value to you.
 
     atrium ctl status [<role>]   # which teammates are working vs idle
+    atrium ctl wait <role> --for idle    # block until it is back at its prompt (`--for exit`: gone)
     atrium ctl ask <role> "<question>"   # what is it doing, what does it need? (answered from a fork; never interrupts)
     atrium ctl who <path>        # which panes edited a file: check before touching a shared one
     atrium ctl kill <role>       # reap a teammate once you have collected its part
@@ -74,8 +81,9 @@ running.
 
 ## Full surface & discovery
 
-    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
+    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] [--worktree W] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl answer <target> | wait <target> [--for answer|idle|exit] [--timeout S]
     atrium ctl ask <target> [--timeout S] <question...> | asked <target> <id> | who <path>
     atrium ctl bus pub <topic> [--to <role>[,...]] <field=value...> | bus sub <topic...>
 

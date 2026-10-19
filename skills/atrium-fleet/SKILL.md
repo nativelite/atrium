@@ -94,13 +94,19 @@ compatible), and an empty `agents` list is rejected.
 | `memory_mb` | number | fixed ceiling on the memory everything the agents run may use. Default dynamic; `0` = off. Hard on Windows and on Linux under `systemd-run --user --scope -p Delegate=yes`; soft otherwise |
 | `deny` | array of strings | commands **no** claude agent in the session may run, including workers spawned later: claude rules (`"Bash(git push --force*)"`) or command prefixes (`"cargo test --workspace"`) |
 | `context` | object | shared context store: `{"provider": "context-mode", "share": "knowledge"}` (`share`: `knowledge` = shared index, private session memory; `full`; `none`). Stored per fleet under `.atrium/ctx/<fleet>/`, and kept by a pane across `ctl respawn` |
+| `mod` | bool | `false` keeps atrium's mod out of this fleet's claude panes; absent or `true` loads it once `atrium mod install` has run. The mod gives panes typed `atrium_*` tools, reported status, `ctl ask`/`who` and the keys below |
+| `subagents` | `"panes"`\|`"native"`\|`"deny"` | how a claude pane's subagents run: `panes` (default) = visible panes beside the caller, `native` = the engine's own (invisible), `deny` = refused. Needs the mod |
+| `subagents_keep` | bool | `true` leaves a subagent pane open after its answer was collected (default: closed) |
+| `respawn_at` | 1..100 | context-window fill, in percent, at which a claude pane at its prompt gets one `decision_needed` to its parent ("checkpoint and respawn it?"). Never respawns by itself. Needs the mod |
+| `captions` | bool | `true` lets the mod spend a small `haiku` call on each pane's six-word caption, from the model's own words; that text leaves the pane for the call, so it defaults `false`. The tool-call caption (`running cargo test`) is free and always on. `fleet init` templates carry `"captions": false` to flip |
+| `claude_aliases` | array of strings | other commands that *are* claude (`["claude2"]`, a second account's shim), so their panes get every claude rule. For a second account prefer `claude_aliases` in `config.json` with its `config_dir` |
 
 ### Agent-level keys
 
 | key | type | meaning |
 |-----|------|---------|
 | `name` | string (required) | label / role handle |
-| `cmd` | array (required) | the command + args, e.g. `["claude"]` or `["codex"]` |
+| `cmd` | array (required) | the command + args, e.g. `["claude"]` or `["codex"]` (codex: see [codex agents](#codex-agents)) |
 | `kickoff` | string | trailing positional prompt → the agent's **first user message**, so it starts working the instant the fleet comes up. Omit → it idles |
 | `model` | string | `--model <m>` (`opus`\|`sonnet`\|`haiku`\|…) |
 | `effort` | string | `--effort <e>` |
@@ -116,6 +122,28 @@ compatible), and an empty `agents` list is rejected.
 Launch arg order per agent: `cmd… [--add-dir …] [--append-system-prompt prompt]
 [--model M] [--effort E] "<kickoff>"`. You can equivalently inline `--model` in
 `cmd`, but the `model` key reads cleaner in a diff.
+
+### codex agents
+
+A codex agent takes the same keys; atrium spells them the way codex takes them
+(atrium 0.40.2 and newer; before that, `prompt` or `effort` on a codex agent made
+it exit at launch on `unexpected argument`):
+
+- `prompt`, the ctl directive and the worktree norms → one
+  `-c developer_instructions="…"`, codex's developer message;
+- `effort` → `-c model_reasoning_effort="…"`; `model` → `--model`;
+- `add_dirs` → one `--add-dir` per directory (codex makes them writable);
+- `trust`: `plan` = read-only sandbox, `accept`/`automode` = workspace sandbox
+  (the same for codex, which has no command allowlist), `skip` = no sandbox;
+- `deny` does **not** bind a codex agent (claude only).
+
+With `allow_ctl`, a sandboxed codex agent can reach atrium's control socket and
+nothing else (no domains, no other socket). That needs codex's experimental
+`network_proxy` feature; an older codex can't run `atrium ctl` unless it runs at
+`skip`, and on **Windows** a sandboxed codex pane can't reach ctl at all yet. The
+bar says which at spawn. codex also asks "Trust this folder?" the first time it
+runs in a directory, and atrium does not pre-accept that one, so answer it once
+per directory (or run `codex` there by hand first) before a hands-off launch.
 
 ### Minimal fleet
 
@@ -281,6 +309,9 @@ last, and let the lead spawn the rest one item at a time:
   starts the plan over.
 - **Give the fleet a `context` block** so the lead can push long output through
   context-mode, and so its knowledge base survives a restart.
+- **Set `respawn_at`** (e.g. `70`) on a fleet whose panes carry the mod, so a
+  pane whose context fills up raises a checkpoint-and-respawn decision to its
+  lead instead of drifting.
 - **Commit `PLAN.md`** before `fleet up`. Every fresh session, and every worktree,
   starts from it.
 
@@ -472,6 +503,11 @@ Write rules as concrete commands an agent can follow, not as goals.
 - Rust job cap in an *untracked* `.cargo/config.toml` → worktrees outside the repo
   never see it; commit it.
 - `deny` on a codex agent → not enforced (claude only); the banner warns.
+- Coordinating codex agent on Windows, or with a codex that lacks
+  `network_proxy` → its commands can't reach ctl under `plan`/`accept`/`automode`.
+  Give it `"trust": "skip"` only if the human accepts no sandbox for it.
+- codex agent in a directory codex has never run in → it waits on codex's own
+  "Trust this folder?" dialog; answer it once before a hands-off launch.
 - `--dangerously-skip-permissions`, `--permission-mode` or `--allowedTools` in a
   `cmd` → removed at launch, and a preflight warning says so (on atrium ≤ 0.33.0
   the banner claimed this but the flag still reached the agent). Set the posture

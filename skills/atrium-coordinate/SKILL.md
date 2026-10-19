@@ -6,7 +6,7 @@ description: Coordinate a task across teammate agents via `atrium ctl` — split
 # Coordinating a team of agents (atrium ctl)
 
 You are the **coordinator**. Your job is to orchestrate this work across teammate
-agents — each a real `claude` in its own visible atrium pane — through the
+agents — each a real agent CLI (`claude`, or `codex`) in its own visible atrium pane — through the
 `atrium ctl` command. You handle decomposition, briefing, integration, and
 verification; the **parts themselves go to teammates**. Do not sit and implement
 each part yourself — even if you could — that defeats the point of coordinating.
@@ -157,6 +157,19 @@ The tools and the shell verbs are the same control plane; use whichever you have
     atrium ctl spawn --here --role <short-name> -- claude     # tile beside you
     atrium ctl send <short-name> "<the subtask>"
 
+**Isolate each builder in its own worktree** when items touch files in parallel:
+`atrium ctl spawn --here --role <item> --worktree <item> -- claude` runs the
+teammate in a git worktree on branch `atrium/adhoc/<item>`, created (or reused)
+for it, with the worktree norms in its prompt. Its checkpoint commit lands on that
+branch; merge it after review. Reviewers read `git show <sha>` from any tree, so
+they need no worktree.
+
+**codex teammates** work the same way (`-- codex`): atrium gives a codex pane the
+same ctl directive and lets its sandbox reach the control socket. On Windows, or
+with a codex too old to have its `network_proxy` feature, a sandboxed codex pane
+can't run `atrium ctl` (the bar says so at spawn), so it can build but not report
+on the bus: have it commit, and check its checkpoint yourself.
+
 **Placement.** `--here` tiles the teammate beside you as a pane, so you and your
 team sit in one org-chart view — prefer this for a handful of teammates. Use
 `--window` (the default if you omit both) to give each teammate its own window
@@ -175,7 +188,13 @@ do NOT return a value to you.
 
     atrium ctl status            # roll-up of your whole team: working vs idle
     atrium ctl status <role>     # one teammate
+    atrium ctl wait <role> --for idle [--timeout S]   # block until it is back at its prompt (or --for exit)
     atrium ctl kill <role>       # reap a teammate once you have collected its part
+
+With the mod, a teammate also reports its last answer: `atrium ctl answer <role>`
+reads it, and `atrium ctl wait <role> --for answer` waits for a new one. Prefer
+the bus wake and the board for checkpoints; use `wait` when you genuinely have
+nothing else to do until one teammate finishes.
 
 A teammate's `bus pub` on a topic you subscribed to, or addressed `--to` you, is
 typed into your pane once you are idle, as one line starting `[atrium bus #` —
@@ -183,7 +202,8 @@ you do not poll for it. Read the checkpoint it names (`board get <item>`,
 `git show --stat <sha>`) and integrate. `bus feed` is the record when you need
 to catch up; `atrium ctl audit` reviews what you delegated and how it resolved.
 
-Two more eyes, when every teammate's claude carries atrium's mod:
+Two more eyes, when every teammate's claude carries atrium's mod (a codex
+teammate has no mod, so it neither answers `ask` nor shows up in `who`):
 
     atrium ctl ask <role> "what are you doing, and what blocks you?"   # answered from a fork of its context; its turn is not interrupted
     atrium ctl who <path>                                               # which teammates edited a file, across worktrees
@@ -221,6 +241,7 @@ instead of you polling the board:
     atrium ctl bus pub <topic> --to <role>[,<role>] <f=v...> # a hand-off aimed at named teammates
     atrium ctl bus pub <topic> --decision <f=v...>         # an escalation that needs an answer
     atrium ctl bus sub <topic...>                          # follow topics (`*` = everything)
+    atrium ctl bus unsub [<topic...>]                      # stop following (none = all)
     atrium ctl bus feed [--since <seq>]                    # the record: events on your topics
     atrium ctl bus resolve <seq>                           # mark a decision answered
     atrium ctl bus topics                                  # what the fleet coordinates on
@@ -254,9 +275,16 @@ shows one of yours, kill it.
 
 ## Full surface & discovery
 
-    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] -- <cmd...>
+    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] [--worktree W] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl respawn <target> [--worktree W] | answer <target> | wait <target> [--for answer|idle|exit] [--timeout S]
+    atrium ctl ask <target> [--timeout S] <question...> | asked <target> <id> | who <path>
+    atrium ctl board claim <key> [--ttl S] | board release <key>
+    atrium ctl bus pub <topic> [--decision] [--to <role>[,...]] [--new] <field=value...>
 
+`--new` says you mean to open a topic nobody has used yet; without it a publish
+to an unseen topic is refused, so a typo can't start a topic nobody follows. A
+fleet that declares `topics` refuses any other topic, `--new` or not.
 `--identity X` runs a teammate under a credential you already hold; `--here` tiles
 it beside you (vs a new window). `--mode` picks a teammate's permission mode
 (`plan` = read-only, `accept` = auto-accept edits, `automode` = claude's auto mode,
