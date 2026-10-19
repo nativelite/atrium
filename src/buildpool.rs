@@ -407,19 +407,25 @@ mod sys {
         fn ioctl(fd: i32, request: core::ffi::c_ulong, ...) -> i32;
     }
 
-    /// The FIFO and one open read/write end. The open end is what keeps the
-    /// tokens alive: a FIFO's buffered bytes are discarded when its last
-    /// descriptor closes, so the pool holds one for the whole session.
+    /// The FIFO, one open read/write end, and one read-only end to count through.
+    /// The open end is what keeps the tokens alive: a FIFO's buffered bytes are
+    /// discarded when its last descriptor closes, so the pool holds one for the
+    /// whole session. The count needs its own end because macOS answers
+    /// `FIONREAD` with 0 on a read/write FIFO descriptor, whatever is buffered,
+    /// so a pool counted through `file` always looked empty there and every
+    /// refill overfilled it. Nothing reads from `count`, so it never takes a
+    /// token.
     pub struct Pool {
         path: PathBuf,
         file: File,
+        count: File,
     }
 
     impl Pool {
         /// A private FIFO in the temp directory, pre-filled with `size` tokens.
         /// The auth string is `fifo:<path>`, which the `jobserver` crate opens
-        /// read/write. UNTESTED at runtime — written from the jobserver protocol
-        /// and `mkfifo(3)`, compiled on unix targets but not run on a unix host.
+        /// read/write. The pool's own token accounting is covered by the tests
+        /// below on macOS; a client build against it has not been run on unix.
         pub fn create(name: &str, size: usize) -> std::io::Result<(Pool, String)> {
             sweep_stale(&std::env::temp_dir());
             let path = std::env::temp_dir().join(format!("{name}.fifo"));
@@ -441,18 +447,26 @@ mod sys {
                     return Err(e);
                 }
             };
+            // Read-only, and it doesn't block: `file` is already a writer.
+            let count = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+            };
             if let Err(e) = file.write_all(&vec![b'+'; size]) {
                 let _ = std::fs::remove_file(&path);
                 return Err(e);
             }
             let auth = format!("fifo:{}", path.display());
-            Ok((Pool { path, file }, auth))
+            Ok((Pool { path, file, count }, auth))
         }
 
         pub fn available(&self) -> Option<usize> {
             let mut n: i32 = 0;
             // SAFETY: FIONREAD writes one int through the pointer.
-            let rc = unsafe { ioctl(self.file.as_raw_fd(), FIONREAD, &mut n as *mut i32) };
+            let rc = unsafe { ioctl(self.count.as_raw_fd(), FIONREAD, &mut n as *mut i32) };
             (rc == 0).then(|| n.max(0) as usize)
         }
 

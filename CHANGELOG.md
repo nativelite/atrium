@@ -13,6 +13,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   false`, so the opt-in to the model-made caption is a line to flip rather
   than a key to know about ([fleets](docs/fleets.md)).
 
+### Fixed
+- **A codex pane's commands see the pane's environment.** From 0.157 an
+  interactive codex attaches to one per-user background server, forked by
+  whichever codex starts first anywhere and outliving it, and the agent's
+  shell commands run as that server's children with *its* environment. A
+  codex pane lost `ATRIUM_CTL`/`ATRIUM_PANE`/`ATRIUM_TOKEN` when the server
+  came from outside atrium (an editor's codex), so `atrium ctl` failed; and
+  when it came from an earlier atrium pane, every codex on the host ran
+  commands under that pane's capability token. A codex pane now launches with
+  `--no-daemon` (not with `--remote`, nor on `queue`/`agents`, which refuse
+  it). Whether a codex has the flag is asked of its own `--help`, once per
+  program per session; an older one launches as written and the bar says why.
+- **The compile pool holds its size on macOS.** The pool counted its free
+  tokens with `FIONREAD` on its own read/write end of the FIFO, which macOS
+  answers with 0 however many are buffered. On a Mac the pool always looked
+  empty, so each refill with no build running put a full pool's worth back on
+  top of what was there, and the cap stopped capping. It now counts through a
+  read-only end, which reports the real number.
+
 ## [0.40.0] - 2026-10-18
 
 ### Added
