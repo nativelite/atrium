@@ -231,6 +231,25 @@ impl Tree {
         Self::grid_from_ids_along(&order, grid_dir)
     }
 
+    /// What one key (or one `ctl spawn --here`) adds to a window of `ids`:
+    /// [`grid_from_ids_inserting`](Tree::grid_from_ids_inserting) in the
+    /// window's orientation `grid_dir`, which the key that first grows a
+    /// single pane sets — `"` makes a grid of columns, `%` (and `--here`) of
+    /// rows — and later keys only read, so a window grown by hand reflows its
+    /// grid instead of transposing it.
+    pub fn grid_grow(
+        grid_dir: &mut Dir,
+        ids: &[usize],
+        anchor: usize,
+        new_id: usize,
+        dir: Dir,
+    ) -> Self {
+        if ids.len() == 1 {
+            *grid_dir = dir;
+        }
+        Self::grid_from_ids_inserting(ids, *grid_dir, anchor, new_id, dir)
+    }
+
     /// Fold `nodes` (non-empty) into a single left-leaning line of `dir` splits —
     /// `[n0 | [n1 | [… | nk]]]` — matching [`line_from`](Tree::line_from)'s shape
     /// so `rects`, focus movement, and close behave identically to a hand-built
@@ -1135,29 +1154,97 @@ mod tests {
     }
 
     // Growing a window one key at a time from a single pane, with the focus
-    // riding the new pane as it does live: `%` ×3 is a row-major 2×2 and `"`
-    // ×3 its column-major transpose, each new pane next to the last.
+    // riding the new pane as it does live: `%` ×3 is the row-major 2×2 `-n 4`
+    // makes and `"` ×3 its column-major transpose — the TREES, not just the
+    // id order (a 1×4 strip has the same ids).
+    // RED-when-broken: a plain append in a fixed orientation gives a strip.
     #[test]
     fn grid_insert_grown_from_one_pane_with_one_key_is_a_square() {
-        let mut ids: Vec<usize> = vec![0];
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let mut grid_dir = Dir::Vertical;
+        let mut t = Tree::new(0);
         for new in 1..4 {
-            let focus = *ids.last().unwrap();
-            let t = Tree::grid_from_ids_inserting(&ids, Dir::Vertical, focus, new, Dir::Vertical);
-            ids = t.ids();
+            let ids = t.ids();
+            t = Tree::grid_grow(
+                &mut grid_dir,
+                &ids,
+                *ids.last().unwrap(),
+                new,
+                Dir::Vertical,
+            );
         }
-        assert_eq!(ids, vec![0, 1, 2, 3]);
         assert_eq!(
-            Tree::grid_from_ids_along(&ids, Dir::Vertical),
+            t,
             Tree::grid_from_ids(&[0, 1, 2, 3]),
             "the grid `-n 4` makes"
         );
-        let mut ids: Vec<usize> = vec![0];
+
+        let mut grid_dir = Dir::Vertical; // the first `"` flips it to columns
+        let mut t = Tree::new(0);
         for new in 1..4 {
-            let focus = *ids.last().unwrap();
-            let t =
-                Tree::grid_from_ids_inserting(&ids, Dir::Horizontal, focus, new, Dir::Horizontal);
-            ids = t.ids();
+            let ids = t.ids();
+            t = Tree::grid_grow(
+                &mut grid_dir,
+                &ids,
+                *ids.last().unwrap(),
+                new,
+                Dir::Horizontal,
+            );
         }
-        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(grid_dir, Dir::Horizontal);
+        let rs: Vec<Rect> = (0..4).map(|id| rect_of(&t, id, outer)).collect();
+        // Column-major: 0 over 1 on the left, 2 over 3 on the right.
+        assert_eq!((rs[0].row, rs[0].col), (0, 0), "{rs:?}");
+        assert_eq!((rs[1].row, rs[1].col), (15, 0), "{rs:?}");
+        assert_eq!((rs[2].row, rs[2].col), (0, 60), "{rs:?}");
+        assert_eq!((rs[3].row, rs[3].col), (15, 60), "{rs:?}");
+    }
+
+    // The e2e `four_panes_added_by_key_are_all_live` key sequence, as the run
+    // loop drives it — `%`, `"`, `h`, `"` with the focus riding each new pane
+    // and `h` moving it geometrically — ends in a 2×2 with the fourth pane
+    // under the middle one, not a 1×4 strip and not a transposed grid. The
+    // frame cannot be measured over a pty; the shape is proven here.
+    // RED-when-broken: re-tiling in the key's own direction each time (the
+    // first cut of this fix) transposes on the `"`; appending puts 3 last.
+    #[test]
+    fn keys_grow_a_square_in_the_orientation_of_the_first_key() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let mut grid_dir = Dir::Vertical;
+        let mut t = Tree::new(0);
+        // `%`: two side by side; the window is now a grid of rows.
+        t = Tree::grid_grow(&mut grid_dir, &t.ids(), t.focus(), 1, Dir::Vertical);
+        t.focus_pane(1);
+        assert_eq!(grid_dir, Dir::Vertical);
+        // `"`: three. One row of three (nothing below to land in), pane 2 last.
+        t = Tree::grid_grow(&mut grid_dir, &t.ids(), t.focus(), 2, Dir::Horizontal);
+        t.focus_pane(2);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&t, id, outer)).collect();
+        assert!(
+            rs.iter().all(|r| r.row == 0 && r.rows == 30),
+            "one row: {rs:?}"
+        );
+        // `h`: focus moves left, onto the middle pane.
+        assert_eq!(t.move_focus(Move::Left, outer), 1);
+        // `"`: four. A 2×2 of rows with pane 3 under pane 1.
+        t = Tree::grid_grow(&mut grid_dir, &t.ids(), t.focus(), 3, Dir::Horizontal);
+        t.focus_pane(3);
+        assert_eq!(t.ids(), vec![0, 1, 2, 3]);
+        let rs: Vec<Rect> = (0..4).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!((rs[0].row, rs[0].col), (0, 0), "{rs:?}");
+        assert_eq!((rs[1].row, rs[1].col), (0, 60), "{rs:?}");
+        assert_eq!((rs[2].row, rs[2].col), (15, 0), "{rs:?}");
+        assert_eq!((rs[3].row, rs[3].col), (15, 60), "{rs:?}");
+        assert_eq!(t.focus(), 3);
     }
 }

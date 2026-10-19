@@ -31,27 +31,31 @@ fn split_creates_a_second_live_tile_and_both_shells_roundtrip() {
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
 
-/// A 2x2 grid: `%`, then `"` twice (each key re-tiles the whole window into a
-/// balanced grid with the new pane next to the focused one, so three panes are
-/// one line and four are a 2×2) — four live panes. Echo a unique marker in each and assert all four reach the
-/// composited frame.
+/// Four panes added by key — `%`, `"`, `h`, `"` — are all live: echo a unique
+/// marker in each and assert all four reach the composited frame. The SHAPE
+/// (a 2×2 of rows with the fourth pane under the middle one) cannot be measured
+/// over a pty and is proven by
+/// `layout::tests::keys_grow_a_square_in_the_orientation_of_the_first_key`,
+/// which replays this exact sequence; this test proves the panes exist and
+/// take input.
 #[test]
-fn two_by_two_grid_has_four_live_panes() {
+fn four_panes_added_by_key_are_all_live() {
     let mut p = spawn_atrium_shell(30, 120);
     // Pane 1 (top-left after the splits below) — mark it before splitting so the
     // first shell is proven live.
     p.write(b"echo atrium-q1\r\n").unwrap();
     read_until(&mut p, b"atrium-q1", Duration::from_secs(15));
-    // Build the square: % (two side by side), " (three, re-tiled into one
-    // column), h (a no-op in a single column), and " again (four: a 2×2).
-    p.write(b"\x01%").unwrap(); // now two columns, focus right
+    // Build the square: % (two side by side: the window is a grid of rows),
+    // " (three: one row of three, the new pane last), h (focus the middle
+    // pane), and " again (four: a 2×2, the new pane under the middle one).
+    p.write(b"\x01%").unwrap(); // two side by side, focus right
     p.write(b"echo atrium-q2\r\n").unwrap();
     read_until(&mut p, b"atrium-q2", Duration::from_secs(15));
-    p.write(b"\x01\"").unwrap(); // three panes -> one column, focus the new one
+    p.write(b"\x01\"").unwrap(); // three in one row, focus the new one (rightmost)
     p.write(b"echo atrium-q3\r\n").unwrap();
     read_until(&mut p, b"atrium-q3", Duration::from_secs(15));
-    p.write(b"\x01h").unwrap(); // nothing to the left of a column: focus stays
-    p.write(b"\x01\"").unwrap(); // four panes -> 2x2, focus the new one
+    p.write(b"\x01h").unwrap(); // focus the middle pane
+    p.write(b"\x01\"").unwrap(); // four: a 2x2, the new pane under the middle one
     p.write(b"echo atrium-q4\r\n").unwrap();
     // Collect everything for a few seconds and assert all four markers appeared.
     let out = read_until(&mut p, b"atrium-q4", Duration::from_secs(15));

@@ -261,7 +261,8 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
     read_until(&mut p, b"{\"ok\":true,\"pane\":0}", Duration::from_secs(20));
     p.write(format!("\"{atrium}\" ctl who x.rs\r\n").as_bytes())
         .unwrap();
-    let out = read_until(&mut p, b"\"panes\":[", Duration::from_secs(20));
+    // Read to the reply's end before asserting what it does NOT contain.
+    let out = read_until(&mut p, b"]}", Duration::from_secs(20));
     assert!(
         contains(&out, b"\"pane\":0") && !contains(&out, b"\"pane\":1"),
         "one pane so far: {:?}",
@@ -292,13 +293,19 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
         "both panes, the worker by role: {:?}",
         String::from_utf8_lossy(&out)
     );
+    // The whole feed, bounded by a marker echoed after it, so the collision
+    // can be COUNTED: posted once, although two reports named the file.
     p.write(format!("\"{atrium}\" ctl bus feed --json --since 0\r\n").as_bytes())
         .unwrap();
-    let out = read_until(&mut p, b"\"kind\":\"collision\"", Duration::from_secs(20));
+    p.write(b"echo atrium-feed-end\r\n").unwrap();
+    let out = read_until(&mut p, b"atrium-feed-end", Duration::from_secs(20));
+    let posted = out
+        .windows(b"\"kind\":\"collision\"".len())
+        .filter(|w| *w == b"\"kind\":\"collision\"")
+        .count();
     assert!(
-        contains(&out, b"\"kind\":\"collision\"")
-            && contains(&out, b"\"file\":\"/tmp/collide/x.rs\""),
-        "one collision decision on the atrium topic: {:?}",
+        posted == 1 && contains(&out, b"\"file\":\"/tmp/collide/x.rs\""),
+        "exactly one collision decision on the atrium topic, got {posted}: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01q").unwrap();
@@ -308,8 +315,8 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
 /// `ctl ask` queues a question that rides the target's inbox as an `ask`
 /// item, its mod reports the reply as `report ask=<id> reply=<text>`, and the
 /// waiting `ask` prints it; `asked` reads it again. A pane whose mod declared
-/// no `ask` is refused outright.
-#[cfg(unix)]
+/// no `ask` is refused outright. The waiting `ask` runs in the background of
+/// the pane's shell (`&` in sh, `start /b` in cmd) with its output in a file.
 #[test]
 fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
     let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
@@ -327,14 +334,20 @@ fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
     read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
     let out_file = std::env::temp_dir().join(format!("atrium-ask-{}.out", std::process::id()));
     let _ = std::fs::remove_file(&out_file);
-    p.write(
+    let background = if cfg!(windows) {
+        // `start "" /b` runs it in this console without a window; `cmd /S /C`
+        // keeps the inner quotes intact.
+        format!(
+            "start \"\" /b cmd /S /C \"\"{atrium}\" ctl ask 0 --timeout 60 are-you-there > \"{}\"\"\r\n",
+            out_file.display()
+        )
+    } else {
         format!(
             "\"{atrium}\" ctl ask 0 --timeout 60 are-you-there > \"{}\" &\r\n",
             out_file.display()
         )
-        .as_bytes(),
-    )
-    .unwrap();
+    };
+    p.write(background.as_bytes()).unwrap();
     std::thread::sleep(Duration::from_millis(1500));
     p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
         .unwrap();

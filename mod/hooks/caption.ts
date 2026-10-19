@@ -34,9 +34,11 @@ export function clipCaption(s: string): string {
  * `git commit`, `python dev.py check` — and nothing after. A command line
  * carries flags, assignments, quoted text, tokens and paths; a caption, which
  * the whole fleet reads in `ctl status` and the overview, carries only what
- * the pane is doing. Leading `VAR=value` are skipped, a path is its last
- * component, and the words stop at the first flag, assignment, quote,
- * operator or URL; at most three.
+ * the pane is doing. Leading `VAR=value` are skipped, the program is its
+ * last path component, any later token that is a path is dropped (a
+ * directory name is a fact about the project, not about the work), and the
+ * words stop at the first flag, assignment, quote, operator or URL; at most
+ * three.
  */
 export function commandWords(line: string): string {
   const toks = line.trim().split(/\s+/)
@@ -46,7 +48,8 @@ export function commandWords(line: string): string {
   for (; i < toks.length && out.length < 3; i++) {
     const t = toks[i]
     if (t.startsWith('-') || /[=:"'`$|&;<>()]/.test(t)) break
-    out.push(basename(t))
+    if (out.length === 0) out.push(basename(t))
+    else if (!/[\\/]/.test(t)) out.push(t)
   }
   return out.join(' ')
 }

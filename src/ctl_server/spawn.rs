@@ -177,19 +177,10 @@ pub(crate) fn spawn_worker_here(
                 .find(|p| p.agent_id == caller_id)
                 .map(|p| p.id)
                 .unwrap_or(w.tree.focus());
-            if w.panes.len() == 1 {
-                w.grid_dir = layout::Dir::Vertical;
-            }
             let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
             w.panes.push(pane);
             w.next_id += 1;
-            w.tree = Tree::grid_from_ids_inserting(
-                &ids,
-                w.grid_dir,
-                anchor,
-                new_id,
-                layout::Dir::Vertical,
-            );
+            w.tree = Tree::grid_grow(&mut w.grid_dir, &ids, anchor, new_id, layout::Dir::Vertical);
             w.tree.focus_pane(new_id);
             w.zoomed = false;
             // Resize the whole window so both the caller and the fresh worker get
