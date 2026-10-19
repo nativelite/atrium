@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-10-18
+
 ### Added
 - **Captions.** With the mod, every pane reports what it is doing in a few
   words: from each tool call, free (`running cargo test`, `editing
@@ -40,8 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `KEY=value` assignments, quoted text, paths — in `ctl status`, the overview
   and the tile title, for the whole fleet to read. It now names the program
   and its subcommand only (`running cargo test`, `running git commit`,
-  `running python dep_guard.py`): no flags, assignments, quotes, operators or
-  URLs, a path as its last component, three words at most. And the six-word
+  `running dev.py check`): no flags, assignments, quotes, operators or URLs,
+  no path but the program's own name, three words at most. And the six-word
   caption from the model's own streamed text — a second model call the text
   leaves the pane for — is now off unless the fleet says `captions: true`
   (it was on unless `captions: false`); the tool caption is free and always
@@ -1867,7 +1869,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.39.0...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.40.0...HEAD
+[0.40.0]: https://github.com/nativelite/atrium/compare/v0.39.0...v0.40.0
 [0.39.0]: https://github.com/nativelite/atrium/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/nativelite/atrium/compare/v0.37.2...v0.38.0
 [0.37.2]: https://github.com/nativelite/atrium/compare/v0.37.1...v0.37.2
