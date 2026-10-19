@@ -100,6 +100,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
             r#"{{
   "allow_ctl": true,
   "trust": "automode",
+  "captions": false,
   "agents": [
     {{
       "name": "solo",
@@ -119,6 +120,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
             r#"{{
   "allow_ctl": true,
   "trust": "automode",
+  "captions": false,
   "topics": ["work"],
   "agents": [
 {builders},
@@ -140,6 +142,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
             r#"{{
   "allow_ctl": true,
   "trust": "automode",
+  "captions": false,
   "topics": ["work"],
   "agents": [
     {{

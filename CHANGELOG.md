@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The generated fleet file shows the `captions` knob.** Every built-in
+  template (`atrium fleet init solo|pair|crew`) now carries `"captions":
+  false`, so the opt-in to the model-made caption is a line to flip rather
+  than a key to know about ([fleets](docs/fleets.md)).
+
 ## [0.40.0] - 2026-10-18
 
 ### Added

@@ -51,6 +51,17 @@ fn golden(name: &str) -> &'static str {
         "audit_none" => r#"{"ok":true,"audit":[],"oldest_seq":null,"latest_seq":0}"#,
         "status_one" => r#"{"ok":true,"pane":2,"status":"working","idle_ms":7000}"#,
         "status_one_none" => r#"{"ok":true,"pane":2,"status":null,"idle_ms":0}"#,
+        "status_one_doing" => {
+            r#"{"ok":true,"pane":2,"status":"working","idle_ms":0,"doing":"running the tests"}"#
+        }
+        "who" => {
+            r#"{"ok":true,"path":"src/x.rs","panes":[{"pane":2,"role":"dev_1","key":"src/x.rs","path":"/w/a/src/x.rs","first_ms":5,"last_ms":9,"live":true}]}"#
+        }
+        "asked_some" => r#"{"ok":true,"pane":3,"id":1,"reply":"fine"}"#,
+        "asked_none" => r#"{"ok":true,"pane":3,"id":1,"reply":null}"#,
+        "inbox_ask" => {
+            r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"},{"kind":"ask","text":"what now?","id":3}]}"#
+        }
         "list" => {
             r#"{"ok":true,"tree":[{"id":0,"parent":null,"role":"ceo","title":"claude","depth":0,"status":"working","idle_ms":4000},{"id":1,"parent":0,"role":null,"title":"sh","depth":1,"status":null,"idle_ms":0}]}"#
         }
@@ -120,6 +131,52 @@ fn every_reply_serializes_byte_identically_to_the_pre_enum_builders() {
             reply_audit(vec![json::parse(r#"{"seq":1}"#).unwrap()], Some(1), 5).to_string(),
         ),
         ("audit_none", reply_audit(vec![], None, 0).to_string()),
+        (
+            "status_one_doing",
+            reply_status_one(AgentId(2), Some("working"), 0, Some("running the tests")).to_string(),
+        ),
+        (
+            "who",
+            reply_who(
+                "src/x.rs",
+                vec![WhoEntry {
+                    pane: AgentId(2),
+                    role: Some("dev_1".into()),
+                    key: "src/x.rs".into(),
+                    path: "/w/a/src/x.rs".into(),
+                    first_ms: 5,
+                    last_ms: 9,
+                    live: true,
+                }],
+            )
+            .to_string(),
+        ),
+        (
+            "asked_some",
+            reply_asked(AgentId(3), 1, Some("fine")).to_string(),
+        ),
+        ("asked_none", reply_asked(AgentId(3), 1, None).to_string()),
+        (
+            "inbox_ask",
+            reply_inbox(vec![
+                InboxItem {
+                    kind: "send".into(),
+                    text: "do x".into(),
+                    id: None,
+                },
+                InboxItem {
+                    kind: "wake".into(),
+                    text: "[atrium bus #1 fyi] y".into(),
+                    id: None,
+                },
+                InboxItem {
+                    kind: "ask".into(),
+                    text: "what now?".into(),
+                    id: Some(3),
+                },
+            ])
+            .to_string(),
+        ),
         (
             "status_one",
             reply_status_one(AgentId(2), Some("working"), 7_000, None).to_string(),
