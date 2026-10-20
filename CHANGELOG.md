@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.4] - 2026-10-20
+
 ### Changed
 - **A codex `cmd` may carry codex's own options.** It took `--model`/`-m`
   and nothing else, so `--enable network_proxy`, `-c model_verbosity=…`,
@@ -1974,7 +1976,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.40.3...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.40.4...HEAD
+[0.40.4]: https://github.com/nativelite/atrium/compare/v0.40.3...v0.40.4
 [0.40.3]: https://github.com/nativelite/atrium/compare/v0.40.2...v0.40.3
 [0.40.2]: https://github.com/nativelite/atrium/compare/v0.40.1...v0.40.2
 [0.40.1]: https://github.com/nativelite/atrium/compare/v0.40.0...v0.40.1
