@@ -4,6 +4,9 @@
 use super::AgentId;
 use crate::bind;
 
+mod codex;
+use codex::Author;
+
 /// Why a spawn was refused. Each maps to a clear reply the caller can act on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpawnDenied {
@@ -104,9 +107,9 @@ fn worker_allowed_flags(stem: &str) -> Option<&'static [&'static str]> {
         return Some(&["--model", "--effort", "--continue", "-c", "--resume", "-r"]);
     }
     match stem {
-        // codex takes `--model`; its approval flags are atrium's to set (see
-        // `trust::codex_trust_args`), never the caller's.
-        "codex" => Some(&["--model", "-m"]),
+        // codex is vetted the other way round, by `codex::vet`: any flag but
+        // the posture. Never reached; listed so the stem has a policy here.
+        "codex" => Some(&[]),
         // Any other AGENT stem — gemini, aider, cursor-agent — is one atrium will
         // bind but has no trust posture for, so it cannot cap what the agent may
         // do. Refuse rather than guess.
@@ -126,11 +129,23 @@ pub enum ArgvVerdict {
     Refused(String),
 }
 
-/// Vet a ctl-spawn argv: refuse an unknown vendor or an unlisted flag, then
-/// strip the governed permission flags atrium sets itself.
+/// Vet a ctl-spawn argv, which an agent wrote: refuse an unknown vendor or an
+/// unlisted flag, then strip the governed permission flags atrium sets itself.
+/// A codex argv follows `codex`'s rules for [`Author::Agent`].
 ///
 /// Pure, so the whole policy is unit-testable without spawning anything.
 pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
+    vet_argv(argv, Author::Agent)
+}
+
+/// Vet a fleet agent's `cmd`, which a person wrote and the banner shows: the
+/// same as [`vet_spawn_argv`] except that a codex `cmd` may also carry config
+/// that reaches outside codex's sandbox ([`Author::Fleet`]).
+pub fn vet_fleet_argv(argv: &[String]) -> ArgvVerdict {
+    vet_argv(argv, Author::Fleet)
+}
+
+fn vet_argv(argv: &[String], author: Author) -> ArgvVerdict {
     let Some(program) = argv.first() else {
         return ArgvVerdict::Refused("spawn needs a command".to_string());
     };
@@ -141,6 +156,16 @@ pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| program.clone());
     let stem = stem.rsplit(['/', '\\']).next().unwrap_or(&stem).to_string();
+
+    if crate::vendors::vendor_for_stem(&stem) == Some(agsess::Vendor::Codex) {
+        return match codex::vet(argv, author) {
+            Ok(_) => {
+                let (argv, stripped) = sanitize_spawn_argv(argv);
+                ArgvVerdict::Ok { argv, stripped }
+            }
+            Err(why) => ArgvVerdict::Refused(format!("refusing to spawn {stem:?}: {why}")),
+        };
+    }
 
     let allowed = match worker_allowed_flags(&stem) {
         Some(a) => a,
@@ -189,8 +214,23 @@ pub fn vet_spawn_argv(argv: &[String]) -> ArgvVerdict {
 /// (surfaced in the spawn reply's `note` — never silent, per the guardrails).
 /// `--dangerously-skip-permissions` is a bare switch; `--permission-mode` and
 /// `--allowedTools` each consume the following token as their value. Both
-/// `--flag value` and `--flag=value` spellings are handled. Pure.
+/// `--flag value` and `--flag=value` spellings are handled. A codex argv also
+/// loses codex's own posture options (`codex::strip`). Pure.
 pub fn sanitize_spawn_argv(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let (argv, mut stripped) = sanitize_governed(argv);
+    let codex = argv.first().is_some_and(|p| {
+        crate::vendors::vendor_for_stem(&bind::command_stem(p)) == Some(agsess::Vendor::Codex)
+    });
+    if !codex {
+        return (argv, stripped);
+    }
+    let (argv, more) = codex::strip(&argv);
+    stripped.extend(more);
+    (argv, stripped)
+}
+
+/// [`sanitize_spawn_argv`]'s claude half: [`GOVERNED_FLAGS`], for every vendor.
+fn sanitize_governed(argv: &[String]) -> (Vec<String>, Vec<String>) {
     let takes_value = |f: &str| f == "--permission-mode" || f == "--allowedTools";
     let mut cleaned = Vec::with_capacity(argv.len());
     let mut stripped: Vec<String> = Vec::new();

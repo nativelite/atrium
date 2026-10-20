@@ -289,7 +289,7 @@ fn plan_launch<'a>(
     // never fatal.
     let mut warnings: Vec<String> = Vec::new();
     for a in &fleet.agents {
-        match atrium::ctl::vet_spawn_argv(&a.cmd) {
+        match atrium::ctl::vet_fleet_argv(&a.cmd) {
             atrium::ctl::ArgvVerdict::Refused(why) => {
                 return Err(format!("atrium fleet: agent \"{}\": {why}", fsan(&a.name)));
             }

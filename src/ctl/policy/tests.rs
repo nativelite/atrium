@@ -264,3 +264,228 @@ fn delegation_operator_may_delegate_anything() {
     // privileged == the human root: any vault identity is theirs to grant.
     assert!(delegation_allowed(Some("prod"), None, Some("work"), true).is_ok());
 }
+
+// -- codex: any flag but the posture ---------------------------------------
+
+/// The argv a codex vet keeps, or the refusal.
+fn codex_vet(argv: &[&str], fleet: bool) -> Result<(Vec<String>, Vec<String>), String> {
+    let verdict = if fleet {
+        vet_fleet_argv(&v(argv))
+    } else {
+        vet_spawn_argv(&v(argv))
+    };
+    match verdict {
+        ArgvVerdict::Ok { argv, stripped } => Ok((argv, stripped)),
+        ArgvVerdict::Refused(why) => Err(why),
+    }
+}
+
+/// A codex command may carry codex's own options, from a fleet file or a
+/// teammate's spawn, untouched: features, config that sets no posture, web
+/// search, images, a local provider.
+#[test]
+fn codex_takes_its_own_flags_from_a_fleet_or_a_teammate() {
+    let argv = [
+        "codex",
+        "--enable",
+        "network_proxy",
+        "--disable=apps",
+        "-c",
+        "model_verbosity=\"low\"",
+        "--config=features.network_proxy=true",
+        "-cmodel=\"gpt-5.6-luna\"",
+        "--search",
+        "-i",
+        "shot.png",
+        "--oss",
+        "--local-provider",
+        "ollama",
+        "--no-alt-screen",
+        "--strict-config",
+        "-m",
+        "gpt-5.6-luna",
+        "fix the build",
+    ];
+    for fleet in [true, false] {
+        let (kept, stripped) = codex_vet(&argv, fleet).unwrap();
+        assert_eq!(kept, v(&argv), "fleet={fleet}");
+        assert!(stripped.is_empty(), "fleet={fleet}: {stripped:?}");
+    }
+}
+
+/// Every way codex spells a posture is stripped, value and all, and named:
+/// the flags, their short and attached forms, the hidden `--yolo`, and the
+/// same settings as `-c` keys, quoted or not.
+#[test]
+fn codex_loses_every_spelling_of_its_posture() {
+    let cases: &[(&[&str], &str)] = &[
+        (&["--sandbox", "danger-full-access"], "--sandbox"),
+        (&["--sandbox=danger-full-access"], "--sandbox"),
+        (&["-s", "danger-full-access"], "-s"),
+        (&["-sdanger-full-access"], "-s"),
+        (&["-s=danger-full-access"], "-s"),
+        (&["-a", "never"], "-a"),
+        (&["--ask-for-approval=never"], "--ask-for-approval"),
+        (
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (&["--yolo"], "--yolo"),
+        (&["--approve-for-me"], "--approve-for-me"),
+        (
+            &["--dangerously-bypass-hook-trust"],
+            "--dangerously-bypass-hook-trust",
+        ),
+        (&["-p", "wide"], "-p"),
+        (&["--profile=wide"], "--profile"),
+        (&["--remote", "ws://host:1"], "--remote"),
+        (
+            &["--remote-auth-token-env", "TOK"],
+            "--remote-auth-token-env",
+        ),
+        (
+            &["-c", "sandbox_mode=\"danger-full-access\""],
+            "-c sandbox_mode",
+        ),
+        (&["-capproval_policy=\"never\""], "-c approval_policy"),
+        (
+            &["--config", "default_permissions=\"x\""],
+            "-c default_permissions",
+        ),
+        (
+            &["-c", "permissions.x.network.enabled=true"],
+            "-c permissions.x.network.enabled",
+        ),
+        (
+            &["-c", "sandbox_workspace_write.network_access=true"],
+            "-c sandbox_workspace_write.network_access",
+        ),
+        (
+            &["-c", "\"sandbox_mode\"=\"danger-full-access\""],
+            "-c sandbox_mode",
+        ),
+        (&["-c", "profile=\"wide\""], "-c profile"),
+        (
+            &["-c", "profiles.wide.sandbox_mode=\"danger-full-access\""],
+            "-c profiles.wide.sandbox_mode",
+        ),
+        (
+            &["-c", "developer_instructions=\"x\""],
+            "-c developer_instructions",
+        ),
+    ];
+    for (opt, name) in cases {
+        let mut argv = vec!["codex", "-m", "o3"];
+        argv.extend_from_slice(opt);
+        argv.push("go");
+        for fleet in [true, false] {
+            let (kept, stripped) = codex_vet(&argv, fleet).unwrap();
+            assert_eq!(
+                kept,
+                v(&["codex", "-m", "o3", "go"]),
+                "{opt:?} fleet={fleet}"
+            );
+            assert_eq!(stripped, v(&[name]), "{opt:?} fleet={fleet}");
+        }
+    }
+}
+
+/// A key that only starts like a posture key is not one, and nothing after
+/// `--` is an option.
+#[test]
+fn codex_strips_whole_keys_only_and_stops_at_the_separator() {
+    let argv = [
+        "codex",
+        "-c",
+        "sandbox_modes_seen=1",
+        "-c",
+        "permissionsfoo=1",
+        "--",
+        "--yolo",
+    ];
+    let (kept, stripped) = codex_vet(&argv, false).unwrap();
+    assert_eq!(kept, v(&argv));
+    assert!(stripped.is_empty(), "{stripped:?}");
+}
+
+/// `-C` and `--add-dir` widen what the sandbox may write, so they are refused
+/// from anyone, pointing at the fleet keys the banner shows instead.
+#[test]
+fn codex_refuses_a_moved_or_widened_workspace() {
+    for (opt, key) in [
+        (&["-C", "/"][..], "cwd"),
+        (&["-C/"][..], "cwd"),
+        (&["--cd=/"][..], "cwd"),
+        (&["--add-dir", "/"][..], "add_dirs"),
+    ] {
+        let mut argv = vec!["codex"];
+        argv.extend_from_slice(opt);
+        for fleet in [true, false] {
+            let why = codex_vet(&argv, fleet).unwrap_err();
+            assert!(why.contains(key), "{opt:?}: {why}");
+        }
+    }
+}
+
+/// Config that makes codex start a program, send the session somewhere or
+/// widen its sandbox is the fleet author's to choose, never a teammate's: a
+/// sandboxed agent could otherwise spawn a codex that runs a command outside
+/// the sandbox (measured: an MCP server and `notify` both write outside
+/// `read-only`).
+#[test]
+fn codex_config_that_leaves_the_sandbox_is_the_fleet_files_alone() {
+    for opt in [
+        &["-c", "mcp_servers.x.command=\"/bin/sh\""][..],
+        &["-c", "mcp_servers.\"x\".args=[\"-c\",\"id\"]"],
+        &["-c", "notify=[\"/bin/sh\",\"-c\",\"id\"]"],
+        &["--config=hooks.Stop=[]"],
+        &["-c", "model_providers.evil.base_url=\"http://x\""],
+        &["-c", "openai_base_url=\"http://x\""],
+        &["-c", "otel.exporter=\"otlp-http\""],
+        &["-c", "allow_login_shell=true"],
+        &["-c", "features.network_proxy.domains={\"x.com\"=\"allow\"}"],
+        &["-c", "computer_use.default_app_access=\"all\""],
+        &["--ignore-user-config"],
+        &["--ignore-rules"],
+    ] {
+        let mut argv = vec!["codex"];
+        argv.extend_from_slice(opt);
+        let why = codex_vet(&argv, false).unwrap_err();
+        assert!(why.contains("teammate may not"), "{opt:?}: {why}");
+        let (kept, stripped) = codex_vet(&argv, true).unwrap();
+        assert_eq!(kept, v(&argv), "{opt:?}");
+        assert!(stripped.is_empty(), "{opt:?}: {stripped:?}");
+    }
+}
+
+/// The shared sanitizer, which respawn and recovery run over a pane's
+/// recorded command, drops codex's posture and keeps what atrium itself wrote
+/// there: the fleet's `--add-dir`, its effort and its prompt marker, even a
+/// prompt that starts like a flag.
+#[test]
+fn a_recorded_codex_command_keeps_atriums_own_args() {
+    let recorded = v(&[
+        "codex",
+        "--yolo",
+        "--add-dir",
+        "/abs/shared",
+        "--append-system-prompt",
+        "-s is how you spell it",
+        "-c",
+        "model_reasoning_effort=\"high\"",
+        "go",
+    ]);
+    let (kept, stripped) = sanitize_spawn_argv(&recorded);
+    assert_eq!(
+        kept,
+        recorded[..1]
+            .iter()
+            .chain(&recorded[2..])
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(stripped, v(&["--yolo"]));
+    // Another program's `-c` is a command string, never a codex key.
+    let sh = v(&["sh", "-c", "sandbox_mode=1"]);
+    assert_eq!(sanitize_spawn_argv(&sh).0, sh);
+}

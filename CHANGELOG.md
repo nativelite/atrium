@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A codex `cmd` may carry codex's own options.** It took `--model`/`-m`
+  and nothing else, so `--enable network_proxy`, `-c model_verbosity=…`,
+  `--search` and the rest were refused at `fleet up` and `ctl spawn`. It now
+  takes any codex option except the ones that set what codex may do, which
+  are atrium's: the sandbox and approval flags (with the hidden `--yolo`
+  alias), `-p/--profile`, `--remote`, `--approve-for-me`,
+  `--dangerously-bypass-hook-trust` and the same settings as `-c` keys are
+  stripped and named (preflight warning, spawn `note`), in every spelling
+  (`-sx`, `-s=x`, `--sandbox=x`, quoted keys). `-C/--cd` and `--add-dir`
+  are refused in favour of `cwd`/`add_dirs`. Config that makes codex start a
+  program, send the session elsewhere or widen its sandbox (`mcp_servers`,
+  `notify`, `hooks`, `model_providers`, `otel`, network domains, …) is the
+  fleet file's to set: an agent's `ctl spawn` is refused it, since codex runs
+  an MCP server and `notify` outside its own sandbox (measured under
+  `read-only`), and a sandboxed agent could otherwise escape the posture the
+  human chose ([what a codex command may carry](docs/trust-and-security.md#what-a-codex-command-may-carry)).
+  A respawn or recovery strips a recorded codex command's posture too, and
+  keeps the `--add-dir` atrium wrote from `add_dirs`.
+
 ## [0.40.3] - 2026-10-19
 
 ### Fixed

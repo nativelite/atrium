@@ -54,8 +54,8 @@ pub use client::{
 pub use launch::{parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG};
 pub use policy::{
     delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, parse_allow_list,
-    resolve_target, sanitize_spawn_argv, vet_spawn_argv, ArgvVerdict, SpawnDenied, ENV_ALLOW,
-    ENV_AUDIT,
+    resolve_target, sanitize_spawn_argv, vet_fleet_argv, vet_spawn_argv, ArgvVerdict, SpawnDenied,
+    ENV_ALLOW, ENV_AUDIT,
 };
 pub use render::{hyperlink, is_url, status_glyph, status_sgr};
 pub use reply::{

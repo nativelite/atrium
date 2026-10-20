@@ -191,6 +191,35 @@ the bar says so. The fix is outside atrium: install a non-packaged PowerShell 7
 remove the Store build; codex without any `pwsh` falls back to Windows
 PowerShell, which its sandbox runs fine.
 
+### What a codex command may carry
+
+A codex `cmd` (in a fleet, or after `--` in `ctl spawn`) may carry **any** codex
+option — `--enable`/`--disable <feature>`, `-c <key>=<value>`, `--search`,
+`-i`, `--oss`, `--local-provider`, … — except the ones that decide what codex
+is permitted to do. claude's argv is vetted against a short allowlist; codex's
+the other way round, so a fleet can use codex as its author wants.
+
+| Class | Options | What atrium does |
+| --- | --- | --- |
+| Posture | `-s/--sandbox`, `-a/--ask-for-approval`, `--dangerously-bypass-approvals-and-sandbox` and its hidden alias `--yolo`, `--approve-for-me`, `--dangerously-bypass-hook-trust`, `-p/--profile`, `--remote`, `--remote-auth-token-env`; `-c` keys `sandbox_mode`, `approval_policy`, `approvals_reviewer`, `default_permissions`, `permissions.*`, `sandbox_workspace_write.*`, `profile`, `profiles.*`, `developer_instructions` | **stripped** and named: a preflight warning on `fleet up`, the reply's `note` on `ctl spawn`. Posture comes from `trust` / `--mode` only, and `developer_instructions` is atrium's channel for `prompt`. |
+| Placement | `-C/--cd`, `--add-dir` | **refused**: they widen what the sandbox may write (`-C /` makes the disk the workspace). Use the agent's `cwd` and `add_dirs`, which the banner shows. |
+| Out of the sandbox | `-c` keys `mcp_servers.*`, `notify`, `hooks.*`, `model_providers.*`, `openai_base_url`, `chatgpt_base_url`, `mcp_oauth_callback_url`, `otel.*`, `desktop.*`, `allow_login_shell`, `apps.*`, `computer_use.*`, `browser_use.*`, `features.network_proxy.*` (its sub-keys, such as `domains`); `--ignore-user-config`, `--ignore-rules` | **a fleet file may set them; `ctl spawn` refuses them.** |
+
+Every spelling counts: `--sandbox x`, `--sandbox=x`, `-sx`, `-s=x`, and a
+`-c` key quoted or not.
+
+The third class is the one the split exists for. Measured with codex 0.163.0:
+under a `read-only` sandbox, an MCP server and a `notify` program both wrote to
+the home directory, because codex starts them itself, not through the
+sandboxed shell. A person writing a fleet file is choosing that for their own
+machine, and the file is reviewed before it runs. A `ctl spawn` is written by an
+agent, and allowing it there would let a sandboxed agent start a teammate that
+runs a program outside the posture the human chose. `features.network_proxy`
+itself (`--enable network_proxy`) is allowed from either; it is its sub-keys,
+which let network out, that only a fleet file may set.
+
+With `"trust": "skip"` none of this matters: that posture is no sandbox at all.
+
 ## The security model
 
 Giving a hosted agent the power to spawn processes is a real capability. The
