@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.40.3] - 2026-10-19
+
 ### Fixed
 - **Windows: a sandboxed codex pane reaches atrium ctl.** codex's Windows
   sandbox runs the agent's commands under a restricted token, whose access
@@ -1952,7 +1954,8 @@ remain zero. M5 of the atrium 0.3 agent-aware feature.
 The nativelite **agent terminal** suite flagship (see
 `roadmap/agent-terminal-suite.md` in `nativelite/ops`).
 
-[Unreleased]: https://github.com/nativelite/atrium/compare/v0.40.2...HEAD
+[Unreleased]: https://github.com/nativelite/atrium/compare/v0.40.3...HEAD
+[0.40.3]: https://github.com/nativelite/atrium/compare/v0.40.2...v0.40.3
 [0.40.2]: https://github.com/nativelite/atrium/compare/v0.40.1...v0.40.2
 [0.40.1]: https://github.com/nativelite/atrium/compare/v0.40.0...v0.40.1
 [0.40.0]: https://github.com/nativelite/atrium/compare/v0.39.0...v0.40.0

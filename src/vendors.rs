@@ -1438,12 +1438,13 @@ mod tests {
 /// the machine store), which is the whole test. `None` (no `pwsh` on PATH)
 /// is fine: codex falls back to Windows PowerShell, which the sandbox can run.
 pub fn is_store_pwsh(resolved: Option<&std::path::Path>) -> bool {
+    // Split on both separators rather than `Path::components`, which off
+    // Windows treats a backslash as part of the name; the rule then reads the
+    // same on every platform (as `bind::command_stem` does).
     resolved.is_some_and(|p| {
-        p.components().any(|c| {
-            c.as_os_str()
-                .to_string_lossy()
-                .eq_ignore_ascii_case("WindowsApps")
-        })
+        p.to_string_lossy()
+            .split(['\\', '/'])
+            .any(|c| c.eq_ignore_ascii_case("WindowsApps"))
     })
 }
 
