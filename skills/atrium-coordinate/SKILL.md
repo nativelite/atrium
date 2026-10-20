@@ -165,10 +165,11 @@ branch; merge it after review. Reviewers read `git show <sha>` from any tree, so
 they need no worktree.
 
 **codex teammates** work the same way (`-- codex`): atrium gives a codex pane the
-same ctl directive and lets its sandbox reach the control socket. On Windows, or
-with a codex too old to have its `network_proxy` feature, a sandboxed codex pane
-can't run `atrium ctl` (the bar says so at spawn), so it can build but not report
-on the bus: have it commit, and check its checkpoint yourself.
+same ctl directive and lets its sandbox reach the control socket (on Windows
+the pipe admits it as is). With a codex too old to have its `network_proxy`
+feature (macOS/Linux only), a sandboxed codex pane can't run `atrium ctl` (the
+bar says so at spawn), so it can build but not report on the bus: have it
+commit, and check its checkpoint yourself.
 
 **Placement.** `--here` tiles the teammate beside you as a pane, so you and your
 team sit in one org-chart view — prefer this for a handful of teammates. Use

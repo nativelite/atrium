@@ -340,6 +340,8 @@ pub(crate) fn spawn_pane_full(
             ));
         }
         daemonless = atrium::vendors::codex_daemonless(command, supported);
+        #[cfg(windows)]
+        warn_store_pwsh(mode, flash);
         &daemonless[..]
     } else {
         command
@@ -612,6 +614,31 @@ fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(Strin
     }
 }
 
+/// Windows: a sandboxed codex pane runs its commands through `pwsh` when one is
+/// on PATH, and its restricted token cannot start the Microsoft Store build of
+/// it (`CreateProcessAsUserW` fails with `Access is denied`), so every command
+/// the agent runs fails before it starts, `atrium ctl` included. Nothing in the
+/// pane can fix that, so the bar says what will: a non-packaged PowerShell 7
+/// ahead of the Store one on PATH, or no sandbox (`skip`). Resolved the way the
+/// launch is (PATH x PATHEXT), so the warning names the `pwsh` codex will find.
+#[cfg(windows)]
+fn warn_store_pwsh(mode: atrium::ctl::TrustMode, flash: &mut Option<(String, Instant)>) {
+    if mode == atrium::ctl::TrustMode::Skip || mode == atrium::ctl::TrustMode::Off {
+        return;
+    }
+    let resolved = effective_command(&["pwsh".to_string()]);
+    let path = std::path::Path::new(&resolved[0]);
+    if atrium::vendors::is_store_pwsh(Some(path)) {
+        *flash = Some((
+            "codex's sandbox can't start the Store PowerShell (pwsh in WindowsApps): \
+             its commands will fail; install PowerShell 7 (winget install \
+             Microsoft.PowerShell) ahead of it, or spawn codex with --mode skip"
+                .to_string(),
+            Instant::now(),
+        ));
+    }
+}
+
 /// Does this codex take `--no-daemon`? Asked once per program per session, of
 /// its own `--help` (resolved the way the launch will be, shims included). A
 /// codex that cannot answer in 2s counts as not having it: the launch then runs
@@ -626,6 +653,8 @@ fn codex_has_no_daemon(program: &str) -> bool {
 /// rules ([`atrium::vendors::codex_ctl_sandbox`])? Asked, like
 /// [`codex_has_no_daemon`], of its own `codex features list`: a row that starts
 /// with the feature's name. A codex without it keeps the plain `--sandbox`.
+/// Windows never asks: its pipe admits the sandbox as is ([`codex_ctl_socket`]).
+#[cfg_attr(windows, allow(dead_code))]
 fn codex_has_network_proxy(program: &str) -> bool {
     codex_probe(program, &["features", "list"], |out| {
         out.lines()
@@ -655,21 +684,17 @@ fn codex_ctl_socket<'a>(
     None
 }
 
-/// Windows: atrium's endpoint is a named pipe, and codex's allowance is for
-/// unix sockets, so there is nothing to open it with yet. The pane keeps its
-/// sandbox, which blocks the pipe, and the bar says so.
+/// Windows: nothing to let through. codex's sandbox there is a restricted
+/// token, not a network filter, and a named pipe is not network to it; what
+/// kept a sandboxed `atrium ctl` out was the pipe's own DACL, which the
+/// listener now opens to this logon session (`ipc::sys_windows`). The pane
+/// keeps its plain `--sandbox`, and ctl works from it.
 #[cfg(windows)]
 fn codex_ctl_socket<'a>(
     _program: &str,
     _addr: &'a str,
-    flash: &mut Option<(String, Instant)>,
+    _flash: &mut Option<(String, Instant)>,
 ) -> Option<&'a str> {
-    *flash = Some((
-        "codex's sandbox blocks atrium ctl on Windows: this pane's commands can't \
-         reach it (spawn it with --mode skip if it must coordinate)"
-            .to_string(),
-        Instant::now(),
-    ));
     None
 }
 

@@ -1429,3 +1429,46 @@ mod tests {
         assert_eq!(got, 2, "the thread must keep publishing");
     }
 }
+
+/// Is this the Microsoft Store (MSIX) build of PowerShell? codex runs an agent's
+/// commands through `pwsh` when one is on PATH, and its Windows sandbox, a
+/// restricted token, cannot start a packaged app: `CreateProcessAsUserW` fails
+/// with `Access is denied` before the command runs, whatever the command was.
+/// A packaged app lives under a `WindowsApps` directory (the per-user alias or
+/// the machine store), which is the whole test. `None` (no `pwsh` on PATH)
+/// is fine: codex falls back to Windows PowerShell, which the sandbox can run.
+pub fn is_store_pwsh(resolved: Option<&std::path::Path>) -> bool {
+    resolved.is_some_and(|p| {
+        p.components().any(|c| {
+            c.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("WindowsApps")
+        })
+    })
+}
+
+#[cfg(test)]
+mod store_pwsh_tests {
+    use super::is_store_pwsh;
+    use std::path::Path;
+
+    #[test]
+    fn only_a_pwsh_under_windowsapps_is_the_store_build() {
+        for p in [
+            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\pwsh.exe",
+            r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\Microsoft.PowerShell_8wekyb3d8bbwe\pwsh.exe",
+            r"C:\Program Files\WindowsApps\Microsoft.PowerShell_7.5.0.0_x64__8wekyb3d8bbwe\pwsh.exe",
+            r"c:\users\me\appdata\local\microsoft\windowsapps\pwsh.exe",
+        ] {
+            assert!(is_store_pwsh(Some(Path::new(p))), "{p}");
+        }
+        for p in [
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"D:\tools\pwsh\pwsh.exe",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ] {
+            assert!(!is_store_pwsh(Some(Path::new(p))), "{p}");
+        }
+        assert!(!is_store_pwsh(None));
+    }
+}

@@ -138,10 +138,10 @@ it exit at launch on `unexpected argument`):
 - `deny` does **not** bind a codex agent (claude only).
 
 With `allow_ctl`, a sandboxed codex agent can reach atrium's control socket and
-nothing else (no domains, no other socket). That needs codex's experimental
-`network_proxy` feature; an older codex can't run `atrium ctl` unless it runs at
-`skip`, and on **Windows** a sandboxed codex pane can't reach ctl at all yet. The
-bar says which at spawn. codex also asks "Trust this folder?" the first time it
+nothing else (no domains, no other socket). On macOS/Linux that needs codex's
+experimental `network_proxy` feature; an older codex can't run `atrium ctl`
+unless it runs at `skip`, and the bar says so at spawn. On **Windows** the
+control pipe admits codex's sandbox as is (atrium ≥ 0.40.3). codex also asks "Trust this folder?" the first time it
 runs in a directory, and atrium does not pre-accept that one, so answer it once
 per directory (or run `codex` there by hand first) before a hands-off launch.
 
@@ -503,9 +503,14 @@ Write rules as concrete commands an agent can follow, not as goals.
 - Rust job cap in an *untracked* `.cargo/config.toml` → worktrees outside the repo
   never see it; commit it.
 - `deny` on a codex agent → not enforced (claude only); the banner warns.
-- Coordinating codex agent on Windows, or with a codex that lacks
+- Coordinating codex agent on macOS/Linux with a codex that lacks
   `network_proxy` → its commands can't reach ctl under `plan`/`accept`/`automode`.
-  Give it `"trust": "skip"` only if the human accepts no sandbox for it.
+  Give it `"trust": "skip"` only if the human accepts no sandbox for it. (On
+  Windows the control pipe admits codex's sandbox since atrium 0.40.3.)
+- codex agent on Windows whose `pwsh` is the Microsoft Store build (under
+  `WindowsApps`) → its sandbox can't start that shell, so every command fails
+  with `Access is denied` and the bar says so at spawn. Install a non-packaged
+  PowerShell 7 (`winget install Microsoft.PowerShell`) ahead of it on PATH.
 - codex agent in a directory codex has never run in → it waits on codex's own
   "Trust this folder?" dialog; answer it once before a hands-off launch.
 - `--dangerously-skip-permissions`, `--permission-mode` or `--allowedTools` in a

@@ -103,6 +103,7 @@ extern "system" {
 
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_USER_CLASS: i32 = 1; // TOKEN_INFORMATION_CLASS::TokenUser
+const TOKEN_LOGON_SID_CLASS: i32 = 28; // TOKEN_INFORMATION_CLASS::TokenLogonSid
 const SDDL_REVISION_1: u32 = 1;
 
 /// SECURITY_ATTRIBUTES: nLength, lpSecurityDescriptor, bInheritHandle.
@@ -141,9 +142,22 @@ unsafe fn read_wide(mut p: *const u16) -> String {
     String::from_utf16_lossy(&units)
 }
 
-/// Build the SDDL for a DACL that grants full access only to the current user
-/// and LocalSystem, e.g. `D:P(A;;GA;;;S-1-5-21-…)(A;;GA;;;SY)`. `None` if the
-/// user SID can't be resolved (caller then falls back to the default DACL).
+/// Build the SDDL for a DACL that grants full access only to the current user,
+/// LocalSystem and this logon session, e.g.
+/// `D:P(A;;GA;;;S-1-5-21-…)(A;;GA;;;SY)(A;;GA;;;S-1-5-5-0-…)`. `None` if the
+/// user SID can't be resolved (caller then falls back to the default DACL); a
+/// logon SID that can't be read is left out, the pipe then admits every process
+/// of the user except a restricted-token one.
+///
+/// The logon SID is there for codex. codex's Windows sandbox runs the agent's
+/// commands under a *restricted token*: the same user, but an access check
+/// must pass twice, once against the token's groups and once against its
+/// restricting SIDs, which are the logon SID, Everyone and one SID of codex's
+/// own, not the user. An ACE for the user alone fails the second check, so a
+/// sandboxed `atrium ctl` got `ACCESS_DENIED` on the pipe. The logon SID is in
+/// both lists, and it widens nothing: a process of this user in this logon
+/// session could open the pipe already, and another user's or session's
+/// process still can't. Measured with codex 0.163.0.
 fn current_user_sddl() -> Option<Vec<u16>> {
     // SAFETY: GetCurrentProcess takes no arguments and returns a pseudo-handle;
     // no CloseHandle is needed for it.
@@ -154,42 +168,64 @@ fn current_user_sddl() -> Option<Vec<u16>> {
     if unsafe { OpenProcessToken(proc, TOKEN_QUERY, &mut token) } == 0 {
         return None;
     }
+    // TOKEN_USER begins with its SID_AND_ATTRIBUTES; TOKEN_GROUPS (what the
+    // logon-SID class returns) puts a u32 count first, padded to a word.
+    let user = token_sid(token, TOKEN_USER_CLASS, 0);
+    let logon = token_sid(token, TOKEN_LOGON_SID_CLASS, 1);
+    // SAFETY: `token` is open and nothing uses it after this; this is its one
+    // close on this path.
+    unsafe { CloseHandle(token) };
+    let user = user?;
+    // P = protected (no inheritance); GA = generic all; SY = LocalSystem.
+    let mut sddl = format!("D:P(A;;GA;;;{user})(A;;GA;;;SY)");
+    if let Some(logon) = logon {
+        sddl.push_str(&format!("(A;;GA;;;{logon})"));
+    }
+    Some(wide(&sddl))
+}
+
+/// The string SID of the first `SID_AND_ATTRIBUTES` in what `GetTokenInformation`
+/// returns for `class`, which sits `skip_words` pointer-sized words into the
+/// buffer. `None` if the token doesn't answer or the SID doesn't convert.
+fn token_sid(token: Handle, class: i32, skip_words: usize) -> Option<String> {
     // First call sizes the buffer; second fills it.
     let mut need = 0u32;
     // SAFETY: `token` is open; a null buffer with length 0 is the documented
     // sizing call, and `need` is a live local that receives the required size.
-    unsafe { GetTokenInformation(token, TOKEN_USER_CLASS, std::ptr::null_mut(), 0, &mut need) };
+    unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut need) };
     if need == 0 {
-        // SAFETY: `token` was opened above and is closed once, on this return.
-        unsafe { CloseHandle(token) };
         return None;
     }
     // Sized in `usize` words, not bytes: the buffer is read back below as a
     // `SidAndAttributes`, which holds a pointer and so needs pointer alignment.
     // A `Vec<u8>` only promises alignment 1 - casting it made that read UB.
     let word = std::mem::size_of::<usize>();
-    let mut buf = vec![0usize; (need as usize + word - 1) / word];
-    // SAFETY: `token` is still open; `buf` is a live allocation of at least
-    // `need` bytes (rounded up to whole words), and `need` is a live local.
+    let words = (need as usize + word - 1) / word;
+    if words <= skip_words {
+        return None;
+    }
+    let mut buf = vec![0usize; words];
+    // SAFETY: `token` is open; `buf` is a live allocation of at least `need`
+    // bytes (rounded up to whole words), and `need` is a live local.
     let ok = unsafe {
         GetTokenInformation(
             token,
-            TOKEN_USER_CLASS,
+            class,
             buf.as_mut_ptr() as *mut c_void,
             need,
             &mut need,
         )
     };
-    // SAFETY: `token` is open and nothing uses it after this; this is its one
-    // close on this path.
-    unsafe { CloseHandle(token) };
     if ok == 0 {
         return None;
     }
-    // The buffer begins with a SID_AND_ATTRIBUTES whose `sid` points inside it.
-    // SAFETY: the call succeeded, so the buffer holds a TOKEN_USER, whose first
-    // member is this struct; `buf` is `usize`-aligned and at least `need` bytes.
-    let sa = unsafe { &*(buf.as_ptr() as *const SidAndAttributes) };
+    // SAFETY: the call succeeded, so the buffer holds the class's struct, whose
+    // first SID_AND_ATTRIBUTES is `skip_words` words in (checked above to be
+    // inside the buffer); `buf` is `usize`-aligned, and `sid` points into it.
+    let sa = unsafe { &*(buf.as_ptr().add(skip_words) as *const SidAndAttributes) };
+    if sa.sid.is_null() {
+        return None;
+    }
     let mut sid_str: *mut u16 = std::ptr::null_mut();
     // SAFETY: `sa.sid` points into `buf`, which is alive for the call, and
     // `sid_str` is a live local that receives the allocated string.
@@ -202,9 +238,7 @@ fn current_user_sddl() -> Option<Vec<u16>> {
     // SAFETY: `sid_str` came from ConvertSidToStringSidW, whose contract is to
     // free it with LocalFree, and it is not used after this.
     unsafe { LocalFree(sid_str as *mut c_void) };
-    // P = protected (no inheritance); GA = generic all; SY = LocalSystem.
-    let sddl = format!("D:P(A;;GA;;;{sid})(A;;GA;;;SY)");
-    Some(wide(&sddl))
+    Some(sid)
 }
 
 const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
@@ -803,18 +837,23 @@ fn read_reply(h: Handle, start: Instant, stall: Duration, hard: Duration) -> io:
 
 #[cfg(test)]
 mod tests {
-    /// The pipe DACL is built from the token's user SID. A failure falls back to
-    /// the default DACL without a word (`bind` keeps going), so only a direct
-    /// check shows the token read - and the aligned buffer it is read through -
-    /// actually works.
+    /// The pipe DACL is built from the token's user SID and its logon SID. A
+    /// failure falls back to the default DACL without a word (`bind` keeps
+    /// going), so only a direct check shows the token reads - and the aligned
+    /// buffer they go through - actually work. The logon-SID ACE is what lets
+    /// a codex sandbox (a restricted token) open the pipe; without it that
+    /// pane is silently shut out again.
     #[test]
-    fn the_pipe_dacl_names_the_current_user() {
+    fn the_pipe_dacl_names_the_current_user_and_logon_session() {
         let sddl = super::current_user_sddl().expect("the current user's SID resolves");
         let text = String::from_utf16_lossy(&sddl);
+        let text = text.trim_end_matches('\0');
         assert!(text.starts_with("D:P(A;;GA;;;S-1-5-"), "{text}");
+        assert!(text.contains("(A;;GA;;;SY)"), "{text}");
+        let logon = text.rsplit("(A;;GA;;;").next().unwrap_or("");
         assert!(
-            text.ends_with("(A;;GA;;;SY)\0") || text.ends_with("(A;;GA;;;SY)"),
-            "{text}"
+            logon.starts_with("S-1-5-5-") && logon.ends_with(')'),
+            "no logon-SID ACE at the end of {text}"
         );
     }
 }

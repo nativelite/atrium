@@ -91,6 +91,105 @@ fn fleet_up_opens_a_two_agent_window() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A two-agent fleet, a claude `lead` and a codex `dev`, comes up with ctl on at
+/// the `accept` posture, and the codex pane, from inside its own sandbox,
+/// reaches the control pipe: told to run `atrium ctl whoami`, its screen shows
+/// the reply. The spawn log proves the pane was sandboxed (`--sandbox
+/// workspace-write`, `--no-daemon`), not launched at `skip`. This is the live
+/// shape of the founder's report (a codex teammate that could take a message
+/// but never answer on the bus) and the Windows DACL fix behind it. Ignored by
+/// default: it needs real `claude` and `codex` programs, logged in, and a model
+/// turn from codex. Run it by hand:
+/// `cargo test --test atrium codex_dev -- --ignored --nocapture`.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs claude and codex on PATH, logged in; run with --ignored"]
+fn a_claude_lead_and_a_sandboxed_codex_dev_fleet_reaches_ctl() {
+    let td = std::env::temp_dir().join(format!("atrium-codex-dev-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    let log = td.join("spawn.log");
+    // The lead runs in this repo (a directory claude already trusts, so the
+    // launch leaves no new trust entry behind); the dev runs in the temp dir,
+    // where its workspace-write sandbox can do no harm.
+    let repo = env!("CARGO_MANIFEST_DIR").replace('\\', "/");
+    let fleet_json = format!(
+        r#"{{ "fleets": {{ "pair": {{ "grid": "1x2", "allow_ctl": true, "trust": "accept",
+          "mod": false, "captions": false, "agents": [
+          {{ "name": "lead", "cmd": ["claude"], "cwd": "{repo}" }},
+          {{ "name": "dev", "cmd": ["codex",
+             "Run the shell command `atrium ctl whoami` and print its raw output exactly as returned, then stop."] }}
+        ] }} }} }}"#
+    );
+    std::fs::write(td.join("atrium.fleet.json"), fleet_json).unwrap();
+
+    // codex runs its commands through `pwsh` when one is on PATH, and its
+    // sandbox cannot start the Microsoft Store build of it (a packaged app):
+    // every command then fails before it runs, `atrium ctl` included, and the
+    // bar says so at spawn. That is codex's shell, not the pipe, so the fleet
+    // here sees a PATH without the Store alias and codex falls back to Windows
+    // PowerShell, which its sandbox can run. A machine with a non-packaged
+    // PowerShell 7 ahead of the Store one needs none of this.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        std::env::split_paths(&path)
+            .filter(|d| !atrium::vendors::is_store_pwsh(Some(&d.join("pwsh.exe")))),
+    )
+    .unwrap();
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["fleet", "up", "pair"],
+        40,
+        160,
+        &[
+            ("ATRIUM_YES".to_string(), "1".to_string()),
+            (
+                "ATRIUM_SPAWN_LOG".to_string(),
+                log.to_string_lossy().to_string(),
+            ),
+            ("PATH".to_string(), path.to_string_lossy().to_string()),
+        ],
+        Some(&td.to_string_lossy()),
+    )
+    .unwrap();
+
+    let out = read_until(&mut p, b"2:dev", Duration::from_secs(30));
+    assert!(
+        contains(&out, b"1:lead") && contains(&out, b"2:dev"),
+        "the lead and dev panes did not both come up: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The codex pane's `ctl whoami` reply lands on its screen: the pipe let
+    // the sandboxed client in. Without the logon-SID ACE this is ACCESS_DENIED
+    // and the reply never comes.
+    let out = read_until(&mut p, b"\"ok\":true", Duration::from_secs(180));
+    let screen = String::from_utf8_lossy(&strip_csi_bytes(&out)).to_string();
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "no ctl whoami reply on the codex pane's screen: {screen:?}"
+    );
+
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 20);
+
+    // The dev was launched sandboxed, off the daemon: the fix is in the pipe's
+    // access list, not in a bypass.
+    let spawned = std::fs::read_to_string(&log).unwrap_or_default();
+    let codex_line = spawned
+        .lines()
+        .find(|l| l.contains("codex"))
+        .unwrap_or_else(|| panic!("no codex launch in the spawn log: {spawned:?}"));
+    assert!(
+        codex_line.contains("--sandbox") && codex_line.contains("workspace-write"),
+        "the codex pane was not sandboxed: {codex_line}"
+    );
+    assert!(
+        codex_line.contains("--no-daemon"),
+        "the codex pane was not launched off the daemon: {codex_line}"
+    );
+    let _ = std::fs::remove_dir_all(&td);
+}
+
 /// `atrium fleet up nope` with no fleet file is a clean error, not a hung window.
 #[test]
 fn fleet_up_unknown_file_is_a_startup_error() {

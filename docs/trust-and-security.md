@@ -125,11 +125,12 @@ codex's coarser model has no per-command allowlist, so `accept` and `automode`
 are the same for it, and `deny` rules (claude's `--disallowedTools`) don't bind
 a codex pane.
 
-**The control socket is let through the sandbox, and nothing else.** codex's
-sandbox counts a connection to a unix socket as network, and both of its
-sandboxes have no network, so a codex pane at `plan`, `accept` or `automode`
-could not run `atrium ctl` at all (`Operation not permitted`). With the control
-plane on, atrium now launches such a pane under a codex permission profile,
+**The control socket is let through the sandbox, and nothing else.** On
+macOS and Linux, codex's sandbox counts a connection to a unix socket as
+network, and both of its sandboxes have no network, so a codex pane at `plan`,
+`accept` or `automode` could not run `atrium ctl` at all (`Operation not
+permitted`). With the control plane on, atrium now launches such a pane under a
+codex permission profile,
 `atrium_ctl`, in place of `--sandbox`. It is codex's own `:workspace` (or
 `:read-only` for `plan`) with one change: the network is on, but routed through
 codex's proxy in `limited` mode with **no domain allowed** and **one** unix
@@ -152,14 +153,43 @@ Limits:
   (`codex features list`); one without it keeps the plain `--sandbox`, and
   the bar says its commands can't reach ctl. Update codex, or run that pane at
   `--mode skip`.
-- **Windows is not covered yet.** There atrium's endpoint is a named pipe, and
-  codex's allowance is for unix sockets, so a sandboxed codex pane still
-  can't reach ctl on Windows; the bar says so at spawn.
 - **Linux is untested.** The profile is the same, but only macOS was measured.
 - **codex's own folder-trust dialog is not pre-accepted.** codex asks "Trust
   this folder?" the first time it runs in a directory and saves the answer in
   `~/.codex/config.toml`; atrium does not write that file, so a hands-off codex
   pane in a new directory waits on the dialog until someone answers it.
+
+**On Windows the pipe admits the sandbox itself.** There codex's sandbox is
+not a network filter but a *restricted token*: the agent's commands run as the
+same user, with an access check that must pass twice, against the token's
+groups and again against its restricting SIDs, which are the logon session,
+Everyone and one SID of codex's own, not the user. atrium's control pipe
+granted the user and SYSTEM only, which fails the second check, so a sandboxed
+`atrium ctl` got `ACCESS_DENIED` and the pane could receive but never reply.
+The pipe's access list now also names **atrium's own logon SID**, the one SID in
+both lists. That widens nothing: a process of this user in this logon session
+could open the pipe already, and another user's, or another logon session's,
+still can't. No profile and no `network_proxy` are needed on Windows; the pane
+keeps its plain `--sandbox`. Measured with codex 0.163.0: `atrium ctl list`
+run under `codex sandbox` from inside a live pane gets its reply
+(`tests/atrium/ctl.rs`, `ctl_list_roundtrips_from_inside_a_codex_sandbox`,
+ignored by default because it needs a `codex` on PATH), and a two-agent fleet,
+a claude `lead` and a codex `dev` at `accept`, in which the codex pane's
+`atrium ctl whoami` answers with its role (`tests/atrium/fleet.rs`,
+`a_claude_lead_and_a_sandboxed_codex_dev_fleet_reaches_ctl`, ignored too: it
+needs both programs logged in).
+
+One Windows condition is codex's, not the pipe's, and atrium can only name it:
+codex runs the agent's commands through `pwsh` when one is on PATH, and its
+restricted token **cannot start the Microsoft Store build of PowerShell** (a
+packaged app under `WindowsApps`): `CreateProcessAsUserW` fails with `Access is
+denied` before the command runs, so *every* command fails, `atrium ctl`
+included, and codex reports that it was denied or could not connect. When a
+sandboxed codex pane spawns and `pwsh` resolves into a `WindowsApps` directory,
+the bar says so. The fix is outside atrium: install a non-packaged PowerShell 7
+(`winget install Microsoft.PowerShell`) ahead of the Store one on PATH, or
+remove the Store build; codex without any `pwsh` falls back to Windows
+PowerShell, which its sandbox runs fine.
 
 ## The security model
 

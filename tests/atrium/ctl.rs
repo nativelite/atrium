@@ -48,6 +48,32 @@ fn ctl_list_roundtrips_through_a_live_atrium() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// `atrium ctl list` run *under codex's Windows sandbox* from inside a live pane
+/// reaches the control pipe. codex runs an agent's commands under a restricted
+/// token, whose access check must also pass against its restricting SIDs; the
+/// pipe's DACL names the logon SID for exactly this, and without that ACE the
+/// open is `ACCESS_DENIED` and the reply never comes. Ignored by default: it
+/// needs a `codex` on PATH (`codex sandbox` is its own sandbox runner), so run
+/// it by hand where one is installed:
+/// `cargo test --test atrium codex_sandbox -- --ignored`.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs codex on PATH; run with --ignored where it is installed"]
+fn ctl_list_roundtrips_from_inside_a_codex_sandbox() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("codex sandbox -- \"{atrium}\" ctl list\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"tree\"", Duration::from_secs(60));
+    assert!(
+        contains(&out, b"\"ok\":true") && contains(&out, b"\"tree\""),
+        "no ctl list reply from inside the codex sandbox in: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl spawn -- <shell>` opens a *visible* new worker window: after the
 /// call the bar gains a second pane entry. This is the C1 "an in-pane
 /// `ctl spawn` opens a visible worker" done-criterion, end to end.

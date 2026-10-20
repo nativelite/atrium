@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Windows: a sandboxed codex pane reaches atrium ctl.** codex's Windows
+  sandbox runs the agent's commands under a restricted token, whose access
+  check must also pass against the token's restricting SIDs (the logon
+  session, Everyone, one SID of codex's own); the control pipe granted only the
+  user and SYSTEM, so every `atrium ctl` from a codex pane at `plan`, `accept`
+  or `automode` was refused with `ACCESS_DENIED`, and the pane could take a
+  message but never answer on the bus. The pipe's access list now also names
+  atrium's own logon SID, which admits that sandbox and no one new: another
+  user's or another logon session's process is still shut out. The spawn-time
+  warning that said Windows was not covered is gone; the pane keeps its plain
+  `--sandbox`. Measured with codex 0.163.0 (`ctl list` run under `codex
+  sandbox` inside a live pane, and a claude-lead + codex-dev fleet at `accept`
+  whose codex pane answers `ctl whoami`; two ignored e2e tests keep the proof)
+  ([codex panes](docs/trust-and-security.md#codex-panes)).
+- **Windows: the bar names the Store PowerShell.** codex runs its commands
+  through `pwsh` when one is on PATH, and its sandbox cannot start the
+  Microsoft Store build of it (a packaged app): every command then fails with
+  `Access is denied` before it runs, which codex reports as being denied or
+  unable to connect. A sandboxed codex pane whose `pwsh` resolves into
+  `WindowsApps` now says so at spawn, with the fix (a non-packaged PowerShell 7
+  ahead of it, or `--mode skip`).
+
 ## [0.40.2] - 2026-10-19
 
 ### Changed

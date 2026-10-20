@@ -64,7 +64,7 @@ version = "0.1.0"
 
 [[package]]
 name = "nativelite-vterm"
-version = "0.5.4"
+version = "0.5.5"
 dependencies = [
  "nativelite-ansi",
  "nativelite-uwidth",
