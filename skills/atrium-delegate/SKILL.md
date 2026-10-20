@@ -41,6 +41,9 @@ editing: the teammate then works in its own git worktree and branch, and you
 merge its commit. `-- codex` spawns a codex teammate instead; on macOS/Linux
 with a codex too old to have its `network_proxy` feature, a sandboxed codex pane
 can't run `atrium ctl`, so check its commit rather than waiting for its bus post.
+A codex spawn may carry codex's own options (`--enable <feature>`, `-c <key>=…`),
+but not its sandbox or approval ones (use `--mode`), nor `-C`, `--add-dir` or a
+`-c` key that starts a program or widens the sandbox (`mcp_servers`, `notify`, …).
 
 When atrium's mod is loaded you also have these as tools: `atrium_spawn`,
 `atrium_send`, `atrium_status`, `atrium_list`, `atrium_kill`, the `atrium_board_*`

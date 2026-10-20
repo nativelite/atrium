@@ -169,7 +169,12 @@ same ctl directive and lets its sandbox reach the control socket (on Windows
 the pipe admits it as is). With a codex too old to have its `network_proxy`
 feature (macOS/Linux only), a sandboxed codex pane can't run `atrium ctl` (the
 bar says so at spawn), so it can build but not report on the bus: have it
-commit, and check its checkpoint yourself.
+commit, and check its checkpoint yourself. A codex spawn may carry codex's own
+options (`-- codex -m <model> --enable <feature> -c model_verbosity="low"`);
+atrium strips any sandbox or approval option (use `--mode`), and refuses `-C`,
+`--add-dir`, and `-c` keys that make codex start a program or widen its sandbox
+(`mcp_servers`, `notify`, `hooks`, network domains, …) — those are the fleet
+file's to set, not a teammate's.
 
 **Placement.** `--here` tiles the teammate beside you as a pane, so you and your
 team sit in one org-chart view — prefer this for a handful of teammates. Use

@@ -135,7 +135,17 @@ it exit at launch on `unexpected argument`):
 - `add_dirs` → one `--add-dir` per directory (codex makes them writable);
 - `trust`: `plan` = read-only sandbox, `accept`/`automode` = workspace sandbox
   (the same for codex, which has no command allowlist), `skip` = no sandbox;
-- `deny` does **not** bind a codex agent (claude only).
+- `deny` does **not** bind a codex agent (claude only);
+- `cmd` may carry **any other codex option** (atrium 0.40.4 and newer; before,
+  only `--model`/`-m`): `--enable network_proxy`, `-c model_verbosity="low"`,
+  `--search`, `--oss`, even `-c mcp_servers.…` or `notify`, which codex runs
+  outside its sandbox, so only put those in a fleet you mean to. Stripped, with a
+  preflight warning: `-s/--sandbox`, `-a/--ask-for-approval`,
+  `--dangerously-bypass-approvals-and-sandbox`/`--yolo`, `-p/--profile`,
+  `--remote` and their `-c` keys (`sandbox_mode`, `approval_policy`,
+  `permissions.*`, …): set `trust`. Refused: `-C/--cd` and `--add-dir`: set
+  `cwd` and `add_dirs`. A teammate's `ctl spawn -- codex …` gets the same, minus
+  the out-of-sandbox keys (`mcp_servers`, `notify`, `hooks`, network domains, …).
 
 With `allow_ctl`, a sandboxed codex agent can reach atrium's control socket and
 nothing else (no domains, no other socket). On macOS/Linux that needs codex's
