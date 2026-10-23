@@ -1,6 +1,6 @@
 ---
 name: atrium-delegate
-description: Delegate an independent, substantial part of your work to a teammate agent (a claude in its own atrium pane) via `atrium ctl`, when it genuinely pays off. Use when running inside atrium and part of the task is large and independent.
+description: Delegate an independent, substantial part of your work to a teammate agent (a claude or codex in its own atrium pane) via `atrium ctl`, when it genuinely pays off. Use when running inside atrium and part of the task is large and independent.
 ---
 
 # Delegating to a teammate agent (atrium ctl)
