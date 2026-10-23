@@ -16,10 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over the fleet's), now refines what happens inside that posture in codex's
   own terms — `approval` (`never`, `on-request`, `on-failure`, `untrusted`),
   `git` (`write`, the default at `accept`/`automode`, or `read`),
-  `read_only` paths, `network` through codex's proxy to every host or the
-  `domains` listed, and `unix_sockets` — and atrium folds it into the same
-  `atrium_ctl` permission profile. A key the block does not have is an
-  error, not a silent no-op. The banner names each distinct block with the
+  `read_only` paths, `network` through codex's proxy (`true`/`"full"` or
+  `"limited"`) to every host or the `domains` listed less `deny_domains`,
+  `local` (loopback and local servers), `unix_sockets`, and `raw`, any other
+  key of codex's permission profile passed through as written (the proxy and
+  SOCKS settings, MITM hooks, …), so the block reaches the whole profile —
+  and atrium folds it into the same `atrium_ctl` permission profile. A key
+  the block does not have is an error, not a silent no-op, and a `raw` key
+  the block sets itself is refused. The banner names each distinct block with the
   agents it reaches and warns when one is set on an agent that is not codex;
   `plan` takes only the approval and the network, `skip` ignores the block,
   and an agent's `ctl spawn` cannot set one

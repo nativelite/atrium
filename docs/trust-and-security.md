@@ -165,9 +165,12 @@ and appending to `config` are refused. `plan` stays read-only, git included.
 inside the posture `trust` chose, in codex's own terms: its approval policy
 (`approval`), whether git stays read-only (`git`), paths kept read-only
 inside the workspace (`read_only`), the network through codex's proxy to
-every host or the listed ones (`network`, `domains`), and further unix
-sockets (`unix_sockets`). atrium folds it into the same `atrium_ctl` profile
-and the banner names each distinct block with the agents it reaches. The
+every host or the listed ones (`network`, `domains`, `deny_domains`),
+loopback and local servers (`local`), further unix sockets
+(`unix_sockets`), and `raw`, any other key of codex's permission profile
+passed through as written — so the block reaches the whole of that profile,
+not a subset atrium chose. atrium folds it into the same `atrium_ctl`
+profile and the banner names each distinct block with the agents it reaches. The
 posture still wins: `plan` takes only the approval and the network, `skip`
 ignores the block, and an agent's `ctl spawn` cannot set one. See
 [codex permissions](fleets.md#codex-permissions).

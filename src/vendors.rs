@@ -283,66 +283,102 @@ pub fn codex_profile(base: &str, net: Option<&CodexNet<'_>>, fs: &[CodexFsRule])
         ));
     }
     if let Some(net) = net.filter(|n| n.any()) {
-        v.extend(codex_config(
-            &format!("permissions.{p}.network.enabled"),
-            "true",
-        ));
-        // `limited` lets only the allowed unix sockets through (HTTPS is
-        // refused without MITM); `full` is the network as the block opened it,
-        // every host or the listed ones.
-        v.extend(codex_config(
-            &format!("permissions.{p}.network.mode"),
-            &toml_string(if net.open { "full" } else { "limited" }),
-        ));
-        if net.open && !net.domains.is_empty() {
+        if net.opened() {
             v.extend(codex_config(
-                &format!("permissions.{p}.network.domains"),
-                &allow_table(net.domains.iter().map(String::as_str)),
+                &format!("permissions.{p}.network.enabled"),
+                "true",
             ));
-        }
-        // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
-        // quotes or not, so the socket path's own dots would break it.
-        let sockets: Vec<&str> = net
-            .ctl
-            .into_iter()
-            .chain(net.sockets.iter().map(String::as_str))
-            .collect();
-        if !sockets.is_empty() {
+            // `limited` lets only the allowed unix sockets through (HTTPS is
+            // refused without MITM); the block's own mode when it opened the
+            // network, `full` for every method and every host or the listed ones.
             v.extend(codex_config(
-                &format!("permissions.{p}.network.unix_sockets"),
-                &allow_table(sockets.into_iter()),
+                &format!("permissions.{p}.network.mode"),
+                &toml_string(net.mode.unwrap_or("limited")),
             ));
+            if net.mode.is_some() {
+                // A map with entries is an allow list to codex: denies alone
+                // would refuse every host (measured). `*` allows the rest, so
+                // `deny_domains` on its own means every host but these.
+                let star = net.domains.is_empty() && !net.deny_domains.is_empty();
+                let hosts: Vec<(&str, &str)> = star
+                    .then_some(("*", "allow"))
+                    .into_iter()
+                    .chain(net.domains.iter().map(|d| (d.as_str(), "allow")))
+                    .chain(net.deny_domains.iter().map(|d| (d.as_str(), "deny")))
+                    .collect();
+                if !hosts.is_empty() {
+                    v.extend(codex_config(
+                        &format!("permissions.{p}.network.domains"),
+                        &access_table(hosts.into_iter()),
+                    ));
+                }
+            }
+            // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
+            // quotes or not, so the socket path's own dots would break it.
+            let sockets: Vec<(&str, &str)> = net
+                .ctl
+                .into_iter()
+                .chain(net.sockets.iter().map(String::as_str))
+                .map(|s| (s, "allow"))
+                .collect();
+            if !sockets.is_empty() {
+                v.extend(codex_config(
+                    &format!("permissions.{p}.network.unix_sockets"),
+                    &access_table(sockets.into_iter()),
+                ));
+            }
+            if net.local {
+                v.extend(codex_config(
+                    &format!("permissions.{p}.network.allow_local_binding"),
+                    "true",
+                ));
+            }
+            v.push("--enable".to_string());
+            v.push(CODEX_NETWORK_PROXY.to_string());
         }
-        v.push("--enable".to_string());
-        v.push(CODEX_NETWORK_PROXY.to_string());
+        // The block's raw keys, as written: the rest of codex's profile.
+        for (key, value) in net.raw {
+            v.extend(codex_config(&format!("permissions.{p}.{key}"), value));
+        }
     }
     v
 }
 
-/// What a codex permission profile opens on the network: the control socket
-/// `ctl`, the network itself (`open`, through codex's proxy) to every host or
-/// the `domains` listed, and `sockets`, further unix sockets. See
-/// [`codex_profile`].
+/// What a codex permission profile opens on the network, and the rest of the
+/// block: the control socket `ctl`; the network itself through codex's proxy
+/// in `mode` (`"full"` or `"limited"`, `None` shut) to every host or the
+/// `domains` listed, less `deny_domains`; `local`, loopback and local servers;
+/// `sockets`, further unix sockets; and `raw`, other profile keys with their
+/// TOML values ([`perms::CodexPerms::raw`]). See [`codex_profile`].
 #[derive(Debug, Clone, Copy)]
 pub struct CodexNet<'a> {
     pub ctl: Option<&'a str>,
-    pub open: bool,
+    pub mode: Option<&'a str>,
     pub domains: &'a [String],
+    pub deny_domains: &'a [String],
+    pub local: bool,
     pub sockets: &'a [String],
+    pub raw: &'a [(String, String)],
 }
 
 impl CodexNet<'_> {
-    /// Is there anything to open? Nothing means the base's own no-network.
+    /// Is the network opened at all (keys, proxy feature)? Nothing means the
+    /// base's own no-network.
+    pub fn opened(&self) -> bool {
+        self.ctl.is_some() || self.mode.is_some() || !self.sockets.is_empty() || self.local
+    }
+
+    /// Is there anything to emit, the network or raw keys?
     pub fn any(&self) -> bool {
-        self.ctl.is_some() || self.open || !self.sockets.is_empty()
+        self.opened() || !self.raw.is_empty()
     }
 }
 
-/// An inline TOML table granting each key `allow`, the shape of codex's
-/// `network.unix_sockets` and `network.domains` maps.
-fn allow_table<'a>(keys: impl Iterator<Item = &'a str>) -> String {
-    let entries: Vec<String> = keys
-        .map(|k| format!("{}={}", toml_string(k), toml_string("allow")))
+/// An inline TOML table of `key=access` pairs, the shape of codex's
+/// `network.unix_sockets` and `network.domains` maps (`allow`/`deny`).
+fn access_table<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let entries: Vec<String> = pairs
+        .map(|(k, access)| format!("{}={}", toml_string(k), toml_string(access)))
         .collect();
     format!("{{{}}}", entries.join(","))
 }
@@ -363,9 +399,12 @@ fn allow_table<'a>(keys: impl Iterator<Item = &'a str>) -> String {
 pub fn codex_ctl_sandbox(base: &str, ctl: &str) -> Vec<String> {
     let net = CodexNet {
         ctl: Some(ctl),
-        open: false,
+        mode: None,
         domains: &[],
+        deny_domains: &[],
+        local: false,
         sockets: &[],
+        raw: &[],
     };
     codex_profile(base, Some(&net), &[])
 }
@@ -1084,9 +1123,12 @@ mod tests {
         );
         let ctl = CodexNet {
             ctl: Some("/t/a.sock"),
-            open: false,
+            mode: None,
             domains: &[],
+            deny_domains: &[],
+            local: false,
             sockets: &[],
+            raw: &[],
         };
         let with_ctl = codex_profile(":workspace", Some(&ctl), &rules);
         let fs = with_ctl
@@ -1143,9 +1185,12 @@ mod tests {
         let socks = vec!["/run/x.sock".to_string()];
         let net = CodexNet {
             ctl: Some("/t/a.sock"),
-            open: true,
+            mode: Some("full"),
             domains: &hosts,
+            deny_domains: &[],
+            local: false,
             sockets: &socks,
+            raw: &[],
         };
         let v = codex_profile(":workspace", Some(&net), &[]).join(" ");
         assert!(v.contains(r#"network.mode="full""#), "{v}");
@@ -1161,9 +1206,12 @@ mod tests {
         // Open to every host: no domains map at all.
         let every = CodexNet {
             ctl: None,
-            open: true,
+            mode: Some("full"),
             domains: &[],
+            deny_domains: &[],
+            local: false,
             sockets: &[],
+            raw: &[],
         };
         let v = codex_profile(":workspace", Some(&every), &[]).join(" ");
         assert!(
@@ -1174,13 +1222,84 @@ mod tests {
         // Nothing to open: the base alone.
         let shut = CodexNet {
             ctl: None,
-            open: false,
+            mode: None,
             domains: &hosts,
+            deny_domains: &[],
+            local: false,
             sockets: &[],
+            raw: &[],
         };
         assert!(!shut.any());
         let v = codex_profile(":workspace", Some(&shut), &[]).join(" ");
         assert!(!v.contains("network"), "{v}");
+    }
+
+    /// Denied hosts ride in the same map as allowed ones, `local` and
+    /// `limited` are spelled as codex's keys, and raw keys follow the named
+    /// ones as written; raw keys alone open no network.
+    #[test]
+    fn codex_profile_spells_denied_hosts_local_binding_and_raw_keys() {
+        let allow = vec!["api.github.com".to_string()];
+        let deny = vec!["telemetry.example".to_string()];
+        let raw = vec![(
+            "network.proxy_url".to_string(),
+            "\"http://127.0.0.1:3128\"".to_string(),
+        )];
+        let net = CodexNet {
+            ctl: None,
+            mode: Some("limited"),
+            domains: &allow,
+            deny_domains: &deny,
+            local: true,
+            sockets: &[],
+            raw: &raw,
+        };
+        let v = codex_profile(":workspace", Some(&net), &[]).join(" ");
+        assert!(v.contains(r#"network.mode="limited""#), "{v}");
+        assert!(
+            v.contains(r#"network.domains={"api.github.com"="allow","telemetry.example"="deny"}"#),
+            "{v}"
+        );
+        assert!(v.contains("network.allow_local_binding=true"), "{v}");
+        assert!(
+            v.ends_with(r#"--enable network_proxy -c permissions.atrium_ctl.network.proxy_url="http://127.0.0.1:3128""#),
+            "{v}"
+        );
+        // Denies alone: codex would refuse every host, so `*` allows the rest
+        // (measured: `*` allow + one deny = that host refused, others answer).
+        let deny_only = CodexNet {
+            ctl: None,
+            mode: Some("full"),
+            domains: &[],
+            deny_domains: &deny,
+            local: false,
+            sockets: &[],
+            raw: &[],
+        };
+        let v = codex_profile(":workspace", Some(&deny_only), &[]).join(" ");
+        assert!(
+            v.contains(r#"network.domains={"*"="allow","telemetry.example"="deny"}"#),
+            "{v}"
+        );
+        let raw_only = CodexNet {
+            ctl: None,
+            mode: None,
+            domains: &[],
+            deny_domains: &[],
+            local: false,
+            sockets: &[],
+            raw: &raw,
+        };
+        assert!(raw_only.any() && !raw_only.opened());
+        let v = codex_profile(":workspace", Some(&raw_only), &[]).join(" ");
+        assert!(
+            !v.contains("network.enabled") && !v.contains("--enable"),
+            "{v}"
+        );
+        assert!(
+            v.ends_with(r#"network.proxy_url="http://127.0.0.1:3128""#),
+            "{v}"
+        );
     }
 
     /// codex and claude both put `? for shortcuts` under an empty prompt; a

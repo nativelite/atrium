@@ -100,6 +100,7 @@ compatible), and an empty `agents` list is rejected.
 | `respawn_at` | 1..100 | context-window fill, in percent, at which a claude pane at its prompt gets one `decision_needed` to its parent ("checkpoint and respawn it?"). Never respawns by itself. Needs the mod |
 | `captions` | bool | `true` lets the mod spend a small `haiku` call on each pane's six-word caption, from the model's own words; that text leaves the pane for the call, so it defaults `false`. The tool-call caption (`running cargo test`) is free and always on. `fleet init` templates carry `"captions": false` to flip |
 | `claude_aliases` | array of strings | other commands that *are* claude (`["claude2"]`, a second account's shim), so their panes get every claude rule. For a second account prefer `claude_aliases` in `config.json` with its `config_dir` |
+| `codex` | object | what the fleet's codex panes may do beyond their posture, workers spawned later included: `approval`, `git`, `read_only`, `network`, `domains`, `deny_domains`, `local`, `unix_sockets`, `raw`. See [codex permissions](#codex-permissions-the-codex-block) (atrium 0.41.0 and newer) |
 
 ### Agent-level keys
 
@@ -118,6 +119,7 @@ compatible), and an empty `agents` list is rejected.
 | `identity` | string | per-agent credential, overrides the fleet default |
 | `can_spawn` | bool | may this agent create its own teammates via `atrium ctl spawn`? Defaults **false** for a fleet agent |
 | `deny` | array of strings | commands **this** agent may not run, on top of the fleet's `deny`. The way to stop a worker running workspace-wide builds (claude agents only) |
+| `codex` | object | this codex agent's own permissions beyond its posture, merged over the fleet's `codex` (scalars override, lists add). codex agents only; the banner warns when it sits on another. See [codex permissions](#codex-permissions-the-codex-block) |
 
 Launch arg order per agent: `cmd… [--add-dir …] [--append-system-prompt prompt]
 [--model M] [--effort E] "<kickoff>"`. You can equivalently inline `--model` in
@@ -143,7 +145,7 @@ it exit at launch on `unexpected argument`):
   preflight warning: `-s/--sandbox`, `-a/--ask-for-approval`,
   `--dangerously-bypass-approvals-and-sandbox`/`--yolo`, `-p/--profile`,
   `--remote` and their `-c` keys (`sandbox_mode`, `approval_policy`,
-  `permissions.*`, …): set `trust`. Refused: `-C/--cd` and `--add-dir`: set
+  `permissions.*`, …): set `trust`, and the `codex` block for the rest. Refused: `-C/--cd` and `--add-dir`: set
   `cwd` and `add_dirs`. A teammate's `ctl spawn -- codex …` gets the same, minus
   the out-of-sandbox keys (`mcp_servers`, `notify`, `hooks`, network domains, …).
 
@@ -154,6 +156,47 @@ unless it runs at `skip`, and the bar says so at spawn. On **Windows** the
 control pipe admits codex's sandbox as is (atrium ≥ 0.40.3). codex also asks "Trust this folder?" the first time it
 runs in a directory, and atrium does not pre-accept that one, so answer it once
 per directory (or run `codex` there by hand first) before a hands-off launch.
+
+#### codex permissions (the `codex` block)
+
+`trust` fixes a codex pane's posture (its sandbox and whether it may write);
+the `codex` block, on the fleet or on one codex agent, sets everything else in
+codex's own terms (atrium 0.41.0 and newer). atrium folds it into the
+`atrium_ctl` permission profile the pane already launches under, and the
+banner names each distinct block with the agents it reaches. Every key is
+optional; a key the block does not have is an **error**, never a silent no-op.
+
+```json
+"codex": {
+  "approval": "never",
+  "git": "write",
+  "read_only": ["../secrets"],
+  "network": true,
+  "domains": ["api.github.com", "*.crates.io"],
+  "deny_domains": ["telemetry.example"],
+  "local": true,
+  "unix_sockets": ["/run/user/1000/podman.sock"],
+  "raw": { "network.proxy_url": "http://127.0.0.1:3128" }
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `approval` | `never` | codex's `--ask-for-approval`: `never` (a refused command returns to the model), `on-request` (codex asks in the pane; a queued send waits), `on-failure`, `untrusted` |
+| `git` | `write` | at `accept`/`automode`, `write` opens the checkout's git dir and common dir so the pane can **commit** (hooks, `config`, `config.worktree` stay read-only); `read` keeps codex's default, `.git` read-only. `plan` is read-only regardless |
+| `read_only` | none | paths kept read-only inside what the pane may write (relative to the fleet file's directory) |
+| `network` | `false` | `true`/`"full"` opens the network through codex's proxy to every host or the `domains` listed; `"limited"` is codex's read-only HTTP mode (no HTTPS) |
+| `domains` / `deny_domains` | none | hosts allowed / refused (`"api.github.com"`, `"*.crates.io"`). `deny_domains` alone = every other host allowed (atrium adds codex's `*` allow; denies alone would refuse every host) |
+| `local` | `false` | `true` lets commands bind local servers and reach the host's loopback |
+| `unix_sockets` | none | further unix sockets, on top of the session's control socket |
+| `raw` | none | any other key of codex's permission profile, `"dotted.key": value`, passed through as written (proxy/SOCKS settings, MITM hooks, …); the keys above are refused here |
+
+The fleet's block reaches every codex pane of the session, workers a lead
+spawns later included; an agent's block overrides the fleet's scalars and adds
+to its lists. `plan` takes only `approval` and the network keys, `skip`
+ignores the block, and a teammate's `ctl spawn` cannot set one. Without a
+block, a codex pane at `accept`/`automode` in a checkout already gets `git:
+write`: that is what lets it commit on its branch.
 
 ### Minimal fleet
 

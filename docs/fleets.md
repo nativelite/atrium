@@ -183,7 +183,8 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
   "read_only": ["../secrets"],
   "network": true,
   "domains": ["api.github.com", "*.crates.io"],
-  "unix_sockets": ["/run/user/1000/podman.sock"]
+  "unix_sockets": ["/run/user/1000/podman.sock"],
+  "raw": { "network.proxy_url": "http://127.0.0.1:3128" }
 }
 ```
 
@@ -192,9 +193,12 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 | `approval` | `never` | codex's `--ask-for-approval` policy: `never` (a refused command returns to the model), `on-request` (codex asks in the pane; a queued send waits for the dialog), `on-failure`, `untrusted`. |
 | `git` | `write` | At `accept`/`automode`, `write` opens the checkout's git dir and common dir so the pane can commit, with `hooks/`, `config` and `config.worktree` kept read-only; `read` keeps codex's own default, `.git` read-only and no commit from inside the sandbox. `plan` is read-only regardless. |
 | `read_only` | none | Paths kept read-only inside what the pane may write (relative to the fleet file's directory, like `add_dirs`). |
-| `network` | `false` | `true` opens the network through codex's proxy — every host, or only the `domains` listed. `false` keeps the sandbox's own no-network, the control socket aside. |
+| `network` | `false` | `true` (or `"full"`) opens the network through codex's proxy — every host, or only the `domains` listed; `"limited"` is codex's read-only HTTP mode (GET/HEAD/OPTIONS, no HTTPS). `false` keeps the sandbox's own no-network, the control socket aside. |
 | `domains` | none | Hosts a networked pane may reach (`"api.github.com"`, `"*.crates.io"`): codex's `network.domains` allow list. Needs `network: true`. |
 | `unix_sockets` | none | Unix sockets the pane's commands may connect to, on top of this session's control socket. |
+| `deny_domains` | none | Hosts refused. On its own it means every other host stays allowed (atrium adds codex's `*` allow entry, since a map of denies alone makes codex refuse every host); with `domains`, those hosts less these. |
+| `local` | `false` | `true` lets the pane's commands bind local servers and reach the host's loopback directly (codex's `network.allow_local_binding`). |
+| `raw` | none | Any other key of codex's permission profile, as an object of `"dotted.key": value` passed through as written under atrium's profile — the proxy and SOCKS settings, MITM hooks, `filesystem.glob_scan_max_depth`, whatever a codex gains. The keys the block sets itself (`extends`, `filesystem`, `network.enabled`/`mode`/`domains`/`unix_sockets`/`allow_local_binding`) are refused here; use the keys above. |
 
 The fleet's block reaches every codex pane of the session, the ones a lead spawns later included; an agent's block overrides the fleet's scalars and adds to its lists. The launch banner names each distinct block with the agents it reaches, and warns when a `codex` block is set on an agent that is not codex. `skip` ignores the block (there is no sandbox to refine), and an agent's `ctl spawn` cannot set one: a sandboxed agent must not widen its own posture.
 

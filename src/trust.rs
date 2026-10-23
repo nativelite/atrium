@@ -308,9 +308,12 @@ pub fn codex_args(
     }
     let net = crate::vendors::CodexNet {
         ctl,
-        open: perms.network_open(),
+        mode: perms.network_mode(),
         domains: &perms.domains,
+        deny_domains: &perms.deny_domains,
+        local: perms.local == Some(true),
         sockets: &perms.unix_sockets,
+        raw: &perms.raw,
     };
     let mut v = vec![s("--ask-for-approval"), s(perms.approval())];
     if fs.is_empty() && !net.any() {
@@ -344,9 +347,12 @@ pub fn codex_profile_trust_args(
     }
     let net = crate::vendors::CodexNet {
         ctl,
-        open: false,
+        mode: None,
         domains: &[],
+        deny_domains: &[],
+        local: false,
         sockets: &[],
+        raw: &[],
     };
     let mut v = vec!["--ask-for-approval".to_string(), "never".to_string()];
     v.extend(crate::vendors::codex_profile(base, Some(&net), fs));
@@ -891,7 +897,7 @@ mod tests {
     /// `Off` ignore the block.
     #[test]
     fn codex_args_turn_a_block_into_the_profile_within_the_posture() {
-        use crate::vendors::perms::{CodexPerms, GitAccess};
+        use crate::vendors::perms::{CodexPerms, GitAccess, Network};
         let git = crate::vendors::codex_git_rules("/r/.git", "/r/.git");
         let none = CodexPerms::default();
         assert_eq!(
@@ -906,9 +912,10 @@ mod tests {
             approval: Some("on-request".into()),
             git: None,
             read_only: vec!["/r/secrets".into()],
-            network: Some(true),
+            network: Some(Network::Full),
             domains: vec!["api.github.com".into()],
             unix_sockets: vec!["/run/x.sock".into()],
+            ..CodexPerms::default()
         };
         let edits = codex_args(TrustMode::Edits, Some("/t/a.sock"), &git, &block).join(" ");
         assert!(
