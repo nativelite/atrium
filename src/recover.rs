@@ -753,6 +753,7 @@ fn resume_session(
                 // roster — so a recovery that replayed argv alone handed every
                 // pane back the commands its fleet entry had taken away.
                 deny: &record.deny,
+                codex: None,
             },
             cell_rows,
             cols,

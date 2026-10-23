@@ -210,6 +210,15 @@ pub(crate) fn spawn_fleet_window(
         };
         // Per-agent identity else the fleet default.
         let identity = agent.identity.as_deref().or(fleet.identity.as_deref());
+        // The agent's own `codex` block, its paths resolved against the fleet
+        // file's directory like `add_dirs`; the session's (the fleet's) is
+        // merged under it at spawn.
+        let fleet_dir = plan
+            .file
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let agent_codex = agent.codex.as_ref().map(|c| c.resolved(&fleet_dir));
         match spawn_pane_full(
             PaneSpec {
                 command: &command,
@@ -220,6 +229,7 @@ pub(crate) fn spawn_fleet_window(
                 extra_env: &ctx_vars,
                 extra_norms: pane_norms.as_deref(),
                 deny: &agent.deny,
+                codex: agent_codex.as_ref(),
             },
             cell_rows,
             cell_cols,

@@ -263,6 +263,65 @@ pub fn codex_ctl_trust_args(mode: TrustMode, ctl: &str) -> Option<Vec<String>> {
     codex_profile_trust_args(mode, Some(ctl), &[])
 }
 
+static FLEET_CODEX: std::sync::OnceLock<Option<crate::vendors::perms::CodexPerms>> =
+    std::sync::OnceLock::new();
+
+/// Record the fleet's `codex` block for every codex pane of the session, the
+/// ones a lead spawns later included. Set once, at `fleet up`, after the
+/// operator approved the roster that carries it.
+pub fn set_fleet_codex(block: Option<crate::vendors::perms::CodexPerms>) {
+    let _ = FLEET_CODEX.set(block);
+}
+
+/// The session's `codex` block: the fleet's, or `None` outside a fleet or
+/// when the fleet set none.
+pub fn session_codex() -> Option<crate::vendors::perms::CodexPerms> {
+    FLEET_CODEX.get().cloned().flatten()
+}
+
+/// The codex posture argv for `mode`, with everything the pane's `codex`
+/// block ([`crate::vendors::perms::CodexPerms`]) adds: its approval policy,
+/// the control socket `ctl`, the git rules `git` (unless the block keeps git
+/// read-only) and its own carve-outs, hosts and sockets. `Plan` keeps its
+/// read-only base and takes only the approval and network keys; `Skip` is
+/// the bypass and `Off` nothing, whatever the block says. A posture with
+/// nothing to open keeps its plain `--sandbox`; anything to open becomes the
+/// `atrium_ctl` profile ([`crate::vendors::codex_profile`]).
+pub fn codex_args(
+    mode: TrustMode,
+    ctl: Option<&str>,
+    git: &[crate::vendors::CodexFsRule],
+    perms: &crate::vendors::perms::CodexPerms,
+) -> Vec<String> {
+    let s = |x: &str| x.to_string();
+    let (base, plain) = match mode {
+        TrustMode::Edits | TrustMode::Auto => (":workspace", "workspace-write"),
+        TrustMode::Plan => (":read-only", "read-only"),
+        TrustMode::Skip | TrustMode::Off => return codex_trust_args(mode),
+    };
+    let mut fs: Vec<crate::vendors::CodexFsRule> = Vec::new();
+    if mode != TrustMode::Plan {
+        if perms.git_write() {
+            fs.extend(git.iter().cloned());
+        }
+        fs.extend(perms.read_only_rules());
+    }
+    let net = crate::vendors::CodexNet {
+        ctl,
+        open: perms.network_open(),
+        domains: &perms.domains,
+        sockets: &perms.unix_sockets,
+    };
+    let mut v = vec![s("--ask-for-approval"), s(perms.approval())];
+    if fs.is_empty() && !net.any() {
+        v.push(s("--sandbox"));
+        v.push(s(plain));
+    } else {
+        v.extend(crate::vendors::codex_profile(base, Some(&net), &fs));
+    }
+    v
+}
+
 /// [`codex_trust_args`] with the sandbox given as a codex permission profile
 /// ([`crate::vendors::codex_profile`]): the posture's own confinement, plus
 /// the control socket `ctl` when there is one and the filesystem rules `fs`
@@ -283,8 +342,14 @@ pub fn codex_profile_trust_args(
     if ctl.is_none() && fs.is_empty() {
         return None;
     }
+    let net = crate::vendors::CodexNet {
+        ctl,
+        open: false,
+        domains: &[],
+        sockets: &[],
+    };
     let mut v = vec!["--ask-for-approval".to_string(), "never".to_string()];
-    v.extend(crate::vendors::codex_profile(base, ctl, fs));
+    v.extend(crate::vendors::codex_profile(base, Some(&net), fs));
     Some(v)
 }
 
@@ -817,6 +882,70 @@ mod tests {
         assert_eq!(joined(TrustMode::Off, None), None);
         // No socket and no rules: nothing to open, the plain args stand.
         assert_eq!(codex_profile_trust_args(TrustMode::Edits, None, &[]), None);
+    }
+
+    /// The one entry point the spawn path uses: an empty block with nothing
+    /// to open is the plain posture; a block's approval, carve-outs, hosts
+    /// and sockets reach the profile at `Edits`/`Auto`; `Plan` takes only the
+    /// approval and the network; `git: read` drops the git rules; `Skip` and
+    /// `Off` ignore the block.
+    #[test]
+    fn codex_args_turn_a_block_into_the_profile_within_the_posture() {
+        use crate::vendors::perms::{CodexPerms, GitAccess};
+        let git = crate::vendors::codex_git_rules("/r/.git", "/r/.git");
+        let none = CodexPerms::default();
+        assert_eq!(
+            codex_args(TrustMode::Edits, None, &[], &none).join(" "),
+            "--ask-for-approval never --sandbox workspace-write"
+        );
+        assert_eq!(
+            codex_args(TrustMode::Plan, None, &git, &none).join(" "),
+            "--ask-for-approval never --sandbox read-only"
+        );
+        let block = CodexPerms {
+            approval: Some("on-request".into()),
+            git: None,
+            read_only: vec!["/r/secrets".into()],
+            network: Some(true),
+            domains: vec!["api.github.com".into()],
+            unix_sockets: vec!["/run/x.sock".into()],
+        };
+        let edits = codex_args(TrustMode::Edits, Some("/t/a.sock"), &git, &block).join(" ");
+        assert!(
+            edits.starts_with("--ask-for-approval on-request -c "),
+            "{edits}"
+        );
+        assert!(
+            edits.contains(r#"filesystem={"/r/.git"="write","/r/.git/hooks"="read","/r/.git/config"="read","/r/.git/config.worktree"="read","/r/secrets"="read"}"#),
+            "{edits}"
+        );
+        assert!(edits.contains(r#"network.mode="full""#), "{edits}");
+        assert!(
+            edits.contains(r#"network.domains={"api.github.com"="allow"}"#),
+            "{edits}"
+        );
+        assert!(
+            edits.contains(r#"unix_sockets={"/t/a.sock"="allow","/run/x.sock"="allow"}"#),
+            "{edits}"
+        );
+        assert!(!edits.contains("--sandbox"), "{edits}");
+        let plan = codex_args(TrustMode::Plan, None, &git, &block).join(" ");
+        assert!(plan.contains(r#"extends=":read-only""#), "{plan}");
+        assert!(!plan.contains("filesystem"), "{plan}");
+        assert!(plan.contains(r#"network.mode="full""#), "{plan}");
+        let read_git = CodexPerms {
+            git: Some(GitAccess::Read),
+            ..CodexPerms::default()
+        };
+        assert_eq!(
+            codex_args(TrustMode::Auto, None, &git, &read_git).join(" "),
+            "--ask-for-approval never --sandbox workspace-write"
+        );
+        assert_eq!(
+            codex_args(TrustMode::Skip, Some("/t/a.sock"), &git, &block),
+            vec!["--dangerously-bypass-approvals-and-sandbox".to_string()]
+        );
+        assert!(codex_args(TrustMode::Off, None, &git, &block).is_empty());
     }
 
     #[test]

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A `codex` block in the fleet file sets the rest of a codex pane's
+  permissions.** `trust` fixed a codex pane's posture and nothing else could
+  be set: the sandbox and approval flags are stripped from a codex `cmd` on
+  purpose. A `codex` object, on the fleet (every codex pane of the session,
+  the workers a lead spawns later included) or on one codex agent (merged
+  over the fleet's), now refines what happens inside that posture in codex's
+  own terms — `approval` (`never`, `on-request`, `on-failure`, `untrusted`),
+  `git` (`write`, the default at `accept`/`automode`, or `read`),
+  `read_only` paths, `network` through codex's proxy to every host or the
+  `domains` listed, and `unix_sockets` — and atrium folds it into the same
+  `atrium_ctl` permission profile. A key the block does not have is an
+  error, not a silent no-op. The banner names each distinct block with the
+  agents it reaches and warns when one is set on an agent that is not codex;
+  `plan` takes only the approval and the network, `skip` ignores the block,
+  and an agent's `ctl spawn` cannot set one
+  ([codex permissions](docs/fleets.md#codex-permissions)).
+
 ### Fixed
 - **A send into a codex pane lands whole and is submitted.** A `ctl send` or
   bus wake is typed into its pane, and a multi-line text typed as keystrokes

@@ -93,6 +93,7 @@ pub(crate) fn respawn(
             extra_env: &context_env,
             extra_norms: norms.as_deref(),
             deny: &deny,
+            codex: None,
         },
         pane_rows,
         pane_cols,

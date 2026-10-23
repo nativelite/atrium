@@ -160,6 +160,18 @@ next time you use git outside the sandbox. Measured under these rules: a
 commit succeeds in a main checkout and in a linked worktree; creating a hook
 and appending to `config` are refused. `plan` stays read-only, git included.
 
+**The rest of a codex pane's permissions are the fleet file's to set.** A
+`codex` block, on the fleet or on one codex agent, refines what happens
+inside the posture `trust` chose, in codex's own terms: its approval policy
+(`approval`), whether git stays read-only (`git`), paths kept read-only
+inside the workspace (`read_only`), the network through codex's proxy to
+every host or the listed ones (`network`, `domains`), and further unix
+sockets (`unix_sockets`). atrium folds it into the same `atrium_ctl` profile
+and the banner names each distinct block with the agents it reaches. The
+posture still wins: `plan` takes only the approval and the network, `skip`
+ignores the block, and an agent's `ctl spawn` cannot set one. See
+[codex permissions](fleets.md#codex-permissions).
+
 Limits:
 
 - **It needs codex's `network_proxy` feature**, which codex marks

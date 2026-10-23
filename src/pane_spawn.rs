@@ -60,6 +60,7 @@ pub(crate) fn open_window(
             extra_env: &[],
             extra_norms: None,
             deny: &[],
+            codex: None,
         },
         rows,
         cols,
@@ -145,6 +146,7 @@ pub(crate) fn spawn_pane(
             extra_env: &[],
             extra_norms: None,
             deny: &[],
+            codex: None,
         },
         rows,
         cols,
@@ -294,6 +296,9 @@ pub(crate) struct PaneSpec<'a> {
     /// This agent's own deny entries (a fleet agent's `deny`), on top of the
     /// built-in fail-safes and the session's rules every claude pane carries.
     pub(crate) deny: &'a [String],
+    /// A fleet agent's own `codex` block, merged over the session's at spawn
+    /// (`None` for every other pane, which gets the session's alone).
+    pub(crate) codex: Option<&'a atrium::vendors::perms::CodexPerms>,
 }
 
 /// The shared spawn core: build the agent's launch from `spec` (session-id
@@ -317,6 +322,7 @@ pub(crate) fn spawn_pane_full(
         extra_env,
         extra_norms,
         deny,
+        codex,
     } = spec;
     // Cross-platform stem: split on `/` and `\` on every OS so a Windows-authored
     // fleet command (e.g. `C:\tools\claude.cmd`) is recognized as an agent on
@@ -363,7 +369,12 @@ pub(crate) fn spawn_pane_full(
     // read-only, a worktree's git dir with it, and a fleet item is done only
     // with a commit. `Plan` is read-only and stays so; outside a checkout there
     // is nothing to open.
+    // The pane's codex block: the fleet's (session-wide, a ctl-spawned worker
+    // included) under this agent's own.
+    let perms =
+        atrium::vendors::perms::CodexPerms::merged(atrium::trust::session_codex().as_ref(), codex);
     let codex_git = if is_codex
+        && perms.git_write()
         && matches!(
             mode,
             atrium::ctl::TrustMode::Edits | atrium::ctl::TrustMode::Auto
@@ -384,8 +395,11 @@ pub(crate) fn spawn_pane_full(
         mode,
         deny,
         extra_norms,
-        codex_ctl,
-        &codex_git,
+        CodexOpen {
+            ctl: codex_ctl,
+            fs: &codex_git,
+            perms: &perms,
+        },
     );
     // A trusted claude launch also pre-accepts claude's folder-trust dialog.
     if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
@@ -512,19 +526,27 @@ fn is_trusted_launch(title: &str, mode: atrium::ctl::TrustMode) -> bool {
     (is_claude || is_codex) && mode != atrium::ctl::TrustMode::Off
 }
 
+/// What a codex pane's sandbox is opened to beyond its posture: the control
+/// socket its commands may reach ([`codex_ctl_socket`]), its git dirs
+/// ([`atrium::vendors::codex_git_rules`]) and its `codex` block, the
+/// session's under its own ([`atrium::vendors::perms::CodexPerms`]).
+pub(crate) struct CodexOpen<'a> {
+    pub(crate) ctl: Option<&'a str>,
+    pub(crate) fs: &'a [atrium::vendors::CodexFsRule],
+    pub(crate) perms: &'a atrium::vendors::perms::CodexPerms,
+}
+
 /// The agent's launch argv before the session id: `command` plus the trust
 /// flags for `mode`, the deny list and the folded system prompt, each for the
-/// vendors that take them. `codex_ctl` is the control socket a sandboxed codex
-/// pane is opened to ([`codex_ctl_socket`]) and `codex_fs` the filesystem
-/// rules it gets (its git dirs); with neither it keeps its plain sandbox.
+/// vendors that take them. `codex` is what a codex pane's sandbox is opened
+/// to beyond its posture ([`CodexOpen`]).
 fn agent_args(
     command: &[String],
     title: &str,
     mode: atrium::ctl::TrustMode,
     deny: &[String],
     extra_norms: Option<&str>,
-    codex_ctl: Option<&str>,
-    codex_fs: &[atrium::vendors::CodexFsRule],
+    codex: CodexOpen<'_>,
 ) -> Vec<String> {
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
@@ -576,8 +598,12 @@ fn agent_args(
             // `is_codex` (not a bare `else`) so that if the claude/codex stem sets
             // ever overlap or a third vendor is added, codex flags reach ONLY a
             // codex pane — never silently some other agent's command.
-            let profile = atrium::trust::codex_profile_trust_args(mode, codex_ctl, codex_fs);
-            v.extend(profile.unwrap_or_else(|| atrium::trust::codex_trust_args(mode)));
+            v.extend(atrium::trust::codex_args(
+                mode,
+                codex.ctl,
+                codex.fs,
+                codex.perms,
+            ));
         }
         v
     } else {

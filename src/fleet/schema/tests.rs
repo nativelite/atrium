@@ -120,6 +120,45 @@ fn build_jobs_sizes_the_compile_pool() {
     assert_eq!(parse(absent).unwrap().get("f").unwrap().build_jobs, None);
 }
 
+/// A `codex` block parses at fleet and agent level into the typed block; a
+/// malformed one is a clear error naming its owner and key; absent is `None`.
+#[test]
+fn a_codex_block_is_parsed_at_fleet_and_agent_level() {
+    let text = r#"{ "fleets": { "f": {
+            "codex": { "network": true, "domains": ["api.github.com"], "git": "read" },
+            "agents": [
+              { "name": "dev", "cmd": ["codex"], "codex": { "approval": "on-request", "read_only": ["../secrets"] } },
+              { "name": "qa", "cmd": ["codex"] }
+            ] } } }"#;
+    let fleets = parse(text).unwrap();
+    let f = fleets.get("f").unwrap();
+    let fleet_block = f.codex.as_ref().expect("fleet block");
+    assert!(fleet_block.network_open());
+    assert_eq!(fleet_block.domains, s(&["api.github.com"]));
+    assert!(!fleet_block.git_write());
+    let dev = f.agents[0].codex.as_ref().expect("agent block");
+    assert_eq!(dev.approval(), "on-request");
+    assert_eq!(dev.read_only, s(&["../secrets"]));
+    assert!(f.agents[1].codex.is_none());
+    for (bad, key) in [
+        (r#""codex": "never""#, "\"codex\" must be an object"),
+        (r#""codex": { "approval": "always" }"#, "codex.approval"),
+        (r#""codex": { "gti": "read" }"#, "gti"),
+    ] {
+        let t = format!(
+            r#"{{ "fleets": {{ "f": {{ {bad}, "agents": [{{ "name": "a", "cmd": ["codex"] }}] }} }} }}"#
+        );
+        let err = parse(&t).unwrap_err();
+        assert!(err.contains(key), "{bad}: {err}");
+        assert!(err.starts_with("fleet \"f\""), "{err}");
+        let t = format!(
+            r#"{{ "fleets": {{ "f": {{ "agents": [{{ "name": "a", "cmd": ["codex"], {bad} }}] }} }} }}"#
+        );
+        let err = parse(&t).unwrap_err();
+        assert!(err.contains("agent \"a\""), "{bad}: {err}");
+    }
+}
+
 #[test]
 fn deny_is_parsed_at_fleet_and_agent_level() {
     let text = r#"{ "fleets": { "f": {

@@ -74,6 +74,7 @@ fn one_agent_fleet(name: &str, cmd: &str, cwd: Option<&str>, dirs: &[&str]) -> F
         memory_mb: None,
         deny: Vec::new(),
         claude_aliases: Vec::new(),
+        codex: None,
         agents: vec![Agent {
             name: name.to_string(),
             cmd: vec![cmd.to_string()],
@@ -347,6 +348,7 @@ fn identical_grants_across_agents_are_disclosed_once() {
         memory_mb: None,
         deny: Vec::new(),
         claude_aliases: Vec::new(),
+        codex: None,
         agents,
     };
     let anchor = Anchor {

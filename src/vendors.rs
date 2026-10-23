@@ -37,6 +37,10 @@
 use agsess::{Status, Vendor, World};
 use std::path::PathBuf;
 
+/// The `codex` block of a fleet file: what it may set about a codex pane
+/// beyond its posture.
+pub mod perms;
+
 /// Every vendor atrium knows how to *recognise* (map a stem/root/tag for). This is
 /// the total set mirroring `agsess::Vendor`; the compiler does **not** force it to
 /// stay total, so a new `agsess::Vendor` variant must be added here too. Building
@@ -257,7 +261,7 @@ pub fn codex_git_rules(git_dir: &str, common_dir: &str) -> Vec<CodexFsRule> {
 ///
 /// The filesystem rules are one inline table keyed by path, because codex
 /// splits a dotted `-c` key on every `.`, quotes or not, and a path has dots.
-pub fn codex_profile(base: &str, ctl: Option<&str>, fs: &[CodexFsRule]) -> Vec<String> {
+pub fn codex_profile(base: &str, net: Option<&CodexNet<'_>>, fs: &[CodexFsRule]) -> Vec<String> {
     let p = CODEX_CTL_PROFILE;
     let mut v = Vec::new();
     v.extend(codex_config("default_permissions", &toml_string(p)));
@@ -278,25 +282,69 @@ pub fn codex_profile(base: &str, ctl: Option<&str>, fs: &[CodexFsRule]) -> Vec<S
             &format!("{{{}}}", rules.join(",")),
         ));
     }
-    if let Some(ctl) = ctl {
+    if let Some(net) = net.filter(|n| n.any()) {
         v.extend(codex_config(
             &format!("permissions.{p}.network.enabled"),
             "true",
         ));
+        // `limited` lets only the allowed unix sockets through (HTTPS is
+        // refused without MITM); `full` is the network as the block opened it,
+        // every host or the listed ones.
         v.extend(codex_config(
             &format!("permissions.{p}.network.mode"),
-            &toml_string("limited"),
+            &toml_string(if net.open { "full" } else { "limited" }),
         ));
+        if net.open && !net.domains.is_empty() {
+            v.extend(codex_config(
+                &format!("permissions.{p}.network.domains"),
+                &allow_table(net.domains.iter().map(String::as_str)),
+            ));
+        }
         // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
         // quotes or not, so the socket path's own dots would break it.
-        v.extend(codex_config(
-            &format!("permissions.{p}.network.unix_sockets"),
-            &format!("{{{}={}}}", toml_string(ctl), toml_string("allow")),
-        ));
+        let sockets: Vec<&str> = net
+            .ctl
+            .into_iter()
+            .chain(net.sockets.iter().map(String::as_str))
+            .collect();
+        if !sockets.is_empty() {
+            v.extend(codex_config(
+                &format!("permissions.{p}.network.unix_sockets"),
+                &allow_table(sockets.into_iter()),
+            ));
+        }
         v.push("--enable".to_string());
         v.push(CODEX_NETWORK_PROXY.to_string());
     }
     v
+}
+
+/// What a codex permission profile opens on the network: the control socket
+/// `ctl`, the network itself (`open`, through codex's proxy) to every host or
+/// the `domains` listed, and `sockets`, further unix sockets. See
+/// [`codex_profile`].
+#[derive(Debug, Clone, Copy)]
+pub struct CodexNet<'a> {
+    pub ctl: Option<&'a str>,
+    pub open: bool,
+    pub domains: &'a [String],
+    pub sockets: &'a [String],
+}
+
+impl CodexNet<'_> {
+    /// Is there anything to open? Nothing means the base's own no-network.
+    pub fn any(&self) -> bool {
+        self.ctl.is_some() || self.open || !self.sockets.is_empty()
+    }
+}
+
+/// An inline TOML table granting each key `allow`, the shape of codex's
+/// `network.unix_sockets` and `network.domains` maps.
+fn allow_table<'a>(keys: impl Iterator<Item = &'a str>) -> String {
+    let entries: Vec<String> = keys
+        .map(|k| format!("{}={}", toml_string(k), toml_string("allow")))
+        .collect();
+    format!("{{{}}}", entries.join(","))
 }
 
 /// Codex's sandbox args for a pane that must reach atrium's control socket at
@@ -313,7 +361,13 @@ pub fn codex_profile(base: &str, ctl: Option<&str>, fs: &[CodexFsRule]) -> Vec<S
 /// alongside one; the network proxy is an experimental codex feature, so the
 /// caller checks this codex has it first.
 pub fn codex_ctl_sandbox(base: &str, ctl: &str) -> Vec<String> {
-    codex_profile(base, Some(ctl), &[])
+    let net = CodexNet {
+        ctl: Some(ctl),
+        open: false,
+        domains: &[],
+        sockets: &[],
+    };
+    codex_profile(base, Some(&net), &[])
 }
 
 /// The filesystem root under which `vendor` writes session transcripts, if known.
@@ -1028,7 +1082,13 @@ mod tests {
                 r#"permissions.atrium_ctl.filesystem={"/r/.git"="write","/r/.git/hooks"="read"}"#,
             ])
         );
-        let with_ctl = codex_profile(":workspace", Some("/t/a.sock"), &rules);
+        let ctl = CodexNet {
+            ctl: Some("/t/a.sock"),
+            open: false,
+            domains: &[],
+            sockets: &[],
+        };
+        let with_ctl = codex_profile(":workspace", Some(&ctl), &rules);
         let fs = with_ctl
             .iter()
             .position(|a| a.starts_with("permissions.atrium_ctl.filesystem="))
@@ -1072,6 +1132,55 @@ mod tests {
         let win = codex_git_rules("C:/p/.git/worktrees/dev", "C:/p/.git");
         assert_eq!(win[1].path, "C:/p/.git/worktrees/dev");
         assert_eq!(win[4].path, "C:/p/.git/worktrees/dev/config.worktree");
+    }
+
+    /// A block that opens the network gets `full` mode, its hosts as an allow
+    /// map when it names any, and its sockets after the control socket; one
+    /// with nothing to open gets no network keys at all.
+    #[test]
+    fn codex_profile_opens_the_network_as_the_block_says() {
+        let hosts = vec!["api.github.com".to_string(), "*.crates.io".to_string()];
+        let socks = vec!["/run/x.sock".to_string()];
+        let net = CodexNet {
+            ctl: Some("/t/a.sock"),
+            open: true,
+            domains: &hosts,
+            sockets: &socks,
+        };
+        let v = codex_profile(":workspace", Some(&net), &[]).join(" ");
+        assert!(v.contains(r#"network.mode="full""#), "{v}");
+        assert!(
+            v.contains(r#"network.domains={"api.github.com"="allow","*.crates.io"="allow"}"#),
+            "{v}"
+        );
+        assert!(
+            v.contains(r#"unix_sockets={"/t/a.sock"="allow","/run/x.sock"="allow"}"#),
+            "{v}"
+        );
+        assert!(v.ends_with("--enable network_proxy"), "{v}");
+        // Open to every host: no domains map at all.
+        let every = CodexNet {
+            ctl: None,
+            open: true,
+            domains: &[],
+            sockets: &[],
+        };
+        let v = codex_profile(":workspace", Some(&every), &[]).join(" ");
+        assert!(
+            v.contains(r#"network.mode="full""#) && !v.contains("domains"),
+            "{v}"
+        );
+        assert!(!v.contains("unix_sockets"), "{v}");
+        // Nothing to open: the base alone.
+        let shut = CodexNet {
+            ctl: None,
+            open: false,
+            domains: &hosts,
+            sockets: &[],
+        };
+        assert!(!shut.any());
+        let v = codex_profile(":workspace", Some(&shut), &[]).join(" ");
+        assert!(!v.contains("network"), "{v}");
     }
 
     /// codex and claude both put `? for shortcuts` under an empty prompt; a

@@ -296,7 +296,19 @@ fn a_codex_prompt_becomes_one_developer_instructions_override() {
 fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
     let cmd = args(&["codex", "--append-system-prompt", "ROLE", "go"]);
     let mode = atrium::ctl::TrustMode::Edits;
-    let opened = agent_args(&cmd, "codex", mode, &[], None, Some("/t/a.sock"), &[]).join(" ");
+    let opened = agent_args(
+        &cmd,
+        "codex",
+        mode,
+        &[],
+        None,
+        CodexOpen {
+            ctl: Some("/t/a.sock"),
+            fs: &[],
+            perms: &Default::default(),
+        },
+    )
+    .join(" ");
     assert!(
         opened.contains(r#"default_permissions="atrium_ctl""#),
         "{opened}"
@@ -306,7 +318,19 @@ fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
         "{opened}"
     );
     assert!(!opened.contains("--sandbox"), "{opened}");
-    let plain = agent_args(&cmd, "codex", mode, &[], None, None, &[]).join(" ");
+    let plain = agent_args(
+        &cmd,
+        "codex",
+        mode,
+        &[],
+        None,
+        CodexOpen {
+            ctl: None,
+            fs: &[],
+            perms: &Default::default(),
+        },
+    )
+    .join(" ");
     assert!(plain.contains("--sandbox workspace-write"), "{plain}");
     assert!(!plain.contains("atrium_ctl"), "{plain}");
     for a in [&opened, &plain] {
@@ -330,8 +354,11 @@ fn a_codex_pane_in_a_checkout_gets_its_git_dirs_opened() {
         atrium::ctl::TrustMode::Edits,
         &[],
         None,
-        None,
-        &git,
+        CodexOpen {
+            ctl: None,
+            fs: &git,
+            perms: &Default::default(),
+        },
     )
     .join(" ");
     assert!(
@@ -352,8 +379,11 @@ fn a_codex_pane_in_a_checkout_gets_its_git_dirs_opened() {
         atrium::ctl::TrustMode::Auto,
         &[],
         None,
-        Some("/t/a.sock"),
-        &git,
+        CodexOpen {
+            ctl: Some("/t/a.sock"),
+            fs: &git,
+            perms: &Default::default(),
+        },
     )
     .join(" ");
     assert!(
@@ -370,8 +400,11 @@ fn a_codex_pane_in_a_checkout_gets_its_git_dirs_opened() {
         atrium::ctl::TrustMode::Plan,
         &[],
         None,
-        None,
-        &git,
+        CodexOpen {
+            ctl: None,
+            fs: &git,
+            perms: &Default::default(),
+        },
     )
     .join(" ");
     assert!(plan.contains("--sandbox read-only"), "{plan}");
@@ -382,8 +415,11 @@ fn a_codex_pane_in_a_checkout_gets_its_git_dirs_opened() {
         atrium::ctl::TrustMode::Edits,
         &[],
         None,
-        None,
-        &git,
+        CodexOpen {
+            ctl: None,
+            fs: &git,
+            perms: &Default::default(),
+        },
     )
     .join(" ");
     assert!(!claude.contains("filesystem"), "{claude}");

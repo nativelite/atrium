@@ -117,6 +117,7 @@ The file is read **read-only**. atrium never writes it.
 | `build_jobs` | optional | Total compiler jobs the whole fleet's builds share (a whole number; `0` = off). Default: one per core, bounded by RAM. |
 | `deny` | optional | Commands no agent in the session may run, including workers a lead spawns later (an array of claude rules like `"Bash(git push --force*)"` or command prefixes like `"cargo test --workspace"`). Claude agents only. |
 | `claude_aliases` | optional | Other commands that are claude (an array of strings like `["claude2"]`): a second account's shim, a wrapper, a renamed install. Their panes get every claude rule and `ctl spawn` accepts them. Adds to `ATRIUM_CLAUDE_ALIASES` for the session. |
+| `codex` | optional | What the fleet's codex panes may do beyond their posture, the workers a lead spawns later included: an object with `approval`, `git`, `read_only`, `network`, `domains`, `unix_sockets` (see [codex permissions](#codex-permissions)). An agent's own `codex` merges over it. |
 | `memory_mb` | optional | A fixed ceiling, in MiB, on the memory everything the agents run may use (`0` = off). Default: a dynamic ceiling that tracks the machine's free memory. A hard kernel limit on Windows, and on Linux when launched under `systemd-run --user --scope -p Delegate=yes`; a soft guard otherwise. |
 
 **`build_jobs`** (optional) sizes the fleet's **shared compile pool**: the total number of compiler jobs all the agents' builds may run at once, however many agents start a build. `0` turns the pool off. Omit it and the pool gets one job per core, bounded by RAM (about 3 GiB per job), so the whole fleet compiles within the budget of one developer's `cargo build`. `ATRIUM_BUILD_JOBS` on the machine wins over the file. The banner's posture line states the budget ("16 compile jobs shared").
@@ -169,6 +170,33 @@ Each agent needs a **`name`** and a **`cmd`** (command plus args). Everything el
 | `trust` | `--trust` for this pane | Overrides the fleet-level `trust` for this one agent, capped at the fleet/session ceiling (a per-agent posture can de-escalate, never elevate). See [trust and security](trust-and-security.md). |
 | `worktree` | worktree group | The worktree group this agent joins. Agents sharing a name co-develop one worktree and branch; distinct names are isolated. See [worktrees](worktrees.md). |
 | `kickoff` | first prompt | An opening message submitted to the agent once it is up (distinct from `prompt`, which is appended to its system prompt) — the initiative that starts it working. |
+| `codex` | codex permission profile | This codex agent's own permissions beyond its posture, merged over the fleet's `codex` (see [codex permissions](#codex-permissions)). codex agents only; the banner says so when it is set on another. |
+
+### codex permissions
+
+**`codex`** (fleet-level, and per codex agent) is the rest of what a codex pane may do, in codex's own terms, once `trust` has fixed its posture. `trust` decides the sandbox and whether the pane may write at all; this block refines what happens inside it, and atrium turns it into the codex permission profile the pane launches under (the same `atrium_ctl` profile that lets a sandboxed pane reach the control socket). Every key is optional; a key the block does not have is an error, so a typo cannot read as enforced:
+
+```json
+"codex": {
+  "approval": "never",
+  "git": "write",
+  "read_only": ["../secrets"],
+  "network": true,
+  "domains": ["api.github.com", "*.crates.io"],
+  "unix_sockets": ["/run/user/1000/podman.sock"]
+}
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `approval` | `never` | codex's `--ask-for-approval` policy: `never` (a refused command returns to the model), `on-request` (codex asks in the pane; a queued send waits for the dialog), `on-failure`, `untrusted`. |
+| `git` | `write` | At `accept`/`automode`, `write` opens the checkout's git dir and common dir so the pane can commit, with `hooks/`, `config` and `config.worktree` kept read-only; `read` keeps codex's own default, `.git` read-only and no commit from inside the sandbox. `plan` is read-only regardless. |
+| `read_only` | none | Paths kept read-only inside what the pane may write (relative to the fleet file's directory, like `add_dirs`). |
+| `network` | `false` | `true` opens the network through codex's proxy — every host, or only the `domains` listed. `false` keeps the sandbox's own no-network, the control socket aside. |
+| `domains` | none | Hosts a networked pane may reach (`"api.github.com"`, `"*.crates.io"`): codex's `network.domains` allow list. Needs `network: true`. |
+| `unix_sockets` | none | Unix sockets the pane's commands may connect to, on top of this session's control socket. |
+
+The fleet's block reaches every codex pane of the session, the ones a lead spawns later included; an agent's block overrides the fleet's scalars and adds to its lists. The launch banner names each distinct block with the agents it reaches, and warns when a `codex` block is set on an agent that is not codex. `skip` ignores the block (there is no sandbox to refine), and an agent's `ctl spawn` cannot set one: a sandboxed agent must not widen its own posture.
 
 **`can_spawn`** is a capability the roster grants, not something implied by having ctl access. A depth cap bounds how far a fan-out goes, but never says who may start one, so the right to create teammates is declared here.
 

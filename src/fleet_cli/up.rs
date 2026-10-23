@@ -389,6 +389,15 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     let fleet = &launch.fleet;
     // Approved: record the fleet's deny rules for every pane in the session.
     atrium::trust::set_fleet_deny(fleet.deny.clone());
+    // And its `codex` block, for every codex pane of the session, with its
+    // paths resolved against the fleet file's directory like `add_dirs`.
+    let fleet_dir = launch
+        .plan
+        .file
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    atrium::trust::set_fleet_codex(fleet.codex.as_ref().map(|c| c.resolved(&fleet_dir)));
     // And whether its claude panes load the mod.
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
     // And when an idle pane's parent is asked to checkpoint and respawn it.

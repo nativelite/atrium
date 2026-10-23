@@ -121,6 +121,7 @@ impl<'a> RunState<'a> {
                         extra_env: &[],
                         extra_norms: None,
                         deny: &[],
+                        codex: None,
                     },
                     rows,
                     cols,

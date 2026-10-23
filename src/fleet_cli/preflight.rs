@@ -123,6 +123,45 @@ fn deny_unbound(fleet: &atrium::fleet::Fleet) -> Vec<String> {
         .collect()
 }
 
+/// Is this agent's command codex?
+fn is_codex_agent(a: &atrium::fleet::Agent) -> bool {
+    a.cmd.first().is_some_and(|c| {
+        atrium::vendors::vendor_for_stem(&atrium::bind::command_stem(c))
+            == Some(agsess::Vendor::Codex)
+    })
+}
+
+/// Names of the agents with a `codex` block of their own that are not codex:
+/// the block binds nothing there, and must not read as enforced. The fleet's
+/// own block is not flagged: it is scoped to codex panes by definition.
+fn codex_unbound(fleet: &atrium::fleet::Fleet) -> Vec<String> {
+    fleet
+        .agents
+        .iter()
+        .filter(|a| a.codex.is_some() && !is_codex_agent(a))
+        .map(|a| a.name.clone())
+        .collect()
+}
+
+/// What each codex agent's effective `codex` block (the fleet's under its
+/// own) changes from the defaults, one line per distinct block naming the
+/// agents it reaches; nothing for a block that changes nothing.
+fn codex_lines(fleet: &atrium::fleet::Fleet) -> Vec<String> {
+    let mut groups: Vec<(atrium::vendors::perms::CodexPerms, Vec<String>)> = Vec::new();
+    for a in fleet.agents.iter().filter(|a| is_codex_agent(a)) {
+        let block =
+            atrium::vendors::perms::CodexPerms::merged(fleet.codex.as_ref(), a.codex.as_ref());
+        match groups.iter_mut().find(|(b, _)| *b == block) {
+            Some((_, names)) => names.push(fsan(&a.name)),
+            None => groups.push((block, vec![fsan(&a.name)])),
+        }
+    }
+    groups
+        .iter()
+        .filter_map(|(block, names)| block.disclosure(names))
+        .collect()
+}
+
 /// The session compile pool as the banner states it: a suffix for the posture
 /// line, plus a warning line when builds will run unpooled. `size` is the pool
 /// this session created; `inherited` means an enclosing session's pool is already
@@ -256,6 +295,23 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
         warnings.push(format!(
             "deny rules apply to claude agents only — not enforced for {}",
             unbound
+                .iter()
+                .map(|n| fsan(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    // What a codex pane may do beyond its posture is part of what the human
+    // approves: each distinct `codex` block, once, with the agents it reaches.
+    // A block on an agent that is not codex binds nothing, so say so.
+    for line in codex_lines(fleet) {
+        out.push(format!("atrium fleet: {line}"));
+    }
+    let misplaced = codex_unbound(fleet);
+    if !misplaced.is_empty() {
+        warnings.push(format!(
+            "a codex block applies to codex agents only — ignored for {}",
+            misplaced
                 .iter()
                 .map(|n| fsan(n))
                 .collect::<Vec<_>>()

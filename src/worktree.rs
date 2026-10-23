@@ -562,6 +562,7 @@ mod tests {
             memory_mb: None,
             deny: Vec::new(),
             claude_aliases: Vec::new(),
+            codex: None,
             agents: agents
                 .iter()
                 .map(|(n, w)| Agent {

@@ -125,6 +125,10 @@ pub struct Fleet {
     /// and `ctl spawn` accepts them. Added to `ATRIUM_CLAUDE_ALIASES` for the
     /// whole session ([`crate::bind::set_claude_aliases`]).
     pub claude_aliases: Vec<String>,
+    /// What this fleet's codex panes may do beyond their posture — the ones a
+    /// lead spawns later included ([`crate::vendors::perms::CodexPerms`]).
+    /// An agent's own `codex` block merges over it.
+    pub codex: Option<crate::vendors::perms::CodexPerms>,
     /// The agents, in file order — one pane each.
     pub agents: Vec<Agent>,
 }
@@ -195,6 +199,9 @@ pub struct Agent {
     /// seeds an interactive session with that first message. Absent ⇒ the agent
     /// idles until prompted (the previous behavior).
     pub kickoff: Option<String>,
+    /// What this codex pane may do beyond its posture, over the fleet's own
+    /// `codex` block ([`crate::vendors::perms::CodexPerms`]). codex agents only.
+    pub codex: Option<crate::vendors::perms::CodexPerms>,
 }
 
 impl Agent {
@@ -484,7 +491,15 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         agents.push(parse_agent(name, i, av)?);
     }
 
+    let codex = match get("codex") {
+        Some(v) => Some(crate::vendors::perms::CodexPerms::parse(
+            &format!("fleet {name:?}"),
+            v,
+        )?),
+        None => None,
+    };
     Ok(Fleet {
+        codex,
         grid,
         trust,
         allow_ctl,
@@ -608,8 +623,16 @@ fn parse_agent(fleet: &str, idx: usize, val: &json::Value) -> Result<Agent, Stri
     };
 
     let deny = deny_list(get("deny"), &format!("fleet {fleet:?} agent {name:?}"))?;
+    let codex = match get("codex") {
+        Some(v) => Some(crate::vendors::perms::CodexPerms::parse(
+            &format!("fleet {fleet:?} agent {name:?}"),
+            v,
+        )?),
+        None => None,
+    };
     Ok(Agent {
         deny,
+        codex,
         name,
         cmd,
         identity,

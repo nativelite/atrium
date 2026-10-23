@@ -1,8 +1,8 @@
 //! The preflight checks and the banner lines they produce.
 
 use super::{
-    banner_lines, build_pool_line, ctl_without_spawner, deny_unbound, pane_cap_warning,
-    plugin_value_enabled, preflight_context_mode, BannerFacts,
+    banner_lines, build_pool_line, codex_lines, codex_unbound, ctl_without_spawner, deny_unbound,
+    pane_cap_warning, plugin_value_enabled, preflight_context_mode, BannerFacts,
 };
 use crate::fleet_cli::up::FleetLaunch;
 
@@ -203,6 +203,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         memory_mb: None,
         deny: fleet_deny.iter().map(|s| s.to_string()).collect(),
         claude_aliases: Vec::new(),
+        codex: None,
         agents: agents
             .iter()
             .map(|(name, cmd, deny)| atrium::fleet::Agent {
@@ -231,6 +232,69 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         )),
         vec!["c".to_string()]
     );
+}
+
+/// Each distinct effective `codex` block is said once with the codex agents
+/// it reaches, an empty one not at all, and a block on an agent that is not
+/// codex is named as ignored.
+#[test]
+fn codex_blocks_are_disclosed_per_distinct_block_and_flagged_off_codex() {
+    use atrium::vendors::perms::CodexPerms;
+    let block = |text: &str| CodexPerms::parse("t", &json::parse(text).unwrap()).unwrap();
+    let agent = |name: &str, cmd: &str, codex: Option<CodexPerms>| atrium::fleet::Agent {
+        name: name.to_string(),
+        cmd: vec![cmd.to_string()],
+        codex,
+        ..Default::default()
+    };
+    let mut fleet = atrium::fleet::Fleet {
+        grid: None,
+        identity: None,
+        trust: None,
+        allow_ctl: None,
+        mod_enabled: None,
+        subagents: None,
+        subagents_keep: None,
+        captions: None,
+        respawn_at: None,
+        context: None,
+        topics: None,
+        worktrees: None,
+        worktree_base: None,
+        worktree_seed: None,
+        build_jobs: None,
+        memory_mb: None,
+        deny: Vec::new(),
+        claude_aliases: Vec::new(),
+        codex: Some(block(r#"{ "network": true }"#)),
+        agents: vec![
+            agent("dev", "codex", None),
+            agent("qa", "codex", None),
+            agent("lead", "claude", None),
+            agent(
+                "ops",
+                "codex",
+                Some(block(r#"{ "git": "read", "approval": "on-request" }"#)),
+            ),
+        ],
+    };
+    assert_eq!(
+        codex_lines(&fleet),
+        vec![
+            "codex dev, qa — network on (every host)".to_string(),
+            "codex ops — approval on-request, git read-only, network on (every host)".to_string(),
+        ]
+    );
+    assert!(
+        codex_unbound(&fleet).is_empty(),
+        "the fleet's block is scoped by definition"
+    );
+    fleet.agents[2].codex = Some(block(r#"{ "network": false }"#));
+    assert_eq!(codex_unbound(&fleet), vec!["lead".to_string()]);
+    // A block that changes nothing is not disclosed.
+    fleet.codex = None;
+    fleet.agents[3].codex = Some(block("{}"));
+    assert!(codex_lines(&fleet).is_empty());
 }
 
 #[test]
