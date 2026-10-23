@@ -154,11 +154,15 @@ When atrium's mod is loaded, every verb below is also a tool (`atrium_spawn`,
 refused with a pointer to `atrium_subagent`, a subagent that is a visible pane.
 The tools and the shell verbs are the same control plane; use whichever you have.
 
-    atrium ctl spawn --here --role <short-name> -- claude     # tile beside you
+    atrium ctl spawn --here --role <short-name>               # tile beside you
     atrium ctl send <short-name> "<the subtask>"
 
+A spawn with no command after `--` creates **your own kind**: codex teammates
+from a codex lead, claude from a claude lead (atrium 0.41.0 and newer). Name
+the other only when the task calls for it: `-- codex` or `-- claude`.
+
 **Isolate each builder in its own worktree** when items touch files in parallel:
-`atrium ctl spawn --here --role <item> --worktree <item> -- claude` runs the
+`atrium ctl spawn --here --role <item> --worktree <item>` runs the
 teammate in a git worktree on branch `atrium/adhoc/<item>`, created (or reused)
 for it, with the worktree norms in its prompt. Its checkpoint commit lands on that
 branch; merge it after review. Reviewers read `git show <sha>` from any tree, so

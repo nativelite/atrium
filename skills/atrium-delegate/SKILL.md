@@ -33,8 +33,11 @@ A fresh teammate per part keeps every session small.
 
 ## How to delegate
 
-    atrium ctl spawn --role <short-name> -- claude
+    atrium ctl spawn --role <short-name>
     atrium ctl send <short-name> "<the subtask>"
+
+No command after `--` spawns your own kind (codex from codex, claude from
+claude; atrium 0.41.0 and newer); `-- claude` or `-- codex` names the other.
 
 Add `--worktree <name>` to the spawn when the part edits files you are also
 editing: the teammate then works in its own git worktree and branch, and you

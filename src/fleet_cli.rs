@@ -47,9 +47,22 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
         Some("init") => match args.get(1) {
             Some(name) if !name.starts_with('-') => {
                 let mut builders = 1usize;
+                let mut cmd: Option<String> = None;
                 let mut i = 2;
                 while i < args.len() {
                     match args[i].as_str() {
+                        "--cmd" => {
+                            match args.get(i + 1) {
+                                Some(c) if !c.is_empty() && !c.starts_with('-') => {
+                                    cmd = Some(c.clone());
+                                    i += 2;
+                                }
+                                _ => {
+                                    eprintln!("atrium fleet init: --cmd needs a program (claude or codex)");
+                                    return ExitCode::FAILURE;
+                                }
+                            }
+                        }
                         "--agents" => match args.get(i + 1).and_then(|n| n.parse::<usize>().ok()) {
                             Some(n) if n >= 1 => {
                                 builders = n;
@@ -66,7 +79,7 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
                         }
                     }
                 }
-                fleet_init(name, builders)
+                fleet_init(name, builders, cmd.as_deref())
             }
             _ => {
                 eprintln!(

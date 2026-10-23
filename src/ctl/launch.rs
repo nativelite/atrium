@@ -254,6 +254,39 @@ them with atrium ctl bus resolve SEQ once answered. \
 Run atrium ctl with no arguments for the full command surface, or use the \
 atrium-coordinate or atrium-delegate skills for the full workflow.";
 
+/// [`AGENT_CTL_DIRECTIVE`] for the agent `vendor` runs: the same orders, with
+/// the teammate it is told to spawn being its own kind — a codex lead spawns
+/// `codex`, a claude lead `claude` — and the raw permission flags it must not
+/// add being its own CLI's. A lead that wants the other kind names it after
+/// `--`. Claude's text is the constant itself, unchanged.
+pub fn agent_ctl_directive(vendor: agsess::Vendor) -> String {
+    match vendor {
+        agsess::Vendor::Codex => AGENT_CTL_DIRECTIVE
+            .replace(
+                "atrium ctl spawn --role NAME -- claude",
+                "atrium ctl spawn --role NAME -- codex",
+            )
+            .replace(
+                "Spawn each teammate as plain claude",
+                "Spawn each teammate as plain codex",
+            )
+            .replace(
+                "never add --dangerously-skip-permissions or --permission-mode yourself",
+                "never add --sandbox, --ask-for-approval or \
+                 --dangerously-bypass-approvals-and-sandbox yourself",
+            )
+            .replace(
+                "automode is claude auto mode",
+                "automode is the same workspace sandbox as accept for codex",
+            )
+            .replace(
+                "Do NOT use your Task tool or background agents to delegate",
+                "Do NOT use your own sub-agents or background agents to delegate",
+            ),
+        _ => AGENT_CTL_DIRECTIVE.to_string(),
+    }
+}
+
 fn parse_depth(val: &str) -> Result<usize, String> {
     val.parse::<usize>()
         .map_err(|_| "--max-depth must be a non-negative integer (0 = unlimited)".to_string())

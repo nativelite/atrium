@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-10-23
+
 ### Added
 - **A `codex` block in the fleet file sets the rest of a codex pane's
   permissions.** `trust` fixed a codex pane's posture and nothing else could
@@ -28,6 +30,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `plan` takes only the approval and the network, `skip` ignores the block,
   and an agent's `ctl spawn` cannot set one
   ([codex permissions](docs/fleets.md#codex-permissions)).
+- **A fleet written where it runs is of the writer's kind, and a lead spawns
+  its own kind.** The directive atrium gives every agent pane told a codex
+  lead to spawn `-- claude`, and `atrium fleet init` wrote claude agents
+  wherever it ran. A codex pane's directive now says `-- codex` and names
+  codex's own flags as the ones to leave out; `ctl spawn` with no command
+  after `--` spawns the caller's own kind (codex from a codex pane, claude
+  from a claude pane and from anything else), and says so in its `note`;
+  `atrium fleet init` writes `["codex"]` agents, with the lead's orders
+  spelled for codex, when run from inside a codex pane (codex marks its
+  commands' environment with `CODEX_THREAD_ID`), claude anywhere else, and
+  `--cmd claude`/`--cmd codex` picks explicitly. Naming the other kind after
+  `--`, or in `cmd`, still works as before.
 
 ### Fixed
 - **A send into a codex pane lands whole and is submitted.** A `ctl send` or

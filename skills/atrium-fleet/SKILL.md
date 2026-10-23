@@ -149,6 +149,14 @@ it exit at launch on `unexpected argument`):
   `cwd` and `add_dirs`. A teammate's `ctl spawn -- codex …` gets the same, minus
   the out-of-sandbox keys (`mcp_servers`, `notify`, `hooks`, network domains, …).
 
+**A fleet written where it runs is of the writer's kind** (atrium 0.41.0 and
+newer): `atrium fleet init <template>` run from inside a codex pane writes every
+agent as `["codex"]` and the lead's orders as `-- codex`; from claude, or
+anywhere else, `["claude"]`. `--cmd codex` / `--cmd claude` picks explicitly.
+When you author a fleet file by hand, default `cmd` to your own kind unless the
+human asked for the other; a lead's `ctl spawn` with no command after `--`
+spawns its own kind too.
+
 With `allow_ctl`, a sandboxed codex agent can reach atrium's control socket and
 nothing else (no domains, no other socket). On macOS/Linux that needs codex's
 experimental `network_proxy` feature; an older codex can't run `atrium ctl`

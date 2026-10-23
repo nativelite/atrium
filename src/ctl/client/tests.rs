@@ -19,12 +19,12 @@ fn send_without_text_is_an_error() {
     assert!(err.contains("text"), "{err}");
 }
 
+/// A spawn with no command after `--` is a request with an empty argv: the
+/// server fills in the caller's own kind (codex from a codex pane, claude
+/// from a claude pane and from anything else). It used to be refused.
 #[test]
-fn spawn_without_command_is_an_error() {
-    let err = build_request(&v(&["spawn", "--role", "x"]), None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("needs a command"), "{err}");
+fn spawn_without_command_asks_for_the_callers_own_kind() {
+    assert!(build_request(&v(&["spawn", "--role", "x"]), None).is_ok());
 }
 
 #[test]

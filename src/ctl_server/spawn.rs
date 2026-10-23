@@ -260,6 +260,21 @@ pub(crate) fn spawn(
     // only ever covered three names, and the surface it guards — MCP
     // servers, plugin dirs, settings files, all of which execute code at
     // startup — is far larger than that.
+    // No command: the caller's own kind. A codex lead gets codex teammates
+    // and a claude lead claude ones unless the spawn names the other after
+    // `--`; from a pane that is no agent (a shell, the operator), claude.
+    let mut notes: Vec<String> = Vec::new();
+    if sp.argv.is_empty() {
+        let own = caller
+            .and_then(|cid| pane_by_agent(windows, cid))
+            .filter(|p| atrium::bind::is_agent_stem(&p.title))
+            .and_then(|p| p.argv.first().cloned())
+            .unwrap_or_else(|| "claude".to_string());
+        notes.push(format!(
+            "no command given: spawned {own}, the caller's own kind"
+        ));
+        sp.argv = vec![own];
+    }
     let stripped = match ctl::vet_spawn_argv(&sp.argv) {
         ctl::ArgvVerdict::Refused(why) => return ctl::reply_err(&why),
         ctl::ArgvVerdict::Ok { argv, stripped } => {
@@ -267,7 +282,6 @@ pub(crate) fn spawn(
             stripped
         }
     };
-    let mut notes: Vec<String> = Vec::new();
     if !stripped.is_empty() {
         notes.push(format!(
             "ignored raw {} — request a mode with --mode instead",

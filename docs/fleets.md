@@ -45,7 +45,7 @@ atrium fleet ls               # list the fleet names in the file
 
 ### Templates
 
-`atrium fleet init <name> [--agents N]` writes `./atrium.fleet.json` from a template, so a fleet starts from a known-good shape rather than a blank file. It copies, never links — the project file is self-contained and reviewable — and refuses to overwrite one that exists. `atrium fleet ls --templates` is the menu.
+`atrium fleet init <name> [--agents N] [--cmd claude|codex]` writes `./atrium.fleet.json` from a template, so a fleet starts from a known-good shape rather than a blank file. Its agents run the writer's own kind: codex when the command runs inside a codex pane (codex marks its commands' environment with `CODEX_THREAD_ID`), claude inside claude and anywhere else; `--cmd` picks explicitly. It copies, never links — the project file is self-contained and reviewable — and refuses to overwrite one that exists. `atrium fleet ls --templates` is the menu.
 
 Three **built-ins** are compiled into atrium, so they work on a fresh machine with no files anywhere:
 

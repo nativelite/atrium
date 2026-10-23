@@ -632,8 +632,17 @@ fn agent_args(
     // on this flag — two separate pushes silently drop the first. codex gets the
     // same block as its one `-c developer_instructions`, also last-wins.
     if is_claude || is_codex {
+        // The directive names the agent's own kind as the teammate to spawn:
+        // a codex lead is told `-- codex` and codex's own flags to leave out.
+        let directive;
         let ctl = if CTL_ADDRESS.get().is_some() {
-            Some(atrium::ctl::AGENT_CTL_DIRECTIVE)
+            let vendor = if is_codex {
+                agsess::Vendor::Codex
+            } else {
+                agsess::Vendor::ClaudeCode
+            };
+            directive = atrium::ctl::agent_ctl_directive(vendor);
+            Some(directive.as_str())
         } else {
             None
         };

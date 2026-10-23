@@ -51,7 +51,9 @@ pub use client::{
     ask_done, build_request, ctl_cmd, parse_ask, parse_wait, wait_done, AskSpec, UsageError,
     WaitFor, WaitSpec, ASK_DEFAULT_TIMEOUT_S, ASK_MAX_TIMEOUT_S,
 };
-pub use launch::{parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG};
+pub use launch::{
+    agent_ctl_directive, parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG,
+};
 pub use policy::{
     delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, parse_allow_list,
     resolve_target, sanitize_spawn_argv, vet_fleet_argv, vet_spawn_argv, ArgvVerdict, SpawnDenied,

@@ -131,6 +131,24 @@ fn agent_directive_teaches_claim_before_work() {
     // before building and release when done, else the primitive goes unused.
     assert!(AGENT_CTL_DIRECTIVE.contains("board claim"));
     assert!(AGENT_CTL_DIRECTIVE.contains("board release"));
+    // A codex pane is told to spawn codex and to leave codex's own permission
+    // flags out; everything else is the same orders. Claude's is the constant.
+    let codex = agent_ctl_directive(agsess::Vendor::Codex);
+    assert!(
+        codex.contains("atrium ctl spawn --role NAME -- codex"),
+        "{codex}"
+    );
+    assert!(codex.contains("plain codex"), "{codex}");
+    assert!(
+        codex.contains("--dangerously-bypass-approvals-and-sandbox"),
+        "{codex}"
+    );
+    assert!(!codex.contains("claude"), "{codex}");
+    assert!(codex.contains("board claim") && codex.contains("ATRIUM_CTL"));
+    assert_eq!(
+        agent_ctl_directive(agsess::Vendor::ClaudeCode),
+        AGENT_CTL_DIRECTIVE
+    );
 }
 
 #[test]

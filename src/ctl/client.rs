@@ -644,9 +644,8 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             other => return Err(format!("unexpected argument {other:?} (use `-- <cmd>`)")),
         }
     }
-    if argv.is_empty() {
-        return Err("spawn needs a command after `--` (e.g. `-- claude`)".to_string());
-    }
+    // No `-- <cmd>`: the server spawns the caller's own kind (codex from a
+    // codex pane, claude from a claude pane; claude from anything else).
     if let Some(r) = role {
         pairs.push(("role", Value::String(r)));
     }

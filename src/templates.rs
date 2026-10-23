@@ -92,9 +92,14 @@ const CREW_INTEGRATOR_KICKOFF: &str = "First run atrium ctl bus sub work. Then w
 
 /// The template's fleet-object text, or `None` for an unknown name. `builders`
 /// scales `pair` and `crew` (1 keeps the roster as is; N names them
-/// `builder-1`…`builder-N`); `solo` ignores it.
-pub fn builtin(name: &str, builders: usize) -> Option<String> {
+/// `builder-1`…`builder-N`); `solo` ignores it. `agent` is the program every
+/// agent runs (`claude` or `codex`): a fleet written from inside codex is a
+/// codex fleet unless told otherwise.
+pub fn builtin(name: &str, builders: usize, agent: &str) -> Option<String> {
     let n = builders.max(1);
+    // The lead's orders name the teammate it spawns: its own kind.
+    let lead_prompt = LEAD_PROMPT.replace("-- claude", &format!("-- {agent}"));
+    let agent = json_str(agent);
     let text = match name {
         "solo" => format!(
             r#"{{
@@ -104,7 +109,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
   "agents": [
     {{
       "name": "solo",
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "opus",
       "effort": "high",
       "can_spawn": true,
@@ -126,7 +131,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
 {builders},
     {{
       "name": "reviewer",
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "opus",
       "effort": "high",
       "prompt": {rp},
@@ -134,7 +139,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
     }}
   ]
 }}"#,
-            builders = builder_agents(n, PAIR_BUILDER_KICKOFF),
+            builders = builder_agents(n, PAIR_BUILDER_KICKOFF, &agent),
             rp = json_str(REVIEWER_PROMPT),
             rk = json_str(PAIR_REVIEWER_KICKOFF)
         ),
@@ -147,7 +152,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
   "agents": [
     {{
       "name": "lead",
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "opus",
       "effort": "high",
       "can_spawn": true,
@@ -157,7 +162,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
 {builders},
     {{
       "name": "reviewer",
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "opus",
       "effort": "high",
       "prompt": {rp},
@@ -165,7 +170,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
     }},
     {{
       "name": "integrator",
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "sonnet",
       "effort": "medium",
       "prompt": {ip},
@@ -173,9 +178,9 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
     }}
   ]
 }}"#,
-            lp = json_str(LEAD_PROMPT),
+            lp = json_str(&lead_prompt),
             lk = json_str(LEAD_KICKOFF),
-            builders = builder_agents(n, CREW_BUILDER_KICKOFF),
+            builders = builder_agents(n, CREW_BUILDER_KICKOFF, &agent),
             rp = json_str(REVIEWER_PROMPT),
             rk = json_str(CREW_REVIEWER_KICKOFF),
             ip = json_str(INTEGRATOR_PROMPT),
@@ -188,7 +193,7 @@ pub fn builtin(name: &str, builders: usize) -> Option<String> {
 
 /// `n` builder agents, each in its own worktree group. One is `builder`;
 /// more are `builder-1`…`builder-n`.
-fn builder_agents(n: usize, kickoff: &str) -> String {
+fn builder_agents(n: usize, kickoff: &str, agent: &str) -> String {
     (1..=n)
         .map(|i| {
             let name = if n == 1 {
@@ -199,7 +204,7 @@ fn builder_agents(n: usize, kickoff: &str) -> String {
             format!(
                 r#"    {{
       "name": {name},
-      "cmd": ["claude"],
+      "cmd": [{agent}],
       "model": "opus",
       "effort": "high",
       "worktree": {name},
@@ -268,7 +273,7 @@ mod tests {
         assert_eq!(NAMES.len(), SUMMARIES.len());
         for &name in NAMES {
             for builders in [1, 2, 3] {
-                let object = builtin(name, builders).unwrap();
+                let object = builtin(name, builders, "claude").unwrap();
                 let text = fleet_file(name, &object);
                 let fleets = crate::fleet::parse(&text)
                     .unwrap_or_else(|e| panic!("{name} x{builders}: {e}\n{text}"));
@@ -315,7 +320,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(builtin("nope", 1), None);
+        assert_eq!(builtin("nope", 1, "claude"), None);
     }
 
     #[test]
@@ -326,5 +331,25 @@ mod tests {
         assert_eq!(json::parse(&esc).unwrap().as_str(), Some("x\ny\t\u{1}"));
         let round = json::parse(&json_str("say \"hi\"\n")).unwrap();
         assert_eq!(round.as_str(), Some("say \"hi\"\n"));
+    }
+
+    /// Written for codex, every agent of a template runs codex and the lead
+    /// is told to spawn codex teammates; the word claude is not in it.
+    #[test]
+    fn a_codex_template_is_codex_throughout() {
+        for name in NAMES {
+            let object = builtin(name, 2, "codex").unwrap();
+            let text = fleet_file(name, &object);
+            let fleets = crate::fleet::parse(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let f = fleets.get(name).unwrap();
+            for a in &f.agents {
+                assert_eq!(a.cmd, ["codex"], "{name}/{}", a.name);
+                let p = a.prompt.as_deref().unwrap_or("");
+                assert!(!p.contains("-- claude"), "{name}/{}: {p}", a.name);
+            }
+            assert!(!text.contains("\"claude\""), "{name}: {text}");
+        }
+        let crew = builtin("crew", 1, "codex").unwrap();
+        assert!(crew.contains("-- codex"), "{crew}");
     }
 }

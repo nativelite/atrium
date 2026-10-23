@@ -8,7 +8,25 @@ use crate::*;
 /// `fleet.json` (which wins over a built-in, and says so), else a built-in.
 /// Copies, never links: the project file is self-contained and reviewable.
 /// Refuses to overwrite an existing file.
-pub(crate) fn fleet_init(name: &str, builders: usize) -> ExitCode {
+/// The program a generated fleet's agents run when `--cmd` did not say:
+/// codex from inside a codex pane (codex marks its commands' environment
+/// with `CODEX_THREAD_ID`), claude from inside claude (`CLAUDECODE`) and from
+/// anywhere else. A fleet written where it will run is of the writer's kind.
+pub(crate) fn own_agent() -> String {
+    own_agent_from(|k| std::env::var_os(k).is_some())
+}
+
+/// [`own_agent`] over an environment given as a predicate, for tests.
+pub(crate) fn own_agent_from(has: impl Fn(&str) -> bool) -> String {
+    if has("CODEX_THREAD_ID") && !has("CLAUDECODE") {
+        "codex".to_string()
+    } else {
+        "claude".to_string()
+    }
+}
+
+pub(crate) fn fleet_init(name: &str, builders: usize, cmd: Option<&str>) -> ExitCode {
+    let agent = cmd.map(str::to_string).unwrap_or_else(own_agent);
     let target = std::path::Path::new("atrium.fleet.json");
     if target.exists() {
         eprintln!(
@@ -53,7 +71,7 @@ pub(crate) fn fleet_init(name: &str, builders: usize) -> ExitCode {
                 }
             }
         }
-        Ok(_) => match atrium::templates::builtin(name, builders) {
+        Ok(_) => match atrium::templates::builtin(name, builders, &agent) {
             Some(object) => (
                 atrium::templates::fleet_file(name, &object),
                 format!("built-in {name:?}"),
@@ -78,4 +96,24 @@ pub(crate) fn fleet_init(name: &str, builders: usize) -> ExitCode {
     println!("wrote ./atrium.fleet.json from {source}");
     println!("next: review it, then `atrium fleet up {name}`");
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::own_agent_from;
+
+    /// Inside codex (its commands carry `CODEX_THREAD_ID`) a generated fleet is
+    /// codex; inside claude (`CLAUDECODE`), or in a plain shell, claude. A shell
+    /// that somehow carries both markers is read as claude: the safer default.
+    #[test]
+    fn a_fleet_written_inside_codex_is_codex_and_claude_otherwise() {
+        let env = |vars: &'static [&'static str]| move |k: &str| vars.contains(&k);
+        assert_eq!(own_agent_from(env(&["CODEX_THREAD_ID"])), "codex");
+        assert_eq!(own_agent_from(env(&["CLAUDECODE"])), "claude");
+        assert_eq!(own_agent_from(env(&[])), "claude");
+        assert_eq!(
+            own_agent_from(env(&["CODEX_THREAD_ID", "CLAUDECODE"])),
+            "claude"
+        );
+    }
 }
