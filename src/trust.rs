@@ -260,13 +260,31 @@ pub fn codex_trust_args(mode: TrustMode) -> Vec<String> {
 /// socket) instead of `--sandbox`. `None` where the posture has no sandbox to
 /// open (`Skip`, `Off`), so the caller keeps [`codex_trust_args`].
 pub fn codex_ctl_trust_args(mode: TrustMode, ctl: &str) -> Option<Vec<String>> {
-    let base = match mode {
-        TrustMode::Edits | TrustMode::Auto => ":workspace",
-        TrustMode::Plan => ":read-only",
+    codex_profile_trust_args(mode, Some(ctl), &[])
+}
+
+/// [`codex_trust_args`] with the sandbox given as a codex permission profile
+/// ([`crate::vendors::codex_profile`]): the posture's own confinement, plus
+/// the control socket `ctl` when there is one and the filesystem rules `fs`
+/// (the git dirs, [`crate::vendors::codex_git_rules`]). The rules apply at
+/// `Edits`/`Auto` only: `Plan` is read-only, and git stays so there. `None`
+/// when there is nothing to open — `Skip`/`Off` have no sandbox, and a posture
+/// with no socket and no rules keeps its plain `--sandbox`.
+pub fn codex_profile_trust_args(
+    mode: TrustMode,
+    ctl: Option<&str>,
+    fs: &[crate::vendors::CodexFsRule],
+) -> Option<Vec<String>> {
+    let (base, fs) = match mode {
+        TrustMode::Edits | TrustMode::Auto => (":workspace", fs),
+        TrustMode::Plan => (":read-only", &[][..]),
         TrustMode::Skip | TrustMode::Off => return None,
     };
+    if ctl.is_none() && fs.is_empty() {
+        return None;
+    }
     let mut v = vec!["--ask-for-approval".to_string(), "never".to_string()];
-    v.extend(crate::vendors::codex_ctl_sandbox(base, ctl));
+    v.extend(crate::vendors::codex_profile(base, ctl, fs));
     Some(v)
 }
 
@@ -764,6 +782,41 @@ mod tests {
         );
         assert_eq!(joined(TrustMode::Skip), None);
         assert_eq!(joined(TrustMode::Off), None);
+    }
+
+    /// Git rules reach the profile at `Edits`/`Auto` with or without a
+    /// socket; `Plan` keeps git read-only (rules dropped, so with no socket it
+    /// keeps its plain `--sandbox`); `Skip`/`Off` get nothing either way.
+    #[test]
+    fn codex_profile_trust_args_carry_git_rules_only_where_the_pane_may_write() {
+        let rules = crate::vendors::codex_git_rules("/r/.git", "/r/.git");
+        let joined = |m, ctl| codex_profile_trust_args(m, ctl, &rules).map(|v| v.join(" "));
+        for m in [TrustMode::Edits, TrustMode::Auto] {
+            let alone = joined(m, None).unwrap();
+            assert!(alone.starts_with("--ask-for-approval never -c "), "{alone}");
+            assert!(
+                alone.contains(r#"permissions.atrium_ctl.filesystem={"/r/.git"="write","#),
+                "{alone}"
+            );
+            assert!(!alone.contains("network"), "{alone}");
+            let with = joined(m, Some("/t/a.sock")).unwrap();
+            assert!(
+                with.contains("permissions.atrium_ctl.filesystem="),
+                "{with}"
+            );
+            assert!(
+                with.contains(r#"unix_sockets={"/t/a.sock"="allow"}"#),
+                "{with}"
+            );
+        }
+        assert_eq!(joined(TrustMode::Plan, None), None);
+        let plan = joined(TrustMode::Plan, Some("/t/a.sock")).unwrap();
+        assert!(!plan.contains("filesystem"), "{plan}");
+        assert!(plan.contains(r#"extends=":read-only""#), "{plan}");
+        assert_eq!(joined(TrustMode::Skip, Some("/t/a.sock")), None);
+        assert_eq!(joined(TrustMode::Off, None), None);
+        // No socket and no rules: nothing to open, the plain args stand.
+        assert_eq!(codex_profile_trust_args(TrustMode::Edits, None, &[]), None);
     }
 
     #[test]

@@ -190,6 +190,189 @@ fn a_claude_lead_and_a_sandboxed_codex_dev_fleet_reaches_ctl() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
+/// A `ctl send` issued the instant a codex pane appears arrives whole and is
+/// submitted, however long codex takes to come up. codex discards the
+/// terminal input pending before its first interactive screen, and a tty
+/// still in cooked mode keeps one line of what is typed, so a send typed at
+/// the short unbound fallback was dropped or cut short; the queue now waits
+/// for the pane to bind, which codex's rollout file marks. A bash pane sends
+/// six lines to the codex pane the moment it is on the bar; the proof is the
+/// rollout's user message, equal to the text sent, and codex's reply on the
+/// screen (a word the instruction does not contain). Ignored by default: it
+/// needs a real `codex`, signed in, and a model turn. Run it by hand:
+/// `cargo test --test atrium fresh_codex_pane -- --ignored --nocapture`.
+#[cfg(unix)]
+#[test]
+#[ignore = "needs codex on PATH, signed in; run with --ignored"]
+fn a_send_into_a_fresh_codex_pane_lands_whole_once_it_is_up() {
+    let pid = std::process::id();
+    let td = std::env::temp_dir().join(format!("atrium-codex-send-e2e-{pid}"));
+    let _ = std::fs::remove_dir_all(&td);
+    std::fs::create_dir_all(&td).unwrap();
+    let started = std::time::SystemTime::now();
+    // A plain directory, not a checkout: codex asks "Trust this folder?" only
+    // inside a git repository, and this test is about the send, not git.
+    let fleet_json = r#"{ "fleets": { "pair": { "grid": "1x2", "allow_ctl": true, "trust": "accept",
+      "mod": false, "captions": false, "agents": [
+      { "name": "sh", "cmd": ["bash", "--norc", "--noprofile"] },
+      { "name": "dev", "cmd": ["codex"] }
+    ] } } }"#;
+    std::fs::write(td.join("atrium.fleet.json"), fleet_json).unwrap();
+    // cargo probes the system's certificate locations at startup and exports
+    // `SSL_CERT_FILE`/`SSL_CERT_DIR` into its own environment, which this test
+    // binary, atrium and then codex inherit. codex under that custom CA path
+    // took minutes to come up (measured: its startup requests crawled), which
+    // no launch from a shell sees. Not part of what is being tested, so drop
+    // them before atrium is spawned.
+    std::env::remove_var("SSL_CERT_FILE");
+    std::env::remove_var("SSL_CERT_DIR");
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["fleet", "up", "pair"],
+        40,
+        160,
+        &[("ATRIUM_YES".to_string(), "1".to_string())],
+        Some(&td.to_string_lossy()),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"2:dev", Duration::from_secs(30));
+    assert!(
+        contains(&out, b"2:dev"),
+        "the codex pane did not come up: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+
+    // Six lines, well past one tty line, sent the instant the pane exists.
+    let marker = format!("ATRIUM-SEND-E2E-{pid}");
+    let filler = "the quick brown fox jumps over the lazy dog ".repeat(8);
+    let lines: Vec<String> = (1..=6)
+        .map(|i| format!("line {i} of the task: {filler}{marker}"))
+        .collect();
+    let text = format!(
+        "{}\nReply with the word ATRIUM spelled backwards, in capitals, and nothing else.",
+        lines.join("\n")
+    );
+    // Typed into the bash pane as one `$'…'` word, so the newlines survive.
+    let cmd = format!(
+        "{} ctl send dev $'{}'\r",
+        env!("CARGO_BIN_EXE_atrium"),
+        text.replace('\n', "\\n")
+    );
+    p.write(cmd.as_bytes()).unwrap();
+    // Accepted (`queued` only says whether the target was mid-turn); the
+    // delivery itself waits for the codex pane to bind.
+    let out = read_until(&mut p, b"\"ok\":true", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":true"),
+        "the send was not accepted: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(&out))
+    );
+
+    // codex's reply lands on its screen once the send was submitted whole.
+    // Read in slices and say what the screen shows after each, so a failure
+    // tells how far codex got (still `loading`, the text unsent, a dialog).
+    let mut out = Vec::new();
+    let began = std::time::Instant::now();
+    while !contains(&out, b"MUIRTA") && began.elapsed() < Duration::from_secs(420) {
+        out.extend(read_until(&mut p, b"MUIRTA", Duration::from_secs(30)));
+        let shown = String::from_utf8_lossy(&strip_csi_bytes(&out)).to_string();
+        let tail: String = shown
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        eprintln!("[{}s] screen tail: {tail:?}", began.elapsed().as_secs());
+    }
+    let screen = String::from_utf8_lossy(&strip_csi_bytes(&out)).to_string();
+    // Everything atrium drew, for reading after a failure (the temp dir is
+    // kept then): where the send landed, what codex showed.
+    let _ = std::fs::write(td.join("stream.txt"), &screen);
+    eprintln!("screen stream: {}", td.join("stream.txt").display());
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 20);
+    assert!(
+        contains(&out, b"MUIRTA"),
+        "codex never answered the send: {screen:?}"
+    );
+
+    // The rollout records the user message as sent: every line, nothing cut.
+    let got = codex_user_message_containing(&marker, started)
+        .expect("a codex rollout written since the start holds the sent message");
+    assert_eq!(got, text, "the send did not arrive whole");
+    let _ = std::fs::remove_dir_all(&td);
+}
+
+/// The text of the first user message containing `marker` in any codex
+/// rollout (`$CODEX_HOME/sessions/**/rollout-*.jsonl`) written since `since`.
+#[cfg(unix)]
+fn codex_user_message_containing(marker: &str, since: std::time::SystemTime) -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")))?;
+    let mut files = Vec::new();
+    jsonl_files_under(&home.join("sessions"), &mut files);
+    for f in files {
+        let fresh = std::fs::metadata(&f)
+            .and_then(|m| m.modified())
+            .is_ok_and(|m| m >= since);
+        if !fresh {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        for line in body.lines() {
+            let Ok(v) = json::parse(line) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+                continue;
+            }
+            let Some(payload) = v.get("payload") else {
+                continue;
+            };
+            let is_user = payload.get("type").and_then(|t| t.as_str()) == Some("message")
+                && payload.get("role").and_then(|r| r.as_str()) == Some("user");
+            if !is_user {
+                continue;
+            }
+            let text: String = payload
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+                .unwrap_or_default();
+            if text.contains(marker) {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn jsonl_files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            jsonl_files_under(&p, out);
+        } else if p.extension().is_some_and(|x| x == "jsonl") {
+            out.push(p);
+        }
+    }
+}
+
 /// `atrium fleet up nope` with no fleet file is a clean error, not a hung window.
 #[test]
 fn fleet_up_unknown_file_is_a_startup_error() {

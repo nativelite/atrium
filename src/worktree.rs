@@ -169,6 +169,30 @@ pub fn is_git_repo(cwd: &Path) -> bool {
     git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|s| s == "true")
 }
 
+/// The git dir and common dir of the checkout containing `cwd`, absolute, as
+/// git spells them (`git rev-parse --path-format=absolute --git-dir
+/// --git-common-dir`): the same `.git` twice for a main checkout; for a linked
+/// worktree its own `<common>/worktrees/<name>` and the main checkout's
+/// `.git`. `None` outside a checkout, or with a git older than 2.31 (no
+/// `--path-format`). What a sandboxed codex pane is opened to
+/// ([`crate::vendors::codex_git_rules`]).
+pub fn git_dirs(cwd: &Path) -> Option<(String, String)> {
+    let out = git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let git_dir = lines.next()?.to_string();
+    let common_dir = lines.next()?.to_string();
+    Some((git_dir, common_dir))
+}
+
 /// The ref new branches fork from and "merged?" is measured against: the current
 /// branch name, or the HEAD commit when detached. Captured once at `fleet up`.
 pub fn base_ref(cwd: &Path) -> Result<String, String> {
@@ -810,6 +834,36 @@ mod tests {
             !is_git_repo(&r.root),
             "its parent holds no repo, so worktrees stay dormant there"
         );
+    }
+
+    /// A main checkout names its one `.git` twice; a linked worktree names its
+    /// own git dir under the main checkout's `worktrees/` and that `.git` as
+    /// the common dir; a plain directory has neither. Compared as git spells
+    /// them (absolute, forward slashes on Windows), after canonicalising both
+    /// sides, since a temp dir may be reached through a symlink or a 8.3 name.
+    #[test]
+    fn git_dirs_name_the_checkouts_own_and_shared_git_directories() {
+        let r = Repo::new("gitdirs");
+        let canon = |s: &str| std::fs::canonicalize(s).unwrap();
+        let (git_dir, common) = git_dirs(&r.repo).expect("a checkout has git dirs");
+        assert_eq!(canon(&git_dir), canon(&common));
+        assert_eq!(
+            canon(&common),
+            std::fs::canonicalize(r.repo.join(".git")).unwrap()
+        );
+        assert!(
+            !git_dir.contains('\\'),
+            "git spells paths with forward slashes: {git_dir}"
+        );
+        let plan = r.plan("dev");
+        assert_eq!(ensure(&r.repo, &plan), Ok(true));
+        let (wt_git, wt_common) = git_dirs(&plan.dir).expect("a worktree has git dirs");
+        assert_eq!(canon(&wt_common), canon(&common));
+        assert_eq!(
+            canon(&wt_git),
+            std::fs::canonicalize(r.repo.join(".git").join("worktrees").join("dev")).unwrap()
+        );
+        assert_eq!(git_dirs(&r.root), None, "no checkout, nothing to open");
     }
 
     #[test]

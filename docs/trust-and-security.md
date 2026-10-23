@@ -146,6 +146,20 @@ it. What it costs: the pane's commands can talk to this atrium session's
 control plane, with that pane's capability token, the same access a claude
 pane has. The spawn log (`ATRIUM_SPAWN_LOG`) shows the exact arguments.
 
+**git works in the sandbox.** codex's `:workspace` keeps a checkout's `.git`
+read-only, and for a linked worktree the git dir its `.git` file points at
+too, so `git add` and `git commit` in an `accept` or `automode` codex pane
+failed with `Read-only file system` (measured, codex 0.163.0 on Linux:
+`Unable to create '<main>/.git/worktrees/<name>/index.lock'`). A fleet item
+is done only with a commit, so a codex pane at those postures whose working
+directory is a checkout now gets filesystem rules in the same profile, socket
+or not: its git dir and the common dir (`git rev-parse --git-dir
+--git-common-dir`) writable, with `hooks/`, `config` and the worktree's
+`config.worktree` kept read-only, the files that would run code as you the
+next time you use git outside the sandbox. Measured under these rules: a
+commit succeeds in a main checkout and in a linked worktree; creating a hook
+and appending to `config` are refused. `plan` stays read-only, git included.
+
 Limits:
 
 - **It needs codex's `network_proxy` feature**, which codex marks

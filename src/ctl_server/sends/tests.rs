@@ -182,3 +182,42 @@ fn take_for_hands_a_pane_its_untyped_deliveries_and_nothing_else() {
     assert_eq!(take_for(&mut pending, AgentId(1)).len(), 1);
     assert_eq!(pending.len(), 1);
 }
+
+/// A pane whose app turned bracketed paste on gets a send as a paste, newlines
+/// inside and all; one that did not, and every Windows pane, gets the bare
+/// text. The Enter is never part of the bytes: it follows after the beat.
+#[test]
+fn a_send_is_typed_as_a_paste_only_into_a_pane_that_asked_for_paste_mode() {
+    let text = "line one\nline two";
+    assert_eq!(typed_bytes(text, false), text.as_bytes());
+    let pasted = typed_bytes(text, true);
+    if cfg!(unix) {
+        assert_eq!(pasted, b"\x1b[200~line one\nline two\x1b[201~");
+    } else {
+        assert_eq!(pasted, text.as_bytes());
+    }
+    assert!(!pasted.ends_with(b"\r"));
+}
+
+/// An unbound codex or claude pane is typed into once its screen shows the
+/// shortcuts hint, however it is styled; a loading screen is not enough,
+/// until the prompt wait runs out. A shell has no hint and is never held.
+#[test]
+fn an_agent_pane_is_held_until_its_prompt_hint_is_on_screen() {
+    let mut loading = vterm::Term::new(6, 40);
+    loading.feed(b">_ OpenAI Codex (v0.0.0)\r\n   loading\r\n");
+    let mut prompt = vterm::Term::new(6, 40);
+    prompt.feed(b"\x1b[1m>_ OpenAI Codex\x1b[0m\r\n\x1b[2m\xe2\x80\xba\x1b[0m Ask Codex to do anything\r\n  \x1b[2m? for shortcuts\x1b[0m\r\n");
+    assert!(!screen_has(loading.screen(), "? for shortcuts"));
+    assert!(screen_has(prompt.screen(), "? for shortcuts"));
+    let soon = Duration::from_secs(3);
+    for title in ["codex", "claude"] {
+        assert!(!prompt_up(title, loading.screen(), soon), "{title}");
+        assert!(prompt_up(title, prompt.screen(), soon), "{title}");
+        assert!(
+            prompt_up(title, loading.screen(), SEND_PROMPT_WAIT),
+            "{title}"
+        );
+    }
+    assert!(prompt_up("bash", loading.screen(), Duration::ZERO));
+}

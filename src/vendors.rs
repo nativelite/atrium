@@ -182,6 +182,123 @@ pub const CODEX_CTL_PROFILE: &str = "atrium_ctl";
 /// The codex feature that enforces a profile's network rules.
 pub const CODEX_NETWORK_PROXY: &str = "network_proxy";
 
+/// The text `vendor`'s TUI shows once its prompt is up and empty, which a pane
+/// of it has on screen when it is ready to be typed into — the shortcuts hint
+/// under the input box, the same words in codex and claude (`? for
+/// shortcuts`, measured: codex 0.163.0's welcome screen and after each turn;
+/// claude's `shortcuts-hint`). `None` for a vendor whose prompt atrium cannot
+/// tell, which gets the plain settle gate.
+///
+/// A queued send into an unbound pane waits for this ([`crate::deliver`]): a
+/// TUI that has drawn something and gone quiet may still be starting (codex
+/// sits on `loading` while it fetches its models), and a paste typed into
+/// that boundary lands in the composer without its Enter, or is discarded —
+/// measured, codex 0.163.0: a paste 1.5 s after launch is never submitted,
+/// the same paste at 8 s, with the hint on screen, is.
+pub fn prompt_marker(vendor: Vendor) -> Option<&'static str> {
+    match vendor {
+        Vendor::Codex | Vendor::ClaudeCode => Some("? for shortcuts"),
+        _ => None,
+    }
+}
+
+/// Does `vendor`'s TUI take a bracketed paste (`ESC[200~ … ESC[201~`) as one
+/// insertion? codex (crossterm) and claude (ink) both parse the markers
+/// whether or not atrium saw them enable the mode, so a send into their panes
+/// is always typed as a paste: typed as keystrokes, codex's composer took a
+/// multi-line text as a run of lines, lost its tail and never submitted.
+pub fn takes_paste(vendor: Vendor) -> bool {
+    matches!(vendor, Vendor::Codex | Vendor::ClaudeCode)
+}
+
+/// One filesystem rule of a codex permission profile: an absolute `path` and
+/// whether codex may write under it (`write`) or only read (`read`). A read
+/// rule inside a write rule is a carve-out; the deeper rule wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexFsRule {
+    pub path: String,
+    pub write: bool,
+}
+
+/// The rules that let git work in a sandboxed codex pane whose working
+/// directory is a checkout, given its git dir and common dir as git spells
+/// them ([`crate::worktree::git_dirs`]).
+///
+/// codex's `:workspace` sandbox keeps a checkout's `.git` read-only, and for a
+/// linked worktree the git dir its `.git` file points at too, so `git add` and
+/// `git commit` fail there with `Read-only file system` (measured, codex
+/// 0.163.0 on Linux: `Unable to create '<main>/.git/worktrees/<name>/index.lock'`).
+/// A fleet item is done only with a commit, so the pane gets explicit rules
+/// instead: the common dir (objects, refs, logs, and the main checkout's own
+/// index) and the worktree's git dir writable, with the files that run code
+/// as the human the next time they use git outside the sandbox kept read-only:
+/// `hooks/`, `config` (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`)
+/// and the worktree's `config.worktree`. Measured under these rules: a commit
+/// succeeds in a main checkout and in a linked worktree; creating a hook and
+/// appending to `config` are refused; a rule naming a file that does not exist
+/// yet is accepted.
+pub fn codex_git_rules(git_dir: &str, common_dir: &str) -> Vec<CodexFsRule> {
+    let rule = |path: String, write: bool| CodexFsRule { path, write };
+    let mut v = vec![rule(common_dir.to_string(), true)];
+    if git_dir != common_dir {
+        v.push(rule(git_dir.to_string(), true));
+    }
+    v.push(rule(format!("{common_dir}/hooks"), false));
+    v.push(rule(format!("{common_dir}/config"), false));
+    v.push(rule(format!("{git_dir}/config.worktree"), false));
+    v
+}
+
+/// The codex permission profile atrium launches a sandboxed pane under: the
+/// built-in `base` (`":workspace"` or `":read-only"`) plus what atrium opens in
+/// it — `fs`, filesystem rules such as [`codex_git_rules`], and `ctl`, the
+/// control socket its commands may reach, as in [`codex_ctl_sandbox`]. A
+/// profile replaces `--sandbox`, which codex refuses alongside one.
+///
+/// The filesystem rules are one inline table keyed by path, because codex
+/// splits a dotted `-c` key on every `.`, quotes or not, and a path has dots.
+pub fn codex_profile(base: &str, ctl: Option<&str>, fs: &[CodexFsRule]) -> Vec<String> {
+    let p = CODEX_CTL_PROFILE;
+    let mut v = Vec::new();
+    v.extend(codex_config("default_permissions", &toml_string(p)));
+    v.extend(codex_config(
+        &format!("permissions.{p}.extends"),
+        &toml_string(base),
+    ));
+    if !fs.is_empty() {
+        let rules: Vec<String> = fs
+            .iter()
+            .map(|r| {
+                let access = if r.write { "write" } else { "read" };
+                format!("{}={}", toml_string(&r.path), toml_string(access))
+            })
+            .collect();
+        v.extend(codex_config(
+            &format!("permissions.{p}.filesystem"),
+            &format!("{{{}}}", rules.join(",")),
+        ));
+    }
+    if let Some(ctl) = ctl {
+        v.extend(codex_config(
+            &format!("permissions.{p}.network.enabled"),
+            "true",
+        ));
+        v.extend(codex_config(
+            &format!("permissions.{p}.network.mode"),
+            &toml_string("limited"),
+        ));
+        // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
+        // quotes or not, so the socket path's own dots would break it.
+        v.extend(codex_config(
+            &format!("permissions.{p}.network.unix_sockets"),
+            &format!("{{{}={}}}", toml_string(ctl), toml_string("allow")),
+        ));
+        v.push("--enable".to_string());
+        v.push(CODEX_NETWORK_PROXY.to_string());
+    }
+    v
+}
+
 /// Codex's sandbox args for a pane that must reach atrium's control socket at
 /// `ctl`, for the sandbox `base` (`":workspace"` or `":read-only"`).
 ///
@@ -196,30 +313,7 @@ pub const CODEX_NETWORK_PROXY: &str = "network_proxy";
 /// alongside one; the network proxy is an experimental codex feature, so the
 /// caller checks this codex has it first.
 pub fn codex_ctl_sandbox(base: &str, ctl: &str) -> Vec<String> {
-    let p = CODEX_CTL_PROFILE;
-    let mut v = Vec::new();
-    v.extend(codex_config("default_permissions", &toml_string(p)));
-    v.extend(codex_config(
-        &format!("permissions.{p}.extends"),
-        &toml_string(base),
-    ));
-    v.extend(codex_config(
-        &format!("permissions.{p}.network.enabled"),
-        "true",
-    ));
-    v.extend(codex_config(
-        &format!("permissions.{p}.network.mode"),
-        &toml_string("limited"),
-    ));
-    // An inline table, not a dotted key: codex splits a `-c` key on every `.`,
-    // quotes or not, so the socket path's own dots would break it.
-    v.extend(codex_config(
-        &format!("permissions.{p}.network.unix_sockets"),
-        &format!("{{{}={}}}", toml_string(ctl), toml_string("allow")),
-    ));
-    v.push("--enable".to_string());
-    v.push(CODEX_NETWORK_PROXY.to_string());
-    v
+    codex_profile(base, Some(ctl), &[])
 }
 
 /// The filesystem root under which `vendor` writes session transcripts, if known.
@@ -906,6 +1000,87 @@ mod tests {
                 "network_proxy",
             ])
         );
+    }
+
+    /// A profile with git rules carries them as one path-keyed inline table
+    /// (`filesystem`, the key codex reads) before the network keys, and a
+    /// profile with rules and no socket has no network keys and no feature.
+    #[test]
+    fn codex_profile_spells_filesystem_rules_as_one_inline_table() {
+        let rules = vec![
+            CodexFsRule {
+                path: "/r/.git".into(),
+                write: true,
+            },
+            CodexFsRule {
+                path: "/r/.git/hooks".into(),
+                write: false,
+            },
+        ];
+        assert_eq!(
+            codex_profile(":workspace", None, &rules),
+            argv(&[
+                "-c",
+                r#"default_permissions="atrium_ctl""#,
+                "-c",
+                r#"permissions.atrium_ctl.extends=":workspace""#,
+                "-c",
+                r#"permissions.atrium_ctl.filesystem={"/r/.git"="write","/r/.git/hooks"="read"}"#,
+            ])
+        );
+        let with_ctl = codex_profile(":workspace", Some("/t/a.sock"), &rules);
+        let fs = with_ctl
+            .iter()
+            .position(|a| a.starts_with("permissions.atrium_ctl.filesystem="))
+            .unwrap();
+        let net = with_ctl
+            .iter()
+            .position(|a| a.starts_with("permissions.atrium_ctl.network."))
+            .unwrap();
+        assert!(fs < net, "{with_ctl:?}");
+        assert_eq!(with_ctl.last().map(String::as_str), Some("network_proxy"));
+    }
+
+    /// The git rules measured to let a sandboxed codex commit while hooks and
+    /// config stay read-only: a main checkout names its one `.git` once, a
+    /// linked worktree names its own git dir as well, and a Windows git dir
+    /// (forward slashes, drive letter) is joined the same way.
+    #[test]
+    fn codex_git_rules_open_the_git_dirs_and_keep_hooks_and_config_read_only() {
+        let paths = |rules: &[CodexFsRule]| -> Vec<(String, bool)> {
+            rules.iter().map(|r| (r.path.clone(), r.write)).collect()
+        };
+        assert_eq!(
+            paths(&codex_git_rules("/r/.git", "/r/.git")),
+            vec![
+                ("/r/.git".to_string(), true),
+                ("/r/.git/hooks".to_string(), false),
+                ("/r/.git/config".to_string(), false),
+                ("/r/.git/config.worktree".to_string(), false),
+            ]
+        );
+        assert_eq!(
+            paths(&codex_git_rules("/r/.git/worktrees/dev", "/r/.git")),
+            vec![
+                ("/r/.git".to_string(), true),
+                ("/r/.git/worktrees/dev".to_string(), true),
+                ("/r/.git/hooks".to_string(), false),
+                ("/r/.git/config".to_string(), false),
+                ("/r/.git/worktrees/dev/config.worktree".to_string(), false),
+            ]
+        );
+        let win = codex_git_rules("C:/p/.git/worktrees/dev", "C:/p/.git");
+        assert_eq!(win[1].path, "C:/p/.git/worktrees/dev");
+        assert_eq!(win[4].path, "C:/p/.git/worktrees/dev/config.worktree");
+    }
+
+    /// codex and claude both put `? for shortcuts` under an empty prompt; a
+    /// vendor whose prompt atrium cannot tell has no marker to wait for.
+    #[test]
+    fn the_prompt_marker_is_the_shortcuts_hint_for_the_two_supported_vendors() {
+        assert_eq!(prompt_marker(Vendor::Codex), Some("? for shortcuts"));
+        assert_eq!(prompt_marker(Vendor::ClaudeCode), Some("? for shortcuts"));
+        assert_eq!(prompt_marker(Vendor::Gemini), None);
     }
 
     /// The skeleton wiring holds: a fresh `VendorWorlds` always contains the

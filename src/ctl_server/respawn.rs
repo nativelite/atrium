@@ -131,6 +131,7 @@ pub(crate) fn respawn(
     p.token = new_pane.token;
     p.activity = false;
     p.painted = false;
+    p.paste_wanted = false;
     let new_id = p.agent_id;
     let role = p.role.clone();
     // Re-tile the window so the new pane (and every sibling) holds its

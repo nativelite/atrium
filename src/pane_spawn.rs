@@ -358,7 +358,35 @@ pub(crate) fn spawn_pane_full(
         Some(addr) if is_codex && sandboxed => codex_ctl_socket(&command[0], addr, flash),
         _ => None,
     };
-    let base = agent_args(launch, &title, mode, deny, extra_norms, codex_ctl);
+    // A sandboxed codex pane that may write and sits in a checkout gets git's
+    // own directories opened (`vendors::codex_git_rules`): codex keeps `.git`
+    // read-only, a worktree's git dir with it, and a fleet item is done only
+    // with a commit. `Plan` is read-only and stays so; outside a checkout there
+    // is nothing to open.
+    let codex_git = if is_codex
+        && matches!(
+            mode,
+            atrium::ctl::TrustMode::Edits | atrium::ctl::TrustMode::Auto
+        ) {
+        let dir = cwd
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        atrium::worktree::git_dirs(&dir)
+            .map(|(g, c)| atrium::vendors::codex_git_rules(&g, &c))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let base = agent_args(
+        launch,
+        &title,
+        mode,
+        deny,
+        extra_norms,
+        codex_ctl,
+        &codex_git,
+    );
     // A trusted claude launch also pre-accepts claude's folder-trust dialog.
     if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
         ensure_folder_trust(cwd, &title, flash);
@@ -462,6 +490,7 @@ pub(crate) fn spawn_pane_full(
         can_spawn: true,
         painted: false,
         mouse_wanted: false,
+        paste_wanted: false,
         argv: command.to_vec(),
         worktree: None,
         deny: deny.to_vec(),
@@ -486,7 +515,8 @@ fn is_trusted_launch(title: &str, mode: atrium::ctl::TrustMode) -> bool {
 /// The agent's launch argv before the session id: `command` plus the trust
 /// flags for `mode`, the deny list and the folded system prompt, each for the
 /// vendors that take them. `codex_ctl` is the control socket a sandboxed codex
-/// pane is opened to ([`codex_ctl_socket`]), `None` to keep its plain sandbox.
+/// pane is opened to ([`codex_ctl_socket`]) and `codex_fs` the filesystem
+/// rules it gets (its git dirs); with neither it keeps its plain sandbox.
 fn agent_args(
     command: &[String],
     title: &str,
@@ -494,6 +524,7 @@ fn agent_args(
     deny: &[String],
     extra_norms: Option<&str>,
     codex_ctl: Option<&str>,
+    codex_fs: &[atrium::vendors::CodexFsRule],
 ) -> Vec<String> {
     // Permission posture for an agent pane (never a shell pane):
     //   Edits (`--trust`)          → `--permission-mode acceptEdits` + a safe
@@ -545,8 +576,8 @@ fn agent_args(
             // `is_codex` (not a bare `else`) so that if the claude/codex stem sets
             // ever overlap or a third vendor is added, codex flags reach ONLY a
             // codex pane — never silently some other agent's command.
-            let ctl = codex_ctl.and_then(|a| atrium::trust::codex_ctl_trust_args(mode, a));
-            v.extend(ctl.unwrap_or_else(|| atrium::trust::codex_trust_args(mode)));
+            let profile = atrium::trust::codex_profile_trust_args(mode, codex_ctl, codex_fs);
+            v.extend(profile.unwrap_or_else(|| atrium::trust::codex_trust_args(mode)));
         }
         v
     } else {

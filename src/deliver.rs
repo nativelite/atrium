@@ -100,13 +100,20 @@ fn classify(b: &[u8]) -> Key {
 /// * `awaiting_tool` — the transcript ends on an unresolved `tool_use`.
 /// * `draft_holds` — [`Draft::holds`] for the target pane.
 /// * `waited` / `unbound_fallback` — an unbound pane (a shell, an agent atrium
-///   could not bind) never yields a status, so it gets the send after a beat.
+///   could not bind, an agent that writes no transcript before its first
+///   message — codex) never yields a status, so it gets the send after a beat.
+/// * `settled` — that pane has drawn something and its screen has since
+///   stopped changing. A TUI still bringing up its first screen loses what is
+///   typed at it: codex drains the terminal input pending before its
+///   interactive screen, and a tty still in cooked mode keeps one line of it.
+///   So the beat alone is not enough; the screen must be up and quiet.
 pub fn ready(
     status: Option<agsess::Status>,
     awaiting_tool: bool,
     draft_holds: bool,
     waited: Duration,
     unbound_fallback: Duration,
+    settled: bool,
 ) -> bool {
     if awaiting_tool || draft_holds {
         return false;
@@ -114,7 +121,7 @@ pub fn ready(
     match status {
         Some(agsess::Status::WaitingPrompt) | Some(agsess::Status::Idle) => true,
         Some(_) => false, // Working / WaitingApproval
-        None => waited >= unbound_fallback,
+        None => waited >= unbound_fallback && settled,
     }
 }
 
@@ -201,14 +208,16 @@ mod tests {
             true,
             false,
             Duration::ZERO,
-            FALLBACK
+            FALLBACK,
+            true
         ));
         assert!(!ready(
             Some(Status::WaitingPrompt),
             true,
             false,
             Duration::ZERO,
-            FALLBACK
+            FALLBACK,
+            true
         ));
     }
 
@@ -219,9 +228,10 @@ mod tests {
             false,
             true,
             Duration::ZERO,
-            FALLBACK
+            FALLBACK,
+            true
         ));
-        assert!(!ready(None, false, true, FALLBACK * 10, FALLBACK));
+        assert!(!ready(None, false, true, FALLBACK * 10, FALLBACK, true));
     }
 
     #[test]
@@ -231,36 +241,75 @@ mod tests {
             false,
             false,
             Duration::ZERO,
-            FALLBACK
+            FALLBACK,
+            true
         ));
         assert!(ready(
             Some(Status::Idle),
             false,
             false,
             Duration::ZERO,
-            FALLBACK
+            FALLBACK,
+            true
         ));
         assert!(!ready(
             Some(Status::Working),
             false,
             false,
             FALLBACK * 10,
-            FALLBACK
+            FALLBACK,
+            true
         ));
         assert!(!ready(
             Some(Status::WaitingApproval),
             false,
             false,
             FALLBACK * 10,
-            FALLBACK
+            FALLBACK,
+            true
         ));
         assert!(!ready(
             None,
             false,
             false,
             FALLBACK - Duration::from_millis(1),
-            FALLBACK
+            FALLBACK,
+            true
         ));
-        assert!(ready(None, false, false, FALLBACK, FALLBACK));
+        assert!(ready(None, false, false, FALLBACK, FALLBACK, true));
+    }
+
+    /// An unbound pane whose screen is still being drawn, or that has drawn
+    /// nothing yet, is not typed into however long the send has waited; once
+    /// it is drawn and still, the beat rules as before. A bound pane's status
+    /// decides on its own.
+    #[test]
+    fn an_unbound_pane_takes_delivery_only_once_its_screen_is_drawn_and_still() {
+        assert!(!ready(None, false, false, FALLBACK * 10, FALLBACK, false));
+        assert!(ready(None, false, false, FALLBACK, FALLBACK, true));
+        assert!(!ready(
+            None,
+            false,
+            false,
+            FALLBACK - Duration::from_millis(1),
+            FALLBACK,
+            true
+        ));
+        assert!(ready(
+            Some(Status::Idle),
+            false,
+            false,
+            Duration::ZERO,
+            FALLBACK,
+            false
+        ));
+        assert!(!ready(
+            Some(Status::Working),
+            false,
+            false,
+            FALLBACK * 10,
+            FALLBACK,
+            true
+        ));
     }
 }

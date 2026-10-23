@@ -49,6 +49,77 @@ pub(crate) const SEND_ENTER_DELAY: Duration = Duration::from_millis(400);
 /// deliver anyway once the send has waited this long, so a queue never wedges.
 pub(crate) const SEND_UNBOUND_FALLBACK: Duration = Duration::from_secs(2);
 
+/// How long an unbound pane's screen must have been still, after it drew
+/// something, before a send is typed into it ([`atrium::deliver::ready`]'s
+/// `settled`). A TUI bringing up its first screen loses what is typed at it
+/// (codex drains pending input before its interactive screen; a cooked tty
+/// keeps one line), and the two-second beat alone caught codex mid-start.
+/// Half a second after the last byte: a welcome screen is drawn in one burst,
+/// a startup that is still printing keeps the send waiting.
+pub(crate) const SEND_SETTLE: Duration = Duration::from_millis(500);
+
+/// The bytes a delivery types for `text` into a pane whose app has bracketed
+/// paste on (`paste_wanted`): what a terminal sends for a paste, the text
+/// between `ESC[200~` and `ESC[201~`, so a multi-line text lands as one
+/// insertion and the Enter after it submits. Typed as keystrokes, codex's
+/// composer took a seven-line block as a run of lines, lost its tail and never
+/// submitted (measured, codex 0.163.0 on Linux); as a paste the same block was
+/// submitted whole. A pane that did not ask for paste mode (a plain shell, a
+/// program reading raw input) gets the bare text, as before. Windows gets the
+/// bare text too: its console host turns input into key records, and the
+/// markers have no key to become.
+/// Longest an unbound pane of a known vendor is held for its prompt hint
+/// ([`atrium::vendors::prompt_marker`]) before the settle gate alone decides:
+/// a TUI that never shows its prompt (not signed in, a dialog, a hung start)
+/// still gets the send rather than wedging its queue. Generous, because a
+/// send typed into a TUI that is still starting is lost, and a slow start is
+/// real: codex's startup makes network requests (plugin sync, account
+/// limits) and was measured taking minutes under a bad certificate path.
+pub(crate) const SEND_PROMPT_WAIT: Duration = Duration::from_secs(300);
+
+/// Is `needle` on the pane's screen? Each row is read as the glyphs it shows
+/// (the right half of a wide glyph skipped), so a hint drawn with attributes
+/// around it still matches; a needle split across two rows does not, and the
+/// prompt hints are short enough never to wrap.
+pub(crate) fn screen_has(screen: &ansi::Screen, needle: &str) -> bool {
+    let (rows, cols) = (screen.rows(), screen.cols());
+    let mut line = String::with_capacity(cols);
+    for r in 0..rows {
+        line.clear();
+        for c in 0..cols {
+            let cell = screen.cell(r, c);
+            if cell.width != ansi::CellWidth::Continuation {
+                line.push(cell.ch);
+            }
+        }
+        if line.contains(needle) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Does `pane`'s screen show its vendor's prompt hint, or is there no hint to
+/// wait for? `waited` past [`SEND_PROMPT_WAIT`] counts as shown.
+fn prompt_up(title: &str, screen: &ansi::Screen, waited: Duration) -> bool {
+    match atrium::vendors::vendor_for_stem(title).and_then(atrium::vendors::prompt_marker) {
+        Some(hint) => waited >= SEND_PROMPT_WAIT || screen_has(screen, hint),
+        None => true,
+    }
+}
+
+pub(crate) fn typed_bytes(text: &str, paste_wanted: bool) -> Vec<u8> {
+    if cfg!(unix) && paste_wanted {
+        let mut v = Vec::with_capacity(text.len() + 12);
+        v.extend_from_slice(b"\x1b[200~");
+        v.extend_from_slice(text.as_bytes());
+        v.extend_from_slice(b"\x1b[201~");
+        v
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 /// Most undelivered sends one target may hold. A pane wedged on an open dialog
 /// never takes delivery, and each send can be a max-size ctl request, so an
 /// uncapped queue grows for as long as the pane stays wedged. 32 is far past any
@@ -178,12 +249,21 @@ pub(crate) fn flush_sends(
                     None => return false, // target gone — drop the send
                     Some(p) => {
                         let sid = p.session_id.as_deref();
+                        // Drawn, nothing more arrived for the settle beat, and
+                        // the agent's prompt hint is on screen: the app's own
+                        // prompt is up, not a loading screen that happens to
+                        // sit still.
+                        let waited = now.duration_since(ps.queued_at);
+                        let settled = p.painted
+                            && now.duration_since(p.last_activity) >= SEND_SETTLE
+                            && prompt_up(&p.title, p.term.screen(), waited);
                         atrium::deliver::ready(
                             world.status_for(sid),
                             world.awaiting_tool_for(sid),
                             p.draft.holds(now),
                             now.duration_since(ps.queued_at),
                             SEND_UNBOUND_FALLBACK,
+                            settled,
                         )
                     }
                 };
@@ -196,7 +276,14 @@ pub(crate) fn flush_sends(
                         // lands — is deliberate, because this runs on the single
                         // event loop and a blocking write into a full buffer
                         // would freeze every pane until the target drained it.
-                        let bytes = ps.text.as_bytes();
+                        // The bytes are the text as the pane takes it: a paste
+                        // into an agent pane that parses one and into a pane
+                        // whose app asked for paste mode, else bare.
+                        let paste = p.paste_wanted
+                            || atrium::vendors::vendor_for_stem(&p.title)
+                                .is_some_and(atrium::vendors::takes_paste);
+                        let wire = typed_bytes(&ps.text, paste);
+                        let bytes = &wire[..];
                         match p.pty.write(&bytes[ps.written..]) {
                             Ok(0) => {} // took nothing this tick; try the next
                             Ok(n) => {

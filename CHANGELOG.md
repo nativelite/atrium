@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A send into a codex pane lands whole and is submitted.** A `ctl send` or
+  bus wake is typed into its pane, and a multi-line text typed as keystrokes
+  was taken by codex's composer as a run of lines: its tail was lost and the
+  Enter after it never submitted, so a lead's instructions sat in the box
+  unsent, or arrived cut short, while the pane looked as if it had never
+  taken them (measured, codex 0.163.0 on Linux: a seven-line block typed raw
+  stayed unsent; the same block as a paste was submitted whole). A codex or
+  claude pane, and any pane whose app turned bracketed paste on (bash), is
+  now typed into as a terminal pastes, the text between `ESC[200~` and
+  `ESC[201~`, then the Enter; a pane that did not ask for it, and every
+  Windows pane, gets the bare text as before. And a pane with no status yet is typed into only once
+  its screen shows its agent's prompt hint (`? for shortcuts`, the same words
+  in codex and claude) and has been still for half a second, not two seconds
+  after spawn regardless: a TUI still bringing up its first screen drops what
+  is typed at it (codex sits on `loading` first and drains pending input
+  before its interactive screen; a paste typed into that lands without its
+  Enter). A pane that never shows its prompt is typed into after five
+  minutes anyway, so a queue cannot wedge
+  (`tests/atrium/fleet.rs`, `a_send_into_a_fresh_codex_pane_lands_whole_once_it_is_up`,
+  ignored: it needs a signed-in codex).
+- **A sandboxed codex pane can commit, in a worktree too.** codex's
+  `:workspace` sandbox keeps a checkout's `.git` read-only, and a linked
+  worktree's git dir with it, so `git add` and `git commit` in an `accept`
+  or `automode` codex pane failed with `Read-only file system`
+  (`<main>/.git/worktrees/<name>/index.lock`). Such a pane in a checkout now
+  launches under the `atrium_ctl` profile with filesystem rules, socket or
+  not: its git dir and common dir writable, `hooks/`, `config` and
+  `config.worktree` read-only, the files that would run code as the human
+  outside the sandbox. Measured with codex 0.163.0 on Linux: a commit
+  succeeds in a main checkout and in a linked worktree, a new hook and an
+  edit to `config` are refused. `plan` stays read-only, git included
+  ([git works in the sandbox](docs/trust-and-security.md#codex-panes)).
+
 ## [0.40.4] - 2026-10-20
 
 ### Changed

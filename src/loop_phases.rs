@@ -93,6 +93,9 @@ pub(crate) fn drain_active_window(
                     if let Some(m) = sniff_mouse_mode(&buf[..n]) {
                         pane.mouse_wanted = m;
                     }
+                    if let Some(p) = sniff_paste_mode(&buf[..n]) {
+                        pane.paste_wanted = p;
+                    }
                     // The focused passthrough pane is the one under the splash:
                     // it is handed off by [`finish_splash`] instead, which also
                     // holds the logo up for its minimum time.
@@ -235,6 +238,9 @@ pub(crate) fn drain_background_windows(windows: &mut [Window], active: usize, bu
                 pane.last_activity = std::time::Instant::now();
                 if let Some(m) = sniff_mouse_mode(&buf[..n]) {
                     pane.mouse_wanted = m;
+                }
+                if let Some(p) = sniff_paste_mode(&buf[..n]) {
+                    pane.paste_wanted = p;
                 }
                 pane.activity = true;
                 // Same rule as the active drain. Without it a pane that did all
@@ -438,6 +444,19 @@ fn clears_screen(bytes: &[u8]) -> bool {
 /// reads may be missed, but apps emit these as a single write at startup/teardown
 /// so it reliably tracks whether a pane wants the wheel. Drives `Pane::mouse_wanted`.
 fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
+    sniff_private_mode(buf, &["1000", "1002", "1003"])
+}
+
+/// [`sniff_mouse_mode`] for bracketed paste, private mode 2004: whether the
+/// app wants a paste delimited (`ESC[200~ … ESC[201~`). Drives
+/// `Pane::paste_wanted`, which decides how a queued send is typed in.
+fn sniff_paste_mode(buf: &[u8]) -> Option<bool> {
+    sniff_private_mode(buf, &["2004"])
+}
+
+/// The last DECSET (`Some(true)`) or DECRST (`Some(false)`) of any of `modes`
+/// in `buf`, `None` when it names none of them.
+fn sniff_private_mode(buf: &[u8], modes: &[&str]) -> Option<bool> {
     let mut result = None;
     let mut i = 0;
     while i + 3 < buf.len() {
@@ -450,7 +469,7 @@ fn sniff_mouse_mode(buf: &[u8]) -> Option<bool> {
             if j < buf.len() && (buf[j] == b'h' || buf[j] == b'l') {
                 let is_mouse = std::str::from_utf8(&buf[start..j])
                     .ok()
-                    .map(|s| s.split(';').any(|p| matches!(p, "1000" | "1002" | "1003")))
+                    .map(|s| s.split(';').any(|p| modes.contains(&p)))
                     .unwrap_or(false);
                 if is_mouse {
                     result = Some(buf[j] == b'h');

@@ -91,6 +91,16 @@ pub(crate) struct Pane {
     /// only forwarded to a pane that wants mouse — so hovering a claude tile
     /// scrolls it, while a bare shell never receives stray mouse bytes.
     pub(crate) mouse_wanted: bool,
+    /// True while this pane's app has bracketed paste enabled (DECSET 2004),
+    /// sniffed from its output like `mouse_wanted`. A queued delivery is typed
+    /// into such a pane as a paste (`ESC[200~ … ESC[201~`), the bytes a
+    /// terminal sends for one: a multi-line text then lands whole, as one
+    /// insertion, and the Enter after it submits. Typed as keystrokes, codex's
+    /// composer took a seven-line block as a run of lines, dropped its tail and
+    /// never submitted (measured, codex 0.163.0 on Linux); as a paste, the same
+    /// block was submitted whole. A codex or claude pane is pasted into whether
+    /// or not this was sniffed ([`atrium::vendors::takes_paste`]).
+    pub(crate) paste_wanted: bool,
     /// The command vector this pane was spawned with — the user command before
     /// atrium appends trust flags or `--session-id`. Used by `atrium recover`.
     pub(crate) argv: Vec<String>,

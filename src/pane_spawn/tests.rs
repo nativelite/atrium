@@ -296,7 +296,7 @@ fn a_codex_prompt_becomes_one_developer_instructions_override() {
 fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
     let cmd = args(&["codex", "--append-system-prompt", "ROLE", "go"]);
     let mode = atrium::ctl::TrustMode::Edits;
-    let opened = agent_args(&cmd, "codex", mode, &[], None, Some("/t/a.sock")).join(" ");
+    let opened = agent_args(&cmd, "codex", mode, &[], None, Some("/t/a.sock"), &[]).join(" ");
     assert!(
         opened.contains(r#"default_permissions="atrium_ctl""#),
         "{opened}"
@@ -306,7 +306,7 @@ fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
         "{opened}"
     );
     assert!(!opened.contains("--sandbox"), "{opened}");
-    let plain = agent_args(&cmd, "codex", mode, &[], None, None).join(" ");
+    let plain = agent_args(&cmd, "codex", mode, &[], None, None, &[]).join(" ");
     assert!(plain.contains("--sandbox workspace-write"), "{plain}");
     assert!(!plain.contains("atrium_ctl"), "{plain}");
     for a in [&opened, &plain] {
@@ -314,6 +314,80 @@ fn a_codex_pane_given_the_ctl_socket_swaps_its_sandbox_for_the_profile() {
         assert!(!a.contains("--disallowedTools"), "{a}");
         assert!(a.contains(r#"developer_instructions="ROLE""#), "{a}");
     }
+}
+
+/// A sandboxed codex pane in a checkout gets its git dirs as filesystem rules
+/// of the profile, socket or not, so it can commit; `Plan` keeps git read-only
+/// and, with no socket, its plain sandbox. The rules are codex's, so a claude
+/// pane never sees them.
+#[test]
+fn a_codex_pane_in_a_checkout_gets_its_git_dirs_opened() {
+    let cmd = args(&["codex", "go"]);
+    let git = atrium::vendors::codex_git_rules("/r/.git/worktrees/dev", "/r/.git");
+    let edits = agent_args(
+        &cmd,
+        "codex",
+        atrium::ctl::TrustMode::Edits,
+        &[],
+        None,
+        None,
+        &git,
+    )
+    .join(" ");
+    assert!(
+        edits.contains(r#"default_permissions="atrium_ctl""#),
+        "{edits}"
+    );
+    assert!(
+        edits.contains(
+            r#"permissions.atrium_ctl.filesystem={"/r/.git"="write","/r/.git/worktrees/dev"="write","/r/.git/hooks"="read","/r/.git/config"="read","/r/.git/worktrees/dev/config.worktree"="read"}"#
+        ),
+        "{edits}"
+    );
+    assert!(!edits.contains("--sandbox"), "{edits}");
+    assert!(!edits.contains("network"), "{edits}");
+    let both = agent_args(
+        &cmd,
+        "codex",
+        atrium::ctl::TrustMode::Auto,
+        &[],
+        None,
+        Some("/t/a.sock"),
+        &git,
+    )
+    .join(" ");
+    assert!(
+        both.contains("permissions.atrium_ctl.filesystem="),
+        "{both}"
+    );
+    assert!(
+        both.contains(r#"unix_sockets={"/t/a.sock"="allow"}"#),
+        "{both}"
+    );
+    let plan = agent_args(
+        &cmd,
+        "codex",
+        atrium::ctl::TrustMode::Plan,
+        &[],
+        None,
+        None,
+        &git,
+    )
+    .join(" ");
+    assert!(plan.contains("--sandbox read-only"), "{plan}");
+    assert!(!plan.contains("filesystem"), "{plan}");
+    let claude = agent_args(
+        &args(&["claude"]),
+        "claude",
+        atrium::ctl::TrustMode::Edits,
+        &[],
+        None,
+        None,
+        &git,
+    )
+    .join(" ");
+    assert!(!claude.contains("filesystem"), "{claude}");
+    assert!(!claude.contains("atrium_ctl"), "{claude}");
 }
 
 /// The network-proxy probe reads `codex features list` and wants a row named
