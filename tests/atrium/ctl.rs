@@ -320,10 +320,20 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
         String::from_utf8_lossy(&out)
     );
     // The whole feed, bounded by a marker echoed after it, so the collision
-    // can be COUNTED: posted once, although two reports named the file.
+    // can be COUNTED: posted once, although two reports named the file. The
+    // marker's typed form never spells the marker (the shell drops the quotes
+    // or the caret): a Linux tty echoes typed input the moment it arrives,
+    // while the feed still runs, and the read once stopped at that echo with
+    // no feed in it (issue #12). Windows holds typed input until the shell
+    // reads it, which hid the race.
     p.write(format!("\"{atrium}\" ctl bus feed --json --since 0\r\n").as_bytes())
         .unwrap();
-    p.write(b"echo atrium-feed-end\r\n").unwrap();
+    let marker: &[u8] = if cfg!(windows) {
+        b"echo atrium-feed-^end\r\n"
+    } else {
+        b"echo atrium-feed-'end'\r\n"
+    };
+    p.write(marker).unwrap();
     let out = read_until(&mut p, b"atrium-feed-end", Duration::from_secs(20));
     let posted = out
         .windows(b"\"kind\":\"collision\"".len())

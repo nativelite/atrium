@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The Linux e2e `ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once`
+  passes (issue #12).** The test bounded the bus feed with an `echo` marker
+  whose typed line spelled the marker; a Linux tty echoes typed input the
+  moment it arrives, while the feed still runs, so the read stopped at that
+  echo with no feed in it and counted no collision. The marker's typed form
+  no longer spells it. Windows holds typed input until the shell reads it,
+  which is why it passed there. Test-only; the broker posted the collision
+  all along.
+
 ## [0.41.0] - 2026-10-23
 
 ### Added
