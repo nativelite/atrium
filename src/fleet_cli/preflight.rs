@@ -206,6 +206,12 @@ pub(super) struct BannerFacts {
     /// ([`atrium::modfiles::describe`]), and whether it is a warning.
     pub(super) mod_line: String,
     pub(super) mod_missing: bool,
+    /// The codex agents whose program takes `--dangerously-bypass-hook-trust`
+    /// (their enabled hooks run without codex's review, see
+    /// [`atrium::vendors::codex_hooks_unreviewed`]), and those whose program
+    /// lacks it (a pane with unreviewed hooks stops at codex's review screen).
+    pub(super) codex_hooks_unreviewed: Vec<String>,
+    pub(super) codex_hooks_reviewed: Vec<String>,
 }
 
 impl BannerFacts {
@@ -214,6 +220,15 @@ impl BannerFacts {
             &atrium::modfiles::status(),
             fleet.mod_enabled.unwrap_or(true),
         );
+        let (mut codex_hooks_unreviewed, mut codex_hooks_reviewed) = (Vec::new(), Vec::new());
+        for a in fleet.agents.iter().filter(|a| is_codex_agent(a)) {
+            let program = a.cmd.first().map(String::as_str).unwrap_or_default();
+            if crate::pane_spawn::codex_has_bypass_hook_trust(program) {
+                codex_hooks_unreviewed.push(a.name.clone());
+            } else {
+                codex_hooks_reviewed.push(a.name.clone());
+            }
+        }
         BannerFacts {
             pool_size: atrium::buildpool::planned_size(fleet.build_jobs),
             pool_inherited: atrium::buildpool::inherited(),
@@ -225,6 +240,8 @@ impl BannerFacts {
                 && std::env::var_os("NO_COLOR").is_none(),
             mod_line,
             mod_missing,
+            codex_hooks_unreviewed,
+            codex_hooks_reviewed,
         }
     }
 }
@@ -316,6 +333,28 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
                 .map(|n| fsan(n))
                 .collect::<Vec<_>>()
                 .join(", ")
+        ));
+    }
+    // A codex pane runs its enabled hooks unreviewed: codex's "Hooks need
+    // review" screen would otherwise stop a hands-off pane, and hooks run
+    // outside the sandbox, so the operator approves this with the posture.
+    let names = |v: &[String]| v.iter().map(|n| fsan(n)).collect::<Vec<_>>().join(", ");
+    let hands_off = launch.trust != atrium::ctl::TrustMode::Off;
+    if hands_off && !facts.codex_hooks_unreviewed.is_empty() {
+        out.push(format!(
+            "atrium fleet: codex hooks run unreviewed for {}: enabled plugin and folder \
+             hooks run as installed, codex's \"Hooks need review\" screen is skipped \
+             ({})",
+            names(&facts.codex_hooks_unreviewed),
+            atrium::vendors::CODEX_BYPASS_HOOK_TRUST
+        ));
+    }
+    if hands_off && !facts.codex_hooks_reviewed.is_empty() {
+        warnings.push(format!(
+            "codex has no {} for {}: a pane with hooks codex has not reviewed stops at \
+             its \"Hooks need review\" screen until someone answers it",
+            atrium::vendors::CODEX_BYPASS_HOOK_TRUST,
+            names(&facts.codex_hooks_reviewed)
         ));
     }
     if let Some(warning) = pool_warning {

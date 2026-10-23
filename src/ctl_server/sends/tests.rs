@@ -221,3 +221,40 @@ fn an_agent_pane_is_held_until_its_prompt_hint_is_on_screen() {
     }
     assert!(prompt_up("bash", loading.screen(), Duration::ZERO));
 }
+
+/// A codex pane showing one of its own startup screens — the hooks review,
+/// the folder trust — is never typed into, however long the send has waited:
+/// Enter there picks an item nobody chose and the text is lost. The screen
+/// is named, for the bar. The same words on a claude or shell pane hold nothing.
+#[test]
+fn a_codex_startup_screen_holds_a_send_past_the_prompt_wait() {
+    let mut hooks = vterm::Term::new(8, 60);
+    hooks.feed(
+        b"\x1b[1mHooks need review\x1b[0m\r\n\x1b[33m6 hooks are new or changed.\x1b[0m\r\n\
+          \r\n> 1. Review hooks\r\n  2. Trust all and continue\r\n",
+    );
+    let mut folder = vterm::Term::new(8, 60);
+    folder.feed(
+        b"Trust this folder? Codex can read, edit, and run files here,\r\n\
+          subject to your permission settings.\r\n\r\n> 1. Trust and continue\r\n",
+    );
+    for term in [&hooks, &folder] {
+        assert!(dialog_up(agsess::Vendor::Codex, term.screen()).is_some());
+        assert!(!prompt_up("codex", term.screen(), Duration::ZERO));
+        assert!(!prompt_up("codex", term.screen(), SEND_PROMPT_WAIT * 4));
+        assert!(prompt_up("bash", term.screen(), Duration::ZERO));
+        assert!(dialog_up(agsess::Vendor::ClaudeCode, term.screen()).is_none());
+    }
+    assert_eq!(
+        dialog_up(agsess::Vendor::Codex, hooks.screen()),
+        Some("Hooks need review")
+    );
+    assert_eq!(
+        dialog_up(agsess::Vendor::Codex, folder.screen()),
+        Some("Trust this folder?")
+    );
+    let mut prompt = vterm::Term::new(8, 60);
+    prompt.feed(b">_ OpenAI Codex\r\n  ? for shortcuts\r\n");
+    assert!(dialog_up(agsess::Vendor::Codex, prompt.screen()).is_none());
+    assert!(prompt_up("codex", prompt.screen(), Duration::ZERO));
+}

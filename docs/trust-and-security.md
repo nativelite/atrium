@@ -107,8 +107,32 @@ claude's separate folder-trust dialog** for each pane's working directory: the
 `~/.claude.json`, which the permission flags do not cover.
 
 atrium writes only that trust bit, only for the pane's own directory, atomically.
-A config it can't parse is left untouched and the pane still launches. That write
-is the one place atrium touches another tool's config, deliberate and opt-in.
+A config it can't parse is left untouched and the pane still launches.
+
+A codex pane gets the same for codex's own gate: its "Trust this folder?"
+screen, saved per directory in `~/.codex/config.toml` (`$CODEX_HOME` when set).
+atrium appends one `[projects.'<dir>']` table with `trust_level = "trusted"`,
+the shape codex writes itself, before the pane starts; a directory the file
+already decides — trusted, or marked `untrusted` on purpose — is left exactly
+as it is, and a file that keeps `projects` as an inline table (which a table
+appended after it could not extend) is left untouched, with the reason on the
+bar. These two writes are the only places atrium touches another tool's
+config, deliberate and opt-in.
+
+A trusted codex pane also runs its **enabled hooks without codex's review**.
+A plugin's hooks (or a folder's `.codex/hooks.json`) that carry no trust hash
+in `config.toml` open codex on a "Hooks need review" screen instead of its
+prompt, and no posture flag skips it: two codex panes in a fleet both sat
+there, and the brief typed at them picked the screen's first item, "Review
+hooks", so the brief was lost and the panes went idle. atrium passes codex's
+own `--dangerously-bypass-hook-trust` to every codex pane at any posture but
+`off`, and the fleet banner says so, because hooks run outside the sandbox:
+the hooks that run are the ones the operator installed and enabled. A codex
+without the flag (older than 0.163) is named on the bar and in the banner,
+and such a pane still stops at the screen. Whatever the posture, a send is
+**held** while a codex pane shows either screen, however long it has waited,
+and the bar names the pane and the screen; the 300 s fallback that types a
+send into a pane whose prompt never appeared no longer types into a dialog.
 
 ## codex panes
 
@@ -183,10 +207,14 @@ Limits:
   the bar says its commands can't reach ctl. Update codex, or run that pane at
   `--mode skip`.
 - **Linux is untested.** The profile is the same, but only macOS was measured.
-- **codex's own folder-trust dialog is not pre-accepted.** codex asks "Trust
-  this folder?" the first time it runs in a directory and saves the answer in
-  `~/.codex/config.toml`; atrium does not write that file, so a hands-off codex
-  pane in a new directory waits on the dialog until someone answers it.
+- **codex's own folder-trust dialog is pre-accepted, and its hooks review
+  skipped.** codex asks "Trust this folder?" the first time it runs in a
+  directory and "Hooks need review" when an enabled plugin's hooks have no trust
+  hash yet; a trusted launch writes the folder's trust into
+  `~/.codex/config.toml` and passes `--dangerously-bypass-hook-trust` (see
+  [The folder-trust write](#the-folder-trust-write)). On an older codex, or
+  a launch at `off`, a send into a pane showing either screen is held and the
+  bar says which pane is waiting.
 
 **On Windows the pipe admits the sandbox itself.** There codex's sandbox is
 not a network filter but a *restricted token*: the agent's commands run as the

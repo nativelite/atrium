@@ -391,8 +391,9 @@ control plane exists.
 
 Fleets are read from `atrium.fleet.json` (current directory first, then
 `%APPDATA%\atrium\fleet.json` on Windows / `~/.config/atrium/fleet.json`
-elsewhere). atrium reads it **read-only** and never writes it. The one file atrium
-*does* write is Claude Code's per-directory folder-trust bit in `~/.claude.json`,
+elsewhere). atrium reads it **read-only** and never writes it. The only files
+atrium *does* write are the agents' per-directory folder trust — Claude Code's
+bit in `~/.claude.json`, codex's `[projects]` entry in `~/.codex/config.toml` —
 and only under `--trust`. See [docs/trust-and-security.md](docs/trust-and-security.md).
 
 A **user-global `config.json`** beside that fleet file (`%APPDATA%\atrium\config.json`

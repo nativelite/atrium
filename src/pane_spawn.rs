@@ -345,7 +345,23 @@ pub(crate) fn spawn_pane_full(
                 Instant::now(),
             ));
         }
-        daemonless = atrium::vendors::codex_daemonless(command, supported);
+        let mut v = atrium::vendors::codex_daemonless(command, supported);
+        // codex's hooks review is a startup screen no posture flag skips, and
+        // a trusted launch means hands-off: run the enabled hooks unreviewed
+        // (`vendors::codex_hooks_unreviewed`), as the fleet banner disclosed.
+        if mode != atrium::ctl::TrustMode::Off {
+            let bypass = codex_has_bypass_hook_trust(&command[0]);
+            if !bypass {
+                *flash = Some((
+                    "codex has no --dangerously-bypass-hook-trust (older than 0.163?): a pane \
+                     with hooks codex has not reviewed stops at its review screen"
+                        .to_string(),
+                    Instant::now(),
+                ));
+            }
+            v = atrium::vendors::codex_hooks_unreviewed(&v, bypass);
+        }
+        daemonless = v;
         #[cfg(windows)]
         warn_store_pwsh(mode, flash);
         &daemonless[..]
@@ -401,9 +417,9 @@ pub(crate) fn spawn_pane_full(
             perms: &perms,
         },
     );
-    // A trusted claude launch also pre-accepts claude's folder-trust dialog.
-    if is_trusted_launch(&title, mode) && atrium::bind::is_claude_stem(&title) {
-        ensure_folder_trust(cwd, &title, flash);
+    // A trusted launch also pre-accepts the agent's own folder-trust dialog.
+    if is_trusted_launch(&title, mode) {
+        ensure_folder_trust(cwd, &title, is_codex, flash);
     }
     // Agent-aware bind (§3.3): if this is an agent pane atrium is launching and the
     // user did not already pick a session, mint a uuid and append
@@ -657,25 +673,35 @@ fn agent_args(
     base
 }
 
-/// Pre-accept claude's *folder-trust* dialog for the pane's working directory
-/// (`cwd`, else atrium's) — a separate gate the permission mode does NOT cover
-/// (it's stored per-dir in ~/.claude.json). Without this a trusted launch in an
-/// untrusted folder still blocks on "trust this folder?". claude-only: codex has
-/// its own per-folder trust in ~/.codex/config.toml (TOML — a follow-up; see
-/// `trust::codex_trust_args`).
+/// Pre-accept the agent's *folder-trust* dialog for the pane's working
+/// directory (`cwd`, else atrium's) — a separate gate the permission posture
+/// does NOT cover. claude keeps it per-dir in ~/.claude.json
+/// ([`atrium::trust::ensure_trusted_in`]); codex in ~/.codex/config.toml
+/// ([`atrium::trust::ensure_codex_trusted`]). Without this a trusted launch in
+/// an untrusted folder still blocks on "trust this folder?".
 ///
-/// The caller decides *when*: only for a claude pane whose mode is not `Off`
+/// The caller decides *when*: only for an agent pane whose mode is not `Off`
 /// (any trusted posture, Plan and Auto included). This sets only the trust bit,
 /// only for this one directory; a parse/IO problem is flashed and the pane
 /// spawns anyway.
-fn ensure_folder_trust(cwd: Option<&str>, title: &str, flash: &mut Option<(String, Instant)>) {
+fn ensure_folder_trust(
+    cwd: Option<&str>,
+    title: &str,
+    is_codex: bool,
+    flash: &mut Option<(String, Instant)>,
+) {
     let dir = cwd
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
-    // An aliased claude with its own config dir keeps its trust map there.
-    let config_dir = atrium::bind::alias_config_dir(title);
-    if let Err(e) = atrium::trust::ensure_trusted_in(config_dir, &dir) {
+    let done = if is_codex {
+        atrium::trust::ensure_codex_trusted(&dir)
+    } else {
+        // An aliased claude with its own config dir keeps its trust map there.
+        let config_dir = atrium::bind::alias_config_dir(title);
+        atrium::trust::ensure_trusted_in(config_dir, &dir)
+    };
+    if let Err(e) = done {
         *flash = Some((format!("folder-trust: {e}"), Instant::now()));
     }
 }
@@ -712,6 +738,16 @@ fn warn_store_pwsh(mode: atrium::ctl::TrustMode, flash: &mut Option<(String, Ins
 fn codex_has_no_daemon(program: &str) -> bool {
     codex_probe(program, &["--help"], |out| {
         out.contains(atrium::vendors::CODEX_NO_DAEMON)
+    })
+}
+
+/// Does this codex take `--dangerously-bypass-hook-trust`
+/// ([`atrium::vendors::codex_hooks_unreviewed`])? Asked of its `--help` like
+/// [`codex_has_no_daemon`], and cached with it. The fleet preflight asks too,
+/// so the banner can say what the launch will do.
+pub(crate) fn codex_has_bypass_hook_trust(program: &str) -> bool {
+    codex_probe(program, &["--help"], |out| {
+        out.contains(atrium::vendors::CODEX_BYPASS_HOOK_TRUST)
     })
 }
 
@@ -765,21 +801,23 @@ fn codex_ctl_socket<'a>(
 }
 
 /// Run `program args…` once per program and args per session, capped at 2s,
-/// and cache what `has` says of its stdout. No answer in time, or no program,
-/// counts as `false`.
+/// cache its stdout, and answer what `has` says of it. The output is what is
+/// cached, not the answer: two questions of the same `--help` (the daemon
+/// flag, the hooks flag) share one run and each get their own answer. No
+/// answer in time, or no program, counts as `false`.
 fn codex_probe(program: &str, args: &[&str], has: impl Fn(&str) -> bool) -> bool {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    static SEEN: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
     let key = format!("{program}\0{}", args.join(" "));
-    if let Some(&known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return known;
+    if let Some(known) = seen.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return known.as_deref().is_some_and(&has);
     }
     let mut cmd = vec![program.to_string()];
     cmd.extend(args.iter().map(|a| a.to_string()));
     let argv = effective_command(&cmd);
-    let known = std::process::Command::new(&argv[0])
+    let output = std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -798,12 +836,12 @@ fn codex_probe(program: &str, args: &[&str], has: impl Fn(&str) -> bool) -> bool
             }
             let mut out = String::new();
             std::io::Read::read_to_string(child.stdout.as_mut()?, &mut out).ok()?;
-            Some(has(&out))
-        })
-        .unwrap_or(false);
+            Some(out)
+        });
+    let known = output.as_deref().is_some_and(&has);
     seen.lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, known);
+        .insert(key, output);
     known
 }
 

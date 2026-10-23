@@ -150,6 +150,105 @@ pub fn codex_daemonless(command: &[String], supported: bool) -> Vec<String> {
     out
 }
 
+/// Codex's flag for running its enabled hooks without its startup review.
+pub const CODEX_BYPASS_HOOK_TRUST: &str = "--dangerously-bypass-hook-trust";
+
+/// A codex launch with [`CODEX_BYPASS_HOOK_TRUST`] inserted after the program,
+/// when the launch can take it.
+///
+/// A codex whose enabled hooks (a plugin's, a folder's `.codex/hooks.json`)
+/// carry no trust hash in its `config.toml` opens on a "Hooks need review"
+/// screen instead of its prompt, and no posture flag skips it: a hands-off
+/// pane sat there, and the brief typed at it picked the screen's first item
+/// (measured, codex 0.163.0: "Review hooks" is highlighted, so Enter opened
+/// the hooks browser and the brief was lost). The flag is codex's own way to
+/// run those hooks unreviewed, which is what a posture that never prompts
+/// means; the fleet banner says so, since hooks run outside the sandbox.
+///
+/// Left as given: a command that already says it, one that targets a remote
+/// server (`--remote`), and one that runs a subcommand other than the
+/// interactive session ([`CODEX_SUBCOMMANDS`]): only the interactive launch
+/// (bare, or with a prompt) is known to take the flag. `supported` is whether
+/// this codex has the flag at all (0.163.0 does; older ones fail on an unknown
+/// argument); the caller probes, this stays pure.
+pub fn codex_hooks_unreviewed(command: &[String], supported: bool) -> Vec<String> {
+    let mut out = command.to_vec();
+    if !supported || command.is_empty() {
+        return out;
+    }
+    let rest = &command[1..];
+    let opts = rest.iter().take_while(|a| a.as_str() != "--");
+    let mut skip = false;
+    let mut seen_positional = false;
+    for a in opts {
+        if a == CODEX_BYPASS_HOOK_TRUST || a == "--remote" || a.starts_with("--remote=") {
+            skip = true;
+            break;
+        }
+        if !seen_positional && !a.starts_with('-') {
+            seen_positional = true;
+            if CODEX_SUBCOMMANDS.contains(&a.as_str()) {
+                skip = true;
+                break;
+            }
+        }
+    }
+    if !skip {
+        out.insert(1, CODEX_BYPASS_HOOK_TRUST.to_string());
+    }
+    out
+}
+
+/// codex's subcommands that are not the interactive session (`codex --help`,
+/// 0.163.0). A first positional that is one of these names a subcommand; any
+/// other is the interactive session's prompt.
+pub const CODEX_SUBCOMMANDS: &[&str] = &[
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "fork",
+    "cloud",
+    "exec-server",
+    "features",
+    "help",
+];
+
+/// The text `vendor`'s TUI shows while a startup screen of its own is up
+/// instead of the prompt, where typing is lost or picks an item nobody chose.
+/// A queued send is held while any is on screen, however long it has waited
+/// ([`crate::deliver`]): codex's hooks review ("Hooks need review") and its
+/// folder trust ("Trust this folder?"), both measured on 0.163.0. atrium
+/// clears both before a trusted launch ([`crate::trust::ensure_codex_trusted`],
+/// [`codex_hooks_unreviewed`]); the hold covers an older codex, an untrusted
+/// launch and a pane someone else started. Empty for every other vendor.
+pub fn dialog_markers(vendor: Vendor) -> &'static [&'static str] {
+    match vendor {
+        Vendor::Codex => &["Hooks need review", "Trust this folder?"],
+        _ => &[],
+    }
+}
+
 /// `s` as a TOML basic string, quotes included.
 ///
 /// Codex parses the value of `-c key=value` as TOML and falls back to the raw
@@ -1309,6 +1408,48 @@ mod tests {
         assert_eq!(prompt_marker(Vendor::Codex), Some("? for shortcuts"));
         assert_eq!(prompt_marker(Vendor::ClaudeCode), Some("? for shortcuts"));
         assert_eq!(prompt_marker(Vendor::Gemini), None);
+    }
+
+    /// Only codex has startup screens atrium knows to hold a send for.
+    #[test]
+    fn the_dialog_markers_are_codex_startup_screens() {
+        assert_eq!(
+            dialog_markers(Vendor::Codex),
+            &["Hooks need review", "Trust this folder?"]
+        );
+        assert!(dialog_markers(Vendor::ClaudeCode).is_empty());
+        assert!(dialog_markers(Vendor::Gemini).is_empty());
+    }
+
+    /// The hooks bypass goes right after the program of an interactive
+    /// launch (bare, with options, with a prompt), and only there: a codex
+    /// without the flag, a launch that already says it, a remote one and a
+    /// subcommand are left as given.
+    #[test]
+    fn the_hooks_bypass_reaches_only_an_interactive_codex() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            codex_hooks_unreviewed(&s(&["codex"]), true),
+            s(&["codex", CODEX_BYPASS_HOOK_TRUST])
+        );
+        assert_eq!(
+            codex_hooks_unreviewed(&s(&["codex", "--no-daemon", "-m", "o3"]), true),
+            s(&["codex", CODEX_BYPASS_HOOK_TRUST, "--no-daemon", "-m", "o3"])
+        );
+        assert_eq!(codex_hooks_unreviewed(&s(&["codex"]), false), s(&["codex"]));
+        let said = s(&["codex", CODEX_BYPASS_HOOK_TRUST]);
+        assert_eq!(codex_hooks_unreviewed(&said, true), said);
+        let remote = s(&["codex", "--remote", "host:1"]);
+        assert_eq!(codex_hooks_unreviewed(&remote, true), remote);
+        for sub in ["exec", "resume", "queue", "features"] {
+            let cmd = s(&["codex", sub, "task"]);
+            assert_eq!(codex_hooks_unreviewed(&cmd, true), cmd, "{sub}");
+        }
+        assert_eq!(
+            codex_hooks_unreviewed(&s(&["codex", "-m", "o3", "do the thing"]), true),
+            s(&["codex", CODEX_BYPASS_HOOK_TRUST, "-m", "o3", "do the thing"])
+        );
+        assert!(codex_hooks_unreviewed(&[], true).is_empty());
     }
 
     /// The skeleton wiring holds: a fresh `VendorWorlds` always contains the

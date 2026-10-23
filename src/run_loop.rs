@@ -180,6 +180,7 @@ impl RunState<'_> {
             &mut self.windows,
             &self.world,
             &self.mods,
+            &mut self.flash,
         ) {
             self.force_repaint = true;
         }

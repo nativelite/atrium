@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A trusted codex pane clears codex's two startup screens before it starts,
+  and a send is never typed into either.** A fleet of two codex panes with the
+  context-mode plugin stopped at launch: both opened on codex's "Hooks need
+  review" screen (an enabled plugin's hooks with no trust hash in
+  `~/.codex/config.toml`), the brief atrium holds for the prompt hint was typed
+  anyway when the 300 s wait ran out, Enter picked the screen's first item,
+  "Review hooks", and the brief was lost. It read as a race because both panes
+  hit it together. codex's "Trust this folder?" screen stops a pane in a new
+  directory the same way, and atrium pre-accepted only claude's. Now, at any
+  posture but `off`, a codex pane runs its enabled hooks unreviewed
+  (`--dangerously-bypass-hook-trust`, probed from `--help` like `--no-daemon`;
+  the fleet banner names the agents, and warns of a codex without the flag)
+  and its directory's trust is written into `config.toml` first — one
+  appended `[projects.'<dir>']` table in codex's own spelling, a directory
+  already decided (trusted, or `untrusted` on purpose) left as it is, an
+  inline `projects` table left untouched with the reason on the bar. And a
+  queued send is held, past any wait, while a codex pane shows either screen,
+  with the pane and the screen named on the bar.
+
 ### Fixed
 - **The Linux e2e `ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once`
   passes (issue #12).** The test bounded the bus feed with an `echo` marker

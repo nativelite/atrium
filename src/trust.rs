@@ -553,6 +553,267 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
+// ---- codex: the folder trust in ~/.codex/config.toml ------------------------
+
+/// Ensure `dir` is marked trusted in codex's `config.toml`, so a codex launched
+/// there won't open on its "Trust this folder?" screen — codex's own folder
+/// gate, which its approval and sandbox flags do not cover, keyed by the
+/// directory (codex tries the working directory, then its git root). Idempotent:
+/// a directory with a `trust_level` already — `trusted`, or `untrusted` by the
+/// operator's choice — is left exactly as it is. The file is `$CODEX_HOME/
+/// config.toml`, else `~/.codex/config.toml`, as codex resolves it. A clear
+/// error string on any IO problem, or a file atrium cannot extend safely; the
+/// caller treats it as non-fatal (the pane spawns, worst case the screen shows).
+pub fn ensure_codex_trusted(dir: &Path) -> Result<Outcome, String> {
+    let path =
+        codex_config_path().ok_or_else(|| "no HOME to locate ~/.codex/config.toml".to_string())?;
+    ensure_codex_trusted_at(&path, dir)
+}
+
+/// [`ensure_codex_trusted`] against an explicit config path (the test seam).
+///
+/// atrium has no TOML parser and does not want one: the edit is an append of
+/// one `[projects.'<dir>']` table with its `trust_level`, the exact shape codex
+/// writes itself, after a scan that only has to recognise codex's own spellings
+/// of a project entry. Everything already in the file stays byte for byte.
+pub fn ensure_codex_trusted_at(path: &Path, dir: &Path) -> Result<Outcome, String> {
+    let key = codex_project_key(dir);
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    match codex_trust_edit(&src, &key)? {
+        None => Ok(Outcome::AlreadyTrusted),
+        Some(out) => {
+            write_atomic(path, &out)?;
+            Ok(Outcome::NowTrusted)
+        }
+    }
+}
+
+/// codex's config file: `$CODEX_HOME/config.toml` when that is set (codex
+/// honors it), else `~/.codex/config.toml` (`$HOME` / `$USERPROFILE`).
+fn codex_config_path() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CODEX_HOME") {
+        if !dir.is_empty() {
+            return Some(PathBuf::from(dir).join("config.toml"));
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(".codex").join("config.toml"))
+}
+
+/// The key codex looks `dir` up under: the absolute path as the OS spells it.
+/// codex keys `projects` by its process's working directory, tried as given
+/// and as canonicalized, matched without ASCII case on Windows and exactly
+/// elsewhere. So the physical path (symlinks resolved, `..` collapsed) is the
+/// one spelling that matches on every platform; Windows' verbatim prefix is
+/// dropped, as codex drops it.
+fn codex_project_key(dir: &Path) -> String {
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|c| c.join(dir))
+            .unwrap_or_else(|_| dir.to_path_buf())
+    };
+    let abs = match std::fs::canonicalize(&abs) {
+        Ok(c) => c,
+        Err(_) => crate::resolve::normalize_path(&abs),
+    };
+    let mut s = abs.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        s = format!(r"\\{rest}");
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        s = rest.to_string();
+    }
+    let sep = std::path::MAIN_SEPARATOR;
+    while s.len() > 1 && s.ends_with(sep) && !s.ends_with(":\\") {
+        s.pop();
+    }
+    s
+}
+
+/// Do two project keys name the same directory? codex matches Windows keys
+/// without ASCII case and POSIX keys exactly.
+fn codex_key_eq(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `key` as a TOML key: a literal string when it can be one (what codex writes,
+/// so a Windows path needs no escaping), else a basic string.
+fn codex_toml_key(key: &str) -> String {
+    if !key.contains('\'') && !key.chars().any(|c| c.is_control()) {
+        format!("'{key}'")
+    } else {
+        crate::vendors::toml_string(key)
+    }
+}
+
+/// The text of one TOML key as written (`'…'`, `"…"` with its escapes, or
+/// bare), or `None` for something that is not a single key.
+fn toml_unquote(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+        return (!inner.contains('\'')).then(|| inner.to_string());
+    }
+    if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c != '\\' {
+                out.push(c);
+                continue;
+            }
+            match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' | 'U' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                _ => return None,
+            }
+        }
+        return Some(out);
+    }
+    (!raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then(|| raw.to_string())
+}
+
+/// A line's TOML table header, `[…]`, as the text between the brackets.
+fn toml_header(line: &str) -> Option<&str> {
+    let t = line.trim();
+    if !t.starts_with('[') || t.starts_with("[[") {
+        return None;
+    }
+    let end = t.find(']')?;
+    Some(t[1..end].trim())
+}
+
+/// A line's `key = …`, as its key text, with the value's first character.
+fn toml_assignment(line: &str) -> Option<(&str, char)> {
+    let t = line.trim();
+    if t.starts_with('#') || t.starts_with('[') {
+        return None;
+    }
+    // The `=` that ends the key: the first one outside quotes.
+    let mut quote: Option<char> = None;
+    for (i, c) in t.char_indices() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, '=') => {
+                let value = t[i + 1..].trim_start().chars().next()?;
+                return Some((t[..i].trim(), value));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the config already speaks of `key`'s trust, if it does.
+enum CodexTrustEntry {
+    /// `[projects.'<key>']` at this line, with no `trust_level` of its own yet.
+    HeaderWithoutLevel(usize),
+    /// A `trust_level` for it, in any of codex's spellings: nothing to do.
+    Decided,
+}
+
+/// `src` with `key` marked trusted, or `None` when the file already decides
+/// it (either way — a directory marked `untrusted` is the operator's call and
+/// is never flipped). `Err` when the file keeps `projects` as an inline table,
+/// which a table appended after it could not extend validly, so the file is
+/// left alone and the caller says so. Pure; the unit-test seam.
+fn codex_trust_edit(src: &str, key: &str) -> Result<Option<String>, String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut table: Option<&str> = None;
+    let mut found: Option<CodexTrustEntry> = None;
+    for (i, line) in lines.iter().enumerate() {
+        let header_open = matches!(found, Some(CodexTrustEntry::HeaderWithoutLevel(_)));
+        if let Some(h) = toml_header(line) {
+            if header_open {
+                break; // its table ended with no trust_level in it
+            }
+            table = Some(h);
+            if let Some(rest) = h.strip_prefix("projects.") {
+                if toml_unquote(rest).is_some_and(|k| codex_key_eq(&k, key)) {
+                    found = Some(CodexTrustEntry::HeaderWithoutLevel(i));
+                }
+            }
+            continue;
+        }
+        let Some((k, first)) = toml_assignment(line) else {
+            continue;
+        };
+        if table.is_none() && k == "projects" && first == '{' {
+            return Err(
+                "~/.codex/config.toml keeps `projects` as an inline table; left untouched"
+                    .to_string(),
+            );
+        }
+        if header_open {
+            if k == "trust_level" {
+                found = Some(CodexTrustEntry::Decided);
+            }
+            continue;
+        }
+        if table == Some("projects") && found.is_none() {
+            // `'<key>'.trust_level = …` or `'<key>' = { … }` under [projects].
+            let named = match k.strip_suffix(".trust_level") {
+                Some(q) => toml_unquote(q),
+                None if first == '{' => toml_unquote(k),
+                None => None,
+            };
+            if named.is_some_and(|n| codex_key_eq(&n, key)) {
+                found = Some(CodexTrustEntry::Decided);
+            }
+        }
+    }
+    let level = r#"trust_level = "trusted""#;
+    let out = match found {
+        Some(CodexTrustEntry::Decided) => return Ok(None),
+        Some(CodexTrustEntry::HeaderWithoutLevel(at)) => {
+            let mut out = String::with_capacity(src.len() + level.len() + 1);
+            for (i, line) in lines.iter().enumerate() {
+                out.push_str(line);
+                out.push('\n');
+                if i == at {
+                    out.push_str(level);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        None => {
+            let mut out = src.to_string();
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!("[projects.{}]\n{level}\n", codex_toml_key(key)));
+            out
+        }
+    };
+    Ok(Some(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1086,6 +1347,124 @@ mod tests {
             ensure_trusted_at(&cfg, &d).unwrap(),
             Outcome::AlreadyTrusted
         ));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- codex: ~/.codex/config.toml ------------------------------------
+
+    /// A config as codex 0.163.0 writes it on Windows: the new project table is
+    /// appended in codex's own spelling, everything before it byte for byte.
+    const CODEX_CONFIG: &str = "[projects.'c:\\users\\budde']\ntrust_level = \"trusted\"\n\n\
+[windows]\nsandbox = \"unelevated\"\n\n[features]\nhooks = true\n\n\
+[plugins.\"context-mode@context-mode\"]\nenabled = true\n";
+
+    #[test]
+    fn codex_trust_appends_one_project_table_in_codex_own_spelling() {
+        let key = r"d:\projects\x";
+        let out = codex_trust_edit(CODEX_CONFIG, key).unwrap().unwrap();
+        assert!(out.starts_with(CODEX_CONFIG), "{out}");
+        assert!(
+            out.ends_with("\n[projects.'d:\\projects\\x']\ntrust_level = \"trusted\"\n"),
+            "{out}"
+        );
+        // A second pass finds the entry it wrote and leaves the file alone.
+        assert!(codex_trust_edit(&out, key).unwrap().is_none());
+    }
+
+    /// An empty or absent file gets just the table; a file without a trailing
+    /// newline gets one before the table.
+    #[test]
+    fn codex_trust_starts_a_file_and_mends_a_missing_newline() {
+        let out = codex_trust_edit("", "/w/x").unwrap().unwrap();
+        assert_eq!(out, "[projects.'/w/x']\ntrust_level = \"trusted\"\n");
+        let out = codex_trust_edit("model = \"o3\"", "/w/x").unwrap().unwrap();
+        assert_eq!(
+            out,
+            "model = \"o3\"\n\n[projects.'/w/x']\ntrust_level = \"trusted\"\n"
+        );
+    }
+
+    /// A directory the operator marked `untrusted` is their call, in every
+    /// spelling codex or a hand accepts: the explicit table, a basic-string
+    /// key, a dotted key and an inline value under `[projects]`.
+    #[test]
+    fn codex_trust_never_flips_a_decided_directory() {
+        for src in [
+            "[projects.'/w/x']\ntrust_level = \"untrusted\"\n",
+            "[projects.\"/w/x\"]\ntrust_level = \"untrusted\"\n",
+            "[projects]\n'/w/x'.trust_level = \"untrusted\"\n",
+            "[projects]\n'/w/x' = { trust_level = \"untrusted\" }\n",
+            "[projects.'/w/x']\n# a comment\ntrust_level = \"trusted\"\n",
+        ] {
+            assert!(codex_trust_edit(src, "/w/x").unwrap().is_none(), "{src}");
+        }
+        // Another project's entry, or one for a directory below, is not ours.
+        let other = "[projects.'/w/x/sub']\ntrust_level = \"untrusted\"\n";
+        assert!(codex_trust_edit(other, "/w/x").unwrap().is_some());
+    }
+
+    /// A project table with no `trust_level` yet gets one right under its
+    /// header, so the file still parses as one table.
+    #[test]
+    fn codex_trust_fills_a_project_table_without_a_level() {
+        let src = "[projects.'/w/x']\nsomething = 1\n\n[tui]\ntheme = \"dark\"\n";
+        let out = codex_trust_edit(src, "/w/x").unwrap().unwrap();
+        assert_eq!(
+            out,
+            "[projects.'/w/x']\ntrust_level = \"trusted\"\nsomething = 1\n\n[tui]\ntheme = \"dark\"\n"
+        );
+    }
+
+    /// An inline `projects` table cannot be extended by a table after it (TOML
+    /// forbids it), so the file is left alone and the caller is told why.
+    #[test]
+    fn codex_trust_refuses_an_inline_projects_table() {
+        let src = "projects = { '/w/y' = { trust_level = \"trusted\" } }\n";
+        let err = codex_trust_edit(src, "/w/x").unwrap_err();
+        assert!(err.contains("inline table"), "{err}");
+    }
+
+    /// A key that cannot be a literal string is written as a basic string.
+    #[test]
+    fn codex_trust_quotes_a_key_with_an_apostrophe_as_a_basic_string() {
+        let out = codex_trust_edit("", "/w/o'neil").unwrap().unwrap();
+        assert!(out.starts_with("[projects.\"/w/o'neil\"]\n"), "{out}");
+        assert!(codex_trust_edit(&out, "/w/o'neil").unwrap().is_none());
+    }
+
+    /// Windows keys match without ASCII case, as codex matches them.
+    #[cfg(windows)]
+    #[test]
+    fn codex_trust_matches_a_windows_key_without_case() {
+        let src = "[projects.'C:\\Users\\Budde']\ntrust_level = \"trusted\"\n";
+        assert!(codex_trust_edit(src, r"c:\users\budde").unwrap().is_none());
+    }
+
+    /// The whole path: a config file on disk gains the table once, atomically,
+    /// and the directory's key is the physical path codex will look up.
+    #[test]
+    fn ensure_codex_trusted_writes_once_and_keys_by_the_physical_path() {
+        let d = tmp("codex");
+        let cfg = d.join("config.toml");
+        std::fs::write(&cfg, CODEX_CONFIG).unwrap();
+        assert!(matches!(
+            ensure_codex_trusted_at(&cfg, &d).unwrap(),
+            Outcome::NowTrusted
+        ));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.starts_with(CODEX_CONFIG));
+        let key = codex_project_key(&d);
+        assert!(!key.starts_with(r"\\?\"), "{key}");
+        assert!(
+            text.contains(&format!("[projects.'{key}']")),
+            "{text}\n{key}"
+        );
+        assert!(matches!(
+            ensure_codex_trusted_at(&cfg, &d).unwrap(),
+            Outcome::AlreadyTrusted
+        ));
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), text);
+        assert!(!cfg.with_extension("toml.atrium-tmp").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 }

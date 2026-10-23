@@ -50,7 +50,42 @@ fn facts() -> BannerFacts {
         color: false,
         mod_line: "mod: installed 0.1.0 at /cfg/mod".to_string(),
         mod_missing: false,
+        codex_hooks_unreviewed: Vec::new(),
+        codex_hooks_reviewed: Vec::new(),
     }
+}
+
+/// What a codex pane does about codex's hooks review is part of the posture
+/// the operator approves: a line names the agents whose hooks run unreviewed,
+/// a warning names those whose codex cannot skip the review screen.
+#[test]
+fn the_banner_says_whose_codex_hooks_run_unreviewed_and_whose_cannot() {
+    let launch = launch_of(TWO_AGENTS, true, &[]);
+    let quiet = banner_lines(&launch, &facts());
+    assert!(
+        !quiet.iter().any(|l| l.contains("codex hooks")),
+        "{quiet:?}"
+    );
+
+    let mut unreviewed = facts();
+    unreviewed.codex_hooks_unreviewed = vec!["cx".to_string()];
+    let lines = banner_lines(&launch, &unreviewed);
+    let line = lines
+        .iter()
+        .find(|l| l.contains("codex hooks run unreviewed for cx"))
+        .unwrap_or_else(|| panic!("{lines:?}"));
+    assert!(line.contains(atrium::vendors::CODEX_BYPASS_HOOK_TRUST));
+    assert!(!line.contains("warning"));
+
+    let mut reviewed = facts();
+    reviewed.codex_hooks_reviewed = vec!["cx".to_string()];
+    let lines = banner_lines(&launch, &reviewed);
+    assert!(
+        lines.iter().any(|l| l.contains("codex has no")
+            && l.contains(atrium::vendors::CODEX_BYPASS_HOOK_TRUST)
+            && l.contains("for cx")),
+        "{lines:?}"
+    );
 }
 
 const TWO_AGENTS: &str = r#"{"deny":["Bash(git push*)"],"agents":[

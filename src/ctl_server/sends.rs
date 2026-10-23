@@ -30,6 +30,9 @@ pub(crate) struct PendingSend {
     /// What queued it: a `ctl send`, or a wake for a bus event. Each origin has
     /// its own cap, so a chatty topic can never crowd out an operator's send.
     origin: SendOrigin,
+    /// The target's startup screen this send was last reported held behind on
+    /// the bar ([`atrium::vendors::dialog_markers`]), so each is said once.
+    held_behind: Option<&'static str>,
 }
 
 /// Where a queued send came from.
@@ -100,12 +103,30 @@ pub(crate) fn screen_has(screen: &ansi::Screen, needle: &str) -> bool {
 }
 
 /// Does `pane`'s screen show its vendor's prompt hint, or is there no hint to
-/// wait for? `waited` past [`SEND_PROMPT_WAIT`] counts as shown.
+/// wait for? `waited` past [`SEND_PROMPT_WAIT`] counts as shown — unless one
+/// of the vendor's own startup screens ([`atrium::vendors::dialog_markers`])
+/// is up, which holds the send however long it has waited: a brief typed at
+/// codex's hooks review picked its first item and was lost (measured, 0.163.0).
 fn prompt_up(title: &str, screen: &ansi::Screen, waited: Duration) -> bool {
-    match atrium::vendors::vendor_for_stem(title).and_then(atrium::vendors::prompt_marker) {
+    let Some(vendor) = atrium::vendors::vendor_for_stem(title) else {
+        return true;
+    };
+    if dialog_up(vendor, screen).is_some() {
+        return false;
+    }
+    match atrium::vendors::prompt_marker(vendor) {
         Some(hint) => waited >= SEND_PROMPT_WAIT || screen_has(screen, hint),
         None => true,
     }
+}
+
+/// The startup screen of `vendor`'s that `screen` shows, if any: the marker
+/// text, for the bar.
+fn dialog_up(vendor: agsess::Vendor, screen: &ansi::Screen) -> Option<&'static str> {
+    atrium::vendors::dialog_markers(vendor)
+        .iter()
+        .copied()
+        .find(|m| screen_has(screen, m))
 }
 
 pub(crate) fn typed_bytes(text: &str, paste_wanted: bool) -> Vec<u8> {
@@ -184,6 +205,7 @@ pub(super) fn queue_send(
         written: 0,
         text_written_at: None,
         origin,
+        held_behind: None,
     });
     true
 }
@@ -221,13 +243,15 @@ pub(super) fn retarget_sends(
 /// Flush queued `ctl send`s (Decision 4: queue until the target is idle). For
 /// each pending send: once the target reports a ready status (or the unbound
 /// fallback elapses), write the text; a beat later write the Enter and drop it.
-/// A vanished target is dropped. Returns whether anything was written (so the
-/// caller can request a repaint).
+/// A vanished target is dropped. A send held behind a target's own startup
+/// screen is said once on the bar (`flash`), naming the pane and the screen.
+/// Returns whether anything was written (so the caller can request a repaint).
 pub(crate) fn flush_sends(
     pending: &mut Vec<PendingSend>,
     windows: &mut [Window],
     world: &atrium::vendors::AgentState,
     mods: &atrium::modstate::ModState,
+    flash: &mut Option<(String, Instant)>,
 ) -> bool {
     if pending.is_empty() {
         return false;
@@ -249,6 +273,23 @@ pub(crate) fn flush_sends(
                     None => return false, // target gone — drop the send
                     Some(p) => {
                         let sid = p.session_id.as_deref();
+                        // The target's own startup screen holds the send for as
+                        // long as it is up; the bar says so, once per screen.
+                        let dialog = atrium::vendors::vendor_for_stem(&p.title)
+                            .and_then(|v| dialog_up(v, p.term.screen()));
+                        if dialog != ps.held_behind {
+                            if let Some(d) = dialog {
+                                *flash = Some((
+                                    format!(
+                                        "send to pane {} held: it is waiting on codex's \
+                                         \"{d}\" screen; answer it there",
+                                        p.id
+                                    ),
+                                    now,
+                                ));
+                            }
+                            ps.held_behind = dialog;
+                        }
                         // Drawn, nothing more arrived for the settle beat, and
                         // the agent's prompt hint is on screen: the app's own
                         // prompt is up, not a loading screen that happens to

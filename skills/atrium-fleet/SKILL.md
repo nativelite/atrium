@@ -161,9 +161,13 @@ With `allow_ctl`, a sandboxed codex agent can reach atrium's control socket and
 nothing else (no domains, no other socket). On macOS/Linux that needs codex's
 experimental `network_proxy` feature; an older codex can't run `atrium ctl`
 unless it runs at `skip`, and the bar says so at spawn. On **Windows** the
-control pipe admits codex's sandbox as is (atrium ≥ 0.40.3). codex also asks "Trust this folder?" the first time it
-runs in a directory, and atrium does not pre-accept that one, so answer it once
-per directory (or run `codex` there by hand first) before a hands-off launch.
+control pipe admits codex's sandbox as is (atrium ≥ 0.40.3). codex's own two
+startup screens — "Trust this folder?" the first time it runs in a directory, and
+"Hooks need review" when an enabled plugin's hooks have no trust hash yet — are
+cleared by a trusted launch (atrium ≥ 0.42.0): the folder's trust is written into
+`~/.codex/config.toml` and the pane runs its enabled hooks unreviewed
+(`--dangerously-bypass-hook-trust`, named in the banner). On an older codex a
+send into a pane showing either screen is held, and the bar says which pane.
 
 #### codex permissions (the `codex` block)
 
@@ -294,8 +298,9 @@ The trust posture is what makes a fleet run without a human clicking "allow":
   builds+tests, and git `add`/`commit`/`merge`/`worktree`/`status`/`log`/`diff`)
   but **deliberately still prompts** on `git push`/`reset`/`clean`. Don't try to
   widen it with raw claude flags in `cmd` — use `trust`.
-- atrium also pre-accepts claude's separate **folder-trust** dialog per pane cwd,
-  so a hands-off launch in a fresh dir doesn't stall on "trust this folder?".
+- atrium also pre-accepts the agent's separate **folder-trust** dialog per pane
+  cwd (claude's in `~/.claude.json`, codex's in `~/.codex/config.toml`), so a
+  hands-off launch in a fresh dir doesn't stall on "trust this folder?".
 
 Rule of thumb: all-opus/sonnet coordinating fleet → launch `--trust automode`. Any
 haiku in the roster → give those agents `"trust": "accept"`.
@@ -572,8 +577,10 @@ Write rules as concrete commands an agent can follow, not as goals.
   `WindowsApps`) → its sandbox can't start that shell, so every command fails
   with `Access is denied` and the bar says so at spawn. Install a non-packaged
   PowerShell 7 (`winget install Microsoft.PowerShell`) ahead of it on PATH.
-- codex agent in a directory codex has never run in → it waits on codex's own
-  "Trust this folder?" dialog; answer it once before a hands-off launch.
+- codex agent sitting on codex's own "Trust this folder?" or "Hooks need review"
+  screen → the codex is older than 0.163 or the launch is at `off`; the bar names
+  the pane and holds its sends. Answer the screen there (atrium ≥ 0.42.0 clears
+  both before a trusted launch).
 - `--dangerously-skip-permissions`, `--permission-mode` or `--allowedTools` in a
   `cmd` → removed at launch, and a preflight warning says so (on atrium ≤ 0.33.0
   the banner claimed this but the flag still reached the agent). Set the posture
