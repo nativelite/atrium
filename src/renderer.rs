@@ -115,7 +115,7 @@ pub(crate) struct Renderer {
     /// passthrough (single or zoomed) pane only gets the heavy repaint nudge
     /// (clear + resize) on a *real* transition — never on a routine `force_repaint`
     /// from bus/board/flash churn. Without this, a zoomed pane during a fleet run
-    /// is cleared several times a second (every ctl request forces a repaint),
+    /// was cleared several times a second (every ctl request forced a repaint),
     /// which reads as paint corruption and makes text selection impossible (the
     /// clear wipes the drag). Sentinel start so the first frame counts as a change.
     last_view: (usize, bool, usize, bool, bool, bool, bool, u16, u16),
@@ -236,7 +236,8 @@ impl Renderer {
             }
         } else if views.board {
             // The board overlay replaces the panes. Re-render only on a repaint
-            // (toggle, or a board write — every ctl request forces one), so idle
+            // (toggle, or a board or bus write — a ctl request that changes what
+            // it shows forces one; reads and empty polls do not), so idle
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
                 frame.extend_from_slice(

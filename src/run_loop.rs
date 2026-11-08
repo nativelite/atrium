@@ -259,15 +259,19 @@ impl RunState<'_> {
     fn serve_ctl(&mut self) {
         // 1b. ctl control channel: drain up to a few requests this tick
         //     (non-blocking; usually zero). Each request is applied as a pane
-        //     operation and answered on the same connection. A spawn appends a
-        //     visible new window, so we force a repaint after any request.
+        //     operation and answered on the same connection. What it did to the
+        //     screen decides the repaint: a spawn or kill voids the renderer's
+        //     baseline (full redraw), a board or bus write repaints the chrome
+        //     over the kept baseline, and a read or an empty poll draws nothing.
+        //     Resetting on every request, polls included, cleared the screen
+        //     several times a second under a modded fleet (see `CtlEffect`).
         let mut served = false;
         if let Some(listener) = self.ctl_listener.as_mut() {
             for _ in 0..8 {
                 match listener.poll() {
                     Ok(Some(line)) => {
                         served = true;
-                        let reply = apply_ctl(
+                        let (reply, effect) = apply_ctl(
                             &line,
                             &mut CtlSession {
                                 windows: &mut self.windows,
@@ -285,8 +289,14 @@ impl RunState<'_> {
                             },
                         );
                         let _ = listener.respond(&reply.to_json());
-                        self.renderer.reset();
-                        self.force_repaint = true;
+                        match effect {
+                            CtlEffect::Layout => {
+                                self.renderer.reset();
+                                self.force_repaint = true;
+                            }
+                            CtlEffect::Chrome => self.force_repaint = true,
+                            CtlEffect::Nothing => {}
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => break,

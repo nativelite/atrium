@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with the pane and the screen named on the bar.
 
 ### Fixed
+- **A ctl request no longer clears the screen unless panes came or went.**
+  Every control request, a mod's `inbox` poll included, reset the renderer and
+  forced a full repaint, a `2J` clear and a redraw of every pane from scratch.
+  With the mod polling each pane every 1.5 s, an eight-pane fleet cleared the
+  screen about five times a second, and on Windows every write to the console
+  host opens a ~16 ms frame that the next keystroke waits behind. Now a
+  `spawn`, `kill` or `respawn` still voids the renderer's baseline; a board,
+  bus, `report`, `send` or other broker write repaints the chrome over the
+  kept baseline; and a read, or a poll that found nothing, draws nothing
+  (`CtlEffect`, `src/ctl_server/dispatch.rs`; the loop honours it in
+  `src/run_loop.rs`).
 - **The Linux e2e `ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once`
   passes (issue #12).** The test bounded the bus feed with an `echo` marker
   whose typed line spelled the marker; a Linux tty echoes typed input the

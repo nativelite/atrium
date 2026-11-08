@@ -55,7 +55,7 @@ pub(crate) fn decision_for_agent(e: &atrium::bus::Event, windows: &[Window]) -> 
 /// else [`dispatch_ctl`] the request and record its outcome. `spawn`/`send`/
 /// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
 /// delegation-scoped.
-pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
+pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> (ctl::Reply, CtlEffect) {
     let (windows, audit) = (&*cx.windows, &mut *cx.audit);
     let req = match ctl::parse_request(line) {
         Ok(r) => r,
@@ -74,7 +74,7 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
                 false,
                 &e,
             );
-            return reply;
+            return (reply, CtlEffect::Nothing);
         }
     };
     // Authenticate the caller by its capability token, not its self-reported id:
@@ -108,7 +108,7 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
         );
         let (action, detail) = req.cmd.audit_label();
         audit.record(None, action, &detail, false, "unauthenticated");
-        return reply;
+        return (reply, CtlEffect::Nothing);
     }
     // The AUTHENTICATED caller, typed apart from the request's self-reported
     // `caller: Option<usize>` hint so the two can never be confused (r10 B4).
@@ -123,11 +123,15 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
     // Subtree-scoped like any read: a worker sees only its own subtree.
     if let Cmd::Audit(ar) = &req.cmd {
         audit.record(caller, "audit", "read", true, "");
-        return audit_reply(audit, windows, caller, privileged, ar.tail);
+        return (
+            audit_reply(audit, windows, caller, privileged, ar.tail),
+            CtlEffect::Nothing,
+        );
     }
 
     let (action, detail) = req.cmd.audit_label();
     let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox | Cmd::Asked(_));
+    let effect = CtlEffect::of(&req.cmd);
     let reply = dispatch_ctl(req, caller, privileged, cx);
     // `wait` polls `answer` twice a second until one exists, and a mod polls
     // `inbox` every second or two: a poll that found nothing is not an action
@@ -139,13 +143,44 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
         _ => false,
     };
     if is_poll && found_nothing {
-        return reply;
+        // Nothing was taken, so nothing on screen can have changed either.
+        return (reply, CtlEffect::Nothing);
     }
     let (ok, note) = audit_outcome(&reply);
     cx.audit.record(caller, action, &detail, ok, &note);
-    reply
+    (reply, effect)
 }
 
+/// What a served request may have done to the screen, so the loop repaints
+/// only as much as it must. Until 0.42.0 every request reset the renderer
+/// and forced a full repaint, a `2J` clear: with a mod polling `inbox` every
+/// 1.5 s per pane, an eight-pane fleet cleared the screen about five times a
+/// second, and on Windows every write to the console host opens a ~16 ms frame
+/// that the next keystroke waits behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CtlEffect {
+    /// A read, or a poll that found nothing: the screen is as it was.
+    Nothing,
+    /// Broker state a panel or the bar shows (board, bus, a report, a send):
+    /// repaint the chrome, keep the renderer's diff baseline.
+    Chrome,
+    /// Panes came or went: the layout changed, so the baseline is void and the
+    /// next frame is drawn from scratch.
+    Layout,
+}
+
+impl CtlEffect {
+    /// Classify by the verb. A failed `spawn` or `kill` costs one needless
+    /// full repaint; those are rare, and the alternative is a reply-shape
+    /// match that drifts the moment a reply variant is added.
+    pub(crate) fn of(cmd: &Cmd) -> CtlEffect {
+        match cmd {
+            Cmd::Spawn(_) | Cmd::Kill(_) | Cmd::Respawn(_) => CtlEffect::Layout,
+            _ if cmd.is_read_only() => CtlEffect::Nothing,
+            _ => CtlEffect::Chrome,
+        }
+    }
+}
 /// The server side of the control channel: turn one parsed [`atrium::ctl::Request`]
 /// into its JSON reply. `list`/`status` serialize the spawn tree (agsess status
 /// folded in); `spawn` opens a visible worker after the pure allowlist/depth
@@ -958,5 +993,49 @@ pub(crate) fn scope_denied(
         Some(atrium::ctl::reply_err(&format!(
             "pane {target} is outside your subtree; a worker may only steer what it spawned"
         )))
+    }
+}
+
+#[cfg(test)]
+mod effect_tests {
+    use super::*;
+
+    fn cmd(line: &str) -> Cmd {
+        ctl::parse_request(line).expect("parse").cmd
+    }
+
+    #[test]
+    fn panes_coming_or_going_void_the_baseline() {
+        for line in [
+            r#"{"cmd":"spawn","argv":["claude"]}"#,
+            r#"{"cmd":"kill","target":"3"}"#,
+            r#"{"cmd":"respawn","target":"3"}"#,
+        ] {
+            assert_eq!(CtlEffect::of(&cmd(line)), CtlEffect::Layout, "{line}");
+        }
+    }
+
+    #[test]
+    fn reads_and_polls_leave_the_screen_alone() {
+        for line in [
+            r#"{"cmd":"list"}"#,
+            r#"{"cmd":"status"}"#,
+            r#"{"cmd":"board","op":"list"}"#,
+            r#"{"cmd":"bus","op":"feed"}"#,
+        ] {
+            assert_eq!(CtlEffect::of(&cmd(line)), CtlEffect::Nothing, "{line}");
+        }
+    }
+
+    #[test]
+    fn broker_writes_repaint_the_chrome_without_a_clear() {
+        for line in [
+            r#"{"cmd":"board","op":"set","key":"m1","fields":{"status":"DONE"}}"#,
+            r#"{"cmd":"bus","op":"pub","topic":"work","msg":"x"}"#,
+            r#"{"cmd":"report","status":"working"}"#,
+            r#"{"cmd":"inbox"}"#,
+        ] {
+            assert_eq!(CtlEffect::of(&cmd(line)), CtlEffect::Chrome, "{line}");
+        }
     }
 }
