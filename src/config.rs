@@ -69,6 +69,9 @@ pub struct GlobalConfig {
     pub mod_path: Option<PathBuf>,
     /// `"mod": false`: inject the mod into no claude pane on this machine.
     pub mod_off: bool,
+    /// `"teams": "off"`: catch no Claude Code teammates as panes on this
+    /// machine ([`crate::tmux_shim`]); `"show"` or absent catches them.
+    pub teams_off: bool,
     pub fleet_defaults: FleetDefaults,
 }
 
@@ -110,6 +113,9 @@ impl GlobalConfig {
         fleet.memory_mb = fleet.memory_mb.or(self.memory_mb);
         if self.mod_off {
             fleet.mod_enabled = fleet.mod_enabled.or(Some(false));
+        }
+        if self.teams_off {
+            fleet.teams = fleet.teams.or(Some(false));
         }
         fleet
     }
@@ -211,6 +217,7 @@ pub const STARTER: &str = r#"{
   "build_jobs": null,
   "memory_mb": null,
   "mod": null,
+  "teams": null,
   "fleet_defaults": {
     "trust": null,
     "identity": null,
@@ -332,6 +339,7 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         memory_mb: None,
         mod_path: None,
         mod_off: false,
+        teams_off: false,
         fleet_defaults: FleetDefaults::default(),
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
@@ -354,6 +362,11 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
             )
         }
     }
+    // `teams`: `"off"` keeps Claude Code's teammates in-process; `"show"` and
+    // `null` catch them as panes. Anything else is a typo, named.
+    cfg.teams_off = crate::tmux_shim::parse_setting(get("teams"))
+        .map_err(|e| format!("config.json: {e}"))?
+        == Some(false);
     if let Some(v) = get("fleet_defaults").filter(|v| !matches!(v, json::Value::Null)) {
         let d = v
             .as_object()
@@ -806,6 +819,41 @@ mod tests {
         assert_eq!(
             answer_to_path("\"/x/y.json\"", d, Some(h)),
             PathBuf::from("/x/y.json")
+        );
+    }
+
+    #[test]
+    fn the_teams_key_is_show_off_or_an_error_and_fills_a_fleet() {
+        let off = parse_with_home(r#"{"teams": "off"}"#, home()).unwrap();
+        assert!(off.teams_off);
+        for on in [
+            r#"{"teams": "show"}"#,
+            r#"{"teams": null}"#,
+            "{}",
+            r#"{"teams": true}"#,
+        ] {
+            assert!(!parse_with_home(on, home()).unwrap().teams_off, "{on}");
+        }
+        let err = parse_with_home(r#"{"teams": "yes"}"#, home()).unwrap_err();
+        assert!(err.contains("teams"), "{err}");
+        let roster = r#"{"fleets":{"a":{"agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+        let fleet = crate::fleet::parse(roster)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone();
+        assert_eq!(off.apply_to_fleet(fleet).teams, Some(false));
+        let explicit =
+            r#"{"fleets":{"a":{"teams": "show", "agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+        let fleet_on = crate::fleet::parse(explicit)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            off.apply_to_fleet(fleet_on).teams,
+            Some(true),
+            "the fleet's own key wins"
         );
     }
 

@@ -549,6 +549,7 @@ mod tests {
             trust: None,
             allow_ctl: None,
             mod_enabled: None,
+            teams: None,
             subagents: None,
             subagents_keep: None,
             captions: None,

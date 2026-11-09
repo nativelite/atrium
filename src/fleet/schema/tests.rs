@@ -645,6 +645,17 @@ fn a_fleet_can_turn_the_mod_off_and_a_non_bool_is_a_clear_error() {
     let f = parse(r#"{ "fleets": { "a": { "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#)
         .unwrap();
     assert_eq!(f.get("a").unwrap().mod_enabled, None);
+    assert_eq!(f.get("a").unwrap().teams, None);
+    let f = parse(
+        r#"{ "fleets": { "a": { "teams": "off", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+    )
+    .unwrap();
+    assert_eq!(f.get("a").unwrap().teams, Some(false));
+    let err = parse(
+        r#"{ "fleets": { "a": { "teams": "panes", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
+    )
+    .unwrap_err();
+    assert!(err.contains("teams"), "{err}");
     let err = parse(
         r#"{ "fleets": { "a": { "mod": "off", "agents": [{ "name": "x", "cmd": ["claude"] }] } } }"#,
     )

@@ -428,6 +428,7 @@ and win over the pointer.
   "build_jobs": null,
   "memory_mb": null,
   "mod": null,
+  "teams": null,
   "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
 }
 ```
@@ -444,6 +445,9 @@ and win over the pointer.
 - **`mod`** — `false` keeps atrium's Claude Code plugin (the mod, `atrium mod
   install`) out of every claude pane on this machine; `{ "path": "<dir>" }` names
   the folder when it was installed somewhere else.
+- **`teams`** — `"off"` keeps a Claude Code lead's teammates in-process instead of
+  catching them as atrium panes; `"show"` (the default) catches them. A fleet's
+  own `teams` key wins.
 - **`fleet_defaults`** — `trust`, `identity`, `allow_ctl`, `grid` for fleets that
   leave them out.
 

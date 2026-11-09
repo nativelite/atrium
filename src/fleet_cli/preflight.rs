@@ -206,6 +206,9 @@ pub(super) struct BannerFacts {
     /// ([`atrium::modfiles::describe`]), and whether it is a warning.
     pub(super) mod_line: String,
     pub(super) mod_missing: bool,
+    /// Whether a Claude Code lead's teammates are caught as panes
+    /// ([`atrium::tmux_shim::describe`]).
+    pub(super) teams_on: bool,
     /// The codex agents whose program takes `--dangerously-bypass-hook-trust`
     /// (their enabled hooks run without codex's review, see
     /// [`atrium::vendors::codex_hooks_unreviewed`]), and those whose program
@@ -240,6 +243,7 @@ impl BannerFacts {
                 && std::env::var_os("NO_COLOR").is_none(),
             mod_line,
             mod_missing,
+            teams_on: fleet.teams.unwrap_or(true),
             codex_hooks_unreviewed,
             codex_hooks_reviewed,
         }
@@ -303,6 +307,12 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
             warnings.push(facts.mod_line.clone());
         } else {
             out.push(format!("atrium fleet: {}", facts.mod_line));
+        }
+        if fleet.allow_ctl.unwrap_or(false) {
+            out.push(format!(
+                "atrium fleet: {}",
+                atrium::tmux_shim::describe(facts.teams_on)
+            ));
         }
     }
     // Deny rules only reach claude (codex has no equivalent flag). Say so when a

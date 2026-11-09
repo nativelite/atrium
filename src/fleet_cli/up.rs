@@ -400,6 +400,8 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     atrium::trust::set_fleet_codex(fleet.codex.as_ref().map(|c| c.resolved(&fleet_dir)));
     // And whether its claude panes load the mod.
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
+    // And whether a Claude Code lead's teammates are caught as panes.
+    atrium::tmux_shim::set_session_enabled(fleet.teams.unwrap_or(true));
     // And when an idle pane's parent is asked to checkpoint and respawn it.
     atrium::modstate::set_session_respawn_at(fleet.respawn_at);
     // And whether the mod may spend a small model call on captions.

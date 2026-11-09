@@ -459,7 +459,7 @@ pub(crate) fn spawn_pane_full(
     // runs inside tmux, with atrium's shim first on PATH to answer, so the
     // teammates its lead spawns become panes here (`atrium::tmux_shim`).
     if let Some(addr) = CTL_ADDRESS.get() {
-        if atrium::bind::is_claude_stem(&title) {
+        if atrium::bind::is_claude_stem(&title) && atrium::tmux_shim::session_enabled() {
             base_env.extend(atrium::tmux_shim::pane_env(
                 addr,
                 &agent_id.to_string(),

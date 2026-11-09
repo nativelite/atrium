@@ -50,6 +50,7 @@ fn facts() -> BannerFacts {
         color: false,
         mod_line: "mod: installed 0.1.0 at /cfg/mod".to_string(),
         mod_missing: false,
+        teams_on: true,
         codex_hooks_unreviewed: Vec::new(),
         codex_hooks_reviewed: Vec::new(),
     }
@@ -225,6 +226,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         trust: None,
         allow_ctl: None,
         mod_enabled: None,
+        teams: None,
         subagents: None,
         subagents_keep: None,
         captions: None,
@@ -288,6 +290,7 @@ fn codex_blocks_are_disclosed_per_distinct_block_and_flagged_off_codex() {
         trust: None,
         allow_ctl: None,
         mod_enabled: None,
+        teams: None,
         subagents: None,
         subagents_keep: None,
         captions: None,

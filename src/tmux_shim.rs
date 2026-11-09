@@ -725,6 +725,47 @@ impl Broker for NoBroker {
     }
 }
 
+/// The `teams` key, in `config.json` and per fleet: `"show"` (or `true`, or
+/// absent) catches a Claude Code lead's teammates as atrium panes; `"off"` (or
+/// `false`) sets no `TMUX` and prepends nothing, so Claude Code's teams run
+/// in-process as they did before. `Ok(None)` is "not said"; `Err` names the
+/// accepted spellings for the caller's error.
+pub fn parse_setting(v: Option<&json::Value>) -> Result<Option<bool>, &'static str> {
+    match v {
+        None | Some(json::Value::Null) => Ok(None),
+        Some(json::Value::Bool(b)) => Ok(Some(*b)),
+        Some(json::Value::String(s)) if s == "show" => Ok(Some(true)),
+        Some(json::Value::String(s)) if s == "off" => Ok(Some(false)),
+        Some(_) => Err("\"teams\" must be \"show\" or \"off\""),
+    }
+}
+
+static SESSION_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record whether this session catches Claude Code's teammates (a fleet's
+/// `teams: off` turns it off). First call wins, like the mod's switch.
+pub fn set_session_enabled(on: bool) {
+    let _ = SESSION_ENABLED.set(on);
+}
+
+/// Does this session put the shim into claude panes? The fleet's say if it
+/// spoke, else the config's `teams` key, else yes.
+pub fn session_enabled() -> bool {
+    match SESSION_ENABLED.get() {
+        Some(on) => *on,
+        None => !crate::config::get().teams_off,
+    }
+}
+
+/// One line for the fleet banner and preflight.
+pub fn describe(on: bool) -> &'static str {
+    if on {
+        "teams: Claude Code's teammates land as panes (teammateMode auto or tmux)"
+    } else {
+        "teams: off (Claude Code's teammates stay in-process)"
+    }
+}
+
 /// Where the shim lives: beside the sessions store, under atrium's per-user
 /// state directory (`%LOCALAPPDATA%\atrium\shim`, `~/.local/state/atrium/shim`).
 /// `root` is [`crate::session_store::state_root`], the sessions directory
@@ -994,6 +1035,19 @@ mod tests {
         let (here, role, _) = &b.spawned[0];
         assert!(!here);
         assert_eq!(role.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn the_teams_setting_is_show_off_a_bool_or_an_error() {
+        let p = |t: &str| parse_setting(json::parse(t).ok().as_ref());
+        assert_eq!(p("null"), Ok(None));
+        assert_eq!(p("\"show\""), Ok(Some(true)));
+        assert_eq!(p("true"), Ok(Some(true)));
+        assert_eq!(p("\"off\""), Ok(Some(false)));
+        assert_eq!(p("false"), Ok(Some(false)));
+        assert!(p("\"yes\"").is_err());
+        assert!(p("1").is_err());
+        assert_eq!(parse_setting(None), Ok(None));
     }
 
     #[test]

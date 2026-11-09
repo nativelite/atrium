@@ -181,8 +181,9 @@ Invoked as `tmux`, atrium serves the verbs the teams backend uses, each one an `
 
 So a teammate is an ordinary atrium pane: `split-window` is `ctl spawn --here` beside the lead, the pane's role is the teammate's `--agent-name`, it is a child of the lead in the spawn tree and under its trust ceiling, and it has the status border, the overview row, the board and the bus. The shim models one window, `@0`, whose panes are the caller and its direct children, which is the team as the lead sees it; pane ids are `%<agent id>`.
 
-Two things to know:
+Three things to know:
 
+- It is a setting. `"teams": "off"` in `config.json` turns it off for every session on the machine; `teams: "off"` in a fleet turns it off for that fleet, and a fleet's own key wins over the config's. `"show"` is the default. Off means the pane gets no `TMUX` and nothing on its `PATH`, so Claude Code's teams run in-process as they did before. The fleet preflight names which is in effect.
 - Claude Code's `teammateMode` setting defaults to `in-process`. Set it to `auto` (split panes when inside tmux, which an atrium claude pane now is) or `tmux`.
 - `atrium --tmux-shim <tmux args…>` reaches the shim by its real name, for a probe: `atrium --tmux-shim -V` prints `tmux 3.5a-atrium`.
 

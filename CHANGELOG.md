@@ -31,7 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   children. `CLAUDE_CODE_TMUX_TRUECOLOR=1` rides along so Claude Code keeps
   truecolor. Set Claude Code's `teammateMode` to `auto` or `tmux` (the default
   is `in-process`); `atrium --tmux-shim <tmux args>` reaches the shim by its
-  real name for a probe (`src/tmux_shim.rs`, 12 unit tests).
+  real name for a probe (`src/tmux_shim.rs`, 13 unit tests). It is a setting:
+  `"teams": "off"` in `config.json` (every session on the machine) or in a
+  fleet (that fleet; its own key wins) keeps a lead's teammates in-process, with
+  no `TMUX` and nothing on `PATH`; `"show"` is the default, and the fleet
+  preflight names which is in effect.
 - **A trusted codex pane clears codex's two startup screens before it starts,
   and a send is never typed into either.** A fleet of two codex panes with the
   context-mode plugin stopped at launch: both opened on codex's "Hooks need

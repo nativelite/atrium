@@ -57,6 +57,10 @@ pub struct Fleet {
     /// `true` injects it when it is installed. The config's `"mod": false`
     /// fills an absent key.
     pub mod_enabled: Option<bool>,
+    /// `teams: "off"` keeps a Claude Code lead's teammates in-process in this
+    /// fleet's claude panes; absent or `"show"` catches them as atrium panes
+    /// ([`crate::tmux_shim`]). The config's `"teams": "off"` fills an absent key.
+    pub teams: Option<bool>,
     /// How the model's subagents run in this fleet's claude panes:
     /// `panes` (visible panes, the default), `native` or `deny`
     /// ([`crate::modstate::Subagents`]).
@@ -333,6 +337,8 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         ),
         None => None,
     };
+    let teams = crate::tmux_shim::parse_setting(get("teams"))
+        .map_err(|e| format!("fleet {name:?}: {e}"))?;
     let subagents = match get("subagents") {
         Some(v) => {
             let word = v.as_str().ok_or_else(|| {
@@ -504,6 +510,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         trust,
         allow_ctl,
         mod_enabled,
+        teams,
         subagents,
         subagents_keep,
         captions,
