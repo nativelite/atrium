@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+<<<<<<< HEAD
 - **A pane's own title, bell and notification, from nativelite-vterm 0.5.6's
   notices.** The emulator now reports what a program says rather than draws
   (`vterm::Notice`: `OSC 0`/`2` titles with xterm's title stack, a bare
@@ -24,6 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change, because a bell is a moment, not a state. A pane's progress report is
   dropped: the host's tab indicator follows the fleet's state. Requires
   nativelite-vterm 0.5.6.
+=======
+- **Certainty status for codex panes, the way claude panes got it in 0.43.0.**
+  A codex pane in a ctl session reports its own status through codex's hooks
+  instead of waiting for the transcript inference: `UserPromptSubmit` and
+  `PreToolUse` report `working`, `PermissionRequest` (which codex runs before
+  its approval prompt) `waiting-approval`, `Stop` and `Interrupt`
+  `waiting-prompt`, `SessionEnd` `ended`, each hook `atrium ctl report
+  status=… --quiet` with the pane's own token. No file is written anywhere:
+  codex reads a `[hooks]` table from every enabled config layer and its `-c`
+  overrides are one, so the pane's command line carries one
+  `-c hooks.<Event>=…` override per event (`atrium::codex_hooks`), and the
+  hooks live and die with the pane. They ride on the
+  `--dangerously-bypass-hook-trust` atrium already passes at any posture but
+  `off` (0.42.0), since codex runs an unreviewed hook only under it, and are
+  never added without it; a command line that overrides the `hooks` table
+  itself is left alone. Verified against the codex source and the installed
+  0.163.0 binary (`docs/agent-status.md`), not against a live login.
+>>>>>>> wt/0.46-g
 
 ## [0.45.1] - 2026-11-09
 

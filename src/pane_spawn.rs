@@ -360,6 +360,16 @@ pub(crate) fn spawn_pane_full(
                 ));
             }
             v = atrium::vendors::codex_hooks_unreviewed(&v, bypass);
+            // Certainty status without the mod (`atrium::codex_hooks`): in a
+            // ctl session the pane's argv also carries atrium's status hooks
+            // as `-c hooks.<Event>=…` overrides, which ride on that same
+            // flag (none without it); never when the user overrides the
+            // `hooks` table themselves.
+            if CTL_ADDRESS.get().is_some() {
+                if let Ok(exe) = std::env::current_exe() {
+                    v = atrium::codex_hooks::add(&v, &exe);
+                }
+            }
         }
         daemonless = v;
         #[cfg(windows)]
