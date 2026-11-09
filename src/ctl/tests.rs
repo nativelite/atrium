@@ -1139,3 +1139,71 @@ fn spawn_beside_parses_a_pane_id_and_needs_here() {
     let err = build_request(&args(&["spawn", "--here", "--beside"]), Some(3)).unwrap_err();
     assert!(err.message().contains("needs a pane id"), "{err:?}");
 }
+
+/// `spawn --here --size 70%` (the tmux shim's `-l 70%`) asks the new pane's
+/// share of the anchor's span; a bare number is cells. It is validated in the
+/// client, carried as text, parsed again by the server, and needs `--here`.
+#[test]
+fn spawn_size_parses_a_percent_or_cells_and_rejects_the_rest() {
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let line = build_request(
+        &args(&["spawn", "--here", "--size", "70%", "--", "claude"]),
+        Some(3),
+    )
+    .unwrap();
+    assert!(line.contains("\"size\":\"70%\""), "{line}");
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => {
+            assert_eq!(sp.size, Some(SpawnSize::Percent(70)));
+            assert_eq!(sp.size.unwrap().permille(120), 700);
+            assert_eq!(sp.size.unwrap().as_flag(), "70%");
+        }
+        other => panic!("{other:?}"),
+    }
+    let line = build_request(
+        &args(&[
+            "spawn", "--here", "--beside", "4", "--size", "20", "--", "claude",
+        ]),
+        Some(3),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => {
+            assert_eq!(sp.size, Some(SpawnSize::Cells(20)));
+            assert_eq!(sp.beside, Some(4));
+            // 20 of 80 cells is a quarter; past the span it is the whole span.
+            assert_eq!(sp.size.unwrap().permille(80), 250);
+            assert_eq!(sp.size.unwrap().permille(10), 1000);
+            assert_eq!(sp.size.unwrap().as_flag(), "20");
+        }
+        other => panic!("{other:?}"),
+    }
+    let line = build_request(&args(&["spawn", "--here", "--", "claude"]), Some(3)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => assert_eq!(sp.size, None, "no --size: an equal grid"),
+        other => panic!("{other:?}"),
+    }
+    for bad in ["0%", "100%", "abc", "0", "%", "7%%"] {
+        let err = build_request(
+            &args(&["spawn", "--here", "--size", bad, "--", "claude"]),
+            Some(3),
+        )
+        .unwrap_err();
+        assert!(err.message().contains("not a size"), "{bad}: {err:?}");
+    }
+    // A negative reads as a flag with no value: refused too, by `value_at`.
+    build_request(
+        &args(&["spawn", "--here", "--size", "-5", "--", "claude"]),
+        Some(3),
+    )
+    .unwrap_err();
+    let err =
+        build_request(&args(&["spawn", "--size", "70%", "--", "claude"]), Some(3)).unwrap_err();
+    assert!(err.message().contains("--here"), "{err:?}");
+    let err = build_request(&args(&["spawn", "--here", "--size"]), Some(3)).unwrap_err();
+    assert!(err.message().contains("needs a value"), "{err:?}");
+    // A hand-rolled request with a bad size is refused, not silently equal.
+    let err = parse_request(r#"{"cmd":"spawn","argv":["claude"],"window":false,"size":"150%"}"#)
+        .unwrap_err();
+    assert!(err.contains("not a size"), "{err}");
+}

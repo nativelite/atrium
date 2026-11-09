@@ -69,7 +69,7 @@ pub use reply::{
     TreeNode, WhoEntry, IDLE_RENDER_MIN_MS,
 };
 pub use request::{
-    parse_request, AgentId, AnswerReq, AskReq, AskedReq, AuditReq, BoardOp, BusOp, Cmd, HelloReq,
-    InboxReq, KillReq, ReportReq, Request, RespawnReq, SendReq, SpawnReq, StatusReq, WhoReq,
-    MAX_TTL_MS,
+    parse_request, parse_spawn_size, AgentId, AnswerReq, AskReq, AskedReq, AuditReq, BoardOp,
+    BusOp, Cmd, HelloReq, InboxReq, KillReq, ReportReq, Request, RespawnReq, SendReq, SpawnReq,
+    SpawnSize, StatusReq, WhoReq, MAX_TTL_MS,
 };

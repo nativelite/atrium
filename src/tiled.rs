@@ -136,12 +136,13 @@ pub(crate) fn split_focused(
     ) {
         Ok(pane) => {
             // The first key to grow a single pane chooses the grid's orientation
-            // (`Tree::grid_grow`); later keys only pick the slot.
+            // (`Tree::grow`); later keys only pick the slot. A key never sets a
+            // ratio: under a `--size` split it keeps that ratio and re-grids
+            // the focused pane's own region equally.
             let anchor = w.tree.focus();
-            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
             w.panes.push(pane);
             w.next_id += 1;
-            w.tree = Tree::grid_grow(&mut w.grid_dir, &ids, anchor, new_id, dir);
+            w.tree = w.tree.grow(&mut w.grid_dir, anchor, new_id, dir, None);
             w.tree.focus_pane(new_id);
             w.zoomed = false; // a fresh split is always tiled
         }

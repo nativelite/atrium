@@ -9,10 +9,16 @@
 //! reserved gutter — each pane draws its own full box border (0.2.1), so
 //! adjacent borders simply abut and the split space is halved with no gap.
 //!
-//! MVP splits are **equal** — a split halves the focused pane — which is all
-//! the 2×2 "four agents in a square" case needs: split vertical, then split
-//! each side horizontally. Proportional drag-resize is deferred (see the 0.2
-//! design doc, §4 "out of scope").
+//! Splits are **equal by default** — a node divides its span in proportion to
+//! the panes under each child, so a 2×2 is four even tiles and a line of three
+//! is thirds — and a node may instead carry a **ratio**, the permille share of
+//! its span given to its first child (`Node::Split::ratio`, clamped to
+//! [`RATIO_MIN`]`..=`[`RATIO_MAX`]). A ratio is set by `ctl spawn --here --size`
+//! (the tmux shim's `split-window -l 70%`): the anchor pane is split and the new
+//! pane takes the asked share. Ratios are relative, so a terminal resize keeps
+//! them; [`Tree::grow`] keeps them when it re-grids a window; the interactive
+//! `"` / `%` splits make equal splits only (no UI sets a ratio) and
+//! drag-resize is still deferred.
 
 /// A sub-rectangle of the screen, 0-based `(row, col)` origin with a size. All
 /// coordinates are in the master (outer) grid the compositor paints into.
@@ -49,8 +55,19 @@ pub enum Dir {
     Vertical,
 }
 
-/// A node in the split tree: either a leaf pane or an even split of two
-/// subtrees.
+/// The smallest share (permille of the span) a ratio'd split gives either child:
+/// 10 %. A `--size 5%` is honoured as 10 %, a `--size 95%` as 90 %, so neither
+/// side is ever a sliver that cannot show its border and a line of text.
+pub const RATIO_MIN: u16 = 100;
+/// The largest share a ratio'd split gives its first child: `1000 - RATIO_MIN`.
+pub const RATIO_MAX: u16 = 1000 - RATIO_MIN;
+
+/// Clamp a permille share into [`RATIO_MIN`]`..=`[`RATIO_MAX`].
+pub fn clamp_ratio(permille: u16) -> u16 {
+    permille.clamp(RATIO_MIN, RATIO_MAX)
+}
+
+/// A node in the split tree: either a leaf pane or a split of two subtrees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Node {
     Leaf(usize),
@@ -58,7 +75,27 @@ enum Node {
         dir: Dir,
         first: Box<Node>,
         second: Box<Node>,
+        /// `None`: the span is divided in proportion to the panes under each
+        /// child (two leaves → 50/50, a leaf beside a pair → 1/3 + 2/3), which
+        /// is what every key, `-n` grid and plain `--here` spawn makes.
+        /// `Some(p)`: `first` gets `p` permille of the span, `second` the rest,
+        /// whatever either holds — a `--size` split (clamped into
+        /// [`RATIO_MIN`]`..=`[`RATIO_MAX`]), or a split **frozen** at its exact
+        /// leaf-count proportion (`1..=999`) because a `--size` split happened
+        /// below it, so the sized pane's neighbours keep their geometry. Every
+        /// ancestor of a ratio'd split is therefore ratio'd too.
+        ratio: Option<u16>,
     },
+}
+
+impl Node {
+    /// True if pane `id` is a leaf of this subtree.
+    fn contains(&self, id: usize) -> bool {
+        match self {
+            Node::Leaf(x) => *x == id,
+            Node::Split { first, second, .. } => first.contains(id) || second.contains(id),
+        }
+    }
 }
 
 /// Which way to move focus.
@@ -261,6 +298,7 @@ impl Tree {
                 dir,
                 first: Box::new(n),
                 second: Box::new(acc),
+                ratio: None,
             };
         }
         acc
@@ -283,6 +321,7 @@ impl Tree {
             dir,
             first: Box::new(leaf(start)),
             second: Box::new(Self::line_from(dir, start + 1, n, leaf)),
+            ratio: None,
         }
     }
 
@@ -335,7 +374,7 @@ impl Tree {
     /// first child is the old pane and whose second child is the new one.
     pub fn split(&mut self, dir: Dir, new_id: usize) {
         let focus = self.focus;
-        Self::split_at(&mut self.root, focus, dir, new_id);
+        Self::split_at(&mut self.root, focus, dir, new_id, None);
         self.focus = new_id;
     }
 
@@ -357,14 +396,28 @@ impl Tree {
     /// what lets `ctl spawn --here` tile a worker beside the pane that requested
     /// it, even when that pane is not the window's current focus.
     pub fn split_pane(&mut self, target: usize, dir: Dir, new_id: usize) -> bool {
-        let ok = Self::split_at(&mut self.root, target, dir, new_id);
+        let ok = Self::split_at(&mut self.root, target, dir, new_id, None);
         if ok {
             self.focus = new_id;
         }
         ok
     }
 
-    fn split_at(node: &mut Node, target: usize, dir: Dir, new_id: usize) -> bool {
+    /// Replace the leaf `target` with a split of `target` and `new_id` in `dir`;
+    /// `ratio` is the first child's (the old pane's) permille share, or `None`
+    /// for an equal split. With a ratio, every leaf-count split on the way down
+    /// to `target` is **frozen** at the proportion it had before the split
+    /// ([`leaf_ratio`](Tree::leaf_ratio)): the new pane then takes its share
+    /// from `target` alone and no other pane moves, where a leaf-count parent
+    /// would have re-divided itself 1-vs-2 and shrunk the neighbours. Returns
+    /// `false` (a no-op) if `target` is not a leaf.
+    fn split_at(
+        node: &mut Node,
+        target: usize,
+        dir: Dir,
+        new_id: usize,
+        ratio: Option<u16>,
+    ) -> bool {
         match node {
             Node::Leaf(id) if *id == target => {
                 let old = *id;
@@ -372,15 +425,114 @@ impl Tree {
                     dir,
                     first: Box::new(Node::Leaf(old)),
                     second: Box::new(Node::Leaf(new_id)),
+                    ratio: ratio.map(clamp_ratio),
                 };
                 true
             }
             Node::Leaf(_) => false,
-            Node::Split { first, second, .. } => {
-                Self::split_at(first, target, dir, new_id)
-                    || Self::split_at(second, target, dir, new_id)
+            Node::Split {
+                first,
+                second,
+                ratio: own,
+                ..
+            } => {
+                let frozen = Self::leaf_ratio(Self::count(first), Self::count(second));
+                let hit = Self::split_at(first, target, dir, new_id, ratio)
+                    || Self::split_at(second, target, dir, new_id, ratio);
+                if hit && ratio.is_some() && own.is_none() {
+                    *own = Some(frozen);
+                }
+                hit
             }
         }
+    }
+
+    /// The permille a leaf-count split gives its first child: `a` leaves against
+    /// `b`, exact, kept off 0 and 1000 so neither side can vanish.
+    fn leaf_ratio(a: usize, b: usize) -> u16 {
+        let p = a * 1000 / (a + b).max(1);
+        p.clamp(1, 999) as u16
+    }
+
+    /// What one key or one `ctl spawn --here` adds to **this** window, keeping
+    /// its ratios: the tree with `new_id` placed next to `anchor`, focus
+    /// unchanged (callers move it; a `--no-focus` spawn must not). This is
+    /// [`grid_grow`](Tree::grid_grow) made ratio-aware, and the tree's own leaf
+    /// order is the order it reflows in, so a pane placed beside its anchor
+    /// stays there on the next growth.
+    ///
+    /// `new_share` is `--size`: the new pane's permille of the **anchor's**
+    /// span (tmux's `split-window -t %N -l 70%` gives the new pane 70 % of pane
+    /// N; a first teammate's `-t @0` is the lead's whole window). The anchor leaf
+    /// alone is split, `anchor` keeping `1000 - new_share` (clamped into
+    /// [`RATIO_MIN`]`..=`[`RATIO_MAX`]), and every leaf-count split above it is
+    /// frozen at its current proportion so no other pane moves. Without one the
+    /// window re-grids, and **every ratio is kept**: the walk descends through
+    /// the ratio'd splits toward the anchor and re-grids only the subtree under
+    /// the last of them (a leaf, or a plain leaf-count grid), inserting the new
+    /// pane beside the anchor in `grid_dir`. So after `-l 70%` the lead keeps
+    /// its 30 % and every later teammate tiles inside the 70 % half, which is
+    /// what tmux shows for `-h -l 70%` followed by `-v` splits of the new pane;
+    /// and a `--size` inside one cell of a 2×2 freezes that 2×2's rows and
+    /// columns, so a later plain spawn reflows only the line it lands in.
+    ///
+    /// A ratio is dropped in exactly two cases: [`close`](Tree::close) collapses
+    /// a ratio'd split whose own child pane went away (the ratio was about that
+    /// pane; a close deeper inside a half keeps the half's share), and an
+    /// `anchor` that is not in the tree appends to a re-grid of the **whole**
+    /// window, dropping every ratio — callers resolve the anchor from the
+    /// window's panes first, so that is the fallback for a vanished pane.
+    ///
+    /// A single pane sets `grid_dir` to `dir`, as `grid_grow` does.
+    pub fn grow(
+        &self,
+        grid_dir: &mut Dir,
+        anchor: usize,
+        new_id: usize,
+        dir: Dir,
+        new_share: Option<u16>,
+    ) -> Self {
+        if self.is_single() {
+            *grid_dir = dir;
+        }
+        let mut t = self.clone();
+        if let Some(share) = new_share {
+            let old_share = 1000u16.saturating_sub(share);
+            if Self::split_at(&mut t.root, anchor, dir, new_id, Some(old_share)) {
+                return t;
+            }
+        }
+        if !Self::grow_at(&mut t.root, *grid_dir, anchor, new_id, dir) {
+            let ids = t.ids();
+            t.root = Self::grid_from_ids_inserting(&ids, *grid_dir, anchor, new_id, dir).root;
+        }
+        t
+    }
+
+    /// The re-grid half of [`grow`](Tree::grow): descend through ratio'd splits
+    /// toward `anchor`, then rebuild the first subtree that is not one as a grid
+    /// with `new_id` beside the anchor. `false` if `anchor` is not in `node`.
+    fn grow_at(node: &mut Node, grid_dir: Dir, anchor: usize, new_id: usize, dir: Dir) -> bool {
+        if let Node::Split {
+            ratio: Some(_),
+            first,
+            second,
+            ..
+        } = node
+        {
+            return if first.contains(anchor) {
+                Self::grow_at(first, grid_dir, anchor, new_id, dir)
+            } else {
+                second.contains(anchor) && Self::grow_at(second, grid_dir, anchor, new_id, dir)
+            };
+        }
+        if !node.contains(anchor) {
+            return false;
+        }
+        let mut ids = Vec::new();
+        Self::collect_ids(node, &mut ids);
+        *node = Self::grid_from_ids_inserting(&ids, grid_dir, anchor, new_id, dir).root;
+        true
     }
 
     /// Remove pane `id` from the tree, collapsing its parent split into the
@@ -420,11 +572,11 @@ impl Tree {
     }
 
     /// Resolve the tree to `(pane_id, Rect)` for every pane, laid out inside
-    /// the outer rect. A split halves the space edge-to-edge with **no**
-    /// reserved gutter — the first child gets the ceil half, the second the
-    /// floor half, and the second abuts the first with no gap (each pane's own
-    /// box border is the seam). Panes that would be zero-sized are still
-    /// emitted with a 1-cell minimum so no pane silently vanishes.
+    /// the outer rect. A split divides the space edge-to-edge with **no**
+    /// reserved gutter — by pane count, or by its ratio when it has one — and
+    /// the second child abuts the first with no gap (each pane's own box border
+    /// is the seam). Panes that would be zero-sized are still emitted with a
+    /// 1-cell minimum so no pane silently vanishes.
     pub fn rects(&self, outer: Rect) -> Vec<(usize, Rect)> {
         let mut out = Vec::new();
         Self::layout(&self.root, outer, &mut out);
@@ -434,20 +586,29 @@ impl Tree {
     fn layout(node: &Node, r: Rect, out: &mut Vec<(usize, Rect)>) {
         match node {
             Node::Leaf(id) => out.push((*id, r)),
-            Node::Split { dir, first, second } => {
-                // Divide the span *proportionally to each child's leaf count*,
-                // not 50/50. A plain two-pane split is 1 leaf vs 1 leaf → 50/50
-                // (manual splits unchanged), but a left-leaning line like
-                // `split(a, split(b, c))` is 1 vs 2 → the first child gets 1/3
-                // and its two-leaf sibling gets 2/3, so a 3-, 6-, or 12-way grid
-                // tiles in even thirds/sixths instead of the old 50/25/25.
+            Node::Split {
+                dir,
+                first,
+                second,
+                ratio,
+            } => {
+                // Without a ratio, divide the span *proportionally to each
+                // child's leaf count*, not 50/50. A plain two-pane split is 1
+                // leaf vs 1 leaf → 50/50 (manual splits unchanged), but a
+                // left-leaning line like `split(a, split(b, c))` is 1 vs 2 → the
+                // first child gets 1/3 and its two-leaf sibling gets 2/3, so a
+                // 3-, 6-, or 12-way grid tiles in even thirds/sixths instead of
+                // the old 50/25/25. With a ratio, the first child gets that
+                // permille of the span whatever either side holds (`--size`).
                 // (`split_span` clamps both sides to >= 1 and keeps them abutting
                 // with no reserved gutter — each pane draws its own box border.)
-                let a = Self::count(first);
-                let b = Self::count(second);
+                let (a, b) = match ratio {
+                    Some(p) => (usize::from(*p), usize::from(1000 - *p)),
+                    None => (Self::count(first), Self::count(second)),
+                };
                 match dir {
                     Dir::Horizontal => {
-                        // Stacked: top gets its leaf-count share, bottom the rest.
+                        // Stacked: top gets its share, bottom the rest.
                         let (top_rows, bot_rows) = Self::split_span(r.rows, a, b);
                         let top = Rect {
                             row: r.row,
@@ -465,7 +626,7 @@ impl Tree {
                         Self::layout(second, bottom, out);
                     }
                     Dir::Vertical => {
-                        // Side by side: left gets its leaf-count share, right the rest.
+                        // Side by side: left gets its share, right the rest.
                         let (left_cols, right_cols) = Self::split_span(r.cols, a, b);
                         let left = Rect {
                             row: r.row,
@@ -487,13 +648,13 @@ impl Tree {
         }
     }
 
-    /// Split `total` cells between two children holding `a` and `b` leaves,
-    /// proportionally to their leaf counts and abutting with no gap. The first
-    /// child gets `round(total * a / (a+b))` (floor, matching the old ceil-half
-    /// behavior for the balanced 1-vs-1 case only where it lands on an integer),
-    /// the second gets the remainder; both are clamped to at least 1 cell so no
-    /// pane silently vanishes. Returns `(first, second)`, `first + second == total`
-    /// whenever `total >= 2`.
+    /// Split `total` cells between two children weighted `a` and `b` (their leaf
+    /// counts, or a ratio's permille and its complement), proportionally and
+    /// abutting with no gap. The first child gets `floor(total * a / (a+b))`
+    /// (matching the old ceil-half behavior for the balanced 1-vs-1 case only
+    /// where it lands on an integer), the second gets the remainder; both are
+    /// clamped to at least 1 cell so no pane silently vanishes. Returns
+    /// `(first, second)`, `first + second == total` whenever `total >= 2`.
     fn split_span(total: usize, a: usize, b: usize) -> (usize, usize) {
         let denom = (a + b).max(1);
         let first = (total * a / denom).max(1);
@@ -1246,5 +1407,300 @@ mod tests {
         assert_eq!((rs[2].row, rs[2].col), (15, 0), "{rs:?}");
         assert_eq!((rs[3].row, rs[3].col), (15, 60), "{rs:?}");
         assert_eq!(t.focus(), 3);
+    }
+
+    // --- ratio'd splits (`--size`, the shim's `-l 70%`) -----------------------
+
+    /// A 120-column window where the lead (0) was split with `--size 70%`: the
+    /// new pane (1) gets 70 % of the width, the lead the remaining 30 %.
+    fn seventy_thirty() -> (Tree, Dir, Rect) {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let mut grid_dir = Dir::Vertical;
+        let t = Tree::new(0).grow(&mut grid_dir, 0, 1, Dir::Vertical, Some(700));
+        (t, grid_dir, outer)
+    }
+
+    // RED-when-broken: a leaf-count split gives 60/60.
+    #[test]
+    fn a_sized_split_gives_the_new_pane_its_share_and_the_anchor_the_rest() {
+        let (t, grid_dir, outer) = seventy_thirty();
+        assert_eq!(
+            grid_dir,
+            Dir::Vertical,
+            "a single pane sets the orientation"
+        );
+        let (lead, mate) = (rect_of(&t, 0, outer), rect_of(&t, 1, outer));
+        assert_eq!((lead.col, lead.cols), (0, 36), "30 % of 120: {lead:?}");
+        assert_eq!((mate.col, mate.cols), (36, 84), "70 % of 120: {mate:?}");
+        assert_eq!(lead.rows, 30);
+        assert_eq!(mate.rows, 30);
+        // Focus stays where it was: `--no-focus` relies on it.
+        assert_eq!(t.focus(), 0);
+        // Stacked, the share is of the rows: 24 rows → 7 over 17 (floor of 30 %).
+        let mut gd = Dir::Vertical;
+        let s = Tree::new(0).grow(&mut gd, 0, 1, Dir::Horizontal, Some(700));
+        let (top, bottom) = (rect_of(&s, 0, OUTER), rect_of(&s, 1, OUTER));
+        assert_eq!((top.row, top.rows), (0, 7), "{top:?}");
+        assert_eq!((bottom.row, bottom.rows), (7, 17), "{bottom:?}");
+        assert_eq!(gd, Dir::Horizontal);
+    }
+
+    // Rounding: the first child gets the floor, the second the remainder, and the
+    // two always sum to the span — no gap and no overlap for any share.
+    #[test]
+    fn a_sized_split_rounds_down_for_the_first_pane_and_sums_to_the_span() {
+        let odd = Rect {
+            row: 0,
+            col: 0,
+            rows: 24,
+            cols: 81,
+        };
+        for share in [100u16, 333, 500, 667, 900] {
+            let mut gd = Dir::Vertical;
+            let t = Tree::new(0).grow(&mut gd, 0, 1, Dir::Vertical, Some(share));
+            let (a, b) = (rect_of(&t, 0, odd), rect_of(&t, 1, odd));
+            let want_first = 81 * usize::from(1000 - share) / 1000;
+            assert_eq!(a.cols, want_first, "share {share}: {a:?}");
+            assert_eq!(b.col, a.cols, "share {share}: abuts");
+            assert_eq!(a.cols + b.cols, 81, "share {share}: fills the span");
+        }
+    }
+
+    // The clamp: a share under 10 % or over 90 % is pulled to the edge, so no
+    // pane is a sliver; `--size 1%` still opens a visible pane.
+    #[test]
+    fn a_sized_split_is_clamped_to_ten_and_ninety_percent() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 100,
+        };
+        let mut gd = Dir::Vertical;
+        let tiny = Tree::new(0).grow(&mut gd, 0, 1, Dir::Vertical, Some(10));
+        assert_eq!(rect_of(&tiny, 1, outer).cols, 10, "1 % is honoured as 10 %");
+        assert_eq!(rect_of(&tiny, 0, outer).cols, 90);
+        let huge = Tree::new(0).grow(&mut gd, 0, 1, Dir::Vertical, Some(990));
+        assert_eq!(
+            rect_of(&huge, 1, outer).cols,
+            90,
+            "99 % is honoured as 90 %"
+        );
+        assert_eq!(rect_of(&huge, 0, outer).cols, 10);
+        assert_eq!(clamp_ratio(0), RATIO_MIN);
+        assert_eq!(clamp_ratio(1000), RATIO_MAX);
+        assert_eq!(clamp_ratio(500), 500);
+    }
+
+    // A ratio is of the ANCHOR's span, not the window's: sizing a pane that is
+    // already half the window gives the new pane 70 % of that half, and the
+    // other half does not move. Nested equal splits stay equal.
+    #[test]
+    fn a_sized_split_of_a_pane_takes_its_share_of_that_pane_only() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let mut gd = Dir::Vertical;
+        // Two equal panes, then size pane 1 (the right half).
+        let t = Tree::new(0).grow(&mut gd, 0, 1, Dir::Vertical, None);
+        let t = t.grow(&mut gd, 1, 2, Dir::Vertical, Some(700));
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!(
+            (rs[0].col, rs[0].cols),
+            (0, 60),
+            "the left half is untouched"
+        );
+        assert_eq!((rs[1].col, rs[1].cols), (60, 18), "30 % of 60");
+        assert_eq!((rs[2].col, rs[2].cols), (78, 42), "70 % of 60");
+        // The equal split above the ratio'd one was frozen at its 50/50, so a
+        // plain split of pane 0 re-grids the left half alone: 0 and 3 thirty
+        // columns each, the right half still 18/42.
+        let t = t.grow(&mut gd, 0, 3, Dir::Vertical, None);
+        let rs: Vec<Rect> = (0..4).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!((rs[0].cols, rs[3].cols), (30, 30), "{rs:?}");
+        assert_eq!((rs[1].cols, rs[2].cols), (18, 42), "{rs:?}");
+        assert_eq!(rs[1].col, 60, "{rs:?}");
+    }
+
+    // The shim's second teammate: `-t %1 -v` with no size, after the first
+    // split took 70 %. The lead keeps its 30 %; the teammates tile inside the
+    // 70 % half, as tmux shows it. A third and fourth keep doing so, and the
+    // focus never moves on its own.
+    // RED-when-broken: `grid_grow` rebuilds the whole window as an equal grid,
+    // so the lead becomes a third, then a quarter.
+    #[test]
+    fn growing_beside_a_sized_pane_keeps_the_ratio_and_tiles_inside_its_half() {
+        let (t, mut grid_dir, outer) = seventy_thirty();
+        let t = t.grow(&mut grid_dir, 1, 2, Dir::Vertical, None);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!((rs[0].col, rs[0].cols), (0, 36), "the lead keeps 30 %");
+        assert_eq!(rs[1].col, 36, "{rs:?}");
+        assert_eq!(rs[1].cols + rs[2].cols, 84, "the teammates share the 70 %");
+        assert_eq!(rs[2].col, rs[1].col + rs[1].cols, "{rs:?}");
+        assert_eq!(t.focus(), 0);
+        // Two more teammates, each beside the last: a 2×2 inside the 70 %.
+        let t = t.grow(&mut grid_dir, 2, 3, Dir::Vertical, None);
+        let t = t.grow(&mut grid_dir, 3, 4, Dir::Vertical, None);
+        assert_eq!(t.len(), 5);
+        let rs: Vec<Rect> = (0..5).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!((rs[0].col, rs[0].cols, rs[0].rows), (0, 36, 30), "{rs:?}");
+        for r in &rs[1..] {
+            assert!(r.col >= 36, "every teammate is in the 70 % half: {r:?}");
+            assert_eq!(r.cols, 42, "a 2×2 of the 84 columns: {r:?}");
+            assert_eq!(r.rows, 15, "a 2×2 of the 30 rows: {r:?}");
+        }
+        // No overlap, full coverage.
+        for i in 0..rs.len() {
+            for j in (i + 1)..rs.len() {
+                assert!(!overlaps(rs[i], rs[j]), "{:?} vs {:?}", rs[i], rs[j]);
+            }
+        }
+        let area: usize = rs.iter().map(|r| r.rows * r.cols).sum();
+        assert_eq!(area, 30 * 120);
+    }
+
+    // Growing from the LEAD's side keeps the ratio too: the lead's 30 % becomes
+    // a grid of the lead and the new pane, the 70 % half does not move.
+    #[test]
+    fn growing_beside_the_sized_anchor_re_grids_its_own_side_only() {
+        let (t, mut grid_dir, outer) = seventy_thirty();
+        let t = t.grow(&mut grid_dir, 0, 2, Dir::Vertical, None);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!(
+            (rs[1].col, rs[1].cols),
+            (36, 84),
+            "the 70 % pane is untouched"
+        );
+        assert_eq!(
+            rs[0].cols + rs[2].cols,
+            36,
+            "lead and newcomer share the 30 %"
+        );
+        assert_eq!(rs[2].col, rs[0].cols, "{rs:?}");
+    }
+
+    // The interactive keys: `%` on a pane under a ratio'd split keeps that
+    // ratio and splits the pane equally (no key sets a ratio).
+    #[test]
+    fn an_equal_split_under_a_ratio_keeps_the_ratio_and_halves_the_pane() {
+        let (t, mut grid_dir, outer) = seventy_thirty();
+        let t = t.grow(&mut grid_dir, 1, 2, Dir::Horizontal, None);
+        let rs: Vec<Rect> = (0..3).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!(rs[0].cols, 36, "ratio kept");
+        // The window's orientation is rows, so `"` on a two-pane row puts the
+        // new pane in the next slot of the row: 1 and 2 side by side, equal.
+        assert_eq!(rs[1].cols, rs[2].cols, "{rs:?}");
+        assert_eq!(rs[1].cols + rs[2].cols, 84);
+    }
+
+    // Ratios are relative: resizing the terminal keeps the 30/70 share.
+    #[test]
+    fn a_resize_keeps_the_share() {
+        let (t, _, _) = seventy_thirty();
+        for cols in [40usize, 80, 200, 333] {
+            let outer = Rect {
+                row: 0,
+                col: 0,
+                rows: 24,
+                cols,
+            };
+            let (lead, mate) = (rect_of(&t, 0, outer), rect_of(&t, 1, outer));
+            assert_eq!(lead.cols, cols * 3 / 10, "{cols} cols: {lead:?}");
+            assert_eq!(mate.cols, cols - cols * 3 / 10, "{cols} cols: {mate:?}");
+        }
+    }
+
+    // A `--size` inside one cell of a 2×2 freezes the rows and the columns above
+    // it at their current proportions: the other three cells do not move, and a
+    // later plain spawn reflows only the line it lands in.
+    // RED-when-broken: a leaf-count parent re-divides 1-vs-2 and the sized
+    // pane's row-mate shrinks to a third; a whole-window re-grid loses the 70 %.
+    #[test]
+    fn a_sized_split_freezes_the_splits_above_it_and_later_grows_reflow_within() {
+        let outer = Rect {
+            row: 0,
+            col: 0,
+            rows: 30,
+            cols: 120,
+        };
+        let mut gd = Dir::Vertical;
+        // Rows [0 1] / [2 3]; size pane 3 → 3 keeps 30 % of its 60, 4 takes 70 %.
+        let t = Tree::grid_from_ids(&[0, 1, 2, 3]);
+        let t = t.grow(&mut gd, 3, 4, Dir::Vertical, Some(700));
+        let rs: Vec<Rect> = (0..5).map(|id| rect_of(&t, id, outer)).collect();
+        assert!(rs.iter().all(|r| r.rows == 15), "rows frozen at 15: {rs:?}");
+        assert_eq!((rs[0].cols, rs[1].cols), (60, 60), "top row untouched");
+        assert_eq!((rs[2].col, rs[2].cols), (0, 60), "2 untouched: {rs:?}");
+        assert_eq!((rs[3].col, rs[3].cols), (60, 18), "{rs:?}");
+        assert_eq!((rs[4].col, rs[4].cols), (78, 42), "{rs:?}");
+        // A plain spawn beside 0 reflows the top row alone, into thirds.
+        let t = t.grow(&mut gd, 0, 5, Dir::Vertical, None);
+        let rs: Vec<Rect> = (0..6).map(|id| rect_of(&t, id, outer)).collect();
+        assert_eq!((rs[0].cols, rs[5].cols, rs[1].cols), (40, 40, 40), "{rs:?}");
+        assert_eq!(rs[5].col, 40, "beside 0: {rs:?}");
+        assert_eq!(
+            (rs[3].cols, rs[4].cols),
+            (18, 42),
+            "bottom row kept: {rs:?}"
+        );
+        assert!(rs.iter().all(|r| r.rows == 15), "{rs:?}");
+        let area: usize = rs.iter().map(|r| r.rows * r.cols).sum();
+        assert_eq!(area, 30 * 120);
+    }
+
+    // Closing the pane a ratio'd split was made for collapses the split (and its
+    // ratio) into the survivor, which fills the window again; closing a pane
+    // inside a half keeps the half's ratio.
+    #[test]
+    fn closing_collapses_a_ratio_with_its_split_but_keeps_it_for_an_inner_close() {
+        let (t, mut grid_dir, outer) = seventy_thirty();
+        let mut t = t.grow(&mut grid_dir, 1, 2, Dir::Vertical, None);
+        assert!(t.close(2));
+        assert_eq!(rect_of(&t, 0, outer).cols, 36, "inner close keeps the 30 %");
+        assert_eq!(rect_of(&t, 1, outer).cols, 84);
+        assert!(t.close(1));
+        assert!(t.is_single());
+        assert_eq!(rect_of(&t, 0, outer), outer);
+    }
+
+    // An anchor that is not in the tree appends to a re-grid of the whole window
+    // (the documented fallback), dropping the ratio.
+    #[test]
+    fn growing_from_a_vanished_anchor_appends_and_drops_the_ratio() {
+        let (t, mut grid_dir, outer) = seventy_thirty();
+        let t = t.grow(&mut grid_dir, 77, 2, Dir::Vertical, None);
+        assert_eq!(t.ids(), vec![0, 1, 2]);
+        let widths: Vec<usize> = (0..3).map(|id| rect_of(&t, id, outer).cols).collect();
+        assert_eq!(widths, vec![40, 40, 40]);
+    }
+
+    // Without a ratio, `grow` is `grid_grow` over the tree's own leaf order.
+    #[test]
+    fn grow_without_a_ratio_is_grid_grow_in_leaf_order() {
+        let mut gd_a = Dir::Vertical;
+        let mut gd_b = Dir::Vertical;
+        let mut a = Tree::new(0);
+        let mut b = Tree::new(0);
+        for (new, dir) in [
+            (1, Dir::Vertical),
+            (2, Dir::Horizontal),
+            (3, Dir::Horizontal),
+        ] {
+            let anchor = new - 1;
+            a = a.grow(&mut gd_a, anchor, new, dir, None);
+            let ids = b.ids();
+            b = Tree::grid_grow(&mut gd_b, &ids, anchor, new, dir);
+            b.focus_pane(0);
+        }
+        assert_eq!(a, b);
+        assert_eq!(gd_a, gd_b);
     }
 }

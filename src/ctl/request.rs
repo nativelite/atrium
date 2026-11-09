@@ -440,6 +440,10 @@ pub struct SpawnReq {
     /// existing teammate's pane. The pane must be in the caller's window; one
     /// that is not falls back to the caller, said in the reply's `note`.
     pub beside: Option<usize>,
+    /// `--here --size <N%|N>`: how much of the anchor pane's span the new pane
+    /// takes (tmux's `split-window -l`), parsed by [`parse_spawn_size`]. `None`
+    /// (the default) re-grids the window into equal tiles.
+    pub size: Option<SpawnSize>,
     /// The credential identity **name** to run the worker under (`--identity X`),
     /// if any. Subject to delegation scoping ([`delegation_allowed`]): a worker
     /// may only pass down an identity it itself holds. `None` = no identity
@@ -456,6 +460,58 @@ pub struct SpawnReq {
     /// (`--worktree <name>`). When set, atrium calls `worktree::plan_for` +
     /// `worktree::ensure` before spawning and passes `plan.dir` as cwd.
     pub worktree: Option<String>,
+}
+
+/// The size a `spawn --here --size` asks for the **new** pane, as tmux's
+/// `split-window -l` writes it: a share of the anchor pane's span, or a count
+/// of cells in the split's direction (columns for a side-by-side split, rows
+/// for a stacked one), which the server turns into a share of that span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnSize {
+    /// `N%`, `1..=99`.
+    Percent(u8),
+    /// `N`, at least 1.
+    Cells(u32),
+}
+
+impl SpawnSize {
+    /// The new pane's share in permille, given the anchor's span in cells for a
+    /// cell count (a count at or past the span is the whole span, which the
+    /// layout then clamps). The layout's own clamp bounds the result.
+    pub fn permille(self, span: usize) -> u16 {
+        match self {
+            SpawnSize::Percent(p) => u16::from(p) * 10,
+            SpawnSize::Cells(n) => {
+                let span = span.max(1);
+                let n = (n as usize).min(span);
+                (n * 1000 / span) as u16
+            }
+        }
+    }
+
+    /// The flag's text again (`70%`, `20`), for the wire and for messages.
+    pub fn as_flag(self) -> String {
+        match self {
+            SpawnSize::Percent(p) => format!("{p}%"),
+            SpawnSize::Cells(n) => n.to_string(),
+        }
+    }
+}
+
+/// Parse a `--size` value: `N%` with `N` in `1..=99`, or a positive whole
+/// number of cells. Anything else is a clear error naming the grammar.
+pub fn parse_spawn_size(s: &str) -> Result<SpawnSize, String> {
+    let bad = || format!("--size: {s:?} is not a size (use N% with N in 1..=99, or N cells)");
+    if let Some(pct) = s.strip_suffix('%') {
+        return match pct.parse::<u8>() {
+            Ok(p) if (1..=99).contains(&p) => Ok(SpawnSize::Percent(p)),
+            _ => Err(bad()),
+        };
+    }
+    match s.parse::<u32>() {
+        Ok(n) if n >= 1 => Ok(SpawnSize::Cells(n)),
+        _ => Err(bad()),
+    }
 }
 
 /// Parse a request line (one JSON object) into a [`Request`], or a clear error.
@@ -501,12 +557,19 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                     ));
                 }
             }
+            // Present-but-unparseable is an error here too, for the same
+            // reason: only a hand-rolled request reaches this with a bad size.
+            let size = match v.get("size").and_then(Value::as_str) {
+                Some(raw) => Some(parse_spawn_size(raw)?),
+                None => None,
+            };
             Cmd::Spawn(SpawnReq {
                 role,
                 argv,
                 new_window,
                 focus,
                 beside,
+                size,
                 identity,
                 mode,
                 worktree: v
