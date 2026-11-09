@@ -453,17 +453,31 @@ fn command_prompt_cancels_and_opens_a_window() {
         "prompt did not open the command as window 2: {:?}",
         String::from_utf8_lossy(&out)
     );
-    p.write(echo_var_cmd("sub").as_bytes()).unwrap();
-    // A fresh shell: the variable set in window 1 is not defined here.
-    let fresh: &[u8] = if cfg!(windows) {
-        b"sub-%ATRIUM_W%"
+    // A fresh shell: the variable set in window 1 is not defined here. The
+    // reply is matched as rendered screen content, not as raw passthrough
+    // bytes (issue #8): a new window's pane is passed through only once it has
+    // painted, and the bar announces `2:sh*` a tick or more before that first
+    // repaint lands. Keys typed in that gap are answered into the emulator,
+    // and the repaint then draws the whole screen from it — `ESC[3;1Hsub-
+    // ESC[4;1H$` — so `sub-\r` never crosses the terminal, although `sub-` is
+    // on screen. On sh the tag is typed with shell quoting (`su''b-`, the empty
+    // '' vanishes) so the echoed command line never contains `sub-` and only
+    // the reply does; `contains` strips the CSI the renderer interleaves.
+    let (typed, fresh): (String, &[u8]) = if cfg!(windows) {
+        (echo_var_cmd("sub"), b"sub-%ATRIUM_W%")
     } else {
-        b"sub-\r"
+        ("echo su''b-${ATRIUM_W}\r\n".to_string(), b"sub-")
     };
+    p.write(typed.as_bytes()).unwrap();
     let out = read_until(&mut p, fresh, Duration::from_secs(15));
     assert!(
         contains(&out, fresh),
         "keys did not reach the new window: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert!(
+        !contains(&out, b"sub-still-one"),
+        "window 2 is not a fresh shell: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"\x01q").unwrap();

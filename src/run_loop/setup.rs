@@ -1,5 +1,10 @@
 //! Opening a session: everything the loop needs, created in the order it
 //! always was.
+//!
+//! [`RunState::start`] is the sequence; each step below is one of its former
+//! stretches, moved whole. The order is load-bearing — the trust policy before
+//! any spawn, the ctl endpoint before the first pane, the terminal taken before
+//! anything can draw — so the steps are called in the order they are written.
 
 use super::{RunArgs, RunState};
 use crate::*;
@@ -20,137 +25,34 @@ impl<'a> RunState<'a> {
             allow_ctl,
             max_depth,
             trust,
-            mut ctl_listener,
+            ctl_listener,
             attention,
             canonical_topics,
         } = args;
-        // Publish the trust policy before any pane is spawned so even the initial
-        // agent picks it up.
-        set_trust_mode(trust);
-        // Record the session policy for the snapshot writer. This is the one place
-        // every launch path meets — a plain launch, `fleet up`, and `recover` all
-        // arrive here — and the fleet path has already installed its deny list, pool
-        // and memory ceiling by now, so reading them here captures the effective
-        // session rather than the command line's half of it.
-        atrium::session::set_policy(atrium::session::PolicyRecord {
-            // Deduped: `session_deny()` is `ATRIUM_DENY` + the fleet's rules, and a
-            // recovery re-installs the merged list as the fleet's — so without this
-            // the env entries are re-appended once per recovery generation.
-            deny: dedup_preserving_order(atrium::trust::session_deny()),
-            claude_aliases: dedup_preserving_order(atrium::bind::session_claude_aliases()),
-            build_jobs: atrium::buildpool::session_size(),
-            memory_mb: atrium::memguard::fleet_mb(),
-            trust: Some(trust),
-            allow_ctl,
-            max_depth,
-            topics: canonical_topics.clone(),
-        });
-        // The terminal as a queue: a terminal that stops reading must not stop the
-        // loop — keys, pane draining, ctl and the safety net all run on. See
-        // `atrium::screen`; the view is repainted whole once it catches up.
-        let mut out = atrium::screen::Screen::stdout();
-        let (rows, cols) = term.size().unwrap_or((24, 80));
-        // Resizes are read from a watcher thread: on Windows the size query itself
-        // blocks while the terminal isn't reading (see `SizeWatch`).
-        let size_watch = atrium::screen::SizeWatch::start((rows, cols));
-        // Alt screen; scroll region above the bar so bottom-line newlines from the
-        // passthrough stream can never push the bar away.
-        // The host's title is saved first (xterm title stack), restored by
-        // `cleanup_screen`; `attention` then sets atrium's own.
-        let _ = write!(
-            out,
-            "{}\x1b[?1049h\x1b[2J\x1b[H\x1b[1;{}r",
-            atrium::attention::TITLE_PUSH,
-            rows - 1
-        );
-        let _ = out.flush();
+        publish_policy(trust, allow_ctl, max_depth, &canonical_topics);
+        let (out, rows, cols, size_watch) = take_screen(term);
 
-        let mut windows: Vec<Window> = Vec::new();
         // The initial pane can fail to spawn (command missing) *or* fail to resolve
         // its identity (no such target, vault locked). A spawn failure aborts atrium
         // (there is nothing to host); an identity-resolve failure is surfaced in the
         // bar and the pane spawns *without* the credential — never silently, and
         // never unauthenticated-without-saying-so (§7).
         let mut flash: Option<(String, Instant)> = None;
-        // ctl control channel (opt-in). Bind the endpoint and publish its address to
-        // the spawn path *before* the first pane is spawned, so every pane — the
-        // initial one included — is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
-        // environment. A bind failure is non-fatal: atrium still runs, just without
-        // ctl, and says so in the bar (never silently unavailable).
         // Queue-until-idle deliveries for `ctl send` (flushed each tick).
         let pending_sends: Vec<PendingSend> = Vec::new();
-        // Operator-approved extra allowlist stems (ATRIUM_CTL_ALLOW); empty ⇒ the
-        // built-in agents-only guard. Read once at startup.
-        let ctl_extra_allow = if allow_ctl {
-            atrium::ctl::extra_allow_from_env()
-        } else {
-            Vec::new()
+        let (ctl_extra_allow, ctl_listener, ctl_audit) =
+            bind_ctl_channel(allow_ctl, ctl_listener, &mut flash);
+        let windows = match spawn_first_window(
+            command,
+            identity,
+            grid,
+            initial_window,
+            (rows, cols),
+            &mut flash,
+        ) {
+            Ok(windows) => windows,
+            Err(e) => return Err(fail_first_window(out, command, &e)),
         };
-        // Bind the endpoint here only if a caller hasn't already (the fleet path
-        // pre-binds so its panes get `ATRIUM_CTL`). `CTL_ADDRESS` is a `OnceLock`, so a
-        // pre-bind means this is a no-op.
-        if allow_ctl && ctl_listener.is_none() {
-            ctl_listener = bind_ctl(&mut flash);
-        }
-        // ctl audit log (design §5): in-memory always when ctl is on, mirrored to a
-        // JSONL file when the operator opts in via `ATRIUM_CTL_AUDIT`. A file that
-        // can't be opened is surfaced once in the bar; the in-memory log runs on.
-        let ctl_audit = if allow_ctl {
-            let path = std::env::var(atrium::ctl::ENV_AUDIT)
-                .ok()
-                .filter(|p| !p.is_empty());
-            let mut a = atrium::audit::Audit::new(atrium::audit::DEFAULT_CAP, path.as_deref());
-            if let Some(err) = a.take_error() {
-                if flash.is_none() {
-                    flash = Some((format!("ctl audit: {err}"), Instant::now()));
-                }
-            }
-            a
-        } else {
-            atrium::audit::Audit::in_memory()
-        };
-        // A pre-built window (fleet) is used as-is; otherwise mass-spawn opens one
-        // window of N tiles in a balanced grid, or the 0.1 single-pane path. All
-        // share the same spawn machinery (each pane its own session).
-        let prebuilt = initial_window.is_some();
-        let initial = match initial_window {
-            Some(w) => Ok(w),
-            None => match grid {
-                // Every pane enrolls in the session job at its own spawn (Windows:
-                // created suspended, assigned, then resumed; Linux: its cgroup).
-                Some(g) => spawn_window_grid(command, rows, cols, g, identity, &mut flash),
-                None => spawn_window(
-                    PaneSpec {
-                        command,
-                        id: 0,
-                        identity,
-                        cwd: None,
-                        mode: trust_mode(),
-                        extra_env: &[],
-                        extra_norms: None,
-                        deny: &[],
-                        codex: None,
-                    },
-                    rows,
-                    cols,
-                    &mut flash,
-                ),
-            },
-        };
-        match initial {
-            Ok(w) => windows.push(w),
-            Err(e) => {
-                cleanup_screen(&mut out);
-                out.finish(SCREEN_FINISH);
-                eprintln!("atrium: cannot start {:?}: {e}", command[0]);
-                return Err(ExitCode::FAILURE);
-            }
-        }
-        // A grid or pre-built (fleet) window is born tiled: resize so every pane's
-        // pty/emulator gets its true inner rect (spawn used rough sizes).
-        if grid.is_some() || prebuilt {
-            resize_window(&mut windows[0], rows, cols);
-        }
         let active = 0usize; // active window index
         let scanner = PrefixScanner::new();
         // Mouse capture is OFF by default so the terminal's own **text selection**
@@ -181,83 +83,11 @@ impl<'a> RunState<'a> {
         let force_repaint = true;
         let last_size_check = Instant::now();
 
-        // Agent session state (§5): one read-only `agsess::World` over the Claude
-        // projects root, polled on the loop's existing `Instant`-throttle pattern —
-        // no threads. The *first* refresh uses `refresh_since(process_start_ms)` so
-        // the cold history scan (agtop measures ~1.4 s for ~60 MB) never freezes
-        // keystrokes; atrium can never care about a session that stopped writing
-        // before it started. Thereafter: bound panes tail ~1 s, discovery ~5 s
-        // (accelerated to ~1 s while any agent pane is still unbound).
-        // The shared board (coordination layer): source-of-truth team state, in-memory
-        // unless ATRIUM_BOARD names a snapshot file. Part of the ctl surface, so it is
-        // already gated by `--allow-ctl`.
-        //
-        // Without an explicit file, a session with a place in the store keeps its board
-        // and bus there, beside its snapshot, so a resume brings back the team's
-        // subscriptions, unread events and board — which lived only in this process
-        // before, and died with it. A resume starts from the resumed session's copies.
-        let sidecar_of = |kind: &str| {
-            session_location().map(|(_, file, _)| atrium::session_store::sidecar(file, kind))
-        };
-        let board = match std::env::var_os(atrium::board::ENV_BOARD) {
-            Some(p) if !p.is_empty() => {
-                atrium::board::Board::with_file(std::path::PathBuf::from(p))
-            }
-            _ => match sidecar_of("board") {
-                Some(path) => atrium::board::Board::with_file_deferred(path),
-                None => atrium::board::Board::new(),
-            },
-        };
-        // The shared pub/sub bus (coordination layer part 2): the team's event stream,
-        // in-memory unless ATRIUM_BUS names a snapshot file. Same ctl gating as the board.
-        let mut bus = match std::env::var_os(atrium::bus::ENV_BUS) {
-            Some(p) if !p.is_empty() => atrium::bus::Bus::with_file(std::path::PathBuf::from(p)),
-            _ => match sidecar_of("bus") {
-                Some(path) => atrium::bus::Bus::with_file_deferred(path),
-                None => atrium::bus::Bus::new(),
-            },
-        };
-        // Sidecar writes leave the loop: a deferred bus and board hand their state out
-        // at most once per snapshot interval, and this thread writes it.
-        let sidecar_writer = atrium::session_store::SidecarWriter::start();
-        let last_sidecar_flush = Instant::now();
-        // A fleet that declared a topic vocabulary switches the bus to strict
-        // admission; without one it stays soft-gated. Set before any pane is spawned,
-        // so the very first publish is already governed by the right policy.
-        if let Some(topics) = &canonical_topics {
-            bus.set_canonical(topics);
-        }
-        // Agent state is refreshed on its own thread (`AgentWatch`); the loop holds the
-        // newest snapshot and never reads a transcript itself.
-        let agents = atrium::vendors::AgentWatch::start(agsess::sessions::now_ms());
-        let world = atrium::vendors::AgentState::default();
-        // Session teardown container: on Windows a kill-on-close Job Object so no pane
-        // tree outlives atrium however it dies (TerminateProcess included); a no-op on
-        // unix (the process-group teardown + watchdog below already cover the tree).
-        // Held for the whole run — dropping it (or the process exiting) fires the
-        // guarantee. Panes never inherit its handle, so they live until atrium exits.
-        // Process-wide, so every pane — a fleet's, spawned before this loop, included
-        // — is enrolled at its own spawn; closed explicitly at teardown below.
-        let session_job = atrium::reap::SessionJob::session();
-        // What `Ctrl+A c`, splits and the command prompt launch under.
-        let launch = Launch {
-            command,
-            identity,
-            job: session_job,
-        };
-        // The crash registry, session snapshot, warden and orphan watchdog (loop
-        // phase 0b); see `safety_net`.
-        let safety_net = SafetyNet::new();
-        // The paint's memory between ticks (retained tiled frame, throttles); see
-        // `renderer`.
-        let renderer = Renderer::new();
-
-        // What wakes the loop: keys on their own thread, and a reader thread per
-        // pane (started at the top of each tick), all ringing one doorbell.
-        let (bell, wake) = atrium::events::doorbell();
-        let keys = atrium::events::KeyReader::start(term.input(), bell.clone()).ok();
-        // The ctl endpoint's accept thread rings the same bell on a connect.
-        atrium::ipc::set_bell(bell.clone());
+        let (board, bus, sidecar_writer, last_sidecar_flush) =
+            open_board_and_bus(&canonical_topics);
+        let (agents, world) = start_agent_watch();
+        let (launch, safety_net, renderer) = start_helpers(command, identity);
+        let (bell, wake, keys) = wire_doorbell(term);
 
         Ok(RunState {
             term,
@@ -301,6 +131,292 @@ impl<'a> RunState<'a> {
             mods: atrium::modstate::ModState::default(),
         })
     }
+}
+
+/// Publish the trust policy and record the session policy — first, before any
+/// pane is spawned, so even the initial agent picks the trust mode up.
+fn publish_policy(
+    trust: atrium::ctl::TrustMode,
+    allow_ctl: bool,
+    max_depth: usize,
+    canonical_topics: &Option<Vec<String>>,
+) {
+    // Publish the trust policy before any pane is spawned so even the initial
+    // agent picks it up.
+    set_trust_mode(trust);
+    // Record the session policy for the snapshot writer. This is the one place
+    // every launch path meets — a plain launch, `fleet up`, and `recover` all
+    // arrive here — and the fleet path has already installed its deny list, pool
+    // and memory ceiling by now, so reading them here captures the effective
+    // session rather than the command line's half of it.
+    atrium::session::set_policy(atrium::session::PolicyRecord {
+        // Deduped: `session_deny()` is `ATRIUM_DENY` + the fleet's rules, and a
+        // recovery re-installs the merged list as the fleet's — so without this
+        // the env entries are re-appended once per recovery generation.
+        deny: dedup_preserving_order(atrium::trust::session_deny()),
+        claude_aliases: dedup_preserving_order(atrium::bind::session_claude_aliases()),
+        build_jobs: atrium::buildpool::session_size(),
+        memory_mb: atrium::memguard::fleet_mb(),
+        trust: Some(trust),
+        allow_ctl,
+        max_depth,
+        topics: canonical_topics.clone(),
+    });
+}
+
+/// Take the screen: the output queue, the terminal's size (and the watcher that
+/// follows it), then the alt screen with the scroll region above the bar.
+/// Returns `(out, rows, cols, size_watch)`.
+fn take_screen(
+    term: &mut rawterm::Terminal,
+) -> (atrium::screen::Screen, u16, u16, atrium::screen::SizeWatch) {
+    // The terminal as a queue: a terminal that stops reading must not stop the
+    // loop — keys, pane draining, ctl and the safety net all run on. See
+    // `atrium::screen`; the view is repainted whole once it catches up.
+    let mut out = atrium::screen::Screen::stdout();
+    let (rows, cols) = term.size().unwrap_or((24, 80));
+    // Resizes are read from a watcher thread: on Windows the size query itself
+    // blocks while the terminal isn't reading (see `SizeWatch`).
+    let size_watch = atrium::screen::SizeWatch::start((rows, cols));
+    // Alt screen; scroll region above the bar so bottom-line newlines from the
+    // passthrough stream can never push the bar away.
+    // The host's title is saved first (xterm title stack), restored by
+    // `cleanup_screen`; `attention` then sets atrium's own.
+    let _ = write!(
+        out,
+        "{}\x1b[?1049h\x1b[2J\x1b[H\x1b[1;{}r",
+        atrium::attention::TITLE_PUSH,
+        rows - 1
+    );
+    let _ = out.flush();
+    (out, rows, cols, size_watch)
+}
+
+/// ctl control channel (opt-in). Bind the endpoint and publish its address to
+/// the spawn path *before* the first pane is spawned, so every pane — the
+/// initial one included — is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
+/// environment. A bind failure is non-fatal: atrium still runs, just without
+/// ctl, and says so in the bar (never silently unavailable).
+/// Returns `(ctl_extra_allow, ctl_listener, ctl_audit)`.
+fn bind_ctl_channel(
+    allow_ctl: bool,
+    mut ctl_listener: Option<atrium::ipc::Listener>,
+    flash: &mut Option<(String, Instant)>,
+) -> (
+    Vec<String>,
+    Option<atrium::ipc::Listener>,
+    atrium::audit::Audit,
+) {
+    // Operator-approved extra allowlist stems (ATRIUM_CTL_ALLOW); empty ⇒ the
+    // built-in agents-only guard. Read once at startup.
+    let ctl_extra_allow = if allow_ctl {
+        atrium::ctl::extra_allow_from_env()
+    } else {
+        Vec::new()
+    };
+    // Bind the endpoint here only if a caller hasn't already (the fleet path
+    // pre-binds so its panes get `ATRIUM_CTL`). `CTL_ADDRESS` is a `OnceLock`, so a
+    // pre-bind means this is a no-op.
+    if allow_ctl && ctl_listener.is_none() {
+        ctl_listener = bind_ctl(flash);
+    }
+    // ctl audit log (design §5): in-memory always when ctl is on, mirrored to a
+    // JSONL file when the operator opts in via `ATRIUM_CTL_AUDIT`. A file that
+    // can't be opened is surfaced once in the bar; the in-memory log runs on.
+    let ctl_audit = if allow_ctl {
+        let path = std::env::var(atrium::ctl::ENV_AUDIT)
+            .ok()
+            .filter(|p| !p.is_empty());
+        let mut a = atrium::audit::Audit::new(atrium::audit::DEFAULT_CAP, path.as_deref());
+        if let Some(err) = a.take_error() {
+            if flash.is_none() {
+                *flash = Some((format!("ctl audit: {err}"), Instant::now()));
+            }
+        }
+        a
+    } else {
+        atrium::audit::Audit::in_memory()
+    };
+    (ctl_extra_allow, ctl_listener, ctl_audit)
+}
+
+/// Spawn the first window and return the window list holding it. A pre-built
+/// window (fleet) is used as-is; otherwise mass-spawn opens one window of N
+/// tiles in a balanced grid, or the 0.1 single-pane path. All share the same
+/// spawn machinery (each pane its own session). A window that cannot start is
+/// the error, for [`fail_first_window`].
+fn spawn_first_window(
+    command: &[String],
+    identity: Option<&str>,
+    grid: Option<atrium::spawn::Grid>,
+    initial_window: Option<Window>,
+    (rows, cols): (u16, u16),
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Vec<Window>> {
+    let mut windows: Vec<Window> = Vec::new();
+    let prebuilt = initial_window.is_some();
+    let initial = match initial_window {
+        Some(w) => Ok(w),
+        None => match grid {
+            // Every pane enrolls in the session job at its own spawn (Windows:
+            // created suspended, assigned, then resumed; Linux: its cgroup).
+            Some(g) => spawn_window_grid(command, rows, cols, g, identity, flash),
+            None => spawn_window(
+                PaneSpec {
+                    command,
+                    id: 0,
+                    identity,
+                    cwd: None,
+                    mode: trust_mode(),
+                    extra_env: &[],
+                    extra_norms: None,
+                    deny: &[],
+                    codex: None,
+                },
+                rows,
+                cols,
+                flash,
+            ),
+        },
+    };
+    windows.push(initial?);
+    // A grid or pre-built (fleet) window is born tiled: resize so every pane's
+    // pty/emulator gets its true inner rect (spawn used rough sizes).
+    if grid.is_some() || prebuilt {
+        resize_window(&mut windows[0], rows, cols);
+    }
+    Ok(windows)
+}
+
+/// The first window could not start: there is nothing to host, so restore the
+/// screen, say why on stderr and end atrium with a failure.
+fn fail_first_window(
+    mut out: atrium::screen::Screen,
+    command: &[String],
+    e: &std::io::Error,
+) -> ExitCode {
+    cleanup_screen(&mut out);
+    out.finish(SCREEN_FINISH);
+    eprintln!("atrium: cannot start {:?}: {e}", command[0]);
+    ExitCode::FAILURE
+}
+
+/// Open the coordination layer: the shared board, the pub/sub bus, the thread
+/// that writes their sidecars, and the bus's admission policy. Returns
+/// `(board, bus, sidecar_writer, last_sidecar_flush)`.
+fn open_board_and_bus(
+    canonical_topics: &Option<Vec<String>>,
+) -> (
+    atrium::board::Board,
+    atrium::bus::Bus,
+    atrium::session_store::SidecarWriter,
+    Instant,
+) {
+    // The shared board (coordination layer): source-of-truth team state, in-memory
+    // unless ATRIUM_BOARD names a snapshot file. Part of the ctl surface, so it is
+    // already gated by `--allow-ctl`.
+    //
+    // Without an explicit file, a session with a place in the store keeps its board
+    // and bus there, beside its snapshot, so a resume brings back the team's
+    // subscriptions, unread events and board — which lived only in this process
+    // before, and died with it. A resume starts from the resumed session's copies.
+    let sidecar_of = |kind: &str| {
+        session_location().map(|(_, file, _)| atrium::session_store::sidecar(file, kind))
+    };
+    let board = match std::env::var_os(atrium::board::ENV_BOARD) {
+        Some(p) if !p.is_empty() => atrium::board::Board::with_file(std::path::PathBuf::from(p)),
+        _ => match sidecar_of("board") {
+            Some(path) => atrium::board::Board::with_file_deferred(path),
+            None => atrium::board::Board::new(),
+        },
+    };
+    // The shared pub/sub bus (coordination layer part 2): the team's event stream,
+    // in-memory unless ATRIUM_BUS names a snapshot file. Same ctl gating as the board.
+    let mut bus = match std::env::var_os(atrium::bus::ENV_BUS) {
+        Some(p) if !p.is_empty() => atrium::bus::Bus::with_file(std::path::PathBuf::from(p)),
+        _ => match sidecar_of("bus") {
+            Some(path) => atrium::bus::Bus::with_file_deferred(path),
+            None => atrium::bus::Bus::new(),
+        },
+    };
+    // Sidecar writes leave the loop: a deferred bus and board hand their state out
+    // at most once per snapshot interval, and this thread writes it.
+    let sidecar_writer = atrium::session_store::SidecarWriter::start();
+    let last_sidecar_flush = Instant::now();
+    // A fleet that declared a topic vocabulary switches the bus to strict
+    // admission; without one it stays soft-gated. Set before any pane is spawned,
+    // so the very first publish is already governed by the right policy.
+    if let Some(topics) = canonical_topics {
+        bus.set_canonical(topics);
+    }
+    (board, bus, sidecar_writer, last_sidecar_flush)
+}
+
+/// Start the agent-state watcher and the empty snapshot the loop reads until
+/// its first refresh. Returns `(agents, world)`.
+fn start_agent_watch() -> (atrium::vendors::AgentWatch, atrium::vendors::AgentState) {
+    // Agent session state (§5): one read-only `agsess::World` over the Claude
+    // projects root, polled on the loop's existing `Instant`-throttle pattern —
+    // no threads. The *first* refresh uses `refresh_since(process_start_ms)` so
+    // the cold history scan (agtop measures ~1.4 s for ~60 MB) never freezes
+    // keystrokes; atrium can never care about a session that stopped writing
+    // before it started. Thereafter: bound panes tail ~1 s, discovery ~5 s
+    // (accelerated to ~1 s while any agent pane is still unbound).
+    //
+    // Agent state is refreshed on its own thread (`AgentWatch`); the loop holds the
+    // newest snapshot and never reads a transcript itself.
+    let agents = atrium::vendors::AgentWatch::start(agsess::sessions::now_ms());
+    let world = atrium::vendors::AgentState::default();
+    (agents, world)
+}
+
+/// Start the loop's helpers: what new panes launch under (over the session
+/// job), the safety net and the renderer. Returns `(launch, safety_net,
+/// renderer)`.
+fn start_helpers<'a>(
+    command: &'a [String],
+    identity: Option<&'a str>,
+) -> (Launch<'a>, SafetyNet, Renderer) {
+    // Session teardown container: on Windows a kill-on-close Job Object so no pane
+    // tree outlives atrium however it dies (TerminateProcess included); a no-op on
+    // unix (the process-group teardown + watchdog below already cover the tree).
+    // Held for the whole run — dropping it (or the process exiting) fires the
+    // guarantee. Panes never inherit its handle, so they live until atrium exits.
+    // Process-wide, so every pane — a fleet's, spawned before this loop, included
+    // — is enrolled at its own spawn; closed explicitly at teardown below.
+    let session_job = atrium::reap::SessionJob::session();
+    // What `Ctrl+A c`, splits and the command prompt launch under.
+    let launch = Launch {
+        command,
+        identity,
+        job: session_job,
+    };
+    // The crash registry, session snapshot, warden and orphan watchdog (loop
+    // phase 0b); see `safety_net`.
+    let safety_net = SafetyNet::new();
+    // The paint's memory between ticks (retained tiled frame, throttles); see
+    // `renderer`.
+    let renderer = Renderer::new();
+    (launch, safety_net, renderer)
+}
+
+/// Wire what wakes the loop: keys on their own thread, and a reader thread per
+/// pane (started at the top of each tick), all ringing one doorbell — the ctl
+/// endpoint's accept thread included. Returns `(bell, wake, keys)`.
+fn wire_doorbell(
+    term: &mut rawterm::Terminal,
+) -> (
+    atrium::events::Doorbell,
+    atrium::events::Wake,
+    Option<atrium::events::KeyReader>,
+) {
+    // What wakes the loop: keys on their own thread, and a reader thread per
+    // pane (started at the top of each tick), all ringing one doorbell.
+    let (bell, wake) = atrium::events::doorbell();
+    let keys = atrium::events::KeyReader::start(term.input(), bell.clone()).ok();
+    // The ctl endpoint's accept thread rings the same bell on a connect.
+    atrium::ipc::set_bell(bell.clone());
+    (bell, wake, keys)
 }
 
 /// Drop repeats, keeping first-seen order. Small-n by construction (a deny list),

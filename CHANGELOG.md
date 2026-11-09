@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Linux e2e flake `session::command_prompt_cancels_and_opens_a_window`**
+  (issue #8; test-only, no change to atrium). The test waited for the raw
+  passthrough bytes `sub-\r` from the window the command prompt opened, but a
+  new window's pane is passed through only once it has painted, and the bar
+  announces it a tick or more before that first repaint. Keys typed in that
+  gap are answered into the emulator and drawn by the repaint
+  (`ESC[3;1Hsub-ESC[4;1H$`), so the bytes never crossed the terminal although
+  the reply was on screen; under WSL it failed about two runs in three. The
+  test now matches the reply as rendered screen content, typed with shell
+  quoting so only the reply contains it, the way afda305 fixed the same class.
+
 ## [0.44.0] - 2026-11-08
 
 ### Added
