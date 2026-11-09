@@ -29,6 +29,25 @@ pub(crate) struct OverviewNode {
     pub(crate) doing: Option<String>,
     /// The pane edits a file another live pane edits too.
     pub(crate) colliding: bool,
+    /// The Claude Code team this pane leads, by name, while its team directory
+    /// is live: the overview lists that team's tasks under this row.
+    pub(crate) leads_team: Option<String>,
+}
+
+/// A teammate's caption when its mod gave none: the subject of the task it is
+/// on, from its team's list (`team`: the pane's `--team-name`; with none, any
+/// live team that lists a task for `label`). The pane's role is the teammate's
+/// name, which is what a task's `owner` holds.
+pub(crate) fn team_caption(
+    label: &str,
+    team: Option<&str>,
+    teams: &[atrium::claude_teams::TeamState],
+) -> Option<String> {
+    teams
+        .iter()
+        .filter(|t| team.map_or(true, |name| t.name == name))
+        .find_map(|t| t.task_for(label))
+        .map(|task| task.subject.clone())
 }
 
 /// Collect every pane, across all windows, as an overview node in spawn-tree
@@ -39,6 +58,7 @@ pub(crate) fn overview_nodes(
     windows: &[Window],
     world: &atrium::vendors::AgentState,
 ) -> Vec<OverviewNode> {
+    let teams = atrium::claude_teams::snapshot();
     let mut nodes = Vec::new();
     for (wi, w) in windows.iter().enumerate() {
         for p in &w.panes {
@@ -50,10 +70,23 @@ pub(crate) fn overview_nodes(
                 .and_then(|id| world.sessions().into_iter().find(|s| s.id == id))
                 .map(|s| s.last_action.clone())
                 .unwrap_or_default();
+            let label = p.role.clone().unwrap_or_else(|| p.title.clone());
+            // A live Claude Code team this pane leads (its session id names the
+            // team) or belongs to (its argv names the team).
+            let leads_team = p
+                .session_id
+                .as_deref()
+                .map(atrium::claude_teams::team_name_for)
+                .filter(|name| teams.iter().any(|t| t.name == *name));
+            let team = atrium::claude_teams::team_name_arg(&p.argv);
+            let doing = facts
+                .and_then(|f| f.doing.clone())
+                .filter(|d| !d.is_empty())
+                .or_else(|| team_caption(&label, team.as_deref(), &teams));
             nodes.push(OverviewNode {
                 window: wi,
                 pane_id: p.id,
-                label: p.role.clone().unwrap_or_else(|| p.title.clone()),
+                label,
                 depth: p.depth,
                 status,
                 identity: p.identity.clone(),
@@ -67,8 +100,9 @@ pub(crate) fn overview_nodes(
                 context_pct: facts.and_then(|f| f.context_pct),
                 cost_usd: facts.and_then(|f| f.cost_usd),
                 agent_id: p.agent_id.0,
-                doing: facts.and_then(|f| f.doing.clone()),
+                doing,
                 colliding: facts.is_some_and(|f| f.colliding),
+                leads_team,
             });
         }
     }
@@ -123,6 +157,12 @@ pub(crate) struct WindowAgg {
 pub(crate) enum OvRow {
     Header(WindowAgg),
     Agent(usize),
+    /// A line of the Claude Code team the agent row above leads: the team's
+    /// summary (`task: None`) or one of its tasks, both indexing `teams`.
+    Team {
+        team: usize,
+        task: Option<usize>,
+    },
 }
 
 /// Status rollup for one window across `nodes`.
@@ -161,7 +201,13 @@ pub(crate) fn window_agg(nodes: &[OverviewNode], window: usize) -> WindowAgg {
 /// global counts in the panel header already cover that case, and a lone header
 /// would be noise. `nodes` are in window order (see [`overview_nodes`]), so a
 /// header is emitted whenever the window changes.
-pub(crate) fn overview_rows(nodes: &[OverviewNode]) -> Vec<OvRow> {
+///
+/// `teams` are the live Claude Code teams: under an agent that leads one of
+/// them, a summary line and then one line per task, in list order.
+pub(crate) fn overview_rows_with(
+    nodes: &[OverviewNode],
+    teams: &[atrium::claude_teams::TeamState],
+) -> Vec<OvRow> {
     let multi = nodes.first().map(|f| f.window).is_some()
         && nodes.iter().any(|n| n.window != nodes[0].window);
     let mut rows = Vec::with_capacity(nodes.len());
@@ -172,8 +218,72 @@ pub(crate) fn overview_rows(nodes: &[OverviewNode]) -> Vec<OvRow> {
             rows.push(OvRow::Header(window_agg(nodes, n.window)));
         }
         rows.push(OvRow::Agent(i));
+        let led = n
+            .leads_team
+            .as_deref()
+            .and_then(|name| teams.iter().position(|t| t.name == name));
+        if let Some(team) = led {
+            rows.push(OvRow::Team { team, task: None });
+            for task in 0..teams[team].tasks.len() {
+                rows.push(OvRow::Team {
+                    team,
+                    task: Some(task),
+                });
+            }
+        }
     }
     rows
+}
+
+/// One line of a team block, without the cursor column: the summary (`task:
+/// None`) or a task as `[ ] subject  (owner)`, with what still blocks it. A
+/// completed task is dim; one in progress carries the activity color.
+pub(crate) fn team_line(
+    team: &atrium::claude_teams::TeamState,
+    task: Option<usize>,
+    indent: &str,
+) -> String {
+    use atrium::claude_teams::TaskStatus;
+    let Some(task) = task.and_then(|i| team.tasks.get(i)) else {
+        let (pending, in_progress, completed) = team.counts();
+        let total = team.tasks.len();
+        return format!(
+            "{indent}  \x1b[2m\u{2261} team {}  {} task{}  [ ]{pending} [~]{in_progress} [x]{completed}\x1b[0m",
+            truncate(&team.name, 24),
+            total,
+            if total == 1 { "" } else { "s" },
+        );
+    };
+    let owner = task
+        .owner
+        .as_deref()
+        .map(|o| format!("  ({})", truncate(o, 16)))
+        .unwrap_or_default();
+    let blocked: Vec<&str> = task
+        .blocked_by
+        .iter()
+        .filter(|id| {
+            team.tasks
+                .iter()
+                .any(|t| t.id == **id && t.status != TaskStatus::Completed)
+        })
+        .map(String::as_str)
+        .collect();
+    let blocked = if blocked.is_empty() {
+        String::new()
+    } else {
+        format!("  \x1b[2mblocked by {}\x1b[0m", blocked.join(", "))
+    };
+    let mark = match task.status {
+        TaskStatus::Pending => format!("\x1b[2m{}\x1b[0m", task.status.mark()),
+        TaskStatus::InProgress => format!("\x1b[38;2;95;240;140m{}\x1b[0m", task.status.mark()),
+        TaskStatus::Completed => format!("\x1b[2m{}", task.status.mark()),
+    };
+    let subject = truncate(&task.subject, 60);
+    match task.status {
+        TaskStatus::Completed => format!("{indent}    {mark} {subject}{owner}\x1b[0m"),
+        _ => format!("{indent}    {mark} {subject}\x1b[2m{owner}\x1b[0m{blocked}"),
+    }
 }
 
 /// The first display row to show so `sel_row` stays visible, filling the viewport
@@ -197,6 +307,26 @@ pub(crate) fn render_overview_panel(
     bus: &atrium::bus::Bus,
     nodes: &[OverviewNode],
     collisions: &[atrium::modstate::Collision],
+    sel: usize,
+    rows: u16,
+    cols: u16,
+) -> String {
+    let teams = atrium::claude_teams::snapshot();
+    render_overview_panel_with(windows, bus, nodes, collisions, &teams, sel, rows, cols)
+}
+
+/// [`render_overview_panel`] with the live Claude Code teams given, so a test
+/// can hand one in: under a lead's row, the team block ([`team_line`]).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the panel's inputs plus the teams a test hands in; no struct is worth one caller"
+)]
+pub(crate) fn render_overview_panel_with(
+    windows: &[Window],
+    bus: &atrium::bus::Bus,
+    nodes: &[OverviewNode],
+    collisions: &[atrium::modstate::Collision],
+    teams: &[atrium::claude_teams::TeamState],
     sel: usize,
     rows: u16,
     cols: u16,
@@ -333,7 +463,7 @@ pub(crate) fn render_overview_panel(
     let list_first = row;
     let list_rows = footer_row.saturating_sub(list_first) as usize;
     let mut last_row = row.saturating_sub(1);
-    let disp = overview_rows(nodes);
+    let disp = overview_rows_with(nodes, teams);
     if disp.is_empty() {
         out.push_str(&format!("\x1b[{row};1H  \x1b[2m(no agents)\x1b[0m\x1b[K"));
         last_row = row;
@@ -376,6 +506,21 @@ pub(crate) fn render_overview_panel(
                         },
                     );
                     out.push_str(&format!("\x1b[{r};1H{line}\x1b[0m\x1b[K"));
+                }
+                OvRow::Team { team, task } => {
+                    // A line of the team the row above leads, indented one
+                    // level past that lead.
+                    let depth = disp[..off]
+                        .iter()
+                        .rev()
+                        .find_map(|d| match d {
+                            OvRow::Agent(i) => Some(nodes[*i].depth),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let indent = "  ".repeat(depth + 1);
+                    let line = team_line(&teams[*team], *task, &indent);
+                    out.push_str(&format!("\x1b[{r};1H  {line}\x1b[0m\x1b[K"));
                 }
                 OvRow::Agent(i) => {
                     let n = &nodes[*i];

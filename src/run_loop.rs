@@ -533,6 +533,24 @@ impl RunState<'_> {
                 .filter_map(|p| p.session_id.clone())
                 .collect(),
         );
+        // 5b'. Claude Code's own teams (`atrium::claude_teams`): while the
+        //      overview is up, look at most once a second for a live team led by
+        //      a claude pane here (a stat of its config.json and a listing of
+        //      its tasks directory; a file is read only when its stamp changed)
+        //      and repaint when a member or task changed. With the overview
+        //      closed nothing is looked at: the overview is the only reader.
+        if self.views.overview {
+            let leads: Vec<&str> = self
+                .windows
+                .iter()
+                .flat_map(|w| w.panes.iter())
+                .filter(|p| !p.exited)
+                .filter_map(|p| p.session_id.as_deref())
+                .collect();
+            if atrium::claude_teams::refresh(&leads) {
+                self.force_repaint = true;
+            }
+        }
         let mut did_refresh = false;
         if let Some(snapshot) = self.agents.latest() {
             self.world = snapshot;
