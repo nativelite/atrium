@@ -600,13 +600,14 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
     Ok(obj(pairs).to_string())
 }
 
-/// `spawn [--role R] [--identity I] [--mode M] [--worktree W] [--here | --window] -- <cmd...>`
+/// `spawn [--role R] [--identity I] [--mode M] [--worktree W] [--here [--beside P] | --window] [--no-focus] -- <cmd...>`
 fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("spawn")));
     let mut role: Option<String> = None;
     let mut identity: Option<String> = None;
     let mut new_window = true;
     let mut focus = true;
+    let mut beside: Option<i64> = None;
     let mut mode: Option<TrustMode> = None;
     let mut worktree: Option<String> = None;
     let mut argv: Vec<String> = Vec::new();
@@ -644,6 +645,20 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 focus = false;
                 i += 1;
             }
+            "--beside" => {
+                let tok = value_at(args, i + 1, "--beside needs a pane id")?;
+                beside = Some(match parse_whole(tok) {
+                    Ok(Some(n)) => i64::try_from(n)
+                        .map_err(|_| format!("--beside: pane id {tok:?} is too large"))?,
+                    Ok(None) => return Err(format!("--beside: pane id {tok:?} is too large")),
+                    Err(()) => {
+                        return Err(format!(
+                            "--beside: {tok:?} is not a pane id (a number; roles are not accepted here)"
+                        ))
+                    }
+                });
+                i += 2;
+            }
             "--window" => {
                 new_window = true;
                 i += 1;
@@ -672,6 +687,12 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("window", Value::Bool(new_window)));
     if !focus {
         pairs.push(("focus", Value::Bool(false)));
+    }
+    if let Some(b) = beside {
+        if new_window {
+            return Err("--beside goes with --here (a new window sits beside nothing)".to_string());
+        }
+        pairs.push(("beside", Value::Number(Number::Int(b))));
     }
     pairs.push((
         "argv",

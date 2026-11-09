@@ -57,6 +57,7 @@ teammates:
   spawn [--role R] [--identity X] [--here | --window] [--mode M] [--worktree W] -- <cmd...>
                                   create a teammate: beside you (--here) or in its own window
         --no-focus                keep the keyboard where it is (the teammate opens unfocused)
+        --beside <pane>           with --here: tile next to that pane (an id in your window) instead of you
                                   (--window, default); --mode plan|accept|automode|skip, capped at
                                   the session policy; --worktree names a git worktree to run in
   send <target> <text...>         type a task into a teammate once it is idle (never mid-turn)
