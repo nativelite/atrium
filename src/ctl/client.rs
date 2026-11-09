@@ -37,9 +37,13 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     // text even on a TTY. Otherwise board/bus views render with SGR colors.
     let raw_json = args.iter().any(|a| a == "--json");
     let no_color = args.iter().any(|a| a == "--no-color");
+    // `--quiet` prints no reply at all: for a hook whose stdout Claude Code
+    // would otherwise read as the hook's own JSON output. The exit code still
+    // says whether the request was taken.
+    let quiet = args.iter().any(|a| a == "--quiet");
     let filtered: Vec<String> = args
         .iter()
-        .filter(|a| a.as_str() != "--json" && a.as_str() != "--no-color")
+        .filter(|a| !matches!(a.as_str(), "--json" | "--no-color" | "--quiet"))
         .cloned()
         .collect();
     let args = &filtered[..];
@@ -82,16 +86,18 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         Ok(reply) => {
             // A `board` result renders as a table (unless --json); everything else
             // prints its JSON reply verbatim.
-            match (args.first().map(String::as_str), raw_json) {
-                (Some("board"), false) => match render_board(&reply, color) {
-                    Some(view) => println!("{view}"),
-                    None => println!("{reply}"),
-                },
-                (Some("bus"), false) => match render_bus(&reply, color) {
-                    Some(view) => println!("{view}"),
-                    None => println!("{reply}"),
-                },
-                _ => println!("{reply}"),
+            if !quiet {
+                match (args.first().map(String::as_str), raw_json) {
+                    (Some("board"), false) => match render_board(&reply, color) {
+                        Some(view) => println!("{view}"),
+                        None => println!("{reply}"),
+                    },
+                    (Some("bus"), false) => match render_bus(&reply, color) {
+                        Some(view) => println!("{view}"),
+                        None => println!("{reply}"),
+                    },
+                    _ => println!("{reply}"),
+                }
             }
             // A non-fatal advisory to STDERR (never stdout, which carries the JSON
             // reply): a `bus pub` that reached zero subscribers. Fires in both the

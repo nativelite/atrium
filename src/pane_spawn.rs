@@ -431,6 +431,22 @@ pub(crate) fn spawn_pane_full(
         user_cmd.push("--session-id".to_string());
         user_cmd.push(uuid.clone());
     }
+    // Certainty status without the mod (`atrium::status_hooks`): in a ctl
+    // session a bound claude pane also gets atrium's hooks file through
+    // `--settings`, so a permission prompt reports itself the moment it
+    // appears; never when the user passed their own `--settings`, and only
+    // once `claude --help` has shown the flag.
+    if session_id.is_some()
+        && CTL_ADDRESS.get().is_some()
+        && atrium::bind::is_claude_stem(&title)
+        && atrium::status_hooks::wants(&user_cmd)
+        && claude_has_settings_flag(&user_cmd[0])
+    {
+        if let Some(path) = status_hooks_path() {
+            user_cmd.push(atrium::status_hooks::FLAG.to_string());
+            user_cmd.push(path.to_string_lossy().into_owned());
+        }
+    }
     let effective = effective_command(&user_cmd);
     log_spawn(&title, &effective);
     let r = rows.max(1);
@@ -923,6 +939,27 @@ fn pane_env(
     );
     base_env.extend_from_slice(extra_env);
     (base_env, token, pane_cgroup)
+}
+
+/// Does this claude take `--settings`? Asked of its `--help` once per session,
+/// like the codex flags.
+pub(crate) fn claude_has_settings_flag(program: &str) -> bool {
+    codex_probe(program, &["--help"], |out| out.contains("--settings"))
+}
+
+/// atrium's status-hooks file, written once per process on the first claude
+/// spawn of a ctl session (`atrium::status_hooks::ensure`); `None` when it
+/// cannot be written, in which case the pane gets no `--settings` and its
+/// status comes from agsess as before.
+fn status_hooks_path() -> Option<std::path::PathBuf> {
+    static HOOKS: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    HOOKS
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let root = atrium::session_store::state_root()?;
+            atrium::status_hooks::ensure(&exe, &root).ok()
+        })
+        .clone()
 }
 
 /// The tmux shim's path, placed once per process on the first claude spawn of

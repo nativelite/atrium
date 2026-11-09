@@ -51,6 +51,7 @@ Mouse capture is off so text selection works; Ctrl+A m turns it on.
 pub const CTL: &str = "\
 usage: atrium ctl <command> [args]    the control plane, run from inside a pane
        atrium ctl --json ...          print the raw JSON reply    --no-color   plain text
+       atrium ctl --quiet ...         print no reply (for a hook); the exit code still answers
 
 teammates:
   spawn [--role R] [--identity X] [--here | --window] [--mode M] [--worktree W] -- <cmd...>
@@ -205,6 +206,7 @@ mod tests {
                     "bus resolve",
                     "bus topics",
                     "--json",
+                    "--quiet",
                     "--no-color",
                 ],
             ),

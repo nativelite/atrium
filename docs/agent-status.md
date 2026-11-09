@@ -79,6 +79,10 @@ With the mod a pane also has a **caption**: what it is doing right now, in a few
 
 A reported status wins over the inferred one for two minutes, then the inference is used again, so a mod that died cannot pin a pane. The mod also reports the context-window fill and the cost so far, which the overview (`Ctrl+A o`) shows per agent (`ctx 41% $0.12`) and summed per window, and the text of each answer, which only the pane that spawned it as a subagent may read (`atrium ctl answer`, `wait`). It never sends conversation text anywhere else. Codex and gemini panes, and a claude without the mod, keep the inference. `atrium ctl status` and `ctl list` show the reported label, including `errored` and `ended`.
 
+## Certainty without the mod: settings hooks
+
+A claude pane in a ctl session (`--allow-ctl`, or any fleet) gets certainty status even without the mod. Claude Code runs *settings hooks*, shell commands on named events, and takes a `--settings <file>` flag that adds a settings file for one session on top of the user's own. atrium writes one such file beside its state (`hooks/claude-status.json`, next to the sessions store) with a command per event that runs `atrium ctl report status=… --quiet` with the pane's own token, inherited from the pane's environment, and passes it to every bound claude pane whose command line does not already carry `--settings` (a user's flag always wins). `UserPromptSubmit`, `PreToolUse` and `PermissionDenied` report `working`; `PermissionRequest` reports `waiting-approval`; `Stop` reports `waiting-prompt`; `SessionEnd` reports `ended`. Each hook prints nothing and exits 0, which for all of these events means "no decision": the permission prompt still shows, the tool still runs. The broker treats these reports as it treats the mod's, ahead of the transcript inference, so the yellow border lands within one tick of the prompt instead of seven to eight seconds later. The flag is added only after `claude --help` has shown that this claude takes `--settings`.
+
 ## See also
 
 - [atrium README](../README.md)

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Certainty status for a claude pane without the mod.** In a ctl session a
+  bound claude pane is launched with `--settings <atrium's hooks file>`
+  (`hooks/claude-status.json`, written beside the sessions store), whose
+  settings hooks run `atrium ctl report status=… --quiet` on
+  `UserPromptSubmit`/`PreToolUse`/`PermissionDenied` (working),
+  `PermissionRequest` (waiting-approval), `Stop` (waiting-prompt) and
+  `SessionEnd` (ended), each with the pane's own token. The yellow border
+  lands within one tick of a permission prompt instead of the seven to eight
+  seconds the transcript inference needs. A user's own `--settings` always
+  wins, and the flag is added only once `claude --help` shows it
+  (`src/status_hooks.rs`; docs/agent-status.md "Certainty without the mod").
+  `atrium ctl --quiet` prints no reply, so a hook's stdout stays empty.
 - **The token-free ctl reads are a documented, stable surface for a host
   terminal.** `list`, `status`, `audit`, `board get`/`list` and `bus
   feed`/`topics` need no token; docs/control-plane.md ("Reading the control
