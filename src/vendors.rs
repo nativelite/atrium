@@ -731,17 +731,13 @@ impl Default for VendorWorlds {
 impl VendorWorlds {
     /// What the UI reads, copied out: the run loop holds this, never the worlds.
     pub fn snapshot(&self) -> AgentState {
-        AgentState {
-            overrides: Default::default(),
-            mod_facts: Default::default(),
-            collisions: Vec::new(),
-            sessions: self
-                .worlds
+        AgentState::from_views(
+            self.worlds
                 .iter()
                 .flat_map(|w| w.sessions.iter())
                 .map(SessionView::from)
                 .collect(),
-        }
+        )
     }
 }
 
@@ -782,6 +778,10 @@ impl From<&agsess::AgentSession> for SessionView {
 #[derive(Debug, Clone, Default)]
 pub struct AgentState {
     sessions: Vec<SessionView>,
+    /// Session id -> index in `sessions`. The loop asks `status_for` once per
+    /// pane per tick, and the history holds hundreds of sessions; a linear
+    /// find there was O(panes x history) every 20 ms.
+    by_id: std::collections::HashMap<String, usize>,
     /// Statuses a pane's mod reported, laid over the inferred ones by
     /// [`crate::modstate::ModState::overlay`]; keyed by session id. A fresh
     /// snapshot from the watch thread carries none, so the loop lays them
@@ -812,6 +812,28 @@ pub struct ModFacts {
 }
 
 impl AgentState {
+    /// A snapshot over `sessions`, indexed by id; no mod facts laid yet.
+    pub fn from_views(sessions: Vec<SessionView>) -> AgentState {
+        let by_id = sessions
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.id.clone(), i))
+            .collect();
+        AgentState {
+            sessions,
+            by_id,
+            overrides: Default::default(),
+            mod_facts: Default::default(),
+            collisions: Vec::new(),
+        }
+    }
+
+    /// Did any session change between two snapshots? Mod facts are laid by
+    /// the loop after a snapshot arrives and are not part of the question.
+    pub fn sessions_changed(prev: &AgentState, next: &AgentState) -> bool {
+        prev.sessions != next.sessions
+    }
+
     /// See [`VendorWorlds::status_for`]. A status the pane's own mod reported
     /// (see [`crate::modstate`]) wins over the inference.
     pub fn status_for(&self, session_id: Option<&str>) -> Option<Status> {
@@ -819,7 +841,10 @@ impl AgentState {
         if let Some(s) = self.overrides.get(id) {
             return Some(*s);
         }
-        self.sessions.iter().find(|s| s.id == id).map(|s| s.status)
+        self.by_id
+            .get(id)
+            .and_then(|&i| self.sessions.get(i))
+            .map(|s| s.status)
     }
 
     /// Lay a reported status over the inferred one for `session_id`.
@@ -925,7 +950,8 @@ impl AgentWatch {
                 let mut worlds = VendorWorlds::new();
                 worlds.refresh_since(cutoff_ms);
                 let mut last = std::time::Instant::now();
-                if tx.send(worlds.snapshot()).is_err() {
+                let mut sent = worlds.snapshot();
+                if tx.send(sent.clone()).is_err() {
                     return;
                 }
                 while !stopping.load(Ordering::SeqCst) {
@@ -936,7 +962,16 @@ impl AgentWatch {
                     }
                     last = std::time::Instant::now();
                     worlds.refresh();
-                    if tx.send(worlds.snapshot()).is_err() {
+                    // A snapshot goes to the loop only when a session changed:
+                    // every one it receives costs a mod-report overlay and an
+                    // overview/log repaint, and an idle fleet changes nothing
+                    // refresh after refresh.
+                    let next = worlds.snapshot();
+                    if !AgentState::sessions_changed(&sent, &next) {
+                        continue;
+                    }
+                    sent = next.clone();
+                    if tx.send(next).is_err() {
                         return;
                     }
                 }
@@ -1957,20 +1992,22 @@ mod tests {
     }
 
     /// The watch thread delivers a first snapshot without the loop doing any
-    /// file work, and newer snapshots replace older ones.
+    /// file work. Later snapshots arrive only when a session changed
+    /// (`snapshot_tests::a_snapshot_is_sent_only_when_a_session_changed`), so
+    /// on a quiet machine this test sees exactly one and on a busy one more;
+    /// it asserts the first, which is the part that does not depend on what
+    /// the machine's agents are doing.
     #[test]
-    fn the_agent_watch_publishes_snapshots_off_the_loop() {
+    fn the_agent_watch_publishes_a_first_snapshot_off_the_loop() {
         let watch = AgentWatch::start(agsess::sessions::now_ms());
         watch.set_interval(std::time::Duration::from_millis(100));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut got = 0;
-        while got < 2 && std::time::Instant::now() < deadline {
-            if watch.latest().is_some() {
-                got += 1;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut first = None;
+        while first.is_none() && std::time::Instant::now() < deadline {
+            first = watch.latest();
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert_eq!(got, 2, "the thread must keep publishing");
+        assert!(first.is_some(), "the thread must publish a first snapshot");
     }
 }
 
@@ -2015,5 +2052,44 @@ mod store_pwsh_tests {
             assert!(!is_store_pwsh(Some(Path::new(p))), "{p}");
         }
         assert!(!is_store_pwsh(None));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn view(id: &str, status: Status) -> SessionView {
+        SessionView {
+            id: id.to_string(),
+            vendor: Vendor::ClaudeCode,
+            status,
+            awaiting_tool: false,
+            cwd: None,
+            first_seen_ms: 0,
+            last_ts_ms: None,
+            last_action: String::new(),
+        }
+    }
+
+    #[test]
+    fn status_is_found_by_id_through_the_index() {
+        let st = AgentState::from_views(vec![view("a", Status::Working), view("b", Status::Idle)]);
+        assert_eq!(st.status_for(Some("b")), Some(Status::Idle));
+        assert_eq!(st.status_for(Some("a")), Some(Status::Working));
+        assert_eq!(st.status_for(Some("zz")), None);
+        assert_eq!(st.status_for(None), None);
+    }
+
+    #[test]
+    fn a_snapshot_is_sent_only_when_a_session_changed() {
+        let a = AgentState::from_views(vec![view("a", Status::Working)]);
+        let same = AgentState::from_views(vec![view("a", Status::Working)]);
+        let moved = AgentState::from_views(vec![view("a", Status::Idle)]);
+        let grown =
+            AgentState::from_views(vec![view("a", Status::Working), view("b", Status::Idle)]);
+        assert!(!AgentState::sessions_changed(&a, &same));
+        assert!(AgentState::sessions_changed(&a, &moved));
+        assert!(AgentState::sessions_changed(&a, &grown));
     }
 }

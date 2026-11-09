@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shapes (atrium issue #20).
 
 ### Fixed
+- **The agent watch sends the loop a snapshot only when a session changed,
+  and status lookups are indexed.** Every refresh (each second with an agent
+  on screen) sent a full snapshot, changed or not, and each one cost the loop
+  a mod-report overlay and an overview/log repaint; and `status_for` was a
+  linear find over the whole session history, asked once per pane per tick.
+  Now a snapshot that equals the last one sent is dropped on the watch
+  thread, and the snapshot carries an id index (atrium issue #18; the
+  agsess-side walk reduction is still open there).
 - **The tmux shim read a refused reply's reason from the wrong key.** A
   `ctl` failure is `{"ok":false,"err":…}`; the shim looked for `error` and
   reported "request refused" instead of the reason. Found by the golden row.
