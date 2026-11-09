@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 /// Passing `&[]` inherits the parent environment — it does NOT mean "empty env" —
 /// so a test that means to prove "no fleet file exists" was really proving "this
 /// developer happens to have none". That has already bitten this suite once.
-#[allow(dead_code)]
 pub(crate) fn hermetic_env(dir: &std::path::Path) -> Vec<(String, String)> {
     let d = dir.to_string_lossy().to_string();
     vec![

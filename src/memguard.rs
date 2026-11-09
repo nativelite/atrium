@@ -309,7 +309,13 @@ pub fn may_kill(
 pub const BUILD_OOM_SCORE_ADJ: i32 = 800;
 
 /// One `/proc/<pid>/stat` line, parsed.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux /proc reader builds one; compiled everywhere so parse_stat is tested everywhere"
+    )
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Stat {
     ppid: u32,
@@ -322,7 +328,13 @@ struct Stat {
 /// A Linux `/proc/<pid>/stat` line. `comm` sits in parentheses and may itself
 /// contain spaces and `)`, so fields are counted from the LAST `)`. Pure, so it
 /// is tested everywhere.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "only the Linux /proc reader calls it; pure, so it is tested everywhere"
+    )
+)]
 fn parse_stat(text: &str) -> Option<Stat> {
     let open = text.find('(')?;
     let close = text.rfind(')')?;
@@ -343,7 +355,13 @@ fn parse_stat(text: &str) -> Option<Stat> {
 /// child that called `setsid()` still counts. A daemon that double-forks away
 /// to init leaves both trails; that residual is the same one `reap` documents.
 /// `table` is `pid -> (ppid, session)`. Pure, so it is tested everywhere.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the unix process readers call it; pure, so it is tested everywhere"
+    )
+)]
 fn pane_members(table: &[(u32, (u32, u32))], panes: &[u32]) -> Vec<u32> {
     let mut members: std::collections::HashSet<u32> = table
         .iter()
@@ -410,7 +428,13 @@ pub fn supported() -> bool {
 #[derive(Default)]
 pub struct Guard {
     /// The limit last set on the job, so an unchanged limit is not re-set.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg_attr(
+        unix,
+        allow(
+            dead_code,
+            reason = "read by the Linux cgroup arm and the Windows job arm; macOS has neither"
+        )
+    )]
     applied: Option<Option<u64>>,
     /// Pressure with nothing to stop has been reported this streak.
     stuck_reported: bool,
@@ -646,7 +670,10 @@ fn members(job: &crate::reap::SessionJob) -> Option<Vec<Member>> {
 #[cfg(unix)]
 mod unix {
     use super::Member;
-    #[allow(unused_imports)]
+    #[allow(
+        unused_imports,
+        reason = "both are Linux syscall types; the macOS arm of this module uses neither"
+    )]
     use core::ffi::{c_long, c_void};
 
     /// Linux: every process belonging to the panes ([`super::pane_members`]).
@@ -902,7 +929,7 @@ mod unix {
         // SAFETY: null-terminated name; `total`/`len` describe a u64 buffer.
         let ok = unsafe {
             sysctlbyname(
-                b"hw.memsize\0".as_ptr() as *const core::ffi::c_char,
+                c"hw.memsize".as_ptr(),
                 &mut total as *mut u64 as *mut c_void,
                 &mut len,
                 core::ptr::null_mut(),
@@ -914,7 +941,7 @@ mod unix {
         // SAFETY: as above, for an int.
         let ok2 = unsafe {
             sysctlbyname(
-                b"kern.memorystatus_level\0".as_ptr() as *const core::ffi::c_char,
+                c"kern.memorystatus_level".as_ptr(),
                 &mut level as *mut i32 as *mut c_void,
                 &mut len2,
                 core::ptr::null_mut(),

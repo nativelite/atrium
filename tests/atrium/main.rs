@@ -3,9 +3,10 @@
 //! Deadline-bounded throughout. (The pure scanner / bar / filter / resolver
 //! tests are unit tests in the library, beside the code they check.)
 
-// Test code: a panic is the failure report. `allow-unwrap-in-tests` covers
-// #[test] fns, not the helpers they share.
-#![allow(clippy::unwrap_used)]
+#![allow(
+    clippy::unwrap_used,
+    reason = "test code: a panic is the failure report; allow-unwrap-in-tests covers #[test] fns, not the helpers they share"
+)]
 
 mod support;
 

@@ -61,3 +61,6 @@ pub mod uid;
 pub mod vendors;
 pub mod warden;
 pub mod worktree;
+
+#[cfg(test)]
+pub(crate) mod test_env;

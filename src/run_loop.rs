@@ -295,6 +295,7 @@ impl RunState<'_> {
         //     Resetting on every request, polls included, cleared the screen
         //     several times a second under a modded fleet (see `CtlEffect`).
         let mut served = false;
+        let mut lost = None;
         if let Some(listener) = self.ctl_listener.as_mut() {
             for _ in 0..8 {
                 match listener.poll() {
@@ -343,9 +344,23 @@ impl RunState<'_> {
                         }
                     }
                     Ok(None) => break,
-                    Err(_) => break,
+                    // The accept thread is gone (nativelite-ipc 0.2 says so
+                    // on every tick from here on): handled below, where the
+                    // listener is no longer borrowed.
+                    Err(e) => {
+                        lost = Some(e);
+                        break;
+                    }
                 }
             }
+        }
+        if let Some(e) = lost {
+            ctl_channel_lost(
+                &mut self.ctl_listener,
+                &mut self.held_inboxes,
+                &mut self.flash,
+                &e,
+            );
         }
         self.serve_held_inboxes();
         // A `report` may have landed: lay it over the snapshot now, so the
@@ -581,4 +596,29 @@ fn active_after_reap(active: usize, empty_before_active: usize, remaining: usize
     active
         .saturating_sub(empty_before_active)
         .min(remaining - 1)
+}
+
+/// The ctl listener's accept thread has died: `poll` said so with `Err`, and
+/// would on every tick from now on (0.44.0 review). Say it once on the bar,
+/// naming the remedy, and let the listener go. With no listener there is no
+/// poll to err, so the message cannot repeat — the `Option` is the once-flag;
+/// a field on `RunState` would need every constructor to initialise it for
+/// the same effect. Dropping the listener also unlinks the endpoint, so an
+/// `atrium ctl` from a pane fails fast instead of connecting to a door nobody
+/// answers, and the `inbox --wait` holds go with it: their clients see the
+/// close and ask again, which fails the same fast way.
+fn ctl_channel_lost(
+    listener: &mut Option<atrium::ipc::Listener>,
+    held: &mut Vec<(atrium::ipc::Ticket, AgentId)>,
+    flash: &mut Option<(String, Instant)>,
+    err: &std::io::Error,
+) {
+    if listener.take().is_none() {
+        return;
+    }
+    held.clear();
+    *flash = Some((
+        format!("ctl channel lost: {err}; restart atrium to bring it back"),
+        Instant::now(),
+    ));
 }

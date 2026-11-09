@@ -429,7 +429,7 @@ impl Stats {
         if self.0.is_empty() {
             return f64::NAN;
         }
-        let rank = ((p * self.0.len() + 99) / 100).max(1);
+        let rank = (p * self.0.len()).div_ceil(100).max(1);
         self.0[rank.min(self.0.len()) - 1]
     }
     fn max(&self) -> f64 {

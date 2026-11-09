@@ -308,7 +308,7 @@ mod tests {
             Ok(b"a".to_vec()),
             Ok(Vec::new()),
             Ok(b"bc".to_vec()),
-            Err(io::Error::new(io::ErrorKind::Other, "gone")),
+            Err(io::Error::other("gone")),
         ]));
         let feed = script.clone();
         let mut keys = KeyReader::start_with(

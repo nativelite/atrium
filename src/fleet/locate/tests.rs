@@ -38,10 +38,6 @@ fn discover_finds_the_local_file_first() {
     let _ = std::fs::remove_dir_all(&td);
 }
 
-/// Serializes the tests that move `XDG_CONFIG_HOME`, since the environment
-/// is process-wide and the suite runs in parallel.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// A user's template is copied as written: the object's text, braces and
 /// quotes inside prompts included, not a re-serialization.
 #[test]
@@ -74,33 +70,26 @@ fn discover_missing_names_both_locations() {
     // and fails the moment they have one — which is a supported, documented
     // setup, so the test was asserting "no global fleet file exists on this
     // machine" rather than the behaviour it means to cover.
-    let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // One crate-wide guard (`test_env`): the config test that compares the two
+    // global paths reads under the same lock, and the restore is on drop.
+    let mut guard = crate::test_env::EnvGuard::hold();
     // BOTH variables, not just the unix one. `global_path` reads APPDATA on
     // Windows and XDG_CONFIG_HOME elsewhere, so overriding only XDG left this
     // test reading the developer's real %APPDATA%\atrium\fleet.json — it was
     // hermetic on exactly one platform, which is the same class of bug the
     // previous fix here was meant to close.
-    let prev_appdata = std::env::var_os("APPDATA");
-    let prev = std::env::var_os("XDG_CONFIG_HOME");
     let empty = std::env::temp_dir().join(format!("atrium-fleet-cfg-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&empty);
     std::fs::create_dir_all(&empty).unwrap();
-    std::env::set_var("XDG_CONFIG_HOME", &empty);
-    std::env::set_var("APPDATA", &empty);
+    guard.set("XDG_CONFIG_HOME", &empty);
+    guard.set("APPDATA", &empty);
 
     let td = std::env::temp_dir().join(format!("atrium-fleet-none-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&td);
     std::fs::create_dir_all(&td).unwrap();
     let found = discover(&td);
 
-    match prev {
-        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-        None => std::env::remove_var("XDG_CONFIG_HOME"),
-    }
-    match prev_appdata {
-        Some(v) => std::env::set_var("APPDATA", v),
-        None => std::env::remove_var("APPDATA"),
-    }
+    drop(guard);
     let _ = std::fs::remove_dir_all(&empty);
 
     let err = found.unwrap_err();

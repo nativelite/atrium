@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and ignored. The interactive splits still make equal splits (no key sets a
   ratio), and a `--here` spawn with no `--size` is unchanged.
 
+### Changed
+- **The Rust floor is 1.81** (`rust-version`; issue #6, one step of the
+  gradual walk from 1.70). 1.81 brings `reason = "..."` and `#[expect]` on
+  lint attributes, so clippy's `allow_attributes_without_reason` is now on
+  (deferred in d33a784 for want of it): every `#[allow]` in the tree states
+  the real reason it is there, and the one lint that fires on every target
+  (`while_let_on_iterator` in `panels::wrap_to`) is an `#[expect]`, which
+  warns the day the code stops needing it.
+
 ### Fixed
 - **Linux e2e flake `session::command_prompt_cancels_and_opens_a_window`**
   (issue #8; test-only, no change to atrium). The test waited for the raw
@@ -33,6 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the reply was on screen; under WSL it failed about two runs in three. The
   test now matches the reply as rendered screen content, typed with shell
   quoting so only the reply contains it, the way afda305 fixed the same class.
+- **A dead ctl channel is said once on the bar, not swallowed** (0.44.0
+  review). `nativelite-ipc` 0.2's `poll` returns `Err` on every tick once the
+  accept thread has died; the run loop broke out of it silently and kept
+  polling. It now flashes `ctl channel lost: <why>; restart atrium to bring
+  it back`, lets the listener go — which unlinks the endpoint, so `atrium
+  ctl` fails fast instead of knocking on a door nobody answers — and so
+  says it exactly once.
+- **Two Linux lib-test races** (issue #9). Every atrium test that moves a
+  process-wide variable (`XDG_CONFIG_HOME`/`APPDATA` in `fleet::locate`,
+  `CODEX_HOME`/`ATRIUM_GEMINI_ROOT` in `vendors`) now goes through one
+  `test_env::EnvGuard` — one crate-wide mutex, restore on drop, panic
+  included — and the config test that compares the two global paths reads
+  under the same guard. The ipc never-reads timing test is fixed in
+  `nativelite-ipc` (its changelog).
+
 
 ## [0.44.0] - 2026-11-08
 

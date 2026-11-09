@@ -160,9 +160,10 @@ pub(crate) fn render_decision_detail(
 /// Word-wrap `text` to `width` columns across at most `max_lines` lines; if it
 /// still overflows, the last line ends with `…`. Whitespace-collapsing — good
 /// enough for a one-shot question, not a general typesetter.
-// `while let … next()` (not `for`) is deliberate: after the loop `words` is
-// reused via `words.peek()` to detect overflow, which a `for` would consume.
-#[allow(clippy::while_let_on_iterator)]
+#[expect(
+    clippy::while_let_on_iterator,
+    reason = "after the loop `words` is reused via `peek()` to detect overflow, which a `for` would consume"
+)]
 pub(crate) fn wrap_to(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();

@@ -2,7 +2,7 @@
 name = "atrium"
 version = "0.44.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.81"
 description = "tmux for agents: a multi-agent terminal that hosts your own CLIs in switchable panes with agent-aware chrome. 100% nativelite - zero third-party dependencies."
 license-file = "LICENSE"
 repository = "https://github.com/nativelite/atrium"
@@ -38,7 +38,7 @@ harness = false
 
 # Enforced by the gate: `dev.py lint` runs clippy with -D warnings. Cargo < 1.74
 # ignores this table (with a warning), so the 1.70 MSRV build is unaffected.
-# Not here: `allow_attributes_without_reason` - its `reason =` needs Rust 1.81.
+# `allow_attributes_without_reason` (below) needed Rust 1.81 for `reason =`; the floor is there since 0.45.0.
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 
@@ -48,3 +48,4 @@ unwrap_used = "warn"                # expect("invariant") or `?`; tests: clippy.
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"
+allow_attributes_without_reason = "warn" # every allow/expect says why it is there (1.81+, issue #6)
