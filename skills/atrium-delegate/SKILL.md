@@ -87,13 +87,13 @@ running.
 
 ## Full surface & discovery
 
-    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--mode plan|accept|automode|skip] [--worktree W] -- <cmd...>
+    atrium ctl spawn [--role R] [--identity X] [--here | --window] [--no-focus] [--beside N] [--mode plan|accept|automode|skip] [--worktree W] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
     atrium ctl answer <target> | wait <target> [--for answer|idle|exit] [--timeout S]
     atrium ctl ask <target> [--timeout S] <question...> | asked <target> <id> | who <path>
     atrium ctl bus pub <topic> [--to <role>[,...]] <field=value...> | bus sub <topic...>
 
-`--identity X` runs a teammate under a credential you already hold; `--here` tiles
+`--no-focus` keeps the keyboard where it is (a `--here` teammate opens unfocused; what Claude Code's own teams ask for); `--beside N` (with `--here`) tiles next to pane N in your window instead of next to you. `--identity X` runs a teammate under a credential you already hold; `--here` tiles
 it beside you (vs a new window); `--mode` picks a teammate's permission mode
 (`plan`/`accept`/`automode`/`skip`), else it inherits the session policy — atrium caps you
 at that policy unless the human operator is directing, so use `--mode` rather than
