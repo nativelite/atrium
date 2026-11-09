@@ -16,6 +16,12 @@
 //! Notify on transitions only: a pane newly `WaitingApproval` (per pane, with
 //! a 30 s cooldown) or a newly pending human-addressed decision (by bus `seq`,
 //! so a resolve followed by a new decision is not hidden by an equal count).
+//! A pane's own `BEL` (from a bound agent pane) or `OSC 9` toast rings too,
+//! under the same per-pane cooldown, as a moment: the title's state word is
+//! the status, not the bell. The pane's title (`OSC 0`/`2`) is not a ring; it
+//! is the pane's badge in the tile label and the bar entry ([`pane_badge`]).
+//! All three come from the pane's emulator (`vterm::Notice`), so the loop
+//! reads them whether the pane is tiled or passthrough.
 //! Channels: `BEL`; an `OSC 9` toast (iTerm2, ConEmu, fwterm); and, for
 //! Windows Terminal, which ignores a plain `OSC 9`, the tab progress indicator
 //! `OSC 9;4;2;0` (red) while anything needs you and `OSC 9;4;0;0` to clear.
@@ -102,6 +108,22 @@ pub struct PaneFact {
     pub exited: bool,
     /// The bound agent's status; `None` for an unbound pane.
     pub status: Option<Status>,
+    /// The program rang `BEL` since the last tick (a `vterm::Notice::Bell`).
+    pub bell: bool,
+    /// The program's own notification (`OSC 9 ; text`, a `Notice::Toast`)
+    /// since the last tick, the last one when it sent several.
+    pub toast: Option<String>,
+}
+
+/// What a pane said this tick that is worth ringing for: a bell from a bound
+/// agent pane, or a notification from any pane. A moment, not a state: it is
+/// in the summary of the tick it arrived in and in no title.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ring {
+    pub key: u64,
+    pub label: String,
+    /// The pane's own words, when it sent an `OSC 9` toast.
+    pub toast: Option<String>,
 }
 
 /// The session's state, reduced to what the title and the ring need.
@@ -111,6 +133,9 @@ pub struct Summary {
     pub needs_you: Vec<(u64, String)>,
     /// Open decisions addressed to the human, by bus `seq`.
     pub decisions: Vec<u64>,
+    /// Panes that rang or toasted this tick ([`Ring`]). Not a state: the title
+    /// ignores it, and `needs()` does not count it.
+    pub rings: Vec<Ring>,
     pub working: usize,
     pub idle: usize,
     pub exited: usize,
@@ -131,6 +156,16 @@ impl Summary {
                 Some(Status::WaitingApproval) => s.needs_you.push((p.key, p.label.clone())),
                 Some(Status::Working) => s.working += 1,
                 Some(Status::WaitingPrompt) | Some(Status::Idle) | None => s.idle += 1,
+            }
+            // A shell's bell (a completion with nothing to complete) is not a
+            // call for the human; a bound agent's is. A notification is
+            // deliberate from any program.
+            if (p.bell && p.status.is_some()) || p.toast.is_some() {
+                s.rings.push(Ring {
+                    key: p.key,
+                    label: p.label.clone(),
+                    toast: p.toast.clone(),
+                });
             }
         }
         s
@@ -226,11 +261,53 @@ pub fn progress_osc(on: bool) -> &'static str {
     }
 }
 
+/// Columns a pane's own title may take in a tile label or a bar entry.
+pub const PANE_BADGE_MAX: usize = 24;
+
+/// A pane's own title as its badge: what the program set with `OSC 0`/`2`
+/// (`vterm::Term::title`), scrubbed like every OSC payload, trimmed, and cut
+/// to [`PANE_BADGE_MAX`] characters with an ellipsis. `None` when there is
+/// none, when it is blank, or when it only names the program again
+/// (`claude`, or ConPTY's `C:\WINDOWS\system32\cmd.exe` for a `cmd` pane):
+/// the label already says that.
+pub fn pane_badge(own: Option<&str>, program: &str) -> Option<String> {
+    let own = text_safe(own?);
+    let own = own.trim();
+    if own.is_empty() {
+        return None;
+    }
+    let stem = std::path::Path::new(own)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(own);
+    if own.eq_ignore_ascii_case(program) || stem.eq_ignore_ascii_case(program) {
+        return None;
+    }
+    let n = own.chars().count();
+    if n <= PANE_BADGE_MAX {
+        return Some(own.to_string());
+    }
+    let mut cut: String = own.chars().take(PANE_BADGE_MAX - 1).collect();
+    cut.push('\u{2026}');
+    Some(cut)
+}
+
 /// A transition worth ringing for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    PaneNeedsYou { key: u64, label: String },
-    DecisionNeedsYou { seq: u64 },
+    PaneNeedsYou {
+        key: u64,
+        label: String,
+    },
+    DecisionNeedsYou {
+        seq: u64,
+    },
+    /// The pane itself rang or toasted ([`Ring`]).
+    PaneRang {
+        key: u64,
+        label: String,
+        toast: Option<String>,
+    },
 }
 
 /// Rings between two summaries, with a per-pane cooldown.
@@ -244,22 +321,18 @@ pub const COOLDOWN_MS: u64 = 30_000;
 
 impl Edges {
     /// The events `next` holds that `prev` did not: a pane newly waiting (and
-    /// not rung within the cooldown), a decision newly pending.
+    /// not rung within the cooldown), a decision newly pending, a pane that
+    /// rang this tick (under the same per-pane cooldown, so an agent that
+    /// rings as it asks is heard once).
     pub fn diff(&mut self, prev: &Summary, next: &Summary, now_ms: u64) -> Vec<Event> {
         let mut events = Vec::new();
         for (key, label) in &next.needs_you {
             if prev.needs_you.iter().any(|(k, _)| k == key) {
                 continue;
             }
-            let recently = self
-                .last_rang
-                .iter()
-                .any(|(k, t)| k == key && now_ms.saturating_sub(*t) < COOLDOWN_MS);
-            if recently {
+            if !self.ring(*key, now_ms) {
                 continue;
             }
-            self.last_rang.retain(|(k, _)| k != key);
-            self.last_rang.push((*key, now_ms));
             events.push(Event::PaneNeedsYou {
                 key: *key,
                 label: label.clone(),
@@ -270,7 +343,31 @@ impl Edges {
                 events.push(Event::DecisionNeedsYou { seq: *seq });
             }
         }
+        for r in &next.rings {
+            if !self.ring(r.key, now_ms) {
+                continue;
+            }
+            events.push(Event::PaneRang {
+                key: r.key,
+                label: r.label.clone(),
+                toast: r.toast.clone(),
+            });
+        }
         events
+    }
+
+    /// Whether pane `key` may ring now; stamps it when it may.
+    fn ring(&mut self, key: u64, now_ms: u64) -> bool {
+        let recently = self
+            .last_rang
+            .iter()
+            .any(|(k, t)| *k == key && now_ms.saturating_sub(*t) < COOLDOWN_MS);
+        if recently {
+            return false;
+        }
+        self.last_rang.retain(|(k, _)| *k != key);
+        self.last_rang.push((key, now_ms));
+        true
     }
 }
 
@@ -318,6 +415,17 @@ impl Tracker {
                 let text = match &events[..] {
                     [Event::PaneNeedsYou { label, .. }] => format!("atrium: {label} needs you"),
                     [Event::DecisionNeedsYou { .. }] => "atrium: a decision needs you".to_string(),
+                    // The pane's own words when it gave some; else that it rang.
+                    [Event::PaneRang {
+                        label,
+                        toast: Some(toast),
+                        ..
+                    }] => format!("atrium: {label} \u{00b7} {toast}"),
+                    [Event::PaneRang {
+                        label, toast: None, ..
+                    }] => {
+                        format!("atrium: {label} rang")
+                    }
                     many => format!("atrium: {} need you", many.len()),
                 };
                 out.push_str(&toast_osc(&text));
@@ -345,7 +453,160 @@ mod tests {
             label: label.to_string(),
             exited: false,
             status,
+            bell: false,
+            toast: None,
         }
+    }
+
+    fn ringing(key: u64, label: &str, status: Option<Status>) -> PaneFact {
+        PaneFact {
+            bell: true,
+            ..pane(key, label, status)
+        }
+    }
+
+    #[test]
+    fn a_bell_from_a_bound_pane_is_a_ring_and_not_a_state() {
+        let s = Summary::build(
+            &[
+                ringing(1, "builder", Some(Status::Working)),
+                ringing(2, "sh", None),
+                PaneFact {
+                    exited: true,
+                    ..ringing(3, "gone", Some(Status::Working))
+                },
+            ],
+            &[],
+        );
+        assert_eq!(
+            s.rings,
+            vec![Ring {
+                key: 1,
+                label: "builder".to_string(),
+                toast: None
+            }],
+            "a bound pane's bell rings; a shell's and an exited pane's do not"
+        );
+        assert!(
+            s.needs_you.is_empty() && s.needs() == 0,
+            "a bell is not a state"
+        );
+        assert_eq!(
+            state_text(&s),
+            "\u{25cf} 1 working",
+            "the state word is the status"
+        );
+    }
+
+    #[test]
+    fn a_toast_rings_from_any_pane_and_carries_its_words() {
+        let s = Summary::build(
+            &[PaneFact {
+                toast: Some("tests done".to_string()),
+                ..pane(4, "sh", None)
+            }],
+            &[],
+        );
+        assert_eq!(
+            s.rings,
+            vec![Ring {
+                key: 4,
+                label: "sh".to_string(),
+                toast: Some("tests done".to_string())
+            }]
+        );
+        assert_eq!(state_text(&s), "\u{25cb} idle");
+    }
+
+    #[test]
+    fn diff_rings_a_bell_under_the_per_pane_cooldown() {
+        let mut e = Edges::default();
+        let quiet = Summary::build(&[pane(1, "b", Some(Status::Working))], &[]);
+        let rang = Summary::build(&[ringing(1, "b", Some(Status::Working))], &[]);
+        assert_eq!(
+            e.diff(&quiet, &rang, 0),
+            vec![Event::PaneRang {
+                key: 1,
+                label: "b".to_string(),
+                toast: None
+            }]
+        );
+        assert!(
+            e.diff(&quiet, &rang, COOLDOWN_MS - 1).is_empty(),
+            "a second bell inside the cooldown is not heard"
+        );
+        assert_eq!(e.diff(&quiet, &rang, COOLDOWN_MS).len(), 1);
+        // The cooldown is shared with the status ring: a pane that just rang
+        // does not ring again for asking, and one that rings as it asks is
+        // heard once, as the ask.
+        let asks = Summary::build(&[ringing(1, "b", Some(Status::WaitingApproval))], &[]);
+        assert!(
+            e.diff(&quiet, &asks, COOLDOWN_MS + 1).is_empty(),
+            "it rang a moment ago"
+        );
+        let ev = e.diff(&quiet, &asks, 2 * COOLDOWN_MS + 1);
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert!(matches!(ev[0], Event::PaneNeedsYou { .. }), "{ev:?}");
+    }
+
+    #[test]
+    fn tracker_toasts_the_panes_own_words_for_its_ring() {
+        let mut t = Tracker::new(setup(Notify::Both));
+        t.tick(Summary::default(), 0);
+        let said = Summary::build(
+            &[PaneFact {
+                toast: Some("build green".to_string()),
+                ..ringing(1, "builder", Some(Status::Working))
+            }],
+            &[],
+        );
+        let out = String::from_utf8(t.tick(said, 10)).unwrap();
+        assert!(
+            out.contains("\x07\x1b]9;atrium: builder \u{00b7} build green\x07"),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains(progress_osc(true)),
+            "a ring is not a needs state: {out:?}"
+        );
+        let bare = Summary::build(&[ringing(2, "lead", Some(Status::Working))], &[]);
+        let out = String::from_utf8(t.tick(bare, 20)).unwrap();
+        assert!(out.contains("\x1b]9;atrium: lead rang\x07"), "{out:?}");
+    }
+
+    #[test]
+    fn pane_badge_is_the_programs_title_trimmed_and_scrubbed() {
+        assert_eq!(pane_badge(None, "claude"), None);
+        assert_eq!(pane_badge(Some("  "), "claude"), None);
+        assert_eq!(
+            pane_badge(Some("claude"), "claude"),
+            None,
+            "the label says that"
+        );
+        assert_eq!(pane_badge(Some("Claude"), "claude"), None);
+        assert_eq!(
+            pane_badge(Some("C:\\WINDOWS\\system32\\cmd.exe"), "cmd"),
+            None,
+            "ConPTY's path to the program"
+        );
+        assert_eq!(
+            pane_badge(Some("\u{2733} fix tests"), "claude").as_deref(),
+            Some("\u{2733} fix tests")
+        );
+        assert_eq!(
+            pane_badge(Some("a\x07b\x1b]0;x\x07c"), "claude").as_deref(),
+            Some("a b ]0;x c"),
+            "controls become spaces; `]` is not one"
+        );
+        let long = "x".repeat(40);
+        let cut = pane_badge(Some(&long), "claude").unwrap();
+        assert_eq!(cut.chars().count(), PANE_BADGE_MAX);
+        assert!(cut.ends_with('\u{2026}'), "{cut:?}");
+        let exact = "y".repeat(PANE_BADGE_MAX);
+        assert_eq!(
+            pane_badge(Some(&exact), "claude").as_deref(),
+            Some(exact.as_str())
+        );
     }
 
     fn setup(notify: Notify) -> Setup {

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A pane's own title, bell and notification, from nativelite-vterm 0.5.6's
+  notices.** The emulator now reports what a program says rather than draws
+  (`vterm::Notice`: `OSC 0`/`2` titles with xterm's title stack, a bare
+  `BEL`, `OSC 9` toasts, `OSC 9;4` progress), read once a tick in the
+  attention phase, for every pane, tiled or passthrough. The pane's title is
+  its badge after the name in the tile label and the bar entry (`2:claude
+  [fix tests] ?`), scrubbed like every OSC payload, cut to 24 characters, and
+  left out when it only names the program again (ConPTY re-emits
+  `C:\WINDOWS\system32\cmd.exe` for a `cmd` pane). A `BEL` from a bound agent
+  pane, or an `OSC 9` notification from any pane, rings the host like a pane
+  newly waiting on you, under the same 30 s per-pane cooldown, so an agent
+  that rings as it asks is heard once; the notification's words become the
+  toast (`atrium: builder · build green`), and the title's state word does not
+  change, because a bell is a moment, not a state. A pane's progress report is
+  dropped: the host's tab indicator follows the fleet's state. Requires
+  nativelite-vterm 0.5.6.
+
 ## [0.45.1] - 2026-11-09
 
 ### Fixed
