@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   slower than 1 s, and prints the table `benches/README.md` records under
   "Soak". The 0.44.0 hold path had one e2e (a single waiter, one send) and no
   measurement of what eight waiters do to the process over time.
+- **Claude Code's own teams show their task list in the overview.** When a
+  claude pane leads one of Claude Code's agent teams (its teammates arrive as
+  atrium panes through the tmux shim), the overview (`Ctrl+A o`) lists the
+  team under the lead's row, one line per task: `[ ]` pending, `[~]` in
+  progress, `[x]` completed, with the owner and what still blocks it; a
+  teammate's row shows its current task as the caption when its mod gave
+  none. atrium derives the team's name from the lead's session id
+  (`session-` plus its first eight characters) and reads Claude Code's own
+  files under `~/.claude/teams/<team>/` and `~/.claude/tasks/<team>/`
+  (`$CLAUDE_CONFIG_DIR` honoured), only while the overview is open, at most
+  once a second, re-reading only a file whose stamp changed; it never writes
+  them. New `atrium::claude_teams` module.
 
 ## [0.45.1] - 2026-11-09
 

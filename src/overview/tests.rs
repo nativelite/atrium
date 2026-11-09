@@ -22,7 +22,152 @@ fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> Overv
         agent_id: 0,
         doing: None,
         colliding: false,
+        leads_team: None,
     }
+}
+
+/// A live Claude Code team as `atrium::claude_teams` would snapshot it: a lead
+/// and two teammates, one task in each state plus a blocked one.
+fn team_fixture() -> atrium::claude_teams::TeamState {
+    use atrium::claude_teams::{Member, Task, TaskStatus, TeamState};
+    let task = |id: &str, subject: &str, status: TaskStatus, owner: Option<&str>| Task {
+        id: id.into(),
+        subject: subject.into(),
+        status,
+        owner: owner.map(str::to_string),
+        blocked_by: Vec::new(),
+        active_form: None,
+    };
+    TeamState {
+        name: "session-9e251086".into(),
+        lead_agent_id: Some("team-lead@session-9e251086".into()),
+        members: ["team-lead", "builder", "writer"]
+            .iter()
+            .map(|n| Member {
+                name: n.to_string(),
+                agent_id: format!("{n}@session-9e251086"),
+            })
+            .collect(),
+        tasks: vec![
+            task(
+                "1",
+                "Parse the team config",
+                TaskStatus::InProgress,
+                Some("builder"),
+            ),
+            Task {
+                blocked_by: vec!["1".into()],
+                ..task("2", "Render the block", TaskStatus::Pending, None)
+            },
+            task("3", "Write the docs", TaskStatus::Completed, Some("writer")),
+        ],
+    }
+}
+
+/// Under the lead's row the overview lists its Claude Code team: a summary
+/// line, then one line per task with its mark, owner and what blocks it; a
+/// teammate without a mod caption is captioned with its current task's subject;
+/// the rows interleave with the agents without disturbing their indices.
+#[test]
+fn overview_panel_lists_the_lead_team_tasks_under_its_row() {
+    let bus = atrium::bus::Bus::new();
+    let teams = vec![team_fixture()];
+    let nodes = vec![
+        OverviewNode {
+            label: "lead".into(),
+            agent_id: 1,
+            leads_team: Some("session-9e251086".into()),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+        OverviewNode {
+            label: "builder".into(),
+            agent_id: 2,
+            depth: 1,
+            doing: team_caption("builder", Some("session-9e251086"), &teams),
+            ..ov_node(0, Some(agsess::Status::Working), false)
+        },
+        OverviewNode {
+            label: "writer".into(),
+            agent_id: 3,
+            depth: 1,
+            doing: team_caption("writer", Some("session-9e251086"), &teams),
+            action: "Bash cargo test".into(),
+            ..ov_node(0, Some(agsess::Status::Idle), false)
+        },
+    ];
+    let rows = overview_rows_with(&nodes, &teams);
+    // Agent0, Team summary, 3 tasks, Agent1, Agent2.
+    assert_eq!(
+        rows.len(),
+        7,
+        "one summary and three task rows under the lead"
+    );
+    assert!(matches!(
+        rows[1],
+        OvRow::Team {
+            team: 0,
+            task: None
+        }
+    ));
+    assert!(matches!(
+        rows[4],
+        OvRow::Team {
+            team: 0,
+            task: Some(2)
+        }
+    ));
+    assert!(matches!(rows[5], OvRow::Agent(1)));
+    // Without teams the rows are the agents alone (the lead still names one).
+    assert_eq!(overview_rows_with(&nodes, &[]).len(), 3);
+
+    let r = strip_csi(&render_overview_panel_with(
+        &[],
+        &bus,
+        &nodes,
+        &[],
+        &teams,
+        0,
+        24,
+        120,
+    ));
+    assert!(
+        r.contains("team session-9e251086  3 tasks  [ ]1 [~]1 [x]1"),
+        "summary line: {r}"
+    );
+    assert!(r.contains("[~] Parse the team config  (builder)"), "{r}");
+    assert!(
+        r.contains("[ ] Render the block  blocked by 1"),
+        "a pending task names what blocks it: {r}"
+    );
+    assert!(r.contains("[x] Write the docs  (writer)"), "{r}");
+    assert!(
+        r.contains("builder          working  — Parse the team config"),
+        "the teammate's caption is its task: {r}"
+    );
+    assert!(
+        r.contains("— Bash cargo test"),
+        "a teammate whose task is completed keeps the transcript's last action: {r}"
+    );
+    let lead_at = r.find("lead").unwrap();
+    let team_at = r.find("team session-").unwrap();
+    let builder_at = r.find("builder ").unwrap();
+    assert!(
+        lead_at < team_at && team_at < builder_at,
+        "block sits between lead and teammates"
+    );
+    // A completed task's owner has no current task; a stranger has none.
+    assert_eq!(team_caption("writer", None, &teams), None);
+    assert_eq!(team_caption("nobody", None, &teams), None);
+    assert_eq!(
+        team_caption("builder", Some("session-other"), &teams),
+        None,
+        "a teammate of another team is not captioned from this one"
+    );
+    assert_eq!(
+        team_caption("builder", None, &teams).as_deref(),
+        Some("Parse the team config"),
+        "with no --team-name any live team is consulted"
+    );
 }
 
 /// A collision lists the file and both panes by label, counts in the header,
@@ -165,7 +310,7 @@ fn window_agg_counts_by_status() {
 #[test]
 fn overview_rows_single_window_has_no_header() {
     let nodes = vec![ov_node(0, None, false), ov_node(0, None, false)];
-    let rows = overview_rows(&nodes);
+    let rows = overview_rows_with(&nodes, &[]);
     // Two agents, no group header (global counts already cover one fleet).
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| matches!(r, OvRow::Agent(_))));
@@ -178,7 +323,7 @@ fn overview_rows_multi_window_inserts_one_header_per_window() {
         ov_node(0, None, false),
         ov_node(1, None, false),
     ];
-    let rows = overview_rows(&nodes);
+    let rows = overview_rows_with(&nodes, &[]);
     // Header(w0), Agent0, Agent1, Header(w1), Agent2 = 5 rows.
     assert_eq!(rows.len(), 5);
     let headers: Vec<usize> = rows
