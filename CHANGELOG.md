@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-11-08
+
 ### Added
 - **The ctl channel wakes the run loop on connect, and `atrium ctl inbox
   --wait` is held until a delivery lands** (issue #15). The endpoint is bound
