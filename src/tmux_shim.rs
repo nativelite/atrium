@@ -725,9 +725,12 @@ impl Broker for NoBroker {
     }
 }
 
-/// Where the shim lives under atrium's per-user state root.
+/// Where the shim lives: beside the sessions store, under atrium's per-user
+/// state directory (`%LOCALAPPDATA%trium\shim`, `~/.local/state/atrium/shim`).
+/// `root` is [`crate::session_store::state_root`], the sessions directory
+/// itself, so the shim is its sibling and never a stray entry in the store.
 pub fn shim_dir(root: &Path) -> PathBuf {
-    root.join("shim")
+    root.parent().unwrap_or(root).join("shim")
 }
 
 /// The shim's file name on this platform.
@@ -1021,13 +1024,15 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let exe = root.join("atrium-fake.exe");
         std::fs::write(&exe, b"binary").unwrap();
-        let shim = ensure(&exe, &root).unwrap();
+        let sessions = root.join("sessions");
+        let shim = ensure(&exe, &sessions).unwrap();
+        assert_eq!(shim.parent().unwrap(), root.join("shim"));
         assert_eq!(
             shim.file_name().unwrap().to_str().unwrap(),
             shim_file_name()
         );
         assert_eq!(std::fs::read(&shim).unwrap(), b"binary");
-        let again = ensure(&exe, &root).unwrap();
+        let again = ensure(&exe, &sessions).unwrap();
         assert_eq!(again, shim);
         let _ = std::fs::remove_dir_all(&root);
     }
