@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-11-08
+
 ### Added
 - **No `settings.json` edit to see Claude Code's teammates.** A claude pane
   that carries `TMUX` (a ctl session with `teams` on) is launched with
