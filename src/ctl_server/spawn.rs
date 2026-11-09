@@ -111,7 +111,9 @@ pub(crate) fn spawn_worker_window(
 
 /// `ctl spawn --here`: tile the worker *beside* the caller, in the caller's own
 /// window, so a lead and its ICs sit in one view. Falls back to an error if the
-/// caller's pane can't be located (nothing to sit beside).
+/// caller's pane can't be located (nothing to sit beside). `--beside <pane>`
+/// anchors on that pane instead when it is in the caller's window (the tmux
+/// shim's `split-window -t %N`); otherwise the caller, and the reply says so.
 pub(crate) fn spawn_worker_here(
     cx: &mut CtlSession<'_>,
     sp: &atrium::ctl::SpawnReq,
@@ -136,6 +138,27 @@ pub(crate) fn spawn_worker_here(
     };
 
     let w = &mut windows[wi];
+    // The pane the worker lands next to: `--beside <pane>` when that pane is in
+    // the caller's window, else the caller itself. An anchor in another window
+    // would not be a split of this one, so it falls back and the reply says so
+    // rather than placing the worker somewhere the request did not name.
+    let mut beside_note: Option<String> = None;
+    let anchor_agent = match sp.beside {
+        Some(b) if w.panes.iter().any(|p| p.agent_id == AgentId(b)) => AgentId(b),
+        Some(b) => {
+            beside_note = Some(format!(
+                "--beside {b}: not a pane in the caller's window; placed beside the caller"
+            ));
+            caller_id
+        }
+        None => caller_id,
+    };
+    let note = match (note, beside_note.as_deref()) {
+        (Some(n), Some(b)) => Some(format!("{n}; {b}")),
+        (None, Some(b)) => Some(b.to_string()),
+        (n, None) => n.map(str::to_string),
+    };
+    let note = note.as_deref();
     let new_id = w.next_id;
     // Rough half-cell inner size; the caller resizes the window right after.
     let (pr, pc) = (
@@ -166,8 +189,9 @@ pub(crate) fn spawn_worker_here(
         Ok(mut pane) => {
             let reply = adopt_worker(&mut pane, sp, caller, new_depth, note);
             // Re-tile the window into a balanced near-square grid over all its
-            // panes (keeping their stable ids) with the worker BESIDE the caller,
-            // rather than splitting the caller alone or appending bottom-right.
+            // panes (keeping their stable ids) with the worker BESIDE the anchor
+            // (the caller, or `--beside`'s pane), rather than splitting the
+            // caller alone or appending bottom-right.
             // A plain `split_pane` each time stacks every `--here` worker into
             // one column, so N of them degrade to an unusable `1×N` strip;
             // re-gridding keeps 2→1×2, 4→2×2, 6→2×3, 12→3×4, … balanced, in the
@@ -178,7 +202,7 @@ pub(crate) fn spawn_worker_here(
             let anchor = w
                 .panes
                 .iter()
-                .find(|p| p.agent_id == caller_id)
+                .find(|p| p.agent_id == anchor_agent)
                 .map(|p| p.id)
                 .unwrap_or(w.tree.focus());
             let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();

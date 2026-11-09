@@ -894,9 +894,11 @@ fn a_workers_to_wakes_the_pane_that_spawned_it() {
 }
 
 /// atrium answering as tmux (`tmux_shim`): from inside a ctl pane, the very
-/// call Claude Code's teams backend makes (`split-window … -P -F '#{pane_id}'
-/// -- <cmd>`) opens a second pane beside the caller and prints its id, the
-/// pane list names both, and `kill-pane` is taken.
+/// calls Claude Code's teams backend makes open teammates and print their ids:
+/// the first split (`-t @0 -h -l 70%`, the window) lands beside the caller, a
+/// second split targeting that teammate (`-t %1 -v`, atrium issue #17) is
+/// taken and lands too, the pane list names all three, and `kill-pane` is
+/// taken. The `-l` size is accepted; atrium's grid is equal-size.
 #[test]
 fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     let (mut p, shell, flag) = spawn_atrium_ctl_shell();
@@ -921,7 +923,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     );
     p.write(
         format!(
-            "\"{atrium}\" --tmux-shim split-window -d -t @0 -h -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
+            "\"{atrium}\" --tmux-shim split-window -d -t @0 -h -l 70% -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
         )
         .as_bytes(),
     )
@@ -944,18 +946,53 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
         "the window lists the caller and the teammate: {:?}",
         String::from_utf8_lossy(&out)
     );
-    // The marker's typed form must not spell it (a tty echoes what is typed).
+    // The second teammate, as Claude Code asks for it: split the first
+    // teammate's pane (`-t %1 -v`). `%2/` is new output: the typed line
+    // spells `#{pane_id}/`.
+    p.write(
+        format!(
+            "\"{atrium}\" --tmux-shim split-window -d -t %1 -v -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"%2/", Duration::from_secs(30));
+    assert!(
+        contains(&out, b"%2/"),
+        "split-window -t %1 prints the second teammate's id: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(
+        format!("\"{atrium}\" --tmux-shim list-panes -t @0 -F #{{pane_id}}:#{{pane_title}}\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"%2:", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"%0:") && contains(&out, b"%1:") && contains(&out, b"%2:"),
+        "the window lists the caller and both teammates: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Both teammates are killed before the marker, so it echoes into a pane
+    // that is the whole window again: at three panes the caller is a third of
+    // 100 columns and the repaint fragments a word in the pty stream. The
+    // marker's typed form must not spell it (a tty echoes what is typed).
     let marker_cmd = if cfg!(windows) {
         "echo kill-ok-ma^rker"
     } else {
         "echo kill-ok-ma\"\"rker"
     };
-    p.write(format!("\"{atrium}\" --tmux-shim kill-pane -t %1 && {marker_cmd}\r\n").as_bytes())
-        .unwrap();
+    p.write(
+        format!(
+            "\"{atrium}\" --tmux-shim kill-pane -t %2 && \"{atrium}\" --tmux-shim kill-pane -t %1 && {marker_cmd}\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
     let out = read_until(&mut p, b"kill-ok-marker", Duration::from_secs(20));
     assert!(
         contains(&out, b"kill-ok-marker"),
-        "kill-pane exits 0: {:?}",
+        "both kill-panes exit 0: {:?}",
         String::from_utf8_lossy(&out)
     );
     p.write(b"q").unwrap();

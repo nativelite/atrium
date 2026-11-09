@@ -163,6 +163,8 @@ impl Broker for CtlBroker {
         &mut self,
         here: bool,
         focus: bool,
+        beside: Option<usize>,
+        size: Option<&str>,
         role: Option<&str>,
         argv: &[String],
     ) -> Result<usize, String> {
@@ -172,6 +174,19 @@ impl Broker for CtlBroker {
             // tmux's `-d`: the lead's human keeps the keyboard.
             args.push("--no-focus");
         }
+        // `-t %N`: Claude Code's second and later teammates split an existing
+        // teammate's pane; the new pane goes beside that one, not the lead.
+        let beside = beside.map(|b| b.to_string());
+        if let Some(b) = beside.as_deref() {
+            args.push("--beside");
+            args.push(b);
+        }
+        // `-l 70%` is accepted and ignored: atrium's split tree has no size on
+        // a node (`layout::Node::Split` is `dir`, `first`, `second`) and lays
+        // panes out proportionally to leaf count, and `--here` re-grids the
+        // whole window on every spawn, so a ratio set on the first split would
+        // be rebuilt away by the second. The teammate gets an equal share.
+        let _ = size;
         if let Some(r) = role {
             args.push("--role");
             args.push(r);

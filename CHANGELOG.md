@@ -20,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other refusal; it used to say `"error"` (atrium issue #14).
 
 ### Added
+- **`atrium ctl spawn --here --beside <pane>`, and the tmux shim honours
+  `split-window -t %N`.** Claude Code's first teammate splits the window
+  (`-t @0 -h -l 70%`) and each later one splits an existing teammate's pane
+  (`-t %N -v|-h`); the shim dropped the target and placed every teammate
+  beside the lead. `nativelite-tmuxproto` 0.3.0 carries the target and the
+  size, and the shim now sends `--beside <agent id>` for a pane target, so the
+  re-grid anchors on that teammate; a pane outside the caller's window falls
+  back to the caller and the reply's `note` says so. The `-l` size is
+  accepted and ignored: atrium's split tree has no size on a node and `--here`
+  re-grids the whole window on every spawn, so every pane gets an equal share
+  (atrium issue #17).
 - **`atrium ctl spawn --here --no-focus`, and the tmux shim honours `-d`.** A
   `--here` spawn focused the new pane, so a Claude Code lead spawning a
   teammate moved its human's keyboard into the teammate; tmux's `-d`, which

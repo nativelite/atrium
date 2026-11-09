@@ -417,6 +417,12 @@ pub struct SpawnReq {
     /// keeps it where it is: what the tmux shim sends for Claude Code's `-d`,
     /// so a lead spawning a teammate does not move its human into it.
     pub focus: bool,
+    /// `--here --beside <pane>`: the agent id of the pane to tile the worker
+    /// next to, instead of the caller. What the tmux shim sends for a
+    /// `split-window -t %N`: Claude Code's second and later teammates split an
+    /// existing teammate's pane. The pane must be in the caller's window; one
+    /// that is not falls back to the caller, said in the reply's `note`.
+    pub beside: Option<usize>,
     /// The credential identity **name** to run the worker under (`--identity X`),
     /// if any. Subject to delegation scoping ([`delegation_allowed`]): a worker
     /// may only pass down an identity it itself holds. `None` = no identity
@@ -453,6 +459,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
             let focus = v.get("focus").and_then(Value::as_bool).unwrap_or(true);
+            let beside = v
+                .get("beside")
+                .and_then(Value::as_i64)
+                .and_then(|n| usize::try_from(n).ok());
             let identity = v
                 .get("identity")
                 .and_then(Value::as_str)
@@ -479,6 +489,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 argv,
                 new_window,
                 focus,
+                beside,
                 identity,
                 mode,
                 worktree: v

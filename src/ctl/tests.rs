@@ -1060,3 +1060,48 @@ fn spawn_no_focus_parses_and_defaults_to_focus() {
         other => panic!("{other:?}"),
     }
 }
+
+/// `spawn --here --beside 4` names the pane to tile next to (the tmux shim's
+/// `split-window -t %4`); it is a number, it needs `--here`, and without it the
+/// request carries no anchor so the server falls back to the caller.
+#[test]
+fn spawn_beside_parses_a_pane_id_and_needs_here() {
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let line = build_request(
+        &args(&[
+            "spawn",
+            "--here",
+            "--beside",
+            "4",
+            "--no-focus",
+            "--",
+            "claude",
+        ]),
+        Some(3),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => {
+            assert!(!sp.new_window);
+            assert!(!sp.focus);
+            assert_eq!(sp.beside, Some(4));
+        }
+        other => panic!("{other:?}"),
+    }
+    let line = build_request(&args(&["spawn", "--here", "--", "claude"]), Some(3)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => assert_eq!(sp.beside, None, "no --beside: beside the caller"),
+        other => panic!("{other:?}"),
+    }
+    let err = build_request(
+        &args(&["spawn", "--here", "--beside", "dev_1", "--", "claude"]),
+        Some(3),
+    )
+    .unwrap_err();
+    assert!(err.message().contains("not a pane id"), "{err:?}");
+    let err =
+        build_request(&args(&["spawn", "--beside", "4", "--", "claude"]), Some(3)).unwrap_err();
+    assert!(err.message().contains("--here"), "{err:?}");
+    let err = build_request(&args(&["spawn", "--here", "--beside"]), Some(3)).unwrap_err();
+    assert!(err.message().contains("needs a pane id"), "{err:?}");
+}
