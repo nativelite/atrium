@@ -973,7 +973,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
         String::from_utf8_lossy(&out)
     );
     // Then the broker path: the caller alone, as `%0`.
-    p.write(format!("\"{atrium}\" --tmux-shim list-panes -F #{{pane_id}}/\r\n").as_bytes())
+    p.write(format!("\"{atrium}\" --tmux-shim list-panes -F \"#{{pane_id}}/\"\r\n").as_bytes())
         .unwrap();
     let out = read_until(&mut p, b"%0/", Duration::from_secs(45));
     assert!(
@@ -983,7 +983,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     );
     p.write(
         format!(
-            "\"{atrium}\" --tmux-shim split-window -d -t @0 -h -l 70% -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
+            "\"{atrium}\" --tmux-shim split-window -d -t @0 -h -l 70% -P -F \"#{{pane_id}}/\" -- {shell} {flag}\r\n"
         )
         .as_bytes(),
     )
@@ -996,8 +996,10 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     );
     // `-d` was passed, so the keyboard stayed with the caller: it asks next.
     p.write(
-        format!("\"{atrium}\" --tmux-shim list-panes -t @0 -F #{{pane_id}}:#{{pane_title}}\r\n")
-            .as_bytes(),
+        format!(
+            "\"{atrium}\" --tmux-shim list-panes -t @0 -F \"#{{pane_id}}:#{{pane_title}}\"\r\n"
+        )
+        .as_bytes(),
     )
     .unwrap();
     let out = read_until(&mut p, b"%1:", Duration::from_secs(20));
@@ -1011,7 +1013,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     // spells `#{pane_id}/`.
     p.write(
         format!(
-            "\"{atrium}\" --tmux-shim split-window -d -t %1 -v -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
+            "\"{atrium}\" --tmux-shim split-window -d -t %1 -v -P -F \"#{{pane_id}}/\" -- {shell} {flag}\r\n"
         )
         .as_bytes(),
     )
@@ -1023,8 +1025,10 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
         String::from_utf8_lossy(&out)
     );
     p.write(
-        format!("\"{atrium}\" --tmux-shim list-panes -t @0 -F #{{pane_id}}:#{{pane_title}}\r\n")
-            .as_bytes(),
+        format!(
+            "\"{atrium}\" --tmux-shim list-panes -t @0 -F \"#{{pane_id}}:#{{pane_title}}\"\r\n"
+        )
+        .as_bytes(),
     )
     .unwrap();
     let out = read_until(&mut p, b"%2:", Duration::from_secs(20));
