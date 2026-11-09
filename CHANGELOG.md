@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-11-08
+
 ### Added
 - **Claude Code's own agent teams land as atrium panes.** Claude Code's
   split-pane teams do not draw panes: the lead runs a program named `tmux`
