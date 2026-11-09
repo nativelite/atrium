@@ -102,7 +102,7 @@
 //! # Where it runs, and where it must not
 //!
 //! At watchdog-death and on an explicit `atrium reap` (plus `--reap-orphans` at
-//! startup, opt-in for this first release). **Never on the 15 ms event loop**: a
+//! startup, opt-in for this first release). **Never on the 20 ms event loop**: a
 //! prior version of this codebase ran `ps` per ancestry hop and the resulting
 //! process storm showed up as timing flakiness in unrelated tests.
 

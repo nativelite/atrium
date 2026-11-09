@@ -118,12 +118,39 @@ a 1.8x gap, from 9x at the 0.34.0 baseline.
 That remaining gap is now explained, and it is not overhead. atrium does
 everything `cat` does *and* runs the bytes through the emulator, one after the
 other: 1/173 + 1/137 predicts 76 MB/s, which is what it measures. Going faster
-means making the emulator cheaper (parsing is 81% of it — the tokens allocate a
-`String` per text run and two `Vec`s per CSI) or overlapping the emulator with
-the write instead of doing them in series. Neither is a small change, and
-nothing in the pipeline is being wasted today.
+means making the emulator cheaper or overlapping the emulator with the write
+instead of doing them in series. (When this was written, parsing was 81% of
+the emulator's cost, with a `String` per text run and two `Vec`s per CSI;
+`nativelite-ansi` 0.4 since moved to borrowed events with no allocation per
+token, and the feed figures below reflect that.) Nothing in the pipeline is
+being wasted today.
 
 Feed cost no longer grows with the grid. The flood figure is the range over
 five runs on a busy machine; `cat` measured 85-160 MB/s over the same runs, so
 treat the remaining gap as roughly 3x, not a precise ratio. Key echo (p50 0.30-0.44
 ms, p99 0.59-0.88 ms) and idle CPU (0.6-0.8%) are unchanged.
+
+## 0.42.0 (2026-11-08), Windows
+
+Measured on the release tree at `810eaa6` after ctl requests stopped forcing a
+full repaint (8011dd9). Same machine class as the baseline; one run, so treat
+the figures as a snapshot, not a trend.
+
+| scenario | echo p50 ms | p90 ms | p99 ms | max ms | idle CPU % | flood MB/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| bare cmd | 0.17 | 0.28 | 0.62 | 0.62 | 0.00 | 386 |
+| atrium, 1 pane | 0.36 | 1.10 | 4.02 | 15.87 | 0.93 | 94 |
+| atrium, 8 tiled panes | 1.31 | 15.67 | 16.13 | 16.33 | 1.71 | 483 (total) |
+
+Emulator feed, in process: 569 MB/s at 24x80, 807 MB/s at 40x160, 803 MB/s at
+60x240 (was 173 MB/s at 40x160 in 0.35.1).
+
+What this does and does not show:
+
+- The 8-pane p90 sits on the Windows console host's ~16 ms frame, as the
+  0.35.0 notes describe; the Windows flood number mostly measures that host.
+  Use the Linux rows for atrium's own throughput.
+- **The repaint fix is not exercised by this harness.** No scenario issues ctl
+  requests, so the clear-per-poll it removed never appears in these rows. A
+  scenario that runs a mod-like `inbox` poll against eight panes is the honest
+  measurement and is tracked under atrium issue #21.

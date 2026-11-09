@@ -151,3 +151,30 @@ fn collect_log_merges_bus_and_board_in_time_order() {
         .any(|r| r.who == "lead" && r.text.contains("title")));
     assert!(rows.iter().any(|r| r.who == "ada" && r.text.contains("ui")));
 }
+
+#[test]
+fn redraw_in_place_clears_each_written_row_to_eol_and_blanks_the_rest() {
+    let out = redraw_in_place("[?25l[1;1Htitle[3;1Hbody", 4);
+    assert!(!out.contains("[2J"));
+    assert!(out.contains("[1;1Htitle[K"), "{out:?}");
+    assert!(out.contains("[3;1Hbody[K"), "{out:?}");
+    assert!(out.contains("[2;1H[K"), "{out:?}");
+    assert!(out.ends_with("[4;1H[K"), "{out:?}");
+    assert!(
+        !out.contains("[1;1H[K"),
+        "a written row is not blanked: {out:?}"
+    );
+}
+
+#[test]
+fn redraw_in_place_leaves_sgr_and_mid_row_moves_alone() {
+    let out = redraw_in_place("[1;1H[1;38;5;37mx[0m[1;10Hy", 1);
+    assert_eq!(out, "[1;1H[1;38;5;37mx[0m[K[1;10Hy[K");
+}
+
+#[test]
+fn the_overlays_no_longer_clear_the_screen() {
+    let board = atrium::board::Board::default();
+    let bus = atrium::bus::Bus::default();
+    assert!(!render_board_panel(&board, &bus, 24, 80, 0, 0).contains("[2J"));
+}

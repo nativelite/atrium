@@ -22,7 +22,7 @@ pub(crate) fn render_board_panel(
     feed_scroll: usize,
     decision_sel: usize,
 ) -> String {
-    let mut out = String::from("\x1b[?25l\x1b[2J");
+    let mut out = String::from("\x1b[?25l");
     let decisions = bus.pending_decisions();
     let has_detail = !decisions.is_empty();
     let sel = decision_sel.min(decisions.len().saturating_sub(1));
@@ -293,7 +293,7 @@ pub(crate) fn render_log_panel(
     now_ms: u64,
 ) -> String {
     let Coord { world, board, bus } = coord;
-    let mut out = String::from("\x1b[?25l\x1b[2J");
+    let mut out = String::from("\x1b[?25l");
     let log = collect_log(windows, world, board, bus);
     out.push_str(&format!(
         "\x1b[1;1H\x1b[1;38;5;37m  activity log\x1b[0m  \x1b[2m(Ctrl+A l to close · live · {} events · PgUp/PgDn scroll)\x1b[0m",
@@ -641,11 +641,66 @@ pub(crate) fn draw_startup_splash(
     // flushes once. `?25l` hides the cursor so it doesn't blink next to the
     // spinner; the agent restores it (`?25h`) at the handoff in the drain.
     let top = (rows.saturating_sub(lines.len()) / 2).max(1);
-    let _ = write!(out, "\x1b[?25l\x1b[2J");
+    let _ = write!(out, "\x1b[?25l");
     for (i, (line, w)) in lines.iter().enumerate() {
         let col = (cols.saturating_sub(*w) / 2) + 1;
         let _ = write!(out, "\x1b[{};{col}H{line}", top + i);
     }
+}
+
+/// Turn a panel frame written for a cleared screen into one that redraws in
+/// place. Every row the frame positions to (`ESC [ r ; c H`) gets `ESC [ K`
+/// (clear to end of line) after its content, and every screen row the frame
+/// never positioned to is blanked, so stale content is wiped without a
+/// full-screen `2J`. The overview has drawn this way since 0.3x; the board, log
+/// and ask overlays cleared the screen on every repaint, which the Windows
+/// console host turns into a visible flash and a ~16 ms frame.
+pub(crate) fn redraw_in_place(frame: &str, rows: u16) -> String {
+    let rows = rows as usize;
+    let mut out = String::with_capacity(frame.len() + rows * 10);
+    let mut written = vec![false; rows + 1];
+    let mut open_row = false;
+    let mut rest = frame;
+    while let Some(i) = rest.find("[") {
+        let after = &rest[i + 2..];
+        let end = after
+            .find(|c: char| !(c.is_ascii_digit() || c == ';'))
+            .unwrap_or(after.len());
+        let params = &after[..end];
+        let is_cup = after[end..].starts_with('H') && params.contains(';');
+        if !is_cup {
+            out.push_str(&rest[..i + 2]);
+            rest = &rest[i + 2..];
+            continue;
+        }
+        out.push_str(&rest[..i]);
+        if open_row {
+            out.push_str("[K");
+        }
+        if let Some(r) = params
+            .split(';')
+            .next()
+            .and_then(|r| r.parse::<usize>().ok())
+        {
+            if (1..=rows).contains(&r) {
+                written[r] = true;
+            }
+        }
+        open_row = true;
+        let seq = i + 2 + end + 1;
+        out.push_str(&rest[i..seq]);
+        rest = &rest[seq..];
+    }
+    out.push_str(rest);
+    if open_row {
+        out.push_str("[K");
+    }
+    for (r, done) in written.iter().enumerate().skip(1) {
+        if !done {
+            out.push_str(&format!("[{r};1H[K"));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

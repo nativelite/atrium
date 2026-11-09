@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The board, log and ask overlays redraw in place.** Each repaint began with
+  a full-screen clear (`2J`) and a redraw from scratch, which the Windows
+  console host shows as a flash and charges as a ~16 ms frame; the overview
+  had already drawn in place. A panel frame now passes through
+  `redraw_in_place` (`src/panels.rs`): every positioned row is cleared to the
+  end of the line after its content and every row the frame did not touch is
+  blanked, so stale content is wiped without clearing the screen (atrium
+  issue #21).
+- **Comments said the run loop ticks every 15 ms; it has ticked every 20 ms
+  since 0.34.0** (`src/ipc.rs`, `src/ipc/wire.rs`, `src/orphan.rs`,
+  `src/signals.rs`, the ipc tests). `benches/README.md` no longer describes
+  the pre-0.4 ansi parser as current, and records a 0.42.0 Windows snapshot
+  with what the harness does not measure (the repaint fix has no scenario yet).
+
 ## [0.42.0] - 2026-11-08
 
 ### Added

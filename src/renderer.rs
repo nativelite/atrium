@@ -241,13 +241,16 @@ impl Renderer {
             // ticks leave the panel steady; the bar still paints below.
             if force_repaint {
                 frame.extend_from_slice(
-                    render_board_panel(
-                        board,
-                        bus,
+                    redraw_in_place(
+                        &render_board_panel(
+                            board,
+                            bus,
+                            rows,
+                            cols,
+                            views.feed_scroll,
+                            views.decision_sel,
+                        ),
                         rows,
-                        cols,
-                        views.feed_scroll,
-                        views.decision_sel,
                     )
                     .as_bytes(),
                 );
@@ -259,7 +262,8 @@ impl Renderer {
             if force_repaint {
                 match ask {
                     Some(a) => frame.extend_from_slice(
-                        crate::ask_panel::render_ask_panel(a, rows, cols).as_bytes(),
+                        redraw_in_place(&crate::ask_panel::render_ask_panel(a, rows, cols), rows)
+                            .as_bytes(),
                     ),
                     None => views.ask = false,
                 }
@@ -271,7 +275,11 @@ impl Renderer {
             if force_repaint {
                 let now = agsess::sessions::now_ms();
                 frame.extend_from_slice(
-                    render_log_panel(windows, coord, rows, cols, views.log_scroll, now).as_bytes(),
+                    redraw_in_place(
+                        &render_log_panel(windows, coord, rows, cols, views.log_scroll, now),
+                        rows,
+                    )
+                    .as_bytes(),
                 );
             }
         } else if windows[active].tiled() {

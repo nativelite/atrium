@@ -62,7 +62,7 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
 /// Render the ask overlay: the question, then the reply or a waiting line.
 /// Absolute CUP per line; the bar row is left for the bar.
 pub(crate) fn render_ask_panel(ask: &AskState, rows: u16, cols: u16) -> String {
-    let mut out = String::from("\x1b[?25l\x1b[2J");
+    let mut out = String::from("\x1b[?25l");
     out.push_str(&format!(
         "\x1b[1;1H\x1b[1;38;5;37m  asked {}\x1b[0m  \x1b[2m(ask #{} · any key closes · atrium ctl asked {} {} reads it again)\x1b[0m",
         ask.label,

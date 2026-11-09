@@ -74,7 +74,7 @@ pub const REPLY_STALL: Duration = Duration::from_secs(5);
 /// that re-arms is how a dripping server held `atrium ctl` open forever.
 ///
 /// 30 s, and the number is measured rather than wished for. atrium hands a
-/// parked reply to the kernel once per 15 ms run-loop tick, one socket
+/// parked reply to the kernel once per 20 ms run-loop tick, one socket
 /// buffer at a time; on this mac that delivers 120 623 bytes (a real `ctl
 /// audit`) in 324 ms, 1 MB in 2.53 s and 4 MiB in 10.59 s — about 400 KB/s.
 /// A full [`MAX_REPLY`] therefore needs roughly 21 s of honest transfer, so
@@ -84,7 +84,7 @@ pub const REPLY_STALL: Duration = Duration::from_secs(5);
 /// endpoint, which cannot exceed it at all.
 pub const REPLY_DEADLINE: Duration = Duration::from_secs(30);
 /// How long a client naps between non-blocking attempts. Well under the
-/// 15 ms tick, so it costs no round trip in practice.
+/// 20 ms tick, so it costs no round trip in practice.
 pub const CLIENT_POLL: Duration = Duration::from_millis(2);
 /// How often the server re-checks that its endpoint is still its own.
 ///
@@ -92,7 +92,7 @@ pub const CLIENT_POLL: Duration = Duration::from_millis(2);
 /// unlinks it, binds their own, harvests a token and renames the original
 /// back restores the exact `(dev, ino)` and slips through the window. 100 ms
 /// keeps that window small — a `stat` is a couple of microseconds against a
-/// 15 ms tick — without pretending it is closed.
+/// 20 ms tick — without pretending it is closed.
 pub const ENDPOINT_CHECK_EVERY: Duration = Duration::from_millis(100);
 /// How often the server may report refused peers. The report used to be an
 /// unconditional `eprint!` inside the accept loop, i.e. an unbounded

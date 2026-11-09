@@ -13,7 +13,7 @@
 //! The fix is deliberately minimal. The handler does exactly one thing — a
 //! relaxed atomic store — which is async-signal-safe; it emphatically does not
 //! allocate, lock, or write to the terminal. The event loop polls stdin on a
-//! 15 ms timeout, so it observes the flag almost immediately and then leaves
+//! 20 ms timeout, so it observes the flag almost immediately and then leaves
 //! through its **normal** path, meaning the existing teardown does the work. No
 //! second cleanup path to keep in sync with the first.
 

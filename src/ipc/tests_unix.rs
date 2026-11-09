@@ -858,7 +858,7 @@ fn a_closed_peer_breaks_setsockopt_but_not_the_buffered_reply() {
 ///
 /// So: a client that sends a real request and then reads NOTHING, ever,
 /// while atrium tries to hand it a reply far larger than one send buffer. Both
-/// `poll()` and `respond()` must come back inside a fraction of one 15 ms
+/// `poll()` and `respond()` must come back inside a fraction of one 20 ms
 /// tick, every tick, for the whole of `WRITE_STALL` — and then the hopeless
 /// connection must be retired instead of held forever.
 #[cfg(unix)]

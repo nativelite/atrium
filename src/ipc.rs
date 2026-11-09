@@ -10,7 +10,7 @@
 //!   `ATRIUM_CTL` into every pane it spawns.
 //! * [`Listener::bind`] / [`Listener::poll`] / [`Listener::respond`] — the
 //!   server side. `poll` is **non-blocking**: it returns `Ok(None)` when no
-//!   request is ready, so it fits the 15 ms run-loop tick with no thread. One
+//!   request is ready, so it fits the 20 ms run-loop tick with no thread. One
 //!   request is handed out at a time — the caller must
 //!   [`respond`](Listener::respond) before the next `poll` yields another — but
 //!   several half-open clients are accepted and parked concurrently, so no
