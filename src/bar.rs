@@ -60,6 +60,10 @@ pub struct PaneInfo {
     /// the entry (`1:claude:lead`) so a decision's `from=lead` maps to a window
     /// number at a glance. `None` (manual panes, shells) ⇒ just `N:title`.
     pub role: Option<String>,
+    /// The pane's own title, as its program set it (`OSC 0`/`2`), already
+    /// scrubbed and cut by `attention::pane_badge`. Rendered as ` [title]`
+    /// after the name, before the marker: `1:claude:lead [fix tests]*`.
+    pub badge: Option<String>,
 }
 
 /// The color role of a bar segment. Text is identical to [`bar_text`]; only the
@@ -120,8 +124,13 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
             Some(r) if !r.is_empty() && *r != p.title => format!("{}:{}", p.title, r),
             _ => p.title.clone(),
         };
+        // The program's own title, when it set one, in brackets after the name.
+        let own = match &p.badge {
+            Some(b) => format!(" [{b}]"),
+            None => String::new(),
+        };
         segs.push(seg(
-            format!("| {}:{}{} ", i + 1, name, mark),
+            format!("| {}:{}{}{} ", i + 1, name, own, mark),
             Role::Entry(state),
         ));
         // The identity name-tag rides next to the window entry — the name only,
@@ -289,6 +298,7 @@ mod tests {
             attention: Attention::from_facts(false, false, activity),
             identity: None,
             role: None,
+            badge: None,
         }
     }
 
@@ -347,6 +357,36 @@ mod tests {
     }
 
     #[test]
+    fn a_panes_own_title_is_a_bracketed_badge_before_the_marker() {
+        // The program's title rides after the name (and the role) and before
+        // the state marker; a pane without one is unchanged.
+        let mut agent = pane("claude", true, false);
+        agent.role = Some("lead".into());
+        agent.badge = crate::attention::pane_badge(Some("fix tests"), "claude");
+        let plain = pane("cmd", false, false);
+        let text = bar_text(&[agent, plain], 80, "");
+        assert!(text.contains("1:claude:lead [fix tests]*"), "{text}");
+        assert!(
+            text.contains("2:cmd-"),
+            "no brackets without a title: {text}"
+        );
+        // Cut by `pane_badge`, and the bar still truncates to its width.
+        let mut long = pane("claude", true, false);
+        long.badge = crate::attention::pane_badge(Some(&"t".repeat(40)), "claude");
+        let text = bar_text(&[long], 80, "");
+        assert!(
+            text.contains(&format!("1:claude [{}\u{2026}]*", "t".repeat(23))),
+            "{text}"
+        );
+        assert_eq!(
+            bar_text(&[pane("claude", true, false)], 12, "")
+                .chars()
+                .count(),
+            12
+        );
+    }
+
+    #[test]
     fn brand_is_a_filled_bold_chip() {
         let s = role_style(&Role::Brand);
         assert_eq!(s.bg, crate::theme::BRAND_BG);
@@ -363,6 +403,7 @@ mod tests {
             attention: Attention::from_facts(exited, false, activity),
             identity: None,
             role: None,
+            badge: None,
         }
     }
 
@@ -374,6 +415,7 @@ mod tests {
             attention: Attention::Waiting,
             identity: None,
             role: None,
+            badge: None,
         }
     }
 

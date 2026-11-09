@@ -122,6 +122,11 @@ pub struct PaneView<'a> {
     /// words), drawn dim after the title when columns remain. Never any
     /// transcript text: the mod composes it from the tool it is running.
     pub caption: Option<&'a str>,
+    /// The pane's own title, as the program set it (`OSC 0`/`2`), already
+    /// scrubbed and cut by [`crate::attention::pane_badge`]; drawn as
+    /// `[title]` after the name. `None` when the program set none or it only
+    /// repeats the program.
+    pub badge: Option<String>,
 }
 
 impl PaneView<'_> {
@@ -395,10 +400,17 @@ fn draw_border(master: &mut Screen, p: &PaneView, rows: usize, cols: usize) {
             Some(role) if !role.is_empty() => crate::fleet::sanitize(role),
             _ => p.title.to_string(),
         };
+        // The program's own title, when it set one, in brackets after the name:
+        // `┌ 2:claude [fix tests] ? ──`. Status markers stay last.
+        let own = match &p.badge {
+            Some(b) => format!("[{b}] "),
+            None => String::new(),
+        };
         let label = format!(
-            " {}:{} {}{}",
+            " {}:{} {}{}{}",
             p.index,
             name,
+            own,
             p.title_badge(),
             p.collision_badge()
         );
@@ -517,6 +529,7 @@ mod tests {
             role: None,
             painted: !screen_is_blank(screen),
             caption: None,
+            badge: None,
         }
     }
 
@@ -544,6 +557,7 @@ mod tests {
             role: None,
             painted: !screen_is_blank(screen),
             caption: None,
+            badge: None,
         }
     }
 
@@ -694,6 +708,7 @@ mod tests {
             role: None,
             painted: !screen_is_blank(screen),
             caption: None,
+            badge: None,
         }
     }
 
@@ -985,6 +1000,78 @@ mod tests {
         // Title badge: " 2:claude ? " appears in the top edge.
         let top: String = (1..14).map(|c| m.cell(0, c).ch).collect();
         assert!(top.starts_with(" 2:claude ? "), "top edge was {top:?}");
+    }
+
+    /// The program's own title sits in brackets after the name and before the
+    /// status marker; a long one arrives already cut by `pane_badge`, and the
+    /// label is still truncated to the box like any other.
+    #[test]
+    fn a_panes_own_title_is_a_bracketed_badge_before_the_marker() {
+        let inner = filled(3, 30, ' ');
+        let rect = Rect {
+            row: 0,
+            col: 0,
+            rows: 5,
+            cols: 32,
+        };
+        let mut v = agent_view(
+            &inner,
+            rect,
+            2,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::WaitingApproval,
+        );
+        v.badge = crate::attention::pane_badge(Some("fix tests"), "claude");
+        let m = compose(5, 32, &[v], 0);
+        let top: String = (1..31).map(|c| m.cell(0, c).ch).collect();
+        assert!(
+            top.starts_with(" 2:claude [fix tests] ? "),
+            "top edge was {top:?}"
+        );
+        // Cut by `pane_badge`: 23 characters and an ellipsis, then the marker
+        // (a 39-column label, so a box wide enough to hold it whole).
+        let wide = filled(3, 44, ' ');
+        let mut v = agent_view(
+            &wide,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 46,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+            agsess::Status::Working,
+        );
+        v.badge = crate::attention::pane_badge(Some(&"t".repeat(40)), "claude");
+        let m = compose(5, 46, &[v], 0);
+        let top: String = (1..45).map(|c| m.cell(0, c).ch).collect();
+        assert_eq!(
+            top.trim_end_matches('\u{2500}'),
+            format!(" 2:claude [{}\u{2026}] ~ ", "t".repeat(23)),
+            "top edge was {top:?}"
+        );
+        // A narrow box truncates the label and keeps the corner.
+        let narrow = filled(3, 10, ' ');
+        let mut v = view(
+            &narrow,
+            Rect {
+                row: 0,
+                col: 0,
+                rows: 5,
+                cols: 12,
+            },
+            2,
+            "claude",
+            PaneState::Idle,
+        );
+        v.badge = Some("fix tests".to_string());
+        let m = compose(5, 12, &[v], 0);
+        let top: String = (1..11).map(|c| m.cell(0, c).ch).collect();
+        assert_eq!(top, " 2:claude ", "top edge was {top:?}");
+        assert_eq!(m.cell(0, 11).ch, TOP_RIGHT, "the corner survives");
     }
 
     #[test]

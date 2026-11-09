@@ -239,7 +239,7 @@ impl RunState<'_> {
         //     built from the facts the bar uses, written right before the frame
         //     so the bytes ride the same console write. Empty most ticks.
         {
-            let facts = attention_facts(&self.windows, &self.world);
+            let facts = attention_facts(&mut self.windows, &self.world);
             let human: Vec<u64> = self
                 .bus
                 .pending_decisions()

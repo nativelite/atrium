@@ -372,6 +372,11 @@ pub(crate) fn bar_infos(
         .enumerate()
         .map(|(i, w)| PaneInfo {
             title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
+            // The pane's own title (`OSC 0`/`2`, kept by its emulator), as
+            // its badge; never when it only repeats the program.
+            badge: w
+                .bar_pane()
+                .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
             active: i == active,
             // A window is "waiting" when a bound agent pane in it is blocked
             // on the human (§4.2 rung 3). Status only.
@@ -399,20 +404,61 @@ pub(crate) fn bar_infos(
 /// The bar note for open `decision_needed` escalations the human must answer —
 /// empty when there are none. A decision addressed to a live teammate
 /// (`to=<role>`) is that agent's to answer and is not counted.
+/// What a pane's program said since the last tick, folded from its emulator's
+/// notices (`vterm::Notice`, 0.5.6): its title, whether it rang, and its last
+/// notification. Read by [`pane_notices`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PaneNotices {
+    /// The title the program set (`OSC 0`/`2`, or a title-stack restore), as
+    /// the emulator keeps it; not only since the last tick.
+    pub(crate) title: Option<String>,
+    /// A `BEL` on its own since the last tick (bells in a row count once).
+    pub(crate) bell: bool,
+    /// The last `OSC 9 ; text` since the last tick.
+    pub(crate) toast: Option<String>,
+}
+
+/// Drain the pane's emulator notices into a [`PaneNotices`]. The emulator is
+/// fed in both drains ([`drain_active_window`], [`drain_background_windows`]),
+/// tiled or passthrough, so this sees what every pane says; it holds at most
+/// 64 notices between reads and the loop reads once a tick (phase 5c). A
+/// `Progress` notice is dropped: atrium drives the host's own indicator from
+/// the fleet's state, not from one pane's.
+pub(crate) fn pane_notices(pane: &mut Pane) -> PaneNotices {
+    let mut n = PaneNotices::default();
+    if pane.term.has_notices() {
+        for notice in pane.term.take_notices() {
+            match notice {
+                vterm::Notice::Bell => n.bell = true,
+                vterm::Notice::Toast(text) => n.toast = Some(text),
+                vterm::Notice::Title(_) | vterm::Notice::Progress { .. } => {}
+            }
+        }
+    }
+    n.title = pane.term.title().map(str::to_string);
+    n
+}
+
 /// What `attention` needs of every pane: a stable key, a label (role, else
-/// title), whether it exited, and its bound agent's status.
+/// title), whether it exited, its bound agent's status, and what its program
+/// said this tick (a bell, a toast). Drains each pane's notices: once a tick.
 pub(crate) fn attention_facts(
-    windows: &[Window],
+    windows: &mut [Window],
     world: &atrium::vendors::AgentState,
 ) -> Vec<atrium::attention::PaneFact> {
     windows
-        .iter()
-        .flat_map(|w| w.panes.iter())
-        .map(|p| atrium::attention::PaneFact {
-            key: p.agent_id.0 as u64,
-            label: p.role.clone().unwrap_or_else(|| p.title.clone()),
-            exited: p.exited,
-            status: world.status_for(p.session_id.as_deref()),
+        .iter_mut()
+        .flat_map(|w| w.panes.iter_mut())
+        .map(|p| {
+            let said = pane_notices(p);
+            atrium::attention::PaneFact {
+                key: p.agent_id.0 as u64,
+                label: p.role.clone().unwrap_or_else(|| p.title.clone()),
+                exited: p.exited,
+                status: world.status_for(p.session_id.as_deref()),
+                bell: said.bell,
+                toast: said.toast,
+            }
         })
         .collect()
 }
@@ -520,6 +566,35 @@ mod tests {
             &mut flash,
         )
         .expect("a shell to host the pane")
+    }
+
+    /// What the program says lands on the pane through its emulator: a title
+    /// and a bell after one feed, read once and then gone (the title stays,
+    /// the bell does not); a toast carries its words.
+    #[test]
+    fn notices_land_on_the_pane_after_a_feed() {
+        let mut pane = idle_pane();
+        let before = pane_notices(&mut pane);
+        assert_eq!(
+            before,
+            PaneNotices::default(),
+            "a fresh pane has said nothing"
+        );
+        pane.term.feed(b"\x1b]2;hi\x07\x07");
+        let said = pane_notices(&mut pane);
+        assert_eq!(said.title.as_deref(), Some("hi"));
+        assert!(
+            said.bell,
+            "the bare BEL rang; the title's terminator did not"
+        );
+        assert_eq!(said.toast, None);
+        let again = pane_notices(&mut pane);
+        assert_eq!(again.title.as_deref(), Some("hi"), "the title is kept");
+        assert!(!again.bell, "a bell is read once");
+        pane.term.feed(b"\x1b]9;done\x07\x1b]9;4;1;50\x07");
+        let said = pane_notices(&mut pane);
+        assert_eq!(said.toast.as_deref(), Some("done"));
+        assert!(!said.bell, "a progress report is not a bell");
     }
 
     /// Feeding the close to the emulator reveals what the app drew inside the

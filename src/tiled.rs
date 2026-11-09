@@ -85,6 +85,7 @@ pub(crate) fn render_tiled(
                     } else {
                         world.doing_for(p.session_id.as_deref())
                     },
+                    badge: atrium::attention::pane_badge(p.term.title(), &p.title),
                 }
             })
         })

@@ -16,7 +16,7 @@ pty = { package = "nativelite-pty", version = "0.4.1", path = "../pty-rs" }
 akey = { package = "nativelite-akey", version = "0.2", path = "../akey" }
 rawterm = { package = "nativelite-rawterm", version = "0.2.2", path = "../rawterm-rs" }
 ansi = { package = "nativelite-ansi", version = "0.4.1", path = "../ansi-rs" }
-vterm = { package = "nativelite-vterm", version = "0.5.4", path = "../vterm-rs" }
+vterm = { package = "nativelite-vterm", version = "0.5.6", path = "../vterm-rs" }
 agsess = { package = "nativelite-agsess", version = "0.3.0", path = "../agsess" }
 json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
 nlipc = { package = "nativelite-ipc", version = "0.2", path = "../ipc" }
