@@ -47,6 +47,49 @@ pub const ENV_CLAUDE_TRUECOLOR: &str = "CLAUDE_CODE_TMUX_TRUECOLOR";
 /// without renaming the binary (tests, and a hand probe).
 pub const FLAG: &str = "--tmux-shim";
 
+/// Claude Code's own flag for how teammates are shown. atrium passes it as
+/// `auto` (split panes when inside tmux, which an atrium claude pane now is;
+/// in-process otherwise) so nobody edits `settings.json` to see teammates.
+pub const TEAMMATE_MODE_FLAG: &str = "--teammate-mode";
+
+/// The first Claude Code that took `--teammate-mode` on the command line
+/// (it is hidden from `--help`, so the version is the probe).
+pub const TEAMMATE_MODE_SINCE: (u64, u64, u64) = (2, 1, 50);
+
+/// Is the first `major.minor.patch` in `version_output` at least `min`?
+/// `claude --version` prints `2.1.289 (Claude Code)`.
+pub fn version_at_least(version_output: &str, min: (u64, u64, u64)) -> bool {
+    let mut nums = [0u64; 3];
+    let mut i = 0;
+    let mut cur: Option<u64> = None;
+    for c in version_output.chars() {
+        match c {
+            '0'..='9' => cur = Some(cur.unwrap_or(0) * 10 + (c as u64 - '0' as u64)),
+            '.' if cur.is_some() && i < 2 => {
+                nums[i] = cur.take().unwrap_or(0);
+                i += 1;
+            }
+            _ if cur.is_some() => break,
+            _ => {}
+        }
+    }
+    if let Some(n) = cur {
+        if i < 3 {
+            nums[i] = n;
+            i += 1;
+        }
+    }
+    i == 3 && (nums[0], nums[1], nums[2]) >= min
+}
+
+/// Should atrium add `--teammate-mode auto` to this argv? Not when the user
+/// already passes the flag: theirs wins.
+pub fn wants_teammate_mode(argv: &[String]) -> bool {
+    !argv
+        .iter()
+        .any(|a| a == TEAMMATE_MODE_FLAG || a.starts_with("--teammate-mode="))
+}
+
 /// The real broker: `atrium ctl` requests over the session's channel, with
 /// the caller's token from the environment (inherited from the claude pane).
 pub struct CtlBroker {
@@ -384,5 +427,27 @@ mod tests {
         assert!(p("\"yes\"").is_err());
         assert!(p("1").is_err());
         assert_eq!(parse_setting(None), Ok(None));
+    }
+
+    #[test]
+    fn the_version_floor_reads_claude_version() {
+        assert!(version_at_least(
+            "2.1.289 (Claude Code)",
+            TEAMMATE_MODE_SINCE
+        ));
+        assert!(version_at_least("2.1.50", (2, 1, 50)));
+        assert!(!version_at_least("2.1.49 (Claude Code)", (2, 1, 50)));
+        assert!(!version_at_least("1.0.128", (2, 1, 50)));
+        assert!(!version_at_least("garbage", (2, 1, 50)));
+        assert!(version_at_least("v3.0.0", (2, 1, 50)));
+    }
+
+    #[test]
+    fn a_users_teammate_mode_flag_wins() {
+        assert!(wants_teammate_mode(&a("claude --session-id x")));
+        assert!(!wants_teammate_mode(&a(
+            "claude --teammate-mode in-process"
+        )));
+        assert!(!wants_teammate_mode(&a("claude --teammate-mode=tmux")));
     }
 }

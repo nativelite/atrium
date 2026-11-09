@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **No `settings.json` edit to see Claude Code's teammates.** A claude pane
+  that carries `TMUX` (a ctl session with `teams` on) is launched with
+  `--teammate-mode auto`: split panes when inside tmux, which such a pane now
+  is, in-process otherwise. A user's own `--teammate-mode` wins, and the flag
+  is added only for a claude of 2.1.50 or newer (`claude --version`; the
+  option is hidden from `--help`) (atrium issue #17).
 - **The host terminal's title names the session and its state, and a "needs
   you" transition rings it.** `atrium · <name> · <state>` (`? builder needs
   you · 2 working`, `● 3 working`, `○ idle`; the name is the fleet's name or

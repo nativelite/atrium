@@ -447,6 +447,21 @@ pub(crate) fn spawn_pane_full(
             user_cmd.push(path.to_string_lossy().into_owned());
         }
     }
+    // Claude Code's teams in split panes without a settings.json edit: a claude
+    // pane that will carry `TMUX` (`atrium::tmux_shim`) also gets
+    // `--teammate-mode auto` (split panes when inside tmux, in-process
+    // otherwise), unless the user passed their own, and only once
+    // `claude --help` has shown the flag.
+    if session_id.is_some()
+        && CTL_ADDRESS.get().is_some()
+        && atrium::bind::is_claude_stem(&title)
+        && atrium::tmux_shim::session_enabled()
+        && atrium::tmux_shim::wants_teammate_mode(&user_cmd)
+        && claude_has_teammate_mode_flag(&user_cmd[0])
+    {
+        user_cmd.push(atrium::tmux_shim::TEAMMATE_MODE_FLAG.to_string());
+        user_cmd.push("auto".to_string());
+    }
     let effective = effective_command(&user_cmd);
     log_spawn(&title, &effective);
     let r = rows.max(1);
@@ -945,6 +960,18 @@ fn pane_env(
 /// like the codex flags.
 pub(crate) fn claude_has_settings_flag(program: &str) -> bool {
     codex_probe(program, &["--help"], |out| out.contains("--settings"))
+}
+
+/// Does this claude take `--teammate-mode`? The option is hidden from
+/// `--help` (2.1.289 defines it with `hideHelp()`), so the answer is its
+/// version: 2.1.50 or newer, with the `--help` text as a fallback should the
+/// option ever be listed. Both probes are cached per session.
+pub(crate) fn claude_has_teammate_mode_flag(program: &str) -> bool {
+    codex_probe(program, &["--version"], |out| {
+        atrium::tmux_shim::version_at_least(out, atrium::tmux_shim::TEAMMATE_MODE_SINCE)
+    }) || codex_probe(program, &["--help"], |out| {
+        out.contains(atrium::tmux_shim::TEAMMATE_MODE_FLAG)
+    })
 }
 
 /// atrium's status-hooks file, written once per process on the first claude
