@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The terminal bench measures the ctl repaint fix.** A fourth interactive
+  scenario, `atrium, 8 tiled panes + ctl polls`, runs the eight panes under
+  `--allow-ctl` with a poller issuing a token-free `ctl list` five times a
+  second (what eight modded panes do with their 1.5 s `inbox` polls), and
+  `ATRIUM_BENCH_BIN=<path>` points the harness at another atrium, so a
+  before/after of one change is one command. The poller finds the endpoint
+  by pid through the new `atrium::ipc::address_for(pid)`, which a host
+  terminal that started atrium can use the same way. Before/after of 8011dd9
+  recorded in benches/README.md (atrium issue #21).
+
 ## [0.43.0] - 2026-11-08
 
 ### Added

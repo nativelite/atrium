@@ -150,7 +150,36 @@ What this does and does not show:
 - The 8-pane p90 sits on the Windows console host's ~16 ms frame, as the
   0.35.0 notes describe; the Windows flood number mostly measures that host.
   Use the Linux rows for atrium's own throughput.
-- **The repaint fix is not exercised by this harness.** No scenario issues ctl
-  requests, so the clear-per-poll it removed never appears in these rows. A
-  scenario that runs a mod-like `inbox` poll against eight panes is the honest
-  measurement and is tracked under atrium issue #21.
+- The repaint fix was not exercised by this run; the ctl-polls scenario below
+  was added for it.
+
+## The ctl-polls scenario (0.43.0, 2026-11-08), Windows
+
+`atrium, 8 tiled panes + ctl polls` is the eight-pane scenario under
+`--allow-ctl` with a poller issuing a token-free `ctl list` five times a
+second for the whole measurement: what eight modded panes do with their
+1.5 s `inbox` polls. The poller finds the endpoint by the atrium's pid
+(`atrium::ipc::address_for`), as a host terminal would. Until 8011dd9 every
+such request reset the renderer and forced a full `2J` repaint; this row is
+the before/after of that change, same machine, same harness, one run each.
+`ATRIUM_BENCH_BIN=<path>` points the harness at another atrium, which is how
+the "before" binary (a release build of 50717aa) was measured.
+
+| atrium | scenario | echo p50 ms | p90 ms | p99 ms | idle CPU % |
+| --- | --- | --- | --- | --- | --- |
+| 50717aa (before) | 8 tiled panes | 0.62 | 15.87 | 16.47 | 1.25 |
+| 50717aa (before) | 8 tiled panes + ctl polls | 1.53 | 15.97 | 16.18 | 1.40 |
+| 0.43.0 (after) | 8 tiled panes | 0.74 | 15.93 | 16.32 | 1.25 |
+| 0.43.0 (after) | 8 tiled panes + ctl polls | 1.16 | 15.81 | 16.47 | 0.94 |
+
+What it shows, and what it cannot:
+
+- Under polls, the median key echo fell from 1.53 to 1.16 ms and idle CPU
+  from 1.40 to 0.94 % of a core; without polls the two builds are within
+  noise of each other, as they should be.
+- The p90 and p99 sit on the Windows console host's ~16 ms frame in every
+  row, so the frame the fix saves per poll does not show in those columns;
+  what a user saw before the fix was a visible flash of every tiled pane
+  several times a second, which no latency column measures. A Linux run has
+  no console frame and would show the saved work directly; not run here.
+- One run each on a busy machine: treat the deltas as direction, not size.

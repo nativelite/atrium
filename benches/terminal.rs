@@ -20,6 +20,7 @@
 //!
 //! Knobs (environment):
 //! - `ATRIUM_BENCH_SAMPLES` (key echoes per scenario, default 100)
+//! - `ATRIUM_BENCH_BIN` (path of the atrium to measure; default: this build)
 //! - `ATRIUM_BENCH_IDLE_S` (idle window, default 10)
 //! - `ATRIUM_BENCH_FLOOD_MB` (per pane, default 16)
 //! - `ATRIUM_BENCH_KEY_GAP_MS` (pause between key samples, default 30)
@@ -35,7 +36,16 @@
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
-const ATRIUM: &str = env!("CARGO_BIN_EXE_atrium");
+/// The atrium under test: this build, or `ATRIUM_BENCH_BIN=<path>` to measure
+/// another (an installed release, or a build of an older commit for a
+/// before/after of one change).
+fn atrium_bin() -> &'static str {
+    static BIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        std::env::var("ATRIUM_BENCH_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_atrium").to_string())
+    })
+}
 
 fn main() {
     // `cargo test --all-targets` runs bench targets too; only `cargo bench`
@@ -175,13 +185,25 @@ impl Shell {
         one.extend(own(&self.interactive));
         let mut eight = vec!["-n".to_string(), "8".to_string(), self.prog.to_string()];
         eight.extend(own(&self.interactive));
+        // The same eight panes under `--allow-ctl`, with a poller issuing a
+        // token-free `ctl list` five times a second for the whole measurement:
+        // what eight modded panes do with their 1.5 s `inbox` polls. Until
+        // 8011dd9 every such request reset the renderer and forced a full
+        // repaint; this row is what measures that.
+        let mut polled = vec!["--allow-ctl".to_string()];
+        polled.extend(eight.iter().cloned());
         vec![
             (format!("bare {}", self.prog), self.prog.to_string(), bare),
-            ("atrium, 1 pane".to_string(), ATRIUM.to_string(), one),
+            ("atrium, 1 pane".to_string(), atrium_bin().to_string(), one),
             (
                 "atrium, 8 tiled panes".to_string(),
-                ATRIUM.to_string(),
+                atrium_bin().to_string(),
                 eight,
+            ),
+            (
+                "atrium, 8 tiled panes + ctl polls".to_string(),
+                atrium_bin().to_string(),
+                polled,
             ),
         ]
     }
@@ -200,10 +222,15 @@ impl Shell {
         eight.extend(catargs.clone());
         vec![
             (format!("bare {cat}"), cat, catargs, 1),
-            ("atrium, 1 pane".to_string(), ATRIUM.to_string(), one, 1),
+            (
+                "atrium, 1 pane".to_string(),
+                atrium_bin().to_string(),
+                one,
+                1,
+            ),
             (
                 "atrium, 8 tiled panes".to_string(),
-                ATRIUM.to_string(),
+                atrium_bin().to_string(),
                 eight,
                 8,
             ),
@@ -215,7 +242,13 @@ impl Shell {
 struct Session {
     pty: pty::Pty,
     out: Receiver<(Instant, Vec<u8>)>,
+    /// Set to stop the ctl poller, when the scenario runs one.
+    polling: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How often the ctl-polls scenario asks: eight panes at the mod's 1.5 s
+/// `inbox` interval is 5.3 requests a second.
+const CTL_POLL_EVERY: Duration = Duration::from_millis(200);
 
 impl Session {
     fn start(prog: &str, args: &[String]) -> Option<Session> {
@@ -236,7 +269,29 @@ impl Session {
                 }
             }
         });
-        Some(Session { pty, out })
+        let polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if prog == atrium_bin() && args.iter().any(|a| a == "--allow-ctl") {
+            // A token-free read against the session's endpoint, named by the
+            // atrium's pid, the way a host terminal would find it.
+            let address = atrium::ipc::address_for(pty.pid());
+            polling.store(true, std::sync::atomic::Ordering::SeqCst);
+            let flag = polling.clone();
+            std::thread::spawn(move || {
+                // Let atrium bind before the first ask.
+                std::thread::sleep(Duration::from_secs(2));
+                while flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    let _ = std::process::Command::new(atrium_bin())
+                        .args(["ctl", "list", "--quiet"])
+                        .env("ATRIUM_CTL", &address)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    std::thread::sleep(CTL_POLL_EVERY);
+                }
+            });
+        }
+        Some(Session { pty, out, polling })
     }
 
     /// Discard output for `d`.
@@ -249,6 +304,8 @@ impl Session {
 
     /// Quit cleanly (atrium: Ctrl+A q), killing whatever is left.
     fn stop(mut self, is_atrium: bool) {
+        self.polling
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         if is_atrium {
             let _ = self.pty.write(b"\x01q");
             let end = Instant::now() + Duration::from_secs(10);
@@ -292,7 +349,7 @@ fn key_echo(prog: &str, args: &[String], samples: usize) -> Option<Stats> {
         let at = arrived?;
         lat.push(at.duration_since(sent).as_secs_f64() * 1000.0);
     }
-    s.stop(prog == ATRIUM);
+    s.stop(prog == atrium_bin());
     Some(Stats::new(lat))
 }
 
@@ -305,7 +362,7 @@ fn idle_cpu(prog: &str, args: &[String], window: Duration) -> Option<f64> {
     s.drain(window);
     let after = cpu_ms(pid);
     let wall = start.elapsed().as_secs_f64() * 1000.0;
-    s.stop(prog == ATRIUM);
+    s.stop(prog == atrium_bin());
     Some((after? - before?) / wall * 100.0)
 }
 

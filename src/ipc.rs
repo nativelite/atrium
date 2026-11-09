@@ -67,6 +67,13 @@ pub fn default_address() -> String {
     sys::default_address(std::process::id())
 }
 
+/// The endpoint the atrium with process id `pid` binds: what a host that
+/// started atrium (or a bench harness) connects to without being handed
+/// `ATRIUM_CTL`. The same naming as [`default_address`] for this process.
+pub fn address_for(pid: u32) -> String {
+    sys::default_address(pid)
+}
+
 /// Idle duration in **milliseconds** from a **monotonic** clock: `now - last`,
 /// saturating to `0` when `now` precedes `last`.
 ///
