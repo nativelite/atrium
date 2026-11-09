@@ -2,7 +2,9 @@
 
 use super::render::{render_board, render_bus};
 use super::reply::{obj, s};
-use super::{zero_sub_warning, TrustMode, ENV_ADDRESS, ENV_PANE, ENV_TOKEN, MAX_TTL_MS};
+use super::{
+    parse_spawn_size, zero_sub_warning, TrustMode, ENV_ADDRESS, ENV_PANE, ENV_TOKEN, MAX_TTL_MS,
+};
 use json::{Number, Value};
 use std::process::ExitCode;
 
@@ -618,7 +620,7 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
     Ok(obj(pairs).to_string())
 }
 
-/// `spawn [--role R] [--identity I] [--mode M] [--worktree W] [--here [--beside P] | --window] [--no-focus] -- <cmd...>`
+/// `spawn [--role R] [--identity I] [--mode M] [--worktree W] [--here [--beside P] [--size S] | --window] [--no-focus] -- <cmd...>`
 fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("spawn")));
     let mut role: Option<String> = None;
@@ -626,6 +628,7 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     let mut new_window = true;
     let mut focus = true;
     let mut beside: Option<i64> = None;
+    let mut size: Option<String> = None;
     let mut mode: Option<TrustMode> = None;
     let mut worktree: Option<String> = None;
     let mut argv: Vec<String> = Vec::new();
@@ -677,6 +680,14 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 });
                 i += 2;
             }
+            "--size" => {
+                let tok = value_at(args, i + 1, "--size needs a value (N% or N cells)")?;
+                // Validated here so a typo is refused before the request is
+                // sent; the wire carries the text as written.
+                parse_spawn_size(tok)?;
+                size = Some(tok.clone());
+                i += 2;
+            }
             "--window" => {
                 new_window = true;
                 i += 1;
@@ -711,6 +722,12 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             return Err("--beside goes with --here (a new window sits beside nothing)".to_string());
         }
         pairs.push(("beside", Value::Number(Number::Int(b))));
+    }
+    if let Some(sz) = size {
+        if new_window {
+            return Err("--size goes with --here (a new window is not a split)".to_string());
+        }
+        pairs.push(("size", Value::String(sz)));
     }
     pairs.push((
         "argv",

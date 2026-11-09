@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Proportional splits: `ctl spawn --here --size <N%|N>`, and the tmux shim
+  honours `-l`.** A split node in the layout tree can carry a ratio, the share
+  of its span given to its first child; `--size 70%` splits the anchor pane
+  alone and gives the new pane 70 % of it (`--size 20`: that many columns),
+  freezing the splits above it so nothing else moves. Ratios are relative, so a
+  terminal resize keeps the share, and a later plain `--here` spawn or `"` /
+  `%` split re-grids only the leaf-count region around its anchor, keeping
+  every ratio; a ratio goes only when the pane its split was made for closes.
+  Claude Code's first teammate (`split-window -d -t @0 -h -l 70%`) now takes 70
+  % of the lead's window and the lead keeps 30 % while later teammates (`-t %N
+  -v`) tile inside the 70 % half, as under tmux; the `-l` used to be accepted
+  and ignored. The interactive splits still make equal splits (no key sets a
+  ratio), and a `--here` spawn with no `--size` is unchanged.
+
 ### Fixed
 - **Linux e2e flake `session::command_prompt_cancels_and_opens_a_window`**
   (issue #8; test-only, no change to atrium). The test waited for the raw

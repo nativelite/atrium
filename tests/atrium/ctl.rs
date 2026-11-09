@@ -958,7 +958,9 @@ fn a_workers_to_wakes_the_pane_that_spawned_it() {
 /// the first split (`-t @0 -h -l 70%`, the window) lands beside the caller, a
 /// second split targeting that teammate (`-t %1 -v`, atrium issue #17) is
 /// taken and lands too, the pane list names all three, and `kill-pane` is
-/// taken. The `-l` size is accepted; atrium's grid is equal-size.
+/// taken. The `-l 70%` is honoured as `--size 70%` (the caller keeps 30 % of
+/// the width); the pane list after the first split still names both panes. The
+/// widths are proven by `layout`'s unit tests, not read off the pty here.
 #[test]
 fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     let (mut p, shell, flag) = spawn_atrium_ctl_shell();
@@ -1038,9 +1040,10 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
         String::from_utf8_lossy(&out)
     );
     // Both teammates are killed before the marker, so it echoes into a pane
-    // that is the whole window again: at three panes the caller is a third of
-    // 100 columns and the repaint fragments a word in the pty stream. The
-    // marker's typed form must not spell it (a tty echoes what is typed).
+    // that is the whole window again: at three panes the caller is 30 % of 100
+    // columns (the first split's `-l 70%`) and the repaint fragments a word in
+    // the pty stream. The marker's typed form must not spell it (a tty echoes
+    // what is typed).
     let marker_cmd = if cfg!(windows) {
         "echo kill-ok-ma^rker"
     } else {

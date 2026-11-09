@@ -196,6 +196,11 @@ pub(crate) fn spawn_worker_here(
             // one column, so N of them degrade to an unusable `1×N` strip;
             // re-gridding keeps 2→1×2, 4→2×2, 6→2×3, 12→3×4, … balanced, in the
             // window's own orientation (rows, for a window `--here` started).
+            // With `--size` (the shim's `-l 70%`) the anchor alone is split and
+            // the worker takes that share of it; the ratio stays on the tree,
+            // and later plain spawns re-grid only the region around their
+            // anchor (`Tree::grow`), so a lead sized to 30 % keeps it while its
+            // teammates tile inside the other 70 %.
             // Focus lands on the fresh worker, unless the caller said
             // `--no-focus` (the tmux shim's `-d`: a Claude Code lead spawning a
             // teammate must not move its human into it).
@@ -205,10 +210,27 @@ pub(crate) fn spawn_worker_here(
                 .find(|p| p.agent_id == anchor_agent)
                 .map(|p| p.id)
                 .unwrap_or(w.tree.focus());
-            let ids: Vec<usize> = w.panes.iter().map(|p| p.id).collect();
+            // A cell count is against the anchor's current width: `--here`
+            // splits side by side, so the span is its columns.
+            let share = sp.size.map(|sz| {
+                let span = w
+                    .tree
+                    .rects(tiled_outer(rows, cols))
+                    .into_iter()
+                    .find(|(id, _)| *id == anchor)
+                    .map(|(_, r)| r.cols)
+                    .unwrap_or(cols as usize);
+                sz.permille(span)
+            });
             w.panes.push(pane);
             w.next_id += 1;
-            w.tree = Tree::grid_grow(&mut w.grid_dir, &ids, anchor, new_id, layout::Dir::Vertical);
+            w.tree = w.tree.grow(
+                &mut w.grid_dir,
+                anchor,
+                new_id,
+                layout::Dir::Vertical,
+                share,
+            );
             if sp.focus {
                 w.tree.focus_pane(new_id);
             }

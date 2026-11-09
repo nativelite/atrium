@@ -181,12 +181,16 @@ impl Broker for CtlBroker {
             args.push("--beside");
             args.push(b);
         }
-        // `-l 70%` is accepted and ignored: atrium's split tree has no size on
-        // a node (`layout::Node::Split` is `dir`, `first`, `second`) and lays
-        // panes out proportionally to leaf count, and `--here` re-grids the
-        // whole window on every spawn, so a ratio set on the first split would
-        // be rebuilt away by the second. The teammate gets an equal share.
-        let _ = size;
+        // `-l 70%` (or `-l 20`, cells): the new pane's share of the target
+        // pane, as `--size`. The split tree keeps the ratio on its node and a
+        // later teammate's spawn re-grids only the half it lands in
+        // (`layout::Tree::grow`), so the lead keeps its 30 % as it does under
+        // tmux. tmuxproto hands `-l` over raw; one the `--size` grammar refuses
+        // (`0%`, `100%`) is dropped here so the split still happens, equal.
+        if let Some(sz) = size.filter(|s| crate::ctl::parse_spawn_size(s).is_ok()) {
+            args.push("--size");
+            args.push(sz);
+        }
         if let Some(r) = role {
             args.push("--role");
             args.push(r);
