@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.1] - 2026-11-09
+
 ### Fixed
 - **A token-free `bus feed` returned nothing.** The host-read surface
   documented in 0.43.0 lists `bus feed` among the token-free reads, but a

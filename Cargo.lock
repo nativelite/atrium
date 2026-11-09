@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "atrium"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "nativelite-abus",
  "nativelite-agsess",
@@ -50,7 +50,7 @@ version = "0.1.0"
 
 [[package]]
 name = "nativelite-ipc"
-version = "0.2.0"
+version = "0.2.1"
 
 [[package]]
 name = "nativelite-json"
