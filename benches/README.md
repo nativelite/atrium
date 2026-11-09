@@ -183,3 +183,64 @@ What it shows, and what it cannot:
   several times a second, which no latency column measures. A Linux run has
   no console frame and would show the saved work directly; not run here.
 - One run each on a busy machine: treat the deltas as direction, not size.
+
+## Soak: the held inbox and the waking channel (unreleased, 2026-11-09)
+
+Not a bench but an ignored e2e, `tests/atrium/soak.rs`, kept beside the
+numbers it produces:
+
+```sh
+ATRIUM_SOAK_SECS=600 cargo test --test atrium soak -- --ignored --nocapture
+python dev.py soak      # the same, ATRIUM_SOAK_SECS default 60
+```
+
+atrium `--allow-ctl -n 8 <shell>` runs in a pty. Every pane registers as a
+modded pane (`hello mod=0.1.0 caps=status,inbox`) and holds an `inbox --wait`
+open from the test process with that pane's token (`ATRIUM_TOKEN`, which each
+pane's shell writes to a file as it starts), so eight held connections sit in
+the run loop's `serve_held_inboxes` for the whole run; the lead (pane 0) sends
+a numbered marker to a random pane twice a second, and a token-free host asks
+`list` five times a second by pid (`atrium::ipc::address_for`), the way the
+ctl-polls scenario does. Every 5 s the atrium process's working set and
+handle count (open fds on Linux) are sampled. The run fails on RSS or handle
+growth over 20 % from the minute-1 sample to the end, a marker not received
+within 10 s of its send (or a refused send), a host request over 5 s or
+refused, or a final `list` slower than 1 s.
+
+Both runs below are 120 s on the founder's desktop (16 cores, 64 GB; the
+Linux row is WSL Ubuntu on the same machine), one run each, with the tree at
+the commit that added the harness. "Baseline" is the 60 s sample. Delivery
+is the time from the lead's `send` request to the marker arriving in the
+waiter's held reply.
+
+| metric | Windows | Linux (WSL) |
+| --- | --- | --- |
+| rss MB start / baseline / end | 11.4 / 12.0 / 12.3 (+2.5 %) | 7.8 / 8.1 / 8.3 (+2.6 %) |
+| handles (fds) start / baseline / end | 167 / 175 / 168 (-4.0 %) | 32 / 33 / 25 (-24.2 %) |
+| host `list` requests (refused or failed) | 591 (0) | 584 (0) |
+| host p50 / p99 / max ms | 2.54 / 10.43 / 39.19 | 2.14 / 142.65 / 329.51 |
+| sends / received / late or lost / refused | 239 / 239 / 0 / 0 | 238 / 238 / 0 / 0 |
+| delivery p50 / p99 / max ms | 1.5 / 10.6 / 24.5 | 1.3 / 32.5 / 313.9 |
+| waiter replies / expired holds / errors | 247 / 0 / 0 | 246 / 0 / 0 |
+| final `list` ms | 2.32 | 2.30 |
+
+What it shows, and what it cannot:
+
+- No leak or stall at this length: every marker reached its waiting pane,
+  within the run loop's tick on the median, and the working set at the end
+  is within noise of the minute-1 sample on both platforms. The eight held
+  connections are in the start and baseline handle counts; the end sample is
+  taken after the lead's `soak-stop` wakes have released the waiters, which
+  is the drop of about eight (168 from 175; 25 from 33), so a hold costs one
+  handle or fd and gives it back. The waiter replies are the markers plus
+  those eight wakes; no hold reached `HOLD_DEADLINE`.
+- Two minutes is a smoke of the harness, not the soak it is for; the number
+  that matters is the 600 s run, which `ATRIUM_SOAK_SECS=600` gives. A growth
+  under 20 % over two minutes says little about a slow leak.
+- The Windows host max (39 ms) is the console host's frame, not the channel:
+  the same ~16 ms stalls the latency rows above sit on, twice over. The
+  Linux tail is wider: a host p99 of 143 ms and a worst delivery of 314 ms
+  against medians of 2 and 1.3 ms, under WSL with eight interactive `sh`
+  panes repainting. Well inside the 5 s and 10 s budgets, and one run, so
+  noted rather than chased; a 600 s run on native Linux would say whether it
+  is the channel or the host.

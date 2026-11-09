@@ -40,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never added without it; a command line that overrides the `hooks` table
   itself is left alone. Verified against the codex source and the installed
   0.163.0 binary (`docs/agent-status.md`), not against a live login.
+- **A soak harness for the held inbox and the waking control channel**
+  (test-only; `tests/atrium/soak.rs`, ignored by default). `ATRIUM_SOAK_SECS=600
+  cargo test --test atrium soak -- --ignored --nocapture` (or `python dev.py
+  soak`) runs atrium `--allow-ctl -n 8` in a pty with every pane registered as
+  a modded pane holding `inbox --wait` open, a lead sending a numbered marker to
+  a random pane twice a second and a token-free host asking `list` five times a
+  second, and samples the process's working set and handle count every 5 s. It
+  fails on RSS or handle growth over 20 % from the minute-1 sample, a send not
+  received within 10 s, a host request over 5 s or refused, or a final `list`
+  slower than 1 s, and prints the table `benches/README.md` records under
+  "Soak". The 0.44.0 hold path had one e2e (a single waiter, one send) and no
+  measurement of what eight waiters do to the process over time.
 
 ## [0.45.1] - 2026-11-09
 
