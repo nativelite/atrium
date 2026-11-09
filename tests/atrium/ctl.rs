@@ -932,13 +932,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
         "split-window prints the new pane's id: {:?}",
         String::from_utf8_lossy(&out)
     );
-    // `ctl spawn --here` focuses the new pane (a human's split), so the
-    // keyboard is now in the teammate; a Claude Code lead is a process and
-    // keeps its own pane. Step back to the caller before asking as it.
-    std::thread::sleep(Duration::from_millis(500));
-    p.write(b"\x01h").unwrap();
-    p.write(b"\x01k").unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    // `-d` was passed, so the keyboard stayed with the caller: it asks next.
     p.write(
         format!("\"{atrium}\" --tmux-shim list-panes -t @0 -F #{{pane_id}}:#{{pane_title}}\r\n")
             .as_bytes(),

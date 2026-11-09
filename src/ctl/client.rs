@@ -606,6 +606,7 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     let mut role: Option<String> = None;
     let mut identity: Option<String> = None;
     let mut new_window = true;
+    let mut focus = true;
     let mut mode: Option<TrustMode> = None;
     let mut worktree: Option<String> = None;
     let mut argv: Vec<String> = Vec::new();
@@ -639,6 +640,10 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 new_window = false;
                 i += 1;
             }
+            "--no-focus" => {
+                focus = false;
+                i += 1;
+            }
             "--window" => {
                 new_window = true;
                 i += 1;
@@ -665,6 +670,9 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
         pairs.push(("worktree", Value::String(w)));
     }
     pairs.push(("window", Value::Bool(new_window)));
+    if !focus {
+        pairs.push(("focus", Value::Bool(false)));
+    }
     pairs.push((
         "argv",
         Value::Array(argv.into_iter().map(Value::String).collect()),

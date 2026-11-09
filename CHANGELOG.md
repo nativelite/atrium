@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`atrium ctl spawn --here --no-focus`, and the tmux shim honours `-d`.** A
+  `--here` spawn focused the new pane, so a Claude Code lead spawning a
+  teammate moved its human's keyboard into the teammate; tmux's `-d`, which
+  Claude Code passes on every teammate spawn, means the new pane does not take
+  focus. The shim now passes `--no-focus` for it (`nativelite-tmuxproto` 0.2.0
+  carries the flag as `detached`), and the verb is there for any caller.
 - **The terminal bench measures the ctl repaint fix.** A fourth interactive
   scenario, `atrium, 8 tiled panes + ctl polls`, runs the eight panes under
   `--allow-ctl` with a poller issuing a token-free `ctl list` five times a

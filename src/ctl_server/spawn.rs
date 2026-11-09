@@ -172,7 +172,9 @@ pub(crate) fn spawn_worker_here(
             // one column, so N of them degrade to an unusable `1×N` strip;
             // re-gridding keeps 2→1×2, 4→2×2, 6→2×3, 12→3×4, … balanced, in the
             // window's own orientation (rows, for a window `--here` started).
-            // Focus lands on the fresh worker.
+            // Focus lands on the fresh worker, unless the caller said
+            // `--no-focus` (the tmux shim's `-d`: a Claude Code lead spawning a
+            // teammate must not move its human into it).
             let anchor = w
                 .panes
                 .iter()
@@ -183,7 +185,9 @@ pub(crate) fn spawn_worker_here(
             w.panes.push(pane);
             w.next_id += 1;
             w.tree = Tree::grid_grow(&mut w.grid_dir, &ids, anchor, new_id, layout::Dir::Vertical);
-            w.tree.focus_pane(new_id);
+            if sp.focus {
+                w.tree.focus_pane(new_id);
+            }
             w.zoomed = false;
             // Resize the whole window so both the caller and the fresh worker get
             // their exact inner rects — without this the worker keeps its rough

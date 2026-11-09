@@ -159,9 +159,19 @@ impl Broker for CtlBroker {
             })
             .collect())
     }
-    fn spawn(&mut self, here: bool, role: Option<&str>, argv: &[String]) -> Result<usize, String> {
+    fn spawn(
+        &mut self,
+        here: bool,
+        focus: bool,
+        role: Option<&str>,
+        argv: &[String],
+    ) -> Result<usize, String> {
         let mut args: Vec<&str> = vec!["spawn"];
         args.push(if here { "--here" } else { "--window" });
+        if !focus {
+            // tmux's `-d`: the lead's human keeps the keyboard.
+            args.push("--no-focus");
+        }
         if let Some(r) = role {
             args.push("--role");
             args.push(r);

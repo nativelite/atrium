@@ -413,6 +413,10 @@ pub struct SpawnReq {
     /// Open in a new window (true, the default) vs. `--here` split beside the
     /// caller (false).
     pub new_window: bool,
+    /// Whether the new pane takes the keyboard (true, the default). `--no-focus`
+    /// keeps it where it is: what the tmux shim sends for Claude Code's `-d`,
+    /// so a lead spawning a teammate does not move its human into it.
+    pub focus: bool,
     /// The credential identity **name** to run the worker under (`--identity X`),
     /// if any. Subject to delegation scoping ([`delegation_allowed`]): a worker
     /// may only pass down an identity it itself holds. `None` = no identity
@@ -448,6 +452,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             };
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
+            let focus = v.get("focus").and_then(Value::as_bool).unwrap_or(true);
             let identity = v
                 .get("identity")
                 .and_then(Value::as_str)
@@ -473,6 +478,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 role,
                 argv,
                 new_window,
+                focus,
                 identity,
                 mode,
                 worktree: v

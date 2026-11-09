@@ -1038,3 +1038,25 @@ fn golden_error_reply_is_the_only_failure_shape() {
         r#"{"ok":false,"err":"unauthenticated: no token"}"#
     );
 }
+
+#[test]
+fn spawn_no_focus_parses_and_defaults_to_focus() {
+    let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let line = build_request(
+        &args(&["spawn", "--here", "--no-focus", "--", "claude"]),
+        Some(3),
+    )
+    .unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => {
+            assert!(!sp.new_window);
+            assert!(!sp.focus);
+        }
+        other => panic!("{other:?}"),
+    }
+    let line = build_request(&args(&["spawn", "--here", "--", "claude"]), Some(3)).unwrap();
+    match parse_request(&line).unwrap().cmd {
+        Cmd::Spawn(sp) => assert!(sp.focus, "focus is the default"),
+        other => panic!("{other:?}"),
+    }
+}
