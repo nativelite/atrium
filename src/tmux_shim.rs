@@ -726,7 +726,7 @@ impl Broker for NoBroker {
 }
 
 /// Where the shim lives: beside the sessions store, under atrium's per-user
-/// state directory (`%LOCALAPPDATA%trium\shim`, `~/.local/state/atrium/shim`).
+/// state directory (`%LOCALAPPDATA%\atrium\shim`, `~/.local/state/atrium/shim`).
 /// `root` is [`crate::session_store::state_root`], the sessions directory
 /// itself, so the shim is its sibling and never a stray entry in the store.
 pub fn shim_dir(root: &Path) -> PathBuf {
