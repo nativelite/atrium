@@ -30,10 +30,11 @@ is:
 
 - **Native delivery**: with the `inbox` cap, atrium never types into the
   pane. A `ctl send` or a bus wake waits in the broker's queue until the mod
-  collects it (`atrium ctl inbox`, polled every 1.5 s while the session is
-  interactive) and submits it through the engine's own prompt queue, which
-  starts a turn only when the session is idle. No draft race, no dialog race,
-  and a task may span lines.
+  collects it (one `atrium ctl inbox --wait` held open while the session is
+  interactive, answered the moment a delivery lands and re-issued; an atrium
+  that does not hold it is polled every 1.5 s instead) and submits it through
+  the engine's own prompt queue, which starts a turn only when the session is
+  idle. No draft race, no dialog race, and a task may span lines.
 - **The `/atrium` pane and band**: `/atrium` opens a pane inside Claude Code
   with the session's open decisions (each with a resolve button and a hotkey),
   the board, and the last bus events, refreshed every 3 s while open. A band

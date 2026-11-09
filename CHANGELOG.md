@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The ctl channel wakes the run loop on connect, and `atrium ctl inbox
+  --wait` is held until a delivery lands** (issue #15). The endpoint is bound
+  with `nativelite-ipc`'s `bind_waking`: an accept thread rings the loop's
+  doorbell the moment a client connects, so a request is served when it
+  arrives rather than on the next 20 ms tick, and nothing is retried per tick
+  to notice one (the per-tick poll stays as the fallback). `inbox --wait` from
+  a pane whose mod declared `inbox` is parked when nothing is queued and
+  answered, with the usual `inbox` reply, as soon as a `send`, a bus wake or an
+  `ask` is queued for that pane; after 60 s unanswered it gets the empty reply
+  and the client asks again. A held request that delivers is recorded in the
+  audit like a poll that found something; a timeout is not. The Claude Code mod
+  keeps one `inbox --wait` open in place of its 1.5 s poll, re-issuing it after
+  each reply, and falls back to the poll on an atrium that answers at once (an
+  older broker or client that does not know the flag).
+
 ### Changed
 - **The `ctl` control channel is the shared `nativelite-ipc` crate.** The
   transport (`src/ipc`: the Windows named pipe with its SDDL and first-instance

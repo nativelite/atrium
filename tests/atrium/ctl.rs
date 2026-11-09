@@ -269,6 +269,66 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// `ctl inbox --wait` holds the connection until a delivery lands: a worker
+/// pane with the `inbox` cap waits with nothing queued (its shell blocks on
+/// the client), the lead sends it a task from another pane, and the waiter's
+/// reply arrives carrying that send — no poll, and the pane was never typed
+/// into. The reply reaches the waiter well inside the 60 s hold.
+#[test]
+fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    // A worker in its own window: the waiter.
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{atrium}\" ctl spawn --role waiter -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20));
+    p.write(b"\x012").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    // The wait: nothing is queued, so the shell blocks here on the held reply.
+    p.write(format!("\"{atrium}\" ctl inbox --wait\r\n").as_bytes())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    // Back to the lead, which sends the waiter its task. The marker's typed
+    // form never spells the marker (the shell drops the quotes or the caret),
+    // so the only place `inbox-wait-marker` can appear is the waiter's reply.
+    p.write(b"\x011").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let send: String = if cfg!(windows) {
+        format!("\"{atrium}\" ctl send waiter inbox-wait-^marker\r\n")
+    } else {
+        format!("\"{atrium}\" ctl send waiter inbox-wait-'marker'\r\n")
+    };
+    p.write(send.as_bytes()).unwrap();
+    read_until(&mut p, b"\"queued\"", Duration::from_secs(20));
+    // The waiter's window shows the held reply, answered when the send landed.
+    p.write(b"\x012").unwrap();
+    let out = read_until(
+        &mut p,
+        b"{\"kind\":\"send\",\"text\":\"inbox-wait-marker\"}",
+        Duration::from_secs(20),
+    );
+    assert!(
+        contains(&out, b"{\"kind\":\"send\",\"text\":\"inbox-wait-marker\"}"),
+        "the held inbox was answered with the send: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Taken once: a plain poll now finds nothing.
+    p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"\"items\":[]", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"items\":[]"),
+        "taken once: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// Two panes that report an edit of the same file collide: `ctl who` names
 /// both (the worker by role), the broker posts one `collision` decision on
 /// the `atrium` topic, and a trailing part of the path finds the file too.

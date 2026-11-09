@@ -84,7 +84,7 @@ pub enum Cmd {
     /// The caller's queued deliveries (`send`s and bus wakes), handed over and
     /// removed from the queue: the mod submits them through the engine's own
     /// prompt queue instead of atrium typing them. About the caller only.
-    Inbox,
+    Inbox(InboxReq),
     /// Queue a question for a pane's mod, which answers it from a fork of the
     /// pane's own context without interrupting its turn. Subtree-scoped like
     /// `send`; the reply is read with `asked`.
@@ -93,6 +93,16 @@ pub enum Cmd {
     Asked(AskedReq),
     /// Who touched a file: every pane whose mod reported an edit of it.
     Who(WhoReq),
+}
+
+/// An `inbox` request's payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct InboxReq {
+    /// `--wait`: when nothing is queued, hold the request open until a
+    /// delivery lands (or the hold runs out, up to
+    /// [`crate::ipc::HOLD_DEADLINE`]) instead of answering with no items.
+    /// The mod runs one of these at a time in place of a poll every 1.5 s.
+    pub wait: bool,
 }
 
 /// An `ask` request's payload.
@@ -148,7 +158,7 @@ impl Cmd {
             // may read it.
             Cmd::Answer(_) => false,
             // Taking deliveries empties the caller's queue.
-            Cmd::Inbox => false,
+            Cmd::Inbox(_) => false,
             // A question is queued into a pane; its reply is the model's
             // output: both for a token-matched caller in the pane's tree.
             Cmd::Ask(_) | Cmd::Asked(_) => false,
@@ -265,7 +275,14 @@ impl Cmd {
             ),
             Cmd::Whoami => ("whoami", String::new()),
             Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
-            Cmd::Inbox => ("inbox", String::new()),
+            Cmd::Inbox(i) => (
+                "inbox",
+                if i.wait {
+                    "wait".to_string()
+                } else {
+                    String::new()
+                },
+            ),
             // The question's length, never its text.
             Cmd::Ask(a) => (
                 "ask",
@@ -688,7 +705,8 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
         Some("whoami") => Cmd::Whoami,
         Some("inbox") => {
             refuse_target(&v, "inbox")?;
-            Cmd::Inbox
+            let wait = v.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            Cmd::Inbox(InboxReq { wait })
         }
         Some("answer") => {
             let target = v

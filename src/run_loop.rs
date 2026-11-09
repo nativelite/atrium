@@ -92,6 +92,11 @@ struct RunState<'a> {
     ctl_extra_allow: Vec<String>,
     ctl_listener: Option<atrium::ipc::Listener>,
     ctl_audit: atrium::audit::Audit,
+    /// The `inbox --wait` requests held open for a delivery: the listener's
+    /// ticket for the connection, and the pane whose mod is waiting. Answered
+    /// in [`RunState::serve_held_inboxes`] when something is queued for the
+    /// pane, with the empty reply when the hold runs out.
+    held_inboxes: Vec<(atrium::ipc::Ticket, AgentId)>,
     /// The active window's index.
     active: usize,
     scanner: PrefixScanner,
@@ -295,6 +300,7 @@ impl RunState<'_> {
                 match listener.poll() {
                     Ok(Some(line)) => {
                         served = true;
+                        let mut hold = None;
                         let (reply, effect) = apply_ctl(
                             &line,
                             &mut CtlSession {
@@ -310,9 +316,23 @@ impl RunState<'_> {
                                 board: &mut self.board,
                                 bus: &mut self.bus,
                                 mods: &mut self.mods,
+                                hold: &mut hold,
                             },
                         );
-                        let _ = listener.respond(&reply.to_json());
+                        match hold {
+                            // An `inbox --wait` with nothing queued: keep the
+                            // connection and answer it when a delivery lands.
+                            // `None` from `park` means the hold pool is full and
+                            // the client was refused, so it asks again.
+                            Some(pane) => {
+                                if let Some(ticket) = listener.park() {
+                                    self.held_inboxes.push((ticket, pane));
+                                }
+                            }
+                            None => {
+                                let _ = listener.respond(&reply.to_json());
+                            }
+                        }
                         match effect {
                             CtlEffect::Layout => {
                                 self.renderer.reset();
@@ -327,12 +347,69 @@ impl RunState<'_> {
                 }
             }
         }
+        self.serve_held_inboxes();
         // A `report` may have landed: lay it over the snapshot now, so the
         // border and bar show it on this very tick rather than after the next
         // transcript refresh.
         if served {
             self.lay_mod_reports();
         }
+    }
+
+    /// Answer the `inbox --wait` requests held open: a pane with a delivery
+    /// queued since (a `send`, a bus wake, an `ask` — all of which land through
+    /// `apply_ctl`, just above) gets the same reply a poll that found them
+    /// would, and is recorded like one; a hold the listener reports as over
+    /// (its deadline, [`atrium::ipc::HOLD_DEADLINE`]) gets the empty reply a
+    /// poll that found nothing would, unrecorded, and the client asks again;
+    /// a pane whose mod gave up the cap meanwhile is refused as a poll would be.
+    fn serve_held_inboxes(&mut self) {
+        let Some(listener) = self.ctl_listener.as_mut() else {
+            return;
+        };
+        if self.held_inboxes.is_empty() {
+            return;
+        }
+        let expired = listener.take_expired();
+        let mut keep = Vec::with_capacity(self.held_inboxes.len());
+        for (ticket, pane) in self.held_inboxes.drain(..) {
+            if expired.contains(&ticket) {
+                // Over, by the listener's clock: the empty reply if the client
+                // is still there (a `NotFound` says it left; nothing to do).
+                let _ = listener
+                    .respond_parked(ticket, &atrium::ctl::reply_inbox(Vec::new()).to_json());
+                continue;
+            }
+            if !self.mods.has_cap(pane.0, "inbox") {
+                let _ = listener
+                    .respond_parked(ticket, &atrium::ctl::reply_err(INBOX_NO_CAP).to_json());
+                continue;
+            }
+            let items = inbox_items(pane, &mut self.pending_sends, &mut self.mods);
+            if items.is_empty() {
+                keep.push((ticket, pane));
+                continue;
+            }
+            let reply = atrium::ctl::reply_inbox(items);
+            match listener.respond_parked(ticket, &reply.to_json()) {
+                Ok(()) => {
+                    self.ctl_audit.record(Some(pane), "inbox", "wait", true, "");
+                }
+                // The client left before its delivery: the items are lost to
+                // it, as they would be to a poll whose reply never arrived.
+                // Say so where the operator can see it.
+                Err(e) => {
+                    self.ctl_audit.record(
+                        Some(pane),
+                        "inbox",
+                        "wait",
+                        false,
+                        &format!("held reply not delivered: {e}"),
+                    );
+                }
+            }
+        }
+        self.held_inboxes = keep;
     }
 
     /// Lay every fresh mod-reported status over the inferred snapshot

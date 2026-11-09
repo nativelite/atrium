@@ -34,6 +34,10 @@ pub(crate) struct CtlSession<'a> {
     /// What each pane's mod has said (`hello`, `report`); see
     /// [`atrium::modstate`].
     pub(crate) mods: &'a mut atrium::modstate::ModState,
+    /// Set by an `inbox --wait` that found nothing: the pane to answer when a
+    /// delivery lands. The run loop parks the connection instead of sending
+    /// the (empty) reply, and answers it from [`inbox_items`] later.
+    pub(crate) hold: &'a mut Option<AgentId>,
 }
 
 /// Is this decision addressed to a live teammate (a `to=<role>` field naming a
@@ -130,7 +134,7 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> (ctl::Reply, Ctl
     }
 
     let (action, detail) = req.cmd.audit_label();
-    let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox | Cmd::Asked(_));
+    let is_poll = matches!(req.cmd, Cmd::Answer(_) | Cmd::Inbox(_) | Cmd::Asked(_));
     let effect = CtlEffect::of(&req.cmd);
     let reply = dispatch_ctl(req, caller, privileged, cx);
     // `wait` polls `answer` twice a second until one exists, and a mod polls
@@ -209,7 +213,7 @@ pub(crate) fn dispatch_ctl(
         Cmd::Report(r) => report(r, caller, cx),
         Cmd::Whoami => whoami(caller, cx),
         Cmd::Answer(a) => answer(a, caller, privileged, cx),
-        Cmd::Inbox => inbox(caller, cx),
+        Cmd::Inbox(i) => inbox(i, caller, cx),
         Cmd::Ask(a) => ask(a, caller, privileged, cx),
         Cmd::Asked(a) => asked(a, caller, privileged, cx),
         Cmd::Who(w) => who(w, caller, privileged, cx),
@@ -332,19 +336,39 @@ fn who(
     ctl::reply_who(&w.path, panes)
 }
 
+/// The refusal for an `inbox` from a pane whose mod did not declare the cap.
+pub(crate) const INBOX_NO_CAP: &str =
+    "this pane's mod did not declare inbox in its hello; deliveries are typed into it";
+
 /// `ctl inbox`: hand the caller's mod its queued deliveries. Only a pane whose
 /// mod declared `inbox` is served (its queue is otherwise the pty path's, and
 /// a send must land exactly once); the items leave the queue as they go.
-fn inbox(caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
+/// `--wait` with nothing queued asks the run loop to hold the connection
+/// (`cx.hold`) and answer it when something lands.
+fn inbox(req: ctl::InboxReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
     let Some(me) = caller else {
         return ctl::reply_err("inbox needs an authenticated pane (ATRIUM_TOKEN)");
     };
     if !cx.mods.has_cap(me.0, "inbox") {
-        return ctl::reply_err(
-            "this pane's mod did not declare inbox in its hello; deliveries are typed into it",
-        );
+        return ctl::reply_err(INBOX_NO_CAP);
     }
-    let mut items: Vec<ctl::InboxItem> = take_for(cx.pending, me)
+    let items = inbox_items(me, cx.pending, cx.mods);
+    if req.wait && items.is_empty() {
+        *cx.hold = Some(me);
+    }
+    ctl::reply_inbox(items)
+}
+
+/// Take `me`'s deliveries — queued sends and wakes the pty path has not begun
+/// to type, then its queued questions — as the items of an `inbox` reply.
+/// Nothing is taken when nothing is queued, so an empty answer is also a
+/// non-destructive "is anything there?".
+pub(crate) fn inbox_items(
+    me: AgentId,
+    pending: &mut Vec<PendingSend>,
+    mods: &mut atrium::modstate::ModState,
+) -> Vec<ctl::InboxItem> {
+    let mut items: Vec<ctl::InboxItem> = take_for(pending, me)
         .into_iter()
         .map(|(origin, text)| {
             let kind = match origin {
@@ -360,14 +384,14 @@ fn inbox(caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
         .collect();
     // Questions ride the same poll; the mod answers them from a fork, never
     // as a prompt.
-    if cx.mods.has_cap(me.0, "ask") {
-        items.extend(cx.mods.take_asks(me.0).into_iter().map(|a| ctl::InboxItem {
+    if mods.has_cap(me.0, "ask") {
+        items.extend(mods.take_asks(me.0).into_iter().map(|a| ctl::InboxItem {
             kind: "ask".to_string(),
             text: a.text,
             id: Some(a.id),
         }));
     }
-    ctl::reply_inbox(items)
+    items
 }
 
 /// `ctl answer`: a pane's last reported answer and status, for the ancestor

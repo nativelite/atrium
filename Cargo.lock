@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "nativelite-agsess"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "nativelite-json",
 ]
@@ -66,7 +66,7 @@ version = "0.2.2"
 
 [[package]]
 name = "nativelite-tmuxproto"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "nativelite-uwidth"

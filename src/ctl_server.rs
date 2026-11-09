@@ -14,7 +14,9 @@ mod wake;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use dispatch::{apply_ctl, decision_for_agent, CtlEffect, CtlSession};
+pub(crate) use dispatch::{
+    apply_ctl, decision_for_agent, inbox_items, CtlEffect, CtlSession, INBOX_NO_CAP,
+};
 pub(crate) use panes::{effective_mode, pane_label, status_label};
 pub(crate) use reply::truncate;
 pub(crate) use sends::{flush_sends, PendingSend};
