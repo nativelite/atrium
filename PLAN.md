@@ -1,78 +1,56 @@
-# PLAN — terminal title and "needs you" notifications
+# PLAN — 0.43.0
 
-This is the fleet's plan and every agent's restart point. The lead owns it and
-the board; a builder reads its item here and the brief on the board. Items are
-built one per fresh session, checkpointed, reviewed fresh, merged one at a time
-by the integrator, who runs the only full gate and pushes `main` after each
-green merge. M4 starts after M1 and M3 are merged; M5 after M4.
+The release after 0.42.0. 0.42.0 is what sits on `main` unreleased on
+2026-11-08: the codex startup-screen fix (50717aa), ctl requests that repaint
+only what they changed (8011dd9), Claude Code's own agent teams landing as
+atrium panes through the tmux-compatible shim (25a0ded, 29bdb45, 4efe488),
+and the `teams` setting (962398f). It ships once the live probe holds: a real
+Claude Code lead in `atrium --allow-ctl claude` spawns a split-pane teammate
+and it appears as an atrium pane with the lead as its parent.
 
-File and line references were refreshed on 2026-09-29 against `d33a784`: after the
-file-split refactor moved `fleet`, `fleet_cli`, `ctl_server`, the recovery code and the
-e2e suite into directories (2026-09-22), `run()` itself moved to `src/run_loop.rs` and
-became `RunArgs` in, `RunState::start` / `tick` / `teardown`.
+Every 0.43.0 item is a GitHub issue on the `0.43.0` milestone; the issue is
+the unit of work and carries the detail. This file is the order and the
+dependencies. Founder decisions that shaped it (2026-11-08): both tmux shims
+share one std-only MIT protocol crate, after 0.42.0; `src/ipc` becomes
+`nativelite-ipc` after 0.42.0 and foldwave builds no transport of its own
+before then; the ctl doorbell and the held inbox connection are one ipc item
+with an adversarial review.
 
 ## Items
 
-| item | size | owner | files | done-signal |
+| # | item | size | depends on | done-signal |
 |---|---|---|---|---|
-| M1 attention module | M | attention | `src/attention.rs` (new), `src/lib.rs` | module + 10 unit tests green (`cargo test --lib attention`) |
-| M2 filter strips child titles | M | filter | `src/filter.rs` | 4 filter tests green; OSC 52/8 still pass |
-| M3 config + fleet keys | M | config | `src/config.rs`, `src/fleet/schema.rs` (the `Fleet` struct, `parse_fleet` and its constructor `:398`), the four `Fleet` literals (`src/fleet/plan/tests.rs:58`, `src/fleet/plan/tests.rs:326`, `src/fleet_cli/preflight/tests.rs:185`, `src/worktree.rs:522`) | `notify`/`title` parse, wrong types error, `apply_to_fleet` fills; tests green |
-| M4 plumbing | M (after M1+M3 merge) | fresh builder | `src/run_loop.rs` (`RunArgs` field, `RunState` field, tick before `renderer.paint`), `src/run_loop/setup.rs` (startup push, `Tracker::new`), `src/main.rs` (`cleanup_screen` reset, the plain launch's `RunArgs`), `src/loop_phases.rs` (`attention_facts`), `src/recover.rs` (the recovery path's `RunArgs`), `src/fleet_cli/up.rs` (`run_fleet`: Setup from the launch) | builds; `cargo test --lib` green; title visible in a live launch |
-| M5 docs + e2e + changelog | M (after M4 merge) | fresh builder | README, `docs/agent-status.md`, `docs/fleets.md`, `docs/control-plane.md`, `CHANGELOG.md`, `tests/atrium/session.rs` | `python docs/build.py`; e2e `host_title_names_the_project_and_is_reset_on_quit` green; integrator's full gate green |
+| A ([#13](https://github.com/nativelite/atrium/issues/13)) | Shared tmux protocol crate; atrium's shim depends on it | M | new org repo; crates.io publish (founder) | `src/tmux_shim.rs` keeps only `Broker`/`CtlBroker`/env/ensure; the 12 shim tests pass against the crate; registry build of atrium compiles |
+| B ([#14](https://github.com/nativelite/atrium/issues/14)) | `nativelite-ipc`: extract `src/ipc` with its exploit replays | L | A published first, or lands in the same release train | atrium depends on the crate; replay tests green in the crate; adversarial review done |
+| C ([#15](https://github.com/nativelite/atrium/issues/15)) | ctl listener on the doorbell + held `inbox --wait` connection | L | B (do inside the crate, not during its move) | a ctl request is served without waiting a tick; the mod's 1.5 s poll is gone; `ctl wait`/`ask` hold a connection |
+| D ([#16](https://github.com/nativelite/atrium/issues/16)) | Hook-injected certainty status for unmodded claude panes | M | — | yellow border within one tick of a permission prompt on a claude pane without the mod; user-passed `--settings` never overridden |
+| E ([#17](https://github.com/nativelite/atrium/issues/17)) | Teams follow-ups: `--teammate-mode auto` on argv, e2e with the fake claude, first-split size | M | 0.42.0 probe result | e2e green; no settings.json edit needed for a fresh user |
+| F ([#18](https://github.com/nativelite/atrium/issues/18)) | agsess refresh O(bound sessions), snapshot on change, indexed status | M | — | refresh cost measured before/after; idle CPU and key echo re-benchmarked |
+| G ([#19](https://github.com/nativelite/atrium/issues/19)) | Title and needs-you notifications: build or retire | M or 0 | founder decision | `src/attention.rs` + the old M1–M5 plan, or the plan deleted |
+| H ([#20](https://github.com/nativelite/atrium/issues/20)) | Token-free ctl reads documented as a stable host-read surface | S | — | docs/control-plane.md states the promise; wire-golden tests pin the reply shapes |
+| I ([#21](https://github.com/nativelite/atrium/issues/21)) | Housekeeping: 15 ms tick docs, benches README, re-bench after 8011dd9, overlays without `2J` | S | — | numbers recorded in benches/README.md |
 
+## Order of attack
 
-## Context
+1. **H, I, D, F** are independent of the crate moves and can start at once,
+   each in its own session or fleet item. D and F touch `src/pane_spawn.rs` and
+   `src/vendors.rs` respectively; nothing else overlaps.
+2. **A** next: a move, not a rewrite. The publish is the gate.
+3. **B then C**: the ipc work is one train. C is the latency win users feel
+   (the polls go away); B is what foldwave is waiting on.
+4. **E** after the 0.42.0 probe says what the shim got wrong in practice.
+5. **G** whenever the founder decides.
 
-When atrium is in a background tab or window, nothing tells the operator what the fleet is doing or that an agent is blocked on them. The status bar already knows (`?` marker, `N waiting`, `N decisions need you`), but only when you are looking. The feature surfaces that outside the pane: the host terminal's title names the session and summarizes state, and a transition into "needs you" rings the terminal.
+## Rules that still hold
 
-Two latent defects get fixed on the way: atrium never owns the title, and in passthrough mode a child's own `OSC 0/2` title escape leaks straight to the host (`src/filter.rs:176-177`), so claude's tab title and atrium's would fight.
+- Zero third-party dependencies; org crates only (`standards/zero-dependency.md`).
+- Local `python dev.py check` green before every push; there is no CI.
+- Severe/critical (B, C) get a scope statement, a self-review and an
+  adversarial pass before the push, and the commit message says so.
+- Every crates.io publish and every repo visibility change is the founder's.
+- The marketplace repo is public: skills and plugin syncs go with a release.
 
-Decisions taken with the founder (2026-09-18): channel default **bell + toast**; notify on **needs-you only** (title changes for everything); name = **fleet name, else project directory**, fleet may override with `title`.
+## Release chain for 0.43.0
 
-## Design
-
-**Title** (`OSC 2`, change-gated): `atrium · <name> · <state>`
-- `? builder needs you · 2 working` / `? 2 need you` / `? 1 decision needs you`
-- `● 3 working`
-- `○ idle`
-Precedence needs-you > working > idle, the bar's own ladder. `Idle | WaitingPrompt | unbound` count as idle; exited panes are neither.
-
-**Notify** on transitions only: a pane newly `WaitingApproval` (by pane key, 30 s cooldown per pane) or a newly pending human-addressed decision (by bus `seq`, so resolve-then-new is not hidden by an equal count). Channels: `BEL`; `OSC 9;<text>` toast (iTerm2/ConEmu); and for Windows Terminal, which ignores plain OSC 9, the tab progress indicator `OSC 9;4;2;0` (error/red) while `needs() > 0` and `OSC 9;4;0` to clear — persistent on the tab, cleared when handled. Config `notify`: `both` (default) | `bell` | `toast` | `off`, in `config.json` and per fleet.
-
-**Plumbing**: a pure `attention` module; the loop computes a `Summary` every tick from the same facts `bar_infos` uses and writes the tracker's bytes to `out` right before `renderer.paint` (`RunState::tick`, `src/run_loop.rs:218`) — same `Screen` chunk as the frame, one write on Windows, fires on an idle tick when the frame is empty. Title pushed at startup (`CSI 22;2 t`), reset at teardown (empty `OSC 2` then `CSI 23;2 t`).
-
-## Edits (ordered)
-
-1. **`src/attention.rs` (new) + `pub mod attention;` in `src/lib.rs`.** API:
-   - `enum Notify { Both, Bell, Toast, Off }` — `parse`, `bell()`, `toast()`, `DEFAULT = Both`.
-   - `struct Setup { name: String, notify: Notify }`; `Setup::project_dir_name()` (cwd basename, `atrium` fallback).
-   - `struct PaneFact { key: u64, label: String, exited: bool, status: Option<agsess::Status> }`.
-   - `struct Summary { needs_you: Vec<(u64, String)>, decisions: Vec<u64>, working, idle, exited }`; `Summary::build(&[PaneFact], human_decisions: &[u64])`; `needs()`.
-   - `state_text(&Summary)`, `title_text(name, &Summary)`, `text_safe(&str)` (control chars incl. BEL/ESC/C1, U+2028/9, bidi/zero-width → space; cap 200 chars — same list as `wake_safe` / `is_unsafe_in_wake` in `src/ctl_server/wake.rs:11`, `:23`).
-   - `TITLE_PUSH = "\x1b[22;2t"`, `TITLE_RESET = "\x1b]2;\x07\x1b[23;2t"`, `title_osc(text)`, `bell()`, `toast_osc(text)`, `progress_osc(on: bool)` (`\x1b]9;4;2;0\x07` / `\x1b]9;4;0;0\x07`).
-   - `enum Event { PaneNeedsYou { key, label }, DecisionNeedsYou { seq } }`; `struct Edges { cooldown_ms, last_rang }` with `diff(prev, next, now_ms) -> Vec<Event>` (`COOLDOWN_MS = 30_000`).
-   - `struct Tracker { setup, prev, edges, last_title, progress_on }` with `tick(next: Summary, now_ms) -> Vec<u8>`: title OSC iff changed; on events and notify≠Off, one BEL and/or one toast (`atrium: builder needs you` / `atrium: 2 need you`); progress on/off iff the needs state flipped and toast is enabled.
-2. **`src/filter.rs`**: `enum Osc { Strip(usize), Hold, No }` + `fn osc(rest)` beside `xtwinops` (`:93-113`): `ESC ]` Ps ∈ {0,1,2} (whole number; `10` ≠ `1`) → strip through `BEL`/`ESC \`; other Ps → pass (52 clipboard, 8 links); unterminated < 512 bytes → hold; over → pass. Wire into `feed` after the xtwinops arm (`:144-154`); update the module doc. Note ConPTY re-emits a child's title as `OSC 0`.
-3. **`src/config.rs`**: `GlobalConfig.notify: Option<Notify>`; parse `"notify"` via `opt_str` + `Notify::parse`, error naming the four values; `apply_to_fleet` fills `fleet.notify`.
-4. **`src/fleet/schema.rs`**: `Fleet.title: Option<String>`, `Fleet.notify: Option<Notify>`; parse in `parse_fleet` beside `identity` (`:287-294`); add to the constructor (`:398`) and the four `Fleet { .. }` literals (`src/fleet/plan/tests.rs:58`, `src/fleet/plan/tests.rs:326`, `src/fleet_cli/preflight/tests.rs:185`, `src/worktree.rs:522`).
-5. **`src/run_loop.rs`, `src/run_loop/setup.rs`, `src/main.rs`**: `RunArgs` (`src/run_loop.rs:20`) gains `attention: atrium::attention::Setup`; in `RunState::start` (`src/run_loop/setup.rs:11`) the startup write (`:57`) is prefixed with `TITLE_PUSH`, and `Tracker::new(setup)` is built beside `Renderer::new()` (`:244`) and kept on `RunState` (`src/run_loop.rs:77`); in `RunState::tick` (`src/run_loop.rs:124`), before `self.renderer.paint` (`:218`): build facts (`attention_facts`), human decisions (`bus.pending_decisions()` filtered by `decision_for_agent`, `src/ctl_server/dispatch.rs:39`, mapped to `seq`), `attention.tick(Summary::build(..), now_ms)`, `out.write_all` if non-empty. `cleanup_screen` (`src/main.rs:548`): `TITLE_RESET` after `\x1b[r`, before `?1049l`. `RunArgs` literals `src/main.rs:463` (plain) and `src/recover.rs:840` (recover): `Setup { name: Setup::project_dir_name(), notify: config::get().notify.unwrap_or(DEFAULT) }`.
-6. **`src/loop_phases.rs`**: `attention_facts(windows, world) -> Vec<PaneFact>` beside `bar_infos` (`:359`): key = `p.agent_id.0` (verify uniqueness across windows; else `(window_idx << 32) | p.id`), label = `role` else `title`, `exited`, `status = world.status_for(session_id)`.
-7. **`src/fleet_cli/up.rs`**, `run_fleet` (its `RunArgs` literal, `:508`): pass `Setup { name: fleet.title.clone().unwrap_or(name), notify: fleet.notify.unwrap_or(DEFAULT) }` from the launch (`apply_to_fleet` has already run, in `load_fleet`).
-8. **Docs**: README config block + bullet for `notify`; short "Title and notifications" note; `docs/agent-status.md` new section after "### Status bar" (format, precedence, channels, cooldown, WT/tmux caveats); `docs/fleets.md` keys `title`, `notify`; `docs/control-plane.md` ~:81 "and rings the terminal"; `CHANGELOG.md` `[Unreleased]` → `### Added`. Rebuild `docs/build.py`.
-
-## Verification
-
-- Unit (`src/attention.rs`): `summary_counts_panes_by_status`; `title_prefers_needs_you_then_working_then_idle` (table incl. 2 waiting, 1 decision, waiting+decision); `title_text_scrubs_control_characters_and_caps_length`; `diff_rings_only_on_a_newly_waiting_pane`; `diff_honors_the_per_pane_cooldown`; `diff_rings_for_a_newly_pending_human_decision` (`{1}→{2}` rings); `tracker_writes_the_title_only_when_it_changes`; `tracker_channels_follow_notify` (Both/Bell/Toast/Off byte contents, progress on/off flips once); `escapes_are_exact`; `notify_parses_its_four_values_and_rejects_others`.
-- `src/filter.rs`: `a_panes_title_change_is_stripped` (OSC 0/1/2, BEL and ST terminated); `osc_52_and_osc_8_pass_through`; `title_split_across_chunks_is_still_stripped`; `osc_10_is_not_osc_1`.
-- `src/config.rs` / `src/fleet/schema.rs`: `notify` parses, garbage names the key, `apply_to_fleet` fills; `title`/`notify` fleet keys parse and wrong types error.
-- e2e (`tests/atrium/session.rs`, using `read_until` / `strip_csi_bytes` / `contains` from `tests/atrium/support.rs`): `host_title_names_the_project_and_is_reset_on_quit` — spawn a shell session, `read_until` `\x1b]2;atrium` (`\x1b]0;atrium` on Windows: ConPTY re-emits as OSC 0), assert a payload contains the cwd basename, `^A q`, then the empty-title reset appears and the process exits. `strip_csi_bytes` leaves `ESC ]` alone so `contains` works.
-- Gate: `python dev.py check` green; live: launch `atrium` in a project → tab title reads `atrium · <dir> · ○ idle`; in a fleet, trigger a permission prompt → tab flashes/rings within ~8 s and the title shows `? <role> needs you`; answer it → title clears, WT tab indicator clears.
-
-## Risks / known limits (documented in agent-status.md)
-
-- Latency: `APPROVAL_DWELL_MS` 7 s + agent refresh 1 s/5 s → a permission prompt rings ~8 s after it appears; working→idle lags `IDLE_MS` 60 s.
-- Windows Terminal: no OSC 9 toast (BEL + the `9;4` tab indicator are the signals); ConPTY has no title stack, the empty-title reset restores the tab name.
-- tmux: OSC 2 sets the pane title (outer title with `set-titles on`); OSC 9 needs `allow-passthrough`; BEL follows `bell-action`.
-- First tick after `recover`/`fleet up` of an already-waiting agent rings once (prev is empty) — intended.
-- Nested atrium: the inner one's title is now stripped by the outer filter (intended).
+A's crate → (B's crate) → atrium 0.43.0 → marketplace plugin bump. If A or B
+slips, atrium 0.43.0 ships without them: D, E, F, H and I are self-contained.
