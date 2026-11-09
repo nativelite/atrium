@@ -455,6 +455,19 @@ pub(crate) fn spawn_pane_full(
             std::env::current_exe().ok().as_deref(),
         ));
     }
+    // Claude Code's teams backend: a claude pane in a ctl session is told it
+    // runs inside tmux, with atrium's shim first on PATH to answer, so the
+    // teammates its lead spawns become panes here (`atrium::tmux_shim`).
+    if let Some(addr) = CTL_ADDRESS.get() {
+        if atrium::bind::is_claude_stem(&title) {
+            base_env.extend(atrium::tmux_shim::pane_env(
+                addr,
+                &agent_id.to_string(),
+                tmux_shim_path().as_deref(),
+                std::env::var_os("PATH").as_deref(),
+            ));
+        }
+    }
 
     // Identity injection (path B): only for an agent pane with an identity set.
     // Decide ONCE so the spawn path and the pane's stored tag can never diverge
@@ -910,6 +923,20 @@ fn pane_env(
     );
     base_env.extend_from_slice(extra_env);
     (base_env, token, pane_cgroup)
+}
+
+/// The tmux shim's path, placed once per process on the first claude spawn of
+/// a ctl session (`atrium::tmux_shim::ensure`). `None` when it cannot be
+/// placed (no state root, an unwritable directory): the pane then gets no
+/// `TMUX` at all rather than one that points at nothing.
+fn tmux_shim_path() -> Option<std::path::PathBuf> {
+    static SHIM: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    SHIM.get_or_init(|| {
+        let exe = std::env::current_exe().ok()?;
+        let root = atrium::session_store::state_root()?;
+        atrium::tmux_shim::ensure(&exe, &root).ok()
+    })
+    .clone()
 }
 
 /// Merge the identity `name`'s resolved credentials over `base_env` for one

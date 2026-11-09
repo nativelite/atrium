@@ -167,6 +167,27 @@ or, from your own pane, just say "coordinate this across a team: …" and let th
 
 **With codex.** codex reads the same `SKILL.md` format. Copy the three directories into `~/.agents/skills/` (all your projects) or a repo's `.agents/skills/` (that repo), or add the plugin marketplace with `codex plugin marketplace add nativelite/marketplace`. A codex pane does not need the skills to know ctl exists: with the control plane on, atrium gives it the same directive it gives claude, as `-c developer_instructions`. Its commands reach the control socket through its sandbox as described in [codex panes](trust-and-security.md#codex-panes).
 
+## Claude Code's own teams, as atrium panes
+
+Claude Code has a teams feature of its own: a lead spawns teammates, hands them tasks from a shared list, and messages them through mailboxes. In split-pane mode each teammate gets a pane, but Claude Code does not draw panes. It runs a program named `tmux` (`split-window -d -t @0 -h -l 70% -P -F '#{pane_id}' -- claude --agent-name …`), reads the new pane's id back, and later `kill-pane`s it. Its backend knows two pane managers, tmux and iTerm2, and picks tmux whenever `TMUX` is set in the lead's environment. On Windows there is neither, so teams fell back to in-process rows inside the lead.
+
+With the control plane on, atrium answers to the name. A claude pane in an `--allow-ctl` session is born with:
+
+- `TMUX=<ctl address>,<atrium pid>,0` and `TMUX_PANE=%<pane>`: what Claude Code's auto-detection looks for;
+- a `PATH` led by `<state root>/shim/`, holding `tmux` (`tmux.exe` on Windows, since the native Claude Code resolves executables only). It is atrium's own binary under a second name, placed on the first claude spawn and refreshed when atrium is reinstalled;
+- `CLAUDE_CODE_TMUX_TRUECOLOR=1`, so Claude Code keeps truecolor instead of assuming a real tmux in between.
+
+Invoked as `tmux`, atrium serves the verbs the teams backend uses, each one an `atrium ctl` request with the caller's own token: `-V`, `display-message -p`, `list-panes -F`, `list-windows -F`, `split-window`, `new-window`, `kill-pane` and `send-keys`. Layout and style verbs (`set-option`, `select-pane`, `select-layout`, `resize-pane`, `show-environment`, `has-session`, `new-session`, `switch-client`, `attach-session`) are honoured by doing nothing. `capture-pane` is refused: atrium never hands one pane the text of another. Anything else exits 1 with a message.
+
+So a teammate is an ordinary atrium pane: `split-window` is `ctl spawn --here` beside the lead, the pane's role is the teammate's `--agent-name`, it is a child of the lead in the spawn tree and under its trust ceiling, and it has the status border, the overview row, the board and the bus. The shim models one window, `@0`, whose panes are the caller and its direct children, which is the team as the lead sees it; pane ids are `%<agent id>`.
+
+Two things to know:
+
+- Claude Code's `teammateMode` setting defaults to `in-process`. Set it to `auto` (split panes when inside tmux, which an atrium claude pane now is) or `tmux`.
+- `atrium --tmux-shim <tmux args…>` reaches the shim by its real name, for a probe: `atrium --tmux-shim -V` prints `tmux 3.5a-atrium`.
+
+The shim speaks only for the pane that runs it, with that pane's token, so it can spawn and kill only inside that pane's subtree, like any `atrium ctl` caller.
+
 ## See also
 
 - [README](../README.md): atrium overview and the full feature set.

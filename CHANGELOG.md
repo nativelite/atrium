@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Claude Code's own agent teams land as atrium panes.** Claude Code's
+  split-pane teams do not draw panes: the lead runs a program named `tmux`
+  (`split-window -d -t @0 -h -l 70% -P -F '#{pane_id}' -- claude --agent-name …`)
+  and reads the new pane's id back, and its backend knows only tmux and
+  iTerm2, so on Windows teams fell back to in-process rows inside the lead.
+  Under `--allow-ctl`, a claude pane is now born with `TMUX`, `TMUX_PANE` and a
+  `PATH` led by a directory holding `tmux` (`tmux.exe` on Windows): atrium's
+  own binary under a second name, placed in the per-user state root's `shim/`
+  on the first claude spawn and refreshed when atrium is reinstalled. Invoked
+  as `tmux`, atrium serves the verbs the installed Claude Code (2.1.289) was
+  read to use, each an `atrium ctl` request with the caller's token, so a
+  teammate is a child of the lead in the spawn tree, under its trust ceiling,
+  with the status border, the overview row, the board and the bus; the pane's
+  role is the teammate's `--agent-name`. Served: `-V` (a tmux 3 version),
+  `display-message -p`, `list-panes -F`, `list-windows -F`, `split-window`,
+  `new-window`, `kill-pane`, `send-keys`; honoured by doing nothing:
+  `set-option`, `select-pane`, `select-layout`, `resize-pane`,
+  `show-environment`, `has-session`, `new-session`, `switch-client`,
+  `attach-session`. `capture-pane` is refused: atrium never hands one pane the
+  text of another. The window is one, `@0`, holding the caller and its direct
+  children. `CLAUDE_CODE_TMUX_TRUECOLOR=1` rides along so Claude Code keeps
+  truecolor. Set Claude Code's `teammateMode` to `auto` or `tmux` (the default
+  is `in-process`); `atrium --tmux-shim <tmux args>` reaches the shim by its
+  real name for a probe (`src/tmux_shim.rs`, 12 unit tests).
 - **A trusted codex pane clears codex's two startup screens before it starts,
   and a send is never typed into either.** A fleet of two codex panes with the
   context-mode plugin stopped at launch: both opened on codex's "Hooks need

@@ -346,6 +346,14 @@ skills, [`atrium-delegate`](skills/atrium-delegate),
 skills](#set-up-the-coordination-skills)), or a hosted agent will not know the
 control plane exists.
 
+**Claude Code's own teams run here too.** A claude pane in an `--allow-ctl`
+session is told it is inside tmux (`TMUX`, `TMUX_PANE`) with atrium's own
+binary answering as `tmux` first on its `PATH`, so when a Claude Code lead
+spawns split-pane teammates, each one is an atrium pane: a child of the lead,
+under its trust ceiling, with the status border and the overview row. Set
+Claude Code's `teammateMode` to `auto` or `tmux`; details in
+[docs/control-plane.md](docs/control-plane.md#claude-codes-own-teams-as-atrium-panes).
+
 ## Reference
 
 ### Environment variables
@@ -354,6 +362,7 @@ control plane exists.
 | --- | --- |
 | `ATRIUM_CTL` | control-channel endpoint (set by atrium in every pane when `--allow-ctl`) |
 | `ATRIUM_PANE` | the caller pane's agent id (set by atrium) |
+| `TMUX`, `TMUX_PANE` | set by atrium in claude panes under `--allow-ctl`, with `tmux` on `PATH` answered by atrium itself, so Claude Code's teams spawn teammates as atrium panes |
 | `ATRIUM_BOARD` | file to persist the board across restarts (in-memory otherwise) |
 | `ATRIUM_BUS` | file to persist the bus across restarts |
 | `ATRIUM_CONFIG` | full path of the user-global `config.json`; wins over the `config.path` pointer (a named path must exist) |

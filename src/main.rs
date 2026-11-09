@@ -263,6 +263,15 @@ fn main() -> ExitCode {
     // mass-spawn, `fleet up` — is covered.
     atrium::signals::install();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The tmux shim: this same binary under the name `tmux`, answering Claude
+    // Code's teams backend from inside a ctl pane (`atrium::tmux_shim`); or
+    // `--tmux-shim <tmux args…>` to reach it by its real name for a probe.
+    if atrium::tmux_shim::invoked_as_shim() {
+        return atrium::tmux_shim::main(&args);
+    }
+    if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
+        return atrium::tmux_shim::main(&args[1..]);
+    }
     // Watchdog mode: a re-exec of atrium that outlives this session and cleans up
     // if it dies in a way no handler can catch (SIGKILL, panic, OOM). Dispatched
     // before anything else — it must never touch the terminal.

@@ -53,6 +53,7 @@ pub mod spawn;
 pub mod templates;
 pub mod theme;
 pub mod tile;
+pub mod tmux_shim;
 pub mod trust;
 pub mod uid;
 pub mod vendors;
