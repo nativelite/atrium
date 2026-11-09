@@ -385,6 +385,11 @@ impl Reply {
             ]),
             Reply::Tree(nodes) => obj(vec![
                 ok,
+                // The atrium that answered: a host terminal reading the
+                // token-free verbs keys its expectations on this, not on the
+                // shape of a reply it finds (docs/control-plane.md, "Reading
+                // the control plane from a host").
+                ("atrium", s(env!("CARGO_PKG_VERSION"))),
                 (
                     "tree",
                     Value::Array(

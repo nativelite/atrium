@@ -608,7 +608,7 @@ impl CtlBroker {
         let v = json::parse(&reply).map_err(|_| "unreadable reply from atrium".to_string())?;
         if v.get("ok").and_then(json::Value::as_bool) != Some(true) {
             let msg = v
-                .get("error")
+                .get("err")
                 .and_then(json::Value::as_str)
                 .unwrap_or("request refused");
             return Err(msg.to_string());

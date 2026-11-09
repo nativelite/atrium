@@ -952,3 +952,89 @@ fn ask_parses_its_flags_and_ends_on_a_reply_or_a_refusal() {
         r#"{"ok":true,"path":"src/x.rs","panes":[{"pane":2,"role":"dev_1","key":"src/x.rs","path":"/w/a/src/x.rs","first_ms":5,"last_ms":9,"live":true}]}"#
     );
 }
+
+// ---- Wire-golden rows for the host-read surface (docs/control-plane.md,
+// "Reading the control plane from a host"). A host terminal reads these
+// token-free replies; their shapes are additive-only from 0.43.0 on, so a
+// failing row here is a wire change and belongs in the changelog as one.
+
+#[test]
+fn golden_list_reply_names_the_atrium_and_each_pane() {
+    let reply = Reply::Tree(vec![
+        ListNode {
+            id: AgentId(1),
+            parent: None,
+            role: None,
+            title: "cmd".to_string(),
+            depth: 0,
+            status: None,
+            idle_ms: 0,
+        },
+        ListNode {
+            id: AgentId(3),
+            parent: Some(AgentId(1)),
+            role: Some("lead".to_string()),
+            title: "claude".to_string(),
+            depth: 1,
+            status: Some("working".to_string()),
+            idle_ms: 1200,
+        },
+    ]);
+    assert_eq!(
+        reply.to_json(),
+        format!(
+            r#"{{"ok":true,"atrium":"{}","tree":[{{"id":1,"parent":null,"role":null,"title":"cmd","depth":0,"status":null,"idle_ms":0}},{{"id":3,"parent":1,"role":"lead","title":"claude","depth":1,"status":"working","idle_ms":1200}}]}}"#,
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+}
+
+#[test]
+fn golden_status_reply_for_one_pane() {
+    let reply = Reply::StatusOne {
+        pane: AgentId(3),
+        status: Some("waiting-approval".to_string()),
+        idle_ms: 7000,
+        doing: None,
+    };
+    assert_eq!(
+        reply.to_json(),
+        r#"{"ok":true,"pane":3,"status":"waiting-approval","idle_ms":7000}"#
+    );
+    let unbound = Reply::StatusOne {
+        pane: AgentId(1),
+        status: None,
+        idle_ms: 0,
+        doing: None,
+    };
+    assert_eq!(
+        unbound.to_json(),
+        r#"{"ok":true,"pane":1,"status":null,"idle_ms":0}"#
+    );
+}
+
+#[test]
+fn golden_board_list_bus_feed_and_topics_replies() {
+    let board = json::parse(r#"{"m1":{"status":"DONE","owner":"dev_1"}}"#).unwrap();
+    assert_eq!(
+        Reply::BoardList(board).to_json(),
+        r#"{"ok":true,"board":{"m1":{"status":"DONE","owner":"dev_1"}}}"#
+    );
+    let feed = json::parse(r#"[{"seq":1,"topic":"work","kind":"fyi","msg":"hi"}]"#).unwrap();
+    assert_eq!(
+        Reply::BusFeed { feed, cursor: 1 }.to_json(),
+        r#"{"ok":true,"feed":[{"seq":1,"topic":"work","kind":"fyi","msg":"hi"}],"cursor":1}"#
+    );
+    assert_eq!(
+        Reply::BusTopics(vec![("work".to_string(), 2)]).to_json(),
+        r#"{"ok":true,"topics":[{"topic":"work","subs":2}]}"#
+    );
+}
+
+#[test]
+fn golden_error_reply_is_the_only_failure_shape() {
+    assert_eq!(
+        reply_err("unauthenticated: no token").to_json(),
+        r#"{"ok":false,"err":"unauthenticated: no token"}"#
+    );
+}

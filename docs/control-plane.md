@@ -132,6 +132,21 @@ atrium ctl audit
 
 The multiplier: many workers, coordinated by a few of them, driven by one human, and every level is a pane you can watch, redirect, zoom into (`Ctrl+A z`), or kill. `ctl` is the small verb layer; the panes, tiling, identity injection, and `agsess` status it stands on already existed.
 
+## Reading the control plane from a host
+
+A terminal or dashboard that hosts atrium can read the session's state over the control channel instead of the `ATRIUM_BUS` sidecar, which it still writes. The channel is `\.\pipetrium-ctl-<pid>` on Windows and the `0600` socket named by `ATRIUM_CTL` elsewhere; one JSON line in, one JSON line out, one request per connection. The verbs that need **no token** are the reads: `list`, `status`, `audit`, `board get`, `board list`, `bus feed`, `bus topics`. Everything that mutates the fleet or its shared state, and every verb that returns a model's words (`answer`, `asked`, `inbox`, `who`), needs the caller pane's `ATRIUM_TOKEN` and is scoped to that pane's subtree.
+
+What a host may rely on, from 0.43.0 on:
+
+- **Additive only.** A reply object keeps every key it has, with its type; new keys may appear in any release. Read what you know, ignore what you do not.
+- **`ok` is always there.** `{"ok":true,…}` carries the reply; `{"ok":false,"err":"<text>"}` is the only failure shape. An unauthenticated write fails this way too.
+- **Ids are stable within a session.** A pane's `id` is its agent id for the life of the session (the same number as `ATRIUM_PANE` inside it and `%<id>` in the tmux shim); `parent` is `null` for a root pane.
+- **`list` names the atrium that answered**: `"atrium":"<version>"`. Key feature expectations on that, never on the presence of a key.
+- **Status words are the agsess vocabulary** (`working`, `waiting-approval`, `waiting-prompt`, `idle`, `errored`, `ended`) or `null` for an unbound pane; `idle_ms` is milliseconds since the pane's last activity.
+- **The sidecar stays.** `ATRIUM_BUS` and `ATRIUM_BOARD` keep their snapshot format; a host that cannot reach the channel (ctl off, or a sandbox between) falls back to them.
+
+The exact reply shapes are pinned by tests in `src/ctl/tests.rs` (`golden_*`); a change that breaks one is a wire change and goes in the changelog as such.
+
 ## The mod: typed tools, the role section and subagent panes
 
 With `atrium mod install` done, every claude pane carries a plugin (the mod, `mod/`) that speaks the verbs above for it and gives the model three things:

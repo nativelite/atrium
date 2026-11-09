@@ -7,7 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The token-free ctl reads are a documented, stable surface for a host
+  terminal.** `list`, `status`, `audit`, `board get`/`list` and `bus
+  feed`/`topics` need no token; docs/control-plane.md ("Reading the control
+  plane from a host") now states what a host may rely on from 0.43.0 on:
+  replies are additive-only, `ok` is always present and
+  `{"ok":false,"err":"<text>"}` is the only failure shape, pane ids are stable
+  for the session, status words are the agsess vocabulary, and the
+  `ATRIUM_BUS`/`ATRIUM_BOARD` sidecars stay as the fallback. The `list` reply
+  gains `"atrium":"<version>"`, the answering atrium, so a host keys feature
+  expectations on it. Wire-golden tests (`golden_*`, `src/ctl/tests.rs`) pin
+  the shapes (atrium issue #20).
+
 ### Fixed
+- **The tmux shim read a refused reply's reason from the wrong key.** A
+  `ctl` failure is `{"ok":false,"err":…}`; the shim looked for `error` and
+  reported "request refused" instead of the reason. Found by the golden row.
 - **The board, log and ask overlays redraw in place.** Each repaint began with
   a full-screen clear (`2J`) and a redraw from scratch, which the Windows
   console host shows as a flash and charges as a ~16 ms frame; the overview

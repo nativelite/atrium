@@ -62,8 +62,14 @@ fn golden(name: &str) -> &'static str {
         "inbox_ask" => {
             r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"},{"kind":"ask","text":"what now?","id":3}]}"#
         }
+        // `atrium` names the answering version (0.43.0): a host keys its
+        // expectations on it, so the row carries this build's version.
         "list" => {
-            r#"{"ok":true,"tree":[{"id":0,"parent":null,"role":"ceo","title":"claude","depth":0,"status":"working","idle_ms":4000},{"id":1,"parent":0,"role":null,"title":"sh","depth":1,"status":null,"idle_ms":0}]}"#
+            concat!(
+                r#"{"ok":true,"atrium":""#,
+                env!("CARGO_PKG_VERSION"),
+                r#"","tree":[{"id":0,"parent":null,"role":"ceo","title":"claude","depth":0,"status":"working","idle_ms":4000},{"id":1,"parent":0,"role":null,"title":"sh","depth":1,"status":null,"idle_ms":0}]}"#
+            )
         }
         other => panic!("no golden for {other}"),
     }
