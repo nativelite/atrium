@@ -19,6 +19,7 @@ ansi = { package = "nativelite-ansi", version = "0.4.1", path = "../ansi-rs" }
 vterm = { package = "nativelite-vterm", version = "0.5.4", path = "../vterm-rs" }
 agsess = { package = "nativelite-agsess", version = "0.2.3", path = "../agsess" }
 json = { package = "nativelite-json", version = "0.1", path = "../json-rs" }
+tmuxproto = { package = "nativelite-tmuxproto", version = "0.1", path = "../tmuxproto" }
 
 [lib]
 name = "atrium"

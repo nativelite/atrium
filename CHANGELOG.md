@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The tmux shim's protocol half is the shared `nativelite-tmuxproto` crate.**
+  Parsing the argv, expanding `#{…}` formats, splitting the teammate's
+  shell-quoted command and running a verb against a pane backend moved out of
+  `src/tmux_shim.rs` into `nativelite-tmuxproto` 0.1 (an org crate, zero
+  dependencies), so atrium and fwterm parse tmux once; what stays in atrium is
+  its backend (`CtlBroker`), the pane environment and the shim file's
+  placement. Behaviour unchanged (atrium issue #13).
+
 ### Added
 - **Certainty status for a claude pane without the mod.** In a ctl session a
   bound claude pane is launched with `--settings <atrium's hooks file>`
