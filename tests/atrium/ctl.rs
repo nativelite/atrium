@@ -892,3 +892,78 @@ fn a_workers_to_wakes_the_pane_that_spawned_it() {
         String::from_utf8_lossy(&strip_csi_bytes(&out))
     );
 }
+
+/// atrium answering as tmux (`tmux_shim`): from inside a ctl pane, the very
+/// call Claude Code's teams backend makes (`split-window … -P -F '#{pane_id}'
+/// -- <cmd>`) opens a second pane beside the caller and prints its id, the
+/// pane list names both, and `kill-pane` is taken.
+#[test]
+fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    // The dispatch first, with no broker: `-V` answers from inside the pane.
+    p.write(format!("\"{atrium}\" --tmux-shim -V\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"3.5a-atrium", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"3.5a-atrium"),
+        "the shim dispatch answers -V inside the pane: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // Then the broker path: the caller alone, as `%0`.
+    p.write(format!("\"{atrium}\" --tmux-shim list-panes -F #{{pane_id}}/\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"%0/", Duration::from_secs(45));
+    assert!(
+        contains(&out, b"%0/"),
+        "list-panes answers from inside the pane: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(
+        format!(
+            "\"{atrium}\" --tmux-shim split-window -d -t @0 -h -P -F #{{pane_id}}/ -- {shell} {flag}\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"%1/", Duration::from_secs(30));
+    assert!(
+        contains(&out, b"%1/"),
+        "split-window prints the new pane's id: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // `ctl spawn --here` focuses the new pane (a human's split), so the
+    // keyboard is now in the teammate; a Claude Code lead is a process and
+    // keeps its own pane. Step back to the caller before asking as it.
+    std::thread::sleep(Duration::from_millis(500));
+    p.write(b"\x01h").unwrap();
+    p.write(b"\x01k").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    p.write(
+        format!("\"{atrium}\" --tmux-shim list-panes -t @0 -F #{{pane_id}}:#{{pane_title}}\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"%1:", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"%0:") && contains(&out, b"%1:"),
+        "the window lists the caller and the teammate: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The marker's typed form must not spell it (a tty echoes what is typed).
+    let marker_cmd = if cfg!(windows) {
+        "echo kill-ok-ma^rker"
+    } else {
+        "echo kill-ok-ma\"\"rker"
+    };
+    p.write(format!("\"{atrium}\" --tmux-shim kill-pane -t %1 && {marker_cmd}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"kill-ok-marker", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"kill-ok-marker"),
+        "kill-pane exits 0: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}

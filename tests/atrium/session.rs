@@ -517,3 +517,53 @@ fn double_prefix_reaches_the_child() {
     p.write(b"\x01q").unwrap();
     assert_eq!(wait_exit(&mut p, 15), 0);
 }
+
+/// The host terminal's title names the project while atrium runs and is
+/// reset on quit (`attention`): the launch writes `OSC 2 ; atrium · <dir> · …`
+/// (ConPTY may re-emit it as `OSC 0`), and `Ctrl+A q` writes the empty title
+/// that hands the tab back before leaving the alt screen.
+#[test]
+fn host_title_names_the_project_and_is_reset_on_quit() {
+    let (shell, args): (&str, Vec<&str>) = if cfg!(windows) {
+        ("cmd", vec!["/Q"])
+    } else {
+        ("sh", vec!["-i"])
+    };
+    let mut argv = vec![shell];
+    argv.extend(args);
+    let mut p = pty::Pty::spawn(env!("CARGO_BIN_EXE_atrium"), &argv, 24, 80).unwrap();
+    let bar_needle: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    let out = read_until(&mut p, bar_needle, Duration::from_secs(15));
+    let title_at = [&b"]2;atrium"[..], b"]0;atrium"].iter().find_map(|n| {
+        out.windows(n.len())
+            .position(|w| w == *n)
+            .map(|i| i + n.len())
+    });
+    let Some(i) = title_at else {
+        panic!("no title in: {:?}", String::from_utf8_lossy(&out));
+    };
+    let payload: Vec<u8> = out[i..]
+        .iter()
+        .take_while(|&&b| b != 0x07)
+        .cloned()
+        .collect();
+    let dir = std::env::current_dir()
+        .unwrap()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        contains(&payload, dir.as_bytes()),
+        "title names the project dir {dir:?}: {:?}",
+        String::from_utf8_lossy(&payload)
+    );
+    p.write(b"q").unwrap();
+    let out = read_until(&mut p, b"[?1049l", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"]2;") || contains(&out, b"]0;"),
+        "the empty title resets the tab before the alt screen is left: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    assert_eq!(wait_exit(&mut p, 15), 0);
+}
