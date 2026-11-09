@@ -17,6 +17,7 @@ shebang + exec bit make `./dev.py` work everywhere:
   ./dev.py lint       # clippy -D warnings (host + unix targets), MSRV build
   ./dev.py guard      # zero-dependency guard
   ./dev.py drift      # docs/*.html match docs/*.md; skills match the plugin's copy
+  ./dev.py soak       # the held-inbox soak (ATRIUM_SOAK_SECS, default 60); not in check
 
 Test runs are bounded. `cargo test` has no per-test timeout and this project has
 no CI to kill a stuck job, so a test that deadlocks used to wedge the machine
@@ -342,6 +343,17 @@ def mods() -> int:
     )
 
 
+def soak() -> int:
+    """The held-inbox / waking-channel soak (tests/atrium/soak.rs): ignored by
+    default, so never part of `check`. `ATRIUM_SOAK_SECS` sets the run length
+    (default 60); the budget is that plus a cold build."""
+    secs = int(os.environ.get("ATRIUM_SOAK_SECS", "60"))
+    return run(
+        "cargo", "test", "--test", "atrium", "soak_held", "--", "--ignored", "--nocapture",
+        timeout=secs + 600,
+    )
+
+
 def check() -> int:
     # guard (cheap) → drift (cheap) → fmt (cheap, fail fast on style drift) →
     # mods (the engine checks the mod; seconds) → lint (a compile, no run) →
@@ -357,6 +369,7 @@ COMMANDS = {
     "lint": lint,
     "guard": guard,
     "drift": drift,
+    "soak": soak,
     "check": check,
 }
 

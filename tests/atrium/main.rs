@@ -18,6 +18,7 @@ mod recover;
 #[cfg(any(windows, target_os = "linux"))]
 mod resources;
 mod session;
+mod soak;
 mod tiling;
 #[cfg(unix)]
 mod trust_ceiling;
