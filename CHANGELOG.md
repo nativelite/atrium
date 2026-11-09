@@ -94,6 +94,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shapes (atrium issue #20).
 
 ### Fixed
+- **The agent watch refreshes the sessions on screen, not the whole history.**
+  Every refresh (each second with an agent on screen) walked every transcript
+  root, stat'ed every known session and read every `subagents/` directory:
+  ~35 ms at ~440 sessions, most of atrium's idle CPU. The loop now tells the
+  watch which sessions its panes show, and while any pane is bound the thread
+  uses `agsess::World::refresh_focused` (nativelite-agsess 0.3.0): it touches
+  the bound sessions, those that wrote within the last two minutes, and any
+  it discovers (a bound session that appears is found at once; another is
+  found through its directory's mtime), and does the full walk only every
+  tenth refresh. A bound pane's status is exactly what the full refresh gave;
+  a session no pane shows may lag up to ten seconds in the overview and the
+  log. With no pane bound every refresh is still full, so an overview over a
+  fleet of plain shells sees the same picture as before. Measured in agsess
+  on a 500-session fixture (debug build): 47 ms a refresh to 1.5 ms between
+  full passes, 6 ms amortised (atrium issue #18, the agsess half; the
+  snapshot and index half is the entry below).
 - **The agent watch sends the loop a snapshot only when a session changed,
   and status lookups are indexed.** Every refresh (each second with an agent
   on screen) sent a full snapshot, changed or not, and each one cost the loop
