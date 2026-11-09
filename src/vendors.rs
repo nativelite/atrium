@@ -684,6 +684,34 @@ impl VendorWorlds {
         }
     }
 
+    /// Refresh every world for the sessions in `focus` only. Mirrors
+    /// [`agsess::World::refresh_focused`], with one adjustment: a bound id each
+    /// world does not know would make every world walk its root every refresh
+    /// (a claude pane's id is unknown to the codex world for good), so a world
+    /// is handed only the bound ids it knows plus the ids no world knows yet —
+    /// those are the panes whose transcript has not appeared, and every root
+    /// is walked until it does, as before.
+    pub fn refresh_focused(&mut self, focus: &agsess::Focus) {
+        let known_anywhere: std::collections::HashSet<&str> = self
+            .worlds
+            .iter()
+            .flat_map(|w| w.sessions.iter())
+            .map(|s| s.id.as_str())
+            .collect();
+        let nowhere: Vec<&str> = focus
+            .bound
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !known_anywhere.contains(id))
+            .collect();
+        for w in &mut self.worlds {
+            let here: std::collections::HashSet<&str> =
+                w.sessions.iter().map(|s| s.id.as_str()).collect();
+            let own = world_focus(focus, &here, &nowhere);
+            w.refresh_focused(&own);
+        }
+    }
+
     /// Resolve a pane's agent status from any vendor's sessions.
     ///
     /// `session_id` is the id atrium stamped on the pane — an injected uuid for
@@ -725,6 +753,25 @@ impl VendorWorlds {
 impl Default for VendorWorlds {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The focus one world gets out of the host's: the bound ids it knows
+/// (`here`) and the ones no world knows (`nowhere`); `recent_ms` unchanged.
+/// Pure, so the split is testable without a root.
+fn world_focus(
+    focus: &agsess::Focus,
+    here: &std::collections::HashSet<&str>,
+    nowhere: &[&str],
+) -> agsess::Focus {
+    agsess::Focus {
+        bound: focus
+            .bound
+            .iter()
+            .filter(|id| here.contains(id.as_str()) || nowhere.contains(&id.as_str()))
+            .cloned()
+            .collect(),
+        recent_ms: focus.recent_ms,
     }
 }
 
@@ -921,10 +968,20 @@ impl AgentState {
 /// of atrium's idle CPU and its worst key-echo latency (the loop stalled up to
 /// 153 ms). The thread refreshes and sends an [`AgentState`]; the loop takes the
 /// newest one whenever it ticks.
+///
+/// The loop also tells the thread which sessions are on screen
+/// ([`set_focus`](AgentWatch::set_focus)). While any pane is bound, a refresh
+/// is [`VendorWorlds::refresh_focused`]: it touches the bound sessions and the
+/// ones that wrote within [`RECENT_MS`](AgentWatch::RECENT_MS), and the whole
+/// history only every [`agsess::DISCOVERY_EVERY`]-th time. With no pane bound
+/// (the overview or the log open over a fleet of shells, say) every refresh is
+/// full, since the session list is then the whole picture.
 pub struct AgentWatch {
     rx: std::sync::mpsc::Receiver<AgentState>,
     /// How often to refresh, in ms; the loop tunes it to what is on screen.
     every_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Which sessions the loop shows; the thread reads it before each refresh.
+    focus: std::sync::Arc<std::sync::Mutex<agsess::Focus>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -933,17 +990,24 @@ impl AgentWatch {
     pub const ACTIVE: std::time::Duration = std::time::Duration::from_millis(1000);
     /// The refresh interval when nothing on screen shows agent state.
     pub const QUIET: std::time::Duration = std::time::Duration::from_millis(5000);
+    /// A session that wrote within this of now is tailed by a focused refresh
+    /// even when no pane shows it, so the overview and the activity log see an
+    /// agent running outside atrium move through its statuses and go idle on
+    /// time; quieter sessions wait for the periodic full refresh (10 s).
+    pub const RECENT_MS: u64 = 2 * agsess::IDLE_MS;
 
     /// Start the thread. Its first refresh uses `cutoff_ms` (see
-    /// [`VendorWorlds::refresh_since`]); later ones are full.
+    /// [`VendorWorlds::refresh_since`]); later ones are full, or focused once
+    /// the loop has set a focus with bound sessions.
     pub fn start(cutoff_ms: u64) -> AgentWatch {
         use std::sync::atomic::Ordering;
         let (tx, rx) = std::sync::mpsc::channel();
         let every_ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             Self::ACTIVE.as_millis() as u64,
         ));
+        let focus = std::sync::Arc::new(std::sync::Mutex::new(agsess::Focus::default()));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (interval, stopping) = (every_ms.clone(), stop.clone());
+        let (interval, shown, stopping) = (every_ms.clone(), focus.clone(), stop.clone());
         let _ = std::thread::Builder::new()
             .name("atrium-agents".to_string())
             .spawn(move || {
@@ -961,7 +1025,13 @@ impl AgentWatch {
                         continue;
                     }
                     last = std::time::Instant::now();
-                    worlds.refresh();
+                    // Copy the focus out so the loop never waits on a refresh.
+                    let focus = shown.lock().map(|f| f.clone()).unwrap_or_default();
+                    if focus.bound.is_empty() {
+                        worlds.refresh();
+                    } else {
+                        worlds.refresh_focused(&focus);
+                    }
                     // A snapshot goes to the loop only when a session changed:
                     // every one it receives costs a mod-report overlay and an
                     // overview/log repaint, and an idle fleet changes nothing
@@ -976,12 +1046,32 @@ impl AgentWatch {
                     }
                 }
             });
-        AgentWatch { rx, every_ms, stop }
+        AgentWatch {
+            rx,
+            every_ms,
+            focus,
+            stop,
+        }
     }
 
     /// The newest snapshot since the last call, if any.
     pub fn latest(&self) -> Option<AgentState> {
         self.rx.try_iter().last()
+    }
+
+    /// Tell the thread which sessions are on screen. The next refresh is
+    /// focused on them when `bound` is non-empty, full otherwise. Cheap to call
+    /// every tick: nothing is written when the focus has not changed.
+    pub fn set_focus(&self, bound: std::collections::HashSet<String>) {
+        let next = agsess::Focus {
+            bound,
+            recent_ms: Self::RECENT_MS,
+        };
+        if let Ok(mut f) = self.focus.lock() {
+            if *f != next {
+                *f = next;
+            }
+        }
     }
 
     /// Refresh at most every `every` from now on.
@@ -1797,6 +1887,71 @@ mod tests {
         );
     }
 
+    /// A world is handed the bound ids it knows and the ids no world knows;
+    /// an id another world knows is left out, or that world would walk its
+    /// root every second for a session that will never appear there.
+    #[test]
+    fn a_world_gets_its_own_bound_ids_and_the_unplaced_ones() {
+        let focus = agsess::Focus {
+            bound: ["mine", "theirs", "nowhere"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            recent_ms: 7,
+        };
+        let here: std::collections::HashSet<&str> = ["mine", "other"].into_iter().collect();
+        let own = world_focus(&focus, &here, &["nowhere"]);
+        let mut got: Vec<&str> = own.bound.iter().map(String::as_str).collect();
+        got.sort_unstable();
+        assert_eq!(got, ["mine", "nowhere"]);
+        assert_eq!(own.recent_ms, 7);
+    }
+
+    /// Over the worlds, a focused refresh reports a bound session exactly as a
+    /// full one does, and a bound session that appears later is found at once
+    /// in the world it belongs to.
+    #[test]
+    fn a_focused_refresh_binds_like_a_full_one_across_worlds() {
+        let td = TempDir::new("focus-root");
+        let root = td.0.join("projects");
+        write_adopt_session(&root, "proj", "sess-f1", &[&claude_user_with_cwd("/w")]);
+        write_adopt_session(&root, "proj", "sess-f2", &[&claude_user_with_cwd("/x")]);
+
+        let mut full = VendorWorlds::with_extra_claude_roots(vec![root.clone()]);
+        full.refresh();
+        // Both start cold. (A `refresh_since(now)` start would mark the stale
+        // fixture caught-up unread, by design, for either refresh kind.)
+        let mut focused = VendorWorlds::with_extra_claude_roots(vec![root.clone()]);
+        let bound = |ids: &[&str]| agsess::Focus {
+            bound: ids.iter().map(|s| s.to_string()).collect(),
+            recent_ms: 0,
+        };
+        focused.refresh_focused(&bound(&["sess-f1", "sess-late"]));
+        let view = |w: &VendorWorlds, id: &str| {
+            w.snapshot()
+                .sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .cloned()
+        };
+        let a = view(&full, "sess-f1").expect("full sees f1");
+        let b = view(&focused, "sess-f1").expect("focused sees f1");
+        assert_eq!(
+            (a.status, a.cwd, a.last_action),
+            (b.status, b.cwd, b.last_action)
+        );
+        assert!(view(&focused, "sess-late").is_none());
+
+        write_adopt_session(&root, "proj", "sess-late", &[&claude_user_with_cwd("/y")]);
+        focused.refresh_focused(&bound(&["sess-f1", "sess-late"]));
+        let late = view(&focused, "sess-late").expect("a bound session is found at once");
+        assert_eq!(
+            late.cwd.as_deref(),
+            Some("/y"),
+            "and tailed in the same refresh"
+        );
+    }
+
     #[test]
     fn adopt_no_candidates_before_launch() {
         let td = TempDir::new("no-cand");
@@ -2001,6 +2156,10 @@ mod tests {
     fn the_agent_watch_publishes_a_first_snapshot_off_the_loop() {
         let watch = AgentWatch::start(agsess::sessions::now_ms());
         watch.set_interval(std::time::Duration::from_millis(100));
+        // A focus with a session no root has: the thread's later refreshes take
+        // the focused path (and walk for the missing id) without disturbing
+        // the first snapshot.
+        watch.set_focus(["no-such-session".to_string()].into_iter().collect());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut first = None;
         while first.is_none() && std::time::Instant::now() < deadline {

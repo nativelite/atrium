@@ -430,6 +430,17 @@ impl RunState<'_> {
         } else {
             atrium::vendors::AgentWatch::QUIET
         });
+        //     And which sessions the panes show: with any bound, the thread
+        //     refreshes those (and the recently active) instead of walking the
+        //     whole history every second (issue #18).
+        self.agents.set_focus(
+            self.windows
+                .iter()
+                .flat_map(|w| w.panes.iter())
+                .filter(|p| !p.exited)
+                .filter_map(|p| p.session_id.clone())
+                .collect(),
+        );
         let mut did_refresh = false;
         if let Some(snapshot) = self.agents.latest() {
             self.world = snapshot;
