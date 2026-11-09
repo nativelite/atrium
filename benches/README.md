@@ -244,3 +244,23 @@ What it shows, and what it cannot:
   panes repainting. Well inside the 5 s and 10 s budgets, and one run, so
   noted rather than chased; a 600 s run on native Linux would say whether it
   is the channel or the host.
+
+### 600 s, Windows (integrator's run, 2026-11-09)
+
+Same harness, `ATRIUM_SOAK_SECS=600`, on the merged tree with the vterm notices,
+codex hooks and team board in (main at the merge of the four 0.46 items).
+
+| metric | value |
+| --- | --- |
+| rss MB start / baseline (60 s) / end | 11.6 / 12.2 / 12.6 (+3.1 %) |
+| handles start / baseline / end | 172 / 174 / 166 (-4.6 %) |
+| host list requests | 2949 (0 refused or failed) |
+| host p50 / p99 / max ms | 2.53 / 29.62 / 239.17 |
+| sends / received / late or lost / refused | 1192 / 1192 / 0 / 0 |
+| delivery p50 / p99 / max ms | 1.5 / 29.6 / 84.0 |
+| waiter replies / expired holds / errors | 1200 / 0 / 0 |
+| final list ms | 2.44 |
+
+Ten minutes, no leak, no stall. The end-of-run handle drop is the eight held
+connections released by the stop wakes before the last sample, as in the 120 s
+runs.
