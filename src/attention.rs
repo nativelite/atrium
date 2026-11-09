@@ -276,10 +276,13 @@ pub fn pane_badge(own: Option<&str>, program: &str) -> Option<String> {
     if own.is_empty() {
         return None;
     }
-    let stem = std::path::Path::new(own)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(own);
+    // ConPTY titles the pane with the program's path, which on Windows uses
+    // a backslash; `Path` on unix knows only `/`, so split on both by hand.
+    let file = own.rsplit(['\\', '/']).next().unwrap_or(own);
+    let stem = match file.rfind('.') {
+        Some(0) | None => file,
+        Some(dot) => &file[..dot],
+    };
     if own.eq_ignore_ascii_case(program) || stem.eq_ignore_ascii_case(program) {
         return None;
     }
