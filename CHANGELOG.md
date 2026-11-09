@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-11-09
+
 ### Added
 - **Proportional splits: `ctl spawn --here --size <N%|N>`, and the tmux shim
   honours `-l`.** A split node in the layout tree can carry a ratio, the share
