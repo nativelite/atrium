@@ -1745,10 +1745,6 @@ mod tests {
 
     // --- roots: vendor_root ---
 
-    // Mutex to serialise env-touching tests. cargo test runs tests in parallel
-    // by default and std::env::set_var / remove_var are process-global.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn vendor_root_claude_is_default_root() {
         // ClaudeCode is the only verified root; it must equal agsess::default_root().
@@ -1778,14 +1774,10 @@ mod tests {
 
     #[test]
     fn vendor_root_codex_home_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CODEX_HOME").ok();
-        std::env::set_var("CODEX_HOME", "/tmp/my_codex");
+        let mut guard = crate::test_env::EnvGuard::hold();
+        guard.set("CODEX_HOME", "/tmp/my_codex");
         let result = vendor_root(Vendor::Codex);
-        match prev {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
+        drop(guard);
         // CODEX_HOME replaces ~/.codex; sessions subdir is appended.
         assert_eq!(
             result,
@@ -1795,14 +1787,10 @@ mod tests {
 
     #[test]
     fn vendor_root_atrium_gemini_override() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("ATRIUM_GEMINI_ROOT").ok();
-        std::env::set_var("ATRIUM_GEMINI_ROOT", "/tmp/my_gemini");
+        let mut guard = crate::test_env::EnvGuard::hold();
+        guard.set("ATRIUM_GEMINI_ROOT", "/tmp/my_gemini");
         let result = vendor_root(Vendor::Gemini);
-        match prev {
-            Some(v) => std::env::set_var("ATRIUM_GEMINI_ROOT", v),
-            None => std::env::remove_var("ATRIUM_GEMINI_ROOT"),
-        }
+        drop(guard);
         assert_eq!(result, Some(std::path::PathBuf::from("/tmp/my_gemini")));
     }
 
@@ -2089,16 +2077,13 @@ mod tests {
 
         // Point the codex world at our synthetic root exactly as an operator would
         // (CODEX_HOME is codex's own env var), then build + refresh via the same
-        // API the run loop uses. Serialize with the other env tests via ENV_LOCK.
-        let _lock = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CODEX_HOME").ok();
-        std::env::set_var("CODEX_HOME", &td.0);
+        // API the run loop uses. Serialized with every other env-touching test
+        // by the crate's `test_env::EnvGuard`, which restores on drop.
+        let mut guard = crate::test_env::EnvGuard::hold();
+        guard.set("CODEX_HOME", &td.0);
         let mut worlds = VendorWorlds::new();
         worlds.refresh();
-        match prev {
-            Some(v) => std::env::set_var("CODEX_HOME", v),
-            None => std::env::remove_var("CODEX_HOME"),
-        }
+        drop(guard);
 
         // Scope to Codex sessions (what the run loop passes to adopt for a codex
         // pane) so real ~/.claude sessions on the dev box can't perturb the test.

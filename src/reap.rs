@@ -524,7 +524,7 @@ mod sys {
         // ULONG_PTR array, so the array starts 8 bytes in on both 32- and 64-bit.
         // A `usize` buffer keeps that alignment.
         let word = core::mem::size_of::<usize>();
-        let header_words = (8 + word - 1) / word; // not `div_ceil`: that is 1.73, the MSRV is 1.70
+        let header_words = 8_usize.div_ceil(word);
         let mut capacity = 256usize;
         loop {
             let mut buf = vec![0usize; header_words + capacity];
@@ -895,14 +895,20 @@ pub fn read_policy(path: &Path) -> Option<String> {
 /// sweep's liveness check, the orphan scan, the warden's ancestry walk) makes a
 /// safety decision from what `ps` prints. One constant so no reader drifts back
 /// to a `$PATH` lookup (r10 audit B7).
-#[allow(dead_code)] // read only by unix/macOS code paths
+#[allow(
+    dead_code,
+    reason = "read only by the unix/macOS process-table readers"
+)]
 pub(crate) const PS_PATH: &str = "/bin/ps";
 
 /// Parse the first `N` whitespace columns from `it` as pids, or `None` if a
 /// column is missing or not a `u32` (a header, a truncated line). The shared
 /// table-builder step of every `ps -o pid=,…` reader; the iterator is left
 /// positioned after the pids for callers that read further columns.
-#[allow(dead_code)] // read only by unix/macOS code paths (tested everywhere)
+#[allow(
+    dead_code,
+    reason = "called only by the unix/macOS readers; pure, so it is tested everywhere"
+)]
 pub(crate) fn pid_columns<'a, const N: usize>(
     it: &mut impl Iterator<Item = &'a str>,
 ) -> Option<[u32; N]> {

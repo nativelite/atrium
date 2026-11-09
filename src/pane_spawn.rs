@@ -800,7 +800,13 @@ pub(crate) fn codex_has_bypass_hook_trust(program: &str) -> bool {
 /// [`codex_has_no_daemon`], of its own `codex features list`: a row that starts
 /// with the feature's name. A codex without it keeps the plain `--sandbox`.
 /// Windows never asks: its pipe admits the sandbox as is ([`codex_ctl_socket`]).
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg_attr(
+    windows,
+    allow(
+        dead_code,
+        reason = "only the unix spawn arm asks; Windows admits the sandbox as is"
+    )
+)]
 fn codex_has_network_proxy(program: &str) -> bool {
     codex_probe(program, &["features", "list"], |out| {
         out.lines()

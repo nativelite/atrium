@@ -708,6 +708,10 @@ mod tests {
 
     #[test]
     fn the_file_sits_beside_the_global_fleet_file_by_default() {
+        // Held, not set: `fleet::locate`'s tests move XDG_CONFIG_HOME / APPDATA
+        // in this process, and the two `global_dir()` reads below must see the
+        // same value (issue #9).
+        let _env = crate::test_env::EnvGuard::hold();
         if std::env::var_os(ENV_CONFIG).is_some()
             || std::env::var_os(crate::fleet::ENV_FLEET).is_some()
         {

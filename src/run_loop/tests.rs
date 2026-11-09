@@ -47,3 +47,29 @@ fn the_active_window_stays_inside_what_is_left() {
     assert_eq!(active_after_reap(3, 0, 3), 2);
     assert_eq!(active_after_reap(1, 2, 4), 0);
 }
+
+/// Once the accept thread is gone, `poll` errs on every tick: the loop says so
+/// once, names the remedy, and lets the listener go — so there is no second
+/// poll to say it again. A real listener stands in for the one the loop owns;
+/// the error is the one `nativelite-ipc` hands back.
+#[test]
+fn a_lost_ctl_channel_is_said_once_and_the_listener_let_go() {
+    let addr = atrium::ipc::address_for(u32::MAX - 13);
+    let mut listener = Some(atrium::ipc::Listener::bind(&addr).expect("bind a test endpoint"));
+    let mut held = Vec::new();
+    let mut flash = None;
+    let err = std::io::Error::other("the ctl accept thread has exited");
+
+    ctl_channel_lost(&mut listener, &mut held, &mut flash, &err);
+    assert!(listener.is_none(), "the dead listener is let go");
+    let (text, _) = flash.take().expect("said on the bar");
+    assert!(
+        text.starts_with("ctl channel lost: the ctl accept thread has exited"),
+        "names the cause: {text}"
+    );
+    assert!(text.contains("restart atrium"), "names the remedy: {text}");
+
+    // The next tick finds no listener: nothing to poll, nothing to say again.
+    ctl_channel_lost(&mut listener, &mut held, &mut flash, &err);
+    assert!(flash.is_none(), "said once");
+}

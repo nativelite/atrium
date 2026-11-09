@@ -105,7 +105,13 @@ pub fn tokens_to_restore(available: usize, size: usize, build_running: bool) -> 
 /// The owning pid encoded in a pool FIFO's file name
 /// (`atrium-build-<pid>-<nonce>.fifo`), or `None` for any other file. Only the
 /// unix sweep uses it; it is compiled everywhere so it is tested everywhere.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the unix sweep calls it; compiled everywhere so it is tested everywhere"
+    )
+)]
 fn stale_owner(file_name: &str) -> Option<u32> {
     let rest = file_name
         .strip_prefix("atrium-build-")?
@@ -128,9 +134,8 @@ impl BuildPool {
     /// Create a pool of `size` tokens under a fresh, unguessable name.
     pub fn create(size: usize) -> std::io::Result<BuildPool> {
         let size = size.max(1);
-        let nonce = crate::uid::token().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "no OS entropy for a pool name")
-        })?;
+        let nonce = crate::uid::token()
+            .ok_or_else(|| std::io::Error::other("no OS entropy for a pool name"))?;
         let name = format!("atrium-build-{}-{}", std::process::id(), &nonce[..16]);
         let (sys, auth) = sys::Pool::create(&name, size)?;
         Ok(BuildPool { size, auth, sys })

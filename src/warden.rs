@@ -213,17 +213,29 @@ pub struct Warden {
     /// Session registries present when we started, plus our own, plus every one
     /// we have since reached a definite verdict on. Anything not in here is a
     /// session we have not judged yet. Only the unix descent check reads it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the unix descent check reads it")
+    )]
     known_sessions: HashSet<u32>,
     /// Sessions we could not judge, so the "could not establish" alert is raised
     /// once per pid rather than every tick. They stay OUT of `known_sessions` on
     /// purpose: a transient failure should resolve itself on a later tick.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg_attr(
+        not(unix),
+        allow(dead_code, reason = "only the unix descent check reads it")
+    )]
     unknown_reported: HashSet<u32>,
     /// Whether the one-time "no descent check on this platform" note has been
     /// raised. Silence must not be mistaken for "nothing found". Only the
     /// non-unix arm of `check_descendants` reads it, hence the allow.
-    #[cfg_attr(unix, allow(dead_code))]
+    #[cfg_attr(
+        unix,
+        allow(
+            dead_code,
+            reason = "only the non-unix arm of check_descendants reads it"
+        )
+    )]
     unsupported_reported: bool,
 }
 
@@ -827,7 +839,13 @@ impl ExeIds {
 /// - If that check ever failed for the real atrium anyway, its `comm` really is
 ///   `atrium`, and nothing lets an agent rename another process — so this
 ///   returns "cannot tell", never "not atrium".
-#[cfg_attr(not(unix), allow(dead_code))]
+#[cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "only the unix descent check calls it; pure, so it is tested everywhere"
+    )
+)]
 fn unreadable_hop(foreign_owner: bool, comm: Option<&str>) -> Option<bool> {
     if !foreign_owner {
         return None;

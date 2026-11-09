@@ -691,7 +691,10 @@ fn proc_ids(pid: u32) -> Option<(u32, u32, u64)> {
 
 /// Split out so the `)`-in-comm hazard is testable without a Linux host: this
 /// function is compiled and tested on every platform.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "only the Linux /proc reader calls it; compiled everywhere so the )-in-comm hazard is tested everywhere"
+)]
 fn parse_proc_stat(text: &str) -> Option<(u32, u32, u64)> {
     let tail = &text[text.rfind(')')? + 1..];
     let f: Vec<&str> = tail.split_whitespace().collect();
@@ -731,7 +734,10 @@ fn env_candidates() -> Vec<Proc> {
 }
 
 /// Pure, so the whole macOS reader is testable from a captured `ps` transcript.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "only the macOS ps reader calls it; pure, so a captured transcript tests it everywhere"
+)]
 fn parse_ps_e(text: &str) -> Vec<Proc> {
     let mut out = Vec::new();
     for line in text.lines() {
