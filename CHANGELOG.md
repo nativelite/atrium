@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A token-free `bus feed` returned nothing.** The host-read surface
+  documented in 0.43.0 lists `bus feed` among the token-free reads, but a
+  caller-less request was served as the operator, who subscribes to nothing,
+  so a host following the doc got an empty feed every time (reported by the
+  fwterm client). A caller-less feed now carries every event past `since`,
+  as the sidecar does; a pane's feed is unchanged.
+
 ## [0.45.0] - 2026-11-09
 
 ### Added

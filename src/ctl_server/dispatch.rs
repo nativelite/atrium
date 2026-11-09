@@ -988,7 +988,19 @@ fn bus(
             ctl::reply_bus_subscribed(current_subs(bus, &who))
         }
         ctl::BusOp::Feed { since } => {
-            let events = bus.feed(&who, since);
+            // A caller-less read is a host's (a terminal, a dashboard): the
+            // operator's view, every event past the cursor, as the ATRIUM_BUS
+            // sidecar shows it. Served as "operator" it subscribed to nothing
+            // and saw nothing, which broke the documented host read. A pane's
+            // feed stays its own subscriptions, minus its own echoes.
+            let events: Vec<&atrium::bus::Event> = if caller.is_none() {
+                bus.tail(usize::MAX)
+                    .into_iter()
+                    .filter(|e| e.seq > since)
+                    .collect()
+            } else {
+                bus.feed(&who, since)
+            };
             // The new cursor is the max seq pulled, or `since` when empty,
             // so it never rewinds.
             let cursor = events.iter().map(|e| e.seq).max().unwrap_or(since);

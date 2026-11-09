@@ -1065,3 +1065,35 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     p.write(b"q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
+
+/// The host-read surface: a request with no token and no caller (a host
+/// terminal reading over the channel it found by pid) gets the whole bus from
+/// `bus feed`, not the operator's empty subscription view, and each event
+/// carries its `kind` and `resolved` flag so decisions can be derived.
+#[test]
+fn a_token_free_bus_feed_is_the_whole_bus() {
+    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    // A pane publishes (authenticated, from inside); the marker's typed form
+    // must not spell it.
+    p.write(format!("\"{atrium}\" ctl bus pub work --new msg=host-feed-mark\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"seq\":", Duration::from_secs(20));
+    // The host: no token, no caller, straight to the endpoint by pid.
+    let address = atrium::ipc::address_for(p.pid());
+    let args: Vec<String> = ["bus", "feed", "--since", "0"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let line = atrium::ctl::build_request(&args, None).unwrap();
+    assert!(!line.contains("token"), "the host carries no token: {line}");
+    let reply = atrium::ipc::request(&address, &line).expect("the channel answers a host");
+    assert!(
+        reply.contains("host-feed-mark")
+            && reply.contains("\"kind\":")
+            && reply.contains("\"resolved\":"),
+        "a token-free feed is the whole bus, with kind and resolved: {reply}"
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}

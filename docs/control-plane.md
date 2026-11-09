@@ -138,6 +138,7 @@ A terminal or dashboard that hosts atrium can read the session's state over the 
 
 What a host may rely on, from 0.43.0 on:
 
+- **A token-free `bus feed` is the whole bus.** With no caller there are no subscriptions to filter by, so the reply carries every event with `seq` past `since`, oldest first, each with its `kind` and `resolved` flag; a host derives the open decisions as the `decision_needed` events whose `resolved` is false, exactly what the sidecar shows. A pane's own `bus feed` stays its subscriptions, minus its own echoes.
 - **Additive only.** A reply object keeps every key it has, with its type; new keys may appear in any release. Read what you know, ignore what you do not.
 - **`ok` is always there.** `{"ok":true,…}` carries the reply; `{"ok":false,"err":"<text>"}` is the only failure shape. An unauthenticated write fails this way too.
 - **Ids are stable within a session.** A pane's `id` is its agent id for the life of the session (the same number as `ATRIUM_PANE` inside it and `%<id>` in the tmux shim); `parent` is `null` for a root pane.
