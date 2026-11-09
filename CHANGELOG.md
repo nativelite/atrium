@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-11-09
+
 ### Added
 - **A pane's own title, bell and notification, from nativelite-vterm 0.5.6's
   notices.** The emulator now reports what a program says rather than draws
