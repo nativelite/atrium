@@ -44,6 +44,9 @@ pub(crate) struct RunArgs<'a> {
     /// panes (so they get `ATRIUM_CTL` in their env) and hands the listener here;
     /// `None` means run() binds its own after the initial spawn (the default path).
     pub(crate) ctl_listener: Option<atrium::ipc::Listener>,
+    /// The host terminal's title and the needs-you ring (`attention`): what
+    /// the session is called, and which channels ring.
+    pub(crate) attention: atrium::attention::Setup,
     /// The fleet's declared canonical topic vocabulary (fleet config `"topics": []`),
     /// if any. `Some` ⇒ the bus enforces strict topic admission (agents route only
     /// on declared topics); `None` ⇒ topics are soft-gated (a novel topic needs
@@ -79,6 +82,8 @@ struct RunState<'a> {
     out: atrium::screen::Screen,
     rows: u16,
     cols: u16,
+    /// The host's title and the needs-you ring, fed once a tick.
+    attention: atrium::attention::Tracker,
     size_watch: atrium::screen::SizeWatch,
     windows: Vec<Window>,
     flash: Option<(String, Instant)>,
@@ -224,6 +229,25 @@ impl RunState<'_> {
         self.refresh_agents();
 
         self.resync_screen();
+
+        // 5c. the host terminal's title and the needs-you ring (`attention`):
+        //     built from the facts the bar uses, written right before the frame
+        //     so the bytes ride the same console write. Empty most ticks.
+        {
+            let facts = attention_facts(&self.windows, &self.world);
+            let human: Vec<u64> = self
+                .bus
+                .pending_decisions()
+                .iter()
+                .filter(|e| !decision_for_agent(e, &self.windows))
+                .map(|e| e.seq)
+                .collect();
+            let summary = atrium::attention::Summary::build(&facts, &human);
+            let bytes = self.attention.tick(summary, agsess::sessions::now_ms());
+            if !bytes.is_empty() {
+                let _ = self.out.write_all(&bytes);
+            }
+        }
 
         // 6-7. paint the active window and the bar as one synchronized frame.
         self.renderer.paint(

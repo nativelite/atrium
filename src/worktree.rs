@@ -550,6 +550,8 @@ mod tests {
             allow_ctl: None,
             mod_enabled: None,
             teams: None,
+            title: None,
+            notify: None,
             subagents: None,
             subagents_keep: None,
             captions: None,

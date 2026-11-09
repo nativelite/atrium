@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The host terminal's title names the session and its state, and a "needs
+  you" transition rings it.** `atrium · <name> · <state>` (`? builder needs
+  you · 2 working`, `● 3 working`, `○ idle`; the name is the fleet's name or
+  its new `title` key, else the project directory), written only when it
+  changes, the host's own title saved at startup and restored at exit. A pane
+  newly waiting on your approval (per pane, 30 s cooldown) or a decision newly
+  addressed to you rings: `BEL`, an `OSC 9` toast, and Windows Terminal's tab
+  progress indicator while anything needs you. New `notify` key in
+  `config.json` and per fleet: `both` (default), `bell`, `toast`, `off`. A
+  pane's own title escapes (`OSC 0/1/2`) are now stripped in passthrough so a
+  child never fights atrium for the tab (`src/attention.rs`, 10 unit tests;
+  `src/filter.rs`, 4; docs/agent-status.md "Terminal title and the needs-you
+  ring"; atrium issue #19, the plan of 2026-09-18).
+
 ### Changed
 - **The tmux shim's protocol half is the shared `nativelite-tmuxproto` crate.**
   Parsing the argv, expanding `#{…}` formats, splitting the teammate's

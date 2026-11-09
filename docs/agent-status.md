@@ -28,6 +28,14 @@ The pane's top-edge label gains a single marker:
 
 A window whose bound agent is waiting shows `?` next to its name, and the bar appends `| N waiting`. This means a blocked agent in a backgrounded window still surfaces, even when it is off-screen.
 
+### Terminal title and the "needs you" ring
+
+The three signals above need you to be looking at atrium. When it sits in a background tab or window, the host terminal carries the state instead. atrium sets the terminal's title to `atrium · <name> · <state>`, where the name is the fleet's name (or its `title` key), else the project directory, and the state is, in precedence order, `? builder needs you · 2 working` / `? 2 need you` / `? 1 decision needs you`, then `● 3 working`, then `○ idle`. Idle, waiting-for-a-prompt and unbound panes count as idle; an exited pane is neither. The title is written only when it changes, and the host's own title is saved at startup and restored at exit.
+
+A *transition* into "needs you" rings: a pane newly waiting on your approval (once per pane, with a 30 s cooldown) or a decision newly addressed to you on the bus. Channels: `BEL`; an `OSC 9` toast (iTerm2, ConEmu, fwterm); and, for Windows Terminal, which ignores a plain `OSC 9`, the tab progress indicator, red while anything needs you and cleared when nothing does. The `notify` key in `config.json`, and per fleet, is `both` (the default), `bell`, `toast` or `off`.
+
+Known limits: without the mod or the settings hooks, a permission prompt rings about eight seconds after it appears (the transcript inference's dwell plus the refresh); working to idle lags by a minute. Windows Terminal shows no toast, so the bell and the tab indicator are its signals; ConPTY has no title stack, so the empty-title reset restores the tab's own name. Under tmux, `OSC 2` sets the pane title (the outer title with `set-titles on`), `OSC 9` needs `allow-passthrough`, and the bell follows `bell-action`. A pane's own title escapes (`OSC 0/1/2`, including ConPTY re-emitting a child's title) are stripped in passthrough so a child never fights atrium for the tab.
+
 ## How the bind works
 
 When atrium spawns an agent pane, it mints a fresh session id and passes `claude --session-id <uuid>`. If you already supplied a session-selecting flag such as `--resume`, `--continue`, or `--session-id`, the id is yours and atrium leaves it alone.

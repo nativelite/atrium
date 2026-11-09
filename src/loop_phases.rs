@@ -399,6 +399,24 @@ pub(crate) fn bar_infos(
 /// The bar note for open `decision_needed` escalations the human must answer —
 /// empty when there are none. A decision addressed to a live teammate
 /// (`to=<role>`) is that agent's to answer and is not counted.
+/// What `attention` needs of every pane: a stable key, a label (role, else
+/// title), whether it exited, and its bound agent's status.
+pub(crate) fn attention_facts(
+    windows: &[Window],
+    world: &atrium::vendors::AgentState,
+) -> Vec<atrium::attention::PaneFact> {
+    windows
+        .iter()
+        .flat_map(|w| w.panes.iter())
+        .map(|p| atrium::attention::PaneFact {
+            key: p.agent_id.0 as u64,
+            label: p.role.clone().unwrap_or_else(|| p.title.clone()),
+            exited: p.exited,
+            status: world.status_for(p.session_id.as_deref()),
+        })
+        .collect()
+}
+
 pub(crate) fn decision_note(bus: &atrium::bus::Bus, windows: &[Window]) -> String {
     let decisions_open = bus
         .pending_decisions()

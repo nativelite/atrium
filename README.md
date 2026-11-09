@@ -429,6 +429,7 @@ and win over the pointer.
   "memory_mb": null,
   "mod": null,
   "teams": null,
+  "notify": null,
   "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
 }
 ```
@@ -450,6 +451,10 @@ and win over the pointer.
   own `teams` key wins.
 - **`fleet_defaults`** — `trust`, `identity`, `allow_ctl`, `grid` for fleets that
   leave them out.
+- **`notify`** — how a "needs you" transition rings the host terminal: `"both"`
+  (default: bell + toast + Windows Terminal's tab indicator), `"bell"`, `"toast"`
+  or `"off"`. The title always follows the state; see [agent-aware
+  status](docs/agent-status.md#terminal-title-and-the-needs-you-ring).
 
 Precedence, lowest to highest: `config.json` → the project fleet's key → the
 `ATRIUM_*` variable → a command-line flag.

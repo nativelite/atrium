@@ -72,6 +72,9 @@ pub struct GlobalConfig {
     /// `"teams": "off"`: catch no Claude Code teammates as panes on this
     /// machine ([`crate::tmux_shim`]); `"show"` or absent catches them.
     pub teams_off: bool,
+    /// `"notify"`: how a "needs you" transition rings the host terminal
+    /// ([`crate::attention`]): `both` (default), `bell`, `toast` or `off`.
+    pub notify: Option<crate::attention::Notify>,
     pub fleet_defaults: FleetDefaults,
 }
 
@@ -117,6 +120,7 @@ impl GlobalConfig {
         if self.teams_off {
             fleet.teams = fleet.teams.or(Some(false));
         }
+        fleet.notify = fleet.notify.or(self.notify);
         fleet
     }
 }
@@ -218,6 +222,7 @@ pub const STARTER: &str = r#"{
   "memory_mb": null,
   "mod": null,
   "teams": null,
+  "notify": null,
   "fleet_defaults": {
     "trust": null,
     "identity": null,
@@ -340,6 +345,7 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         mod_path: None,
         mod_off: false,
         teams_off: false,
+        notify: None,
         fleet_defaults: FleetDefaults::default(),
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
@@ -367,6 +373,16 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
     cfg.teams_off = crate::tmux_shim::parse_setting(get("teams"))
         .map_err(|e| format!("config.json: {e}"))?
         == Some(false);
+    // `notify`: how the host terminal is rung when an agent needs you.
+    cfg.notify = match opt_str(get("notify"), "notify")? {
+        None => None,
+        Some(s) => Some(crate::attention::Notify::parse(&s).ok_or_else(|| {
+            format!(
+                "config.json: \"notify\" must be {}",
+                crate::attention::Notify::VALUES
+            )
+        })?),
+    };
     if let Some(v) = get("fleet_defaults").filter(|v| !matches!(v, json::Value::Null)) {
         let d = v
             .as_object()

@@ -61,6 +61,13 @@ pub struct Fleet {
     /// fleet's claude panes; absent or `"show"` catches them as atrium panes
     /// ([`crate::tmux_shim`]). The config's `"teams": "off"` fills an absent key.
     pub teams: Option<bool>,
+    /// `title`: what the host terminal's title calls this fleet
+    /// ([`crate::attention`]); absent, the fleet's name.
+    pub title: Option<String>,
+    /// `notify`: how a "needs you" transition rings the host terminal:
+    /// `both`, `bell`, `toast` or `off`. The config's `"notify"` fills an
+    /// absent key; absent everywhere, `both`.
+    pub notify: Option<crate::attention::Notify>,
     /// How the model's subagents run in this fleet's claude panes:
     /// `panes` (visible panes, the default), `native` or `deny`
     /// ([`crate::modstate::Subagents`]).
@@ -339,6 +346,28 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
     };
     let teams = crate::tmux_shim::parse_setting(get("teams"))
         .map_err(|e| format!("fleet {name:?}: {e}"))?;
+    let title = match get("title") {
+        None | Some(json::Value::Null) => None,
+        Some(json::Value::String(s)) => Some(s.clone()),
+        Some(_) => return Err(format!("fleet {name:?}: \"title\" must be a string")),
+    };
+    let notify = match get("notify") {
+        None | Some(json::Value::Null) => None,
+        Some(json::Value::String(s)) => {
+            Some(crate::attention::Notify::parse(s).ok_or_else(|| {
+                format!(
+                    "fleet {name:?}: \"notify\" must be {}",
+                    crate::attention::Notify::VALUES
+                )
+            })?)
+        }
+        Some(_) => {
+            return Err(format!(
+                "fleet {name:?}: \"notify\" must be {}",
+                crate::attention::Notify::VALUES
+            ))
+        }
+    };
     let subagents = match get("subagents") {
         Some(v) => {
             let word = v.as_str().ok_or_else(|| {
@@ -511,6 +540,8 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         allow_ctl,
         mod_enabled,
         teams,
+        title,
+        notify,
         subagents,
         subagents_keep,
         captions,

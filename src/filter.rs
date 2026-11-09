@@ -72,6 +72,67 @@ const STRIP: &[&[u8]] = &[
 const MAX_LEN: usize = 8; // "\x1b[?1049h" / "\x1b[?9001h"
 
 /// How a `rest` slice (starting at an ESC) relates to the XTWINOPS
+/// A pane's own title escape, `ESC ] 0|1|2 ; … BEL|ST`. In passthrough the
+/// child's bytes reach the host terminal, so a child's title (claude's tab
+/// title, ConPTY re-emitting it as `OSC 0`) would fight the one atrium sets
+/// (`attention`). Only `Ps` 0, 1 and 2 are title ops; `OSC 52` (clipboard),
+/// `OSC 8` (links) and the rest pass. An unterminated title under 512 bytes
+/// is held for the next chunk; anything longer is passed, not buffered.
+enum Osc {
+    Strip(usize),
+    Hold,
+    No,
+}
+
+/// Longest title escape held across a chunk boundary.
+const OSC_HOLD_MAX: usize = 512;
+
+fn osc(rest: &[u8]) -> Osc {
+    if rest.get(1) != Some(&b']') {
+        return Osc::No;
+    }
+    // `Ps`: digits up to `;`. `10` is not `1`: the whole number decides.
+    let mut j = 2;
+    let mut ps: u32 = 0;
+    let mut digits = 0;
+    while let Some(&b) = rest.get(j) {
+        if b.is_ascii_digit() {
+            ps = ps.saturating_mul(10).saturating_add((b - b'0') as u32);
+            digits += 1;
+            j += 1;
+            if digits > 4 {
+                return Osc::No;
+            }
+        } else {
+            break;
+        }
+    }
+    match rest.get(j) {
+        None => return Osc::Hold,
+        Some(&b';') => {}
+        Some(_) => return Osc::No,
+    }
+    if digits == 0 || ps > 2 {
+        return Osc::No;
+    }
+    // The payload ends at BEL or ST (`ESC \`).
+    let mut k = j + 1;
+    while k < rest.len() {
+        match rest[k] {
+            0x07 => return Osc::Strip(k + 1),
+            0x1B if rest.get(k + 1) == Some(&b'\\') => return Osc::Strip(k + 2),
+            0x1B if k + 1 == rest.len() => break,
+            _ => {}
+        }
+        k += 1;
+    }
+    if rest.len() < OSC_HOLD_MAX {
+        Osc::Hold
+    } else {
+        Osc::No
+    }
+}
+
 /// window-manipulation family, `ESC [ <digits/semicolons> t`.
 enum Xt {
     /// A complete `ESC [ … t` of this many bytes — strip it.
@@ -151,6 +212,19 @@ impl Passthrough {
                     return out;
                 }
                 Xt::No => {}
+            }
+            // A pane's own title (`ESC ] 0/1/2 ; … BEL`) is stripped so the host
+            // shows the title atrium sets, never a child's.
+            match osc(rest) {
+                Osc::Strip(n) => {
+                    i += n;
+                    continue;
+                }
+                Osc::Hold => {
+                    self.pending = rest.to_vec();
+                    return out;
+                }
+                Osc::No => {}
             }
             // If `rest` is a strict prefix of any strip sequence (and could
             // still grow into it once more bytes arrive), hold it for the next
@@ -263,5 +337,46 @@ mod tests {
             feed_all(&[b"\x1b[?1049h\x1b[?9001hkeep\x1b[?1049l"]),
             b"keep".to_vec()
         );
+    }
+
+    #[test]
+    fn a_panes_title_change_is_stripped() {
+        for seq in [
+            &b"\x1b]0;claude\x07"[..],
+            b"\x1b]1;icon\x07",
+            b"\x1b]2;title\x07",
+            b"\x1b]2;title\x1b\\",
+        ] {
+            let mut f = Passthrough::new();
+            let mut input = b"a".to_vec();
+            input.extend_from_slice(seq);
+            input.extend_from_slice(b"b");
+            assert_eq!(f.feed(&input), b"ab", "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn osc_52_and_osc_8_pass_through() {
+        let mut f = Passthrough::new();
+        let clip = b"\x1b]52;c;aGk=\x07";
+        assert_eq!(f.feed(clip), clip.to_vec());
+        let link = b"\x1b]8;;https://x\x07text\x1b]8;;\x07";
+        assert_eq!(f.feed(link), link.to_vec());
+    }
+
+    #[test]
+    fn title_split_across_chunks_is_still_stripped() {
+        let mut f = Passthrough::new();
+        let mut out = f.feed(b"x\x1b]2;half");
+        assert_eq!(out, b"x");
+        out = f.feed(b" title\x07y");
+        assert_eq!(out, b"y");
+    }
+
+    #[test]
+    fn osc_10_is_not_osc_1() {
+        let mut f = Passthrough::new();
+        let fg = b"\x1b]10;?\x07";
+        assert_eq!(f.feed(fg), fg.to_vec());
     }
 }

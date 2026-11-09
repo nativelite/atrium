@@ -564,6 +564,12 @@ fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
             max_depth,
             trust,
             ctl_listener,
+            // The host's title names the fleet (or its `title`); `notify` has
+            // already been filled from the config by `apply_to_fleet`.
+            attention: atrium::attention::Setup {
+                name: fleet.title.clone().unwrap_or_else(|| name.to_string()),
+                notify: fleet.notify.unwrap_or(atrium::attention::Notify::DEFAULT),
+            },
             // A fleet may declare a canonical topic vocabulary; when it does, the bus
             // runs strict. Absent ⇒ soft-gate.
             canonical_topics: fleet.topics.clone(),

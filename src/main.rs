@@ -486,6 +486,12 @@ fn main() -> ExitCode {
             max_depth,
             trust,
             ctl_listener: None,
+            attention: atrium::attention::Setup {
+                name: atrium::attention::Setup::project_dir_name(),
+                notify: atrium::config::get()
+                    .notify
+                    .unwrap_or(atrium::attention::Notify::DEFAULT),
+            },
             // The default (non-fleet) path declares no topic vocabulary: soft-gate.
             canonical_topics: None,
         },
@@ -568,7 +574,11 @@ fn cleanup_screen(out: &mut impl Write) {
         // Reset SGR; disable every mouse mode; disable bracketed paste (2004);
         // show the cursor (25); reset the scroll region; then leave the alt
         // screen (1049) last so the swap-back is the final act.
-        "\x1b[0m{MOUSE_OFF}\x1b[?2004l\x1b[?25h\x1b[r\x1b[?1049l"
+        // The title reset (`attention`) goes between the scroll-region reset
+        // and the alt-screen swap-back: an empty title for hosts with no title
+        // stack (ConPTY), then the stack pop for those with one.
+        "\x1b[0m{MOUSE_OFF}\x1b[?2004l\x1b[?25h\x1b[r{}\x1b[?1049l",
+        atrium::attention::TITLE_RESET
     );
     let _ = out.flush();
 }

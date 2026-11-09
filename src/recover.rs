@@ -848,6 +848,12 @@ fn resume_session(
             max_depth,
             trust,
             ctl_listener,
+            attention: atrium::attention::Setup {
+                name: atrium::attention::Setup::project_dir_name(),
+                notify: atrium::config::get()
+                    .notify
+                    .unwrap_or(atrium::attention::Notify::DEFAULT),
+            },
             // A fleet's declared topics keep the bus strict after a resume, as `fleet
             // up` made it.
             canonical_topics: topics,

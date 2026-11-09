@@ -16,6 +16,7 @@
 //! modifies, or credentials them.
 
 pub mod argv;
+pub mod attention;
 pub mod audit;
 pub mod bar;
 pub mod bind;

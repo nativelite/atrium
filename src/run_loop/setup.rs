@@ -21,6 +21,7 @@ impl<'a> RunState<'a> {
             max_depth,
             trust,
             mut ctl_listener,
+            attention,
             canonical_topics,
         } = args;
         // Publish the trust policy before any pane is spawned so even the initial
@@ -54,7 +55,14 @@ impl<'a> RunState<'a> {
         let size_watch = atrium::screen::SizeWatch::start((rows, cols));
         // Alt screen; scroll region above the bar so bottom-line newlines from the
         // passthrough stream can never push the bar away.
-        let _ = write!(out, "\x1b[?1049h\x1b[2J\x1b[H\x1b[1;{}r", rows - 1);
+        // The host's title is saved first (xterm title stack), restored by
+        // `cleanup_screen`; `attention` then sets atrium's own.
+        let _ = write!(
+            out,
+            "{}\x1b[?1049h\x1b[2J\x1b[H\x1b[1;{}r",
+            atrium::attention::TITLE_PUSH,
+            rows - 1
+        );
         let _ = out.flush();
 
         let mut windows: Vec<Window> = Vec::new();
@@ -254,6 +262,7 @@ impl<'a> RunState<'a> {
             out,
             rows,
             cols,
+            attention: atrium::attention::Tracker::new(attention),
             size_watch,
             windows,
             flash,
