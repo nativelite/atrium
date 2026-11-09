@@ -10,6 +10,7 @@ dependencies = [
  "nativelite-agsess",
  "nativelite-akey",
  "nativelite-ansi",
+ "nativelite-ipc",
  "nativelite-json",
  "nativelite-pty",
  "nativelite-rawterm",
@@ -45,6 +46,10 @@ version = "0.4.1"
 
 [[package]]
 name = "nativelite-cred"
+version = "0.1.0"
+
+[[package]]
+name = "nativelite-ipc"
 version = "0.1.0"
 
 [[package]]

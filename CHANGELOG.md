@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The `ctl` control channel is the shared `nativelite-ipc` crate.** The
+  transport (`src/ipc`: the Windows named pipe with its SDDL and first-instance
+  flag, the `0600` unix socket with its peer-uid check and endpoint tripwire,
+  the one-line framing, the non-blocking listener with bounded and deadlined
+  replies) moved to `nativelite-ipc` 0.1 (an org crate, zero dependencies) so
+  atrium and fwterm serve one hardened channel; `src/ipc.rs` is now a facade
+  that names atrium's endpoint and keeps the four exploit replays against the
+  real binary. Endpoint names and the wire are unchanged, with one exception:
+  the refusal for an oversized reply says `{"ok":false,"err":…}` like every
+  other refusal; it used to say `"error"` (atrium issue #14).
+
 ### Added
 - **`atrium ctl spawn --here --no-focus`, and the tmux shim honours `-d`.** A
   `--here` spawn focused the new pane, so a Claude Code lead spawning a
