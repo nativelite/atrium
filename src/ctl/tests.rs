@@ -783,8 +783,15 @@ fn wait_ends_on_a_newer_answer_an_idle_status_or_a_gone_pane() {
 #[test]
 fn inbox_builds_parses_needs_a_token_and_refuses_a_target() {
     let line = build_request(&v(&["inbox"]), Some(2)).unwrap();
-    assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Inbox));
-    assert!(!Cmd::Inbox.is_read_only());
+    assert!(
+        !line.contains("wait"),
+        "a plain inbox carries no wait field: {line}"
+    );
+    assert!(matches!(
+        parse_request(&line).unwrap().cmd,
+        Cmd::Inbox(InboxReq { wait: false })
+    ));
+    assert!(!Cmd::Inbox(InboxReq::default()).is_read_only());
     let err = parse_request(r#"{"cmd":"inbox","target":"3"}"#).unwrap_err();
     assert!(err.contains("caller only"), "{err}");
     let item = |kind: &str, text: &str, id: Option<u64>| InboxItem {
@@ -801,6 +808,33 @@ fn inbox_builds_parses_needs_a_token_and_refuses_a_target() {
         reply.to_json(),
         r#"{"ok":true,"items":[{"kind":"send","text":"do x"},{"kind":"wake","text":"[atrium bus #1 fyi] y"},{"kind":"ask","text":"what now?","id":3}]}"#
     );
+}
+
+/// `inbox --wait` asks the server to hold the request until a delivery lands.
+/// The flag rides as `"wait":true`; an older server that does not know the
+/// field answers at once, which the mod detects and falls back on. Any other
+/// argument is a usage error rather than a silent poll.
+#[test]
+fn inbox_wait_builds_parses_and_is_labelled_for_the_audit() {
+    let line = build_request(&v(&["inbox", "--wait"]), Some(2)).unwrap();
+    assert!(line.contains(r#""wait":true"#), "{line}");
+    let cmd = parse_request(&line).unwrap().cmd;
+    assert_eq!(cmd, Cmd::Inbox(InboxReq { wait: true }));
+    assert!(!cmd.is_read_only(), "a held inbox still takes deliveries");
+    assert_eq!(cmd.audit_label(), ("inbox", "wait".to_string()));
+    assert_eq!(
+        Cmd::Inbox(InboxReq { wait: false }).audit_label(),
+        ("inbox", String::new())
+    );
+    // Not a boolean: a poll, never an error — the wire stays lenient.
+    let cmd = parse_request(r#"{"cmd":"inbox","wait":"yes"}"#)
+        .unwrap()
+        .cmd;
+    assert_eq!(cmd, Cmd::Inbox(InboxReq { wait: false }));
+    let err = build_request(&v(&["inbox", "--now"]), Some(2)).unwrap_err();
+    assert!(err.to_string().contains("--now"), "{err}");
+    let err = build_request(&v(&["inbox", "--wait", "3"]), Some(2)).unwrap_err();
+    assert!(err.to_string().contains("--wait"), "{err}");
 }
 
 #[test]

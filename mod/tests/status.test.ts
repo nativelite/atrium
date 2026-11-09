@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import { ANSWER_CAP, CAPS, Reporter, clipAnswer, mergeFields, toArgs, transition } from '../hooks/status'
 import type { Status } from '../hooks/status'
-import { acceptedCaps, inboxItems, parseReply } from '../hooks/ctl'
+import { INBOX_FAST_MS, INBOX_FAST_STRIKES, INBOX_WAIT_MS, acceptedCaps, inboxItems, parseReply, waitStep } from '../hooks/ctl'
 
 test('a start is at-the-prompt when a person is there, working otherwise', async () => {
   expect(transition(undefined, { kind: 'start', interactive: true })).toEqual({ status: 'waiting-prompt' })
@@ -158,4 +158,27 @@ test('inbox items are read in order and anything malformed is skipped', async ()
   ])
   expect(inboxItems({ ok: false, err: 'did not declare inbox' })).toEqual([])
   expect(inboxItems({ ok: true })).toEqual([])
+})
+
+test('the wait loop re-issues after a held reply and falls back to polling on an atrium that does not hold', async () => {
+  const empty = { ok: true, items: [] }
+  const full = { ok: true, items: [{ kind: 'send', text: 'go' }] }
+  // Items, however fast: the flag works.
+  expect(waitStep(2, full, 10)).toEqual({ step: 'again', strikes: 0 })
+  // An empty answer after the hold ran out: the flag works.
+  expect(waitStep(2, empty, INBOX_FAST_MS)).toEqual({ step: 'again', strikes: 0 })
+  // Fast empties: strikes, then the poll.
+  let s = waitStep(0, empty, 20)
+  expect(s).toEqual({ step: 'again', strikes: 1 })
+  s = waitStep(s.strikes, empty, 20)
+  expect(s).toEqual({ step: 'again', strikes: 2 })
+  s = waitStep(s.strikes, empty, 20)
+  expect(s).toEqual({ step: 'poll', strikes: INBOX_FAST_STRIKES })
+  // A delivery between strikes clears them.
+  expect(waitStep(2, full, 5).strikes).toBe(0)
+  // Any refusal: poll (the channel may be gone; the poll's cadence is the safe retry).
+  expect(waitStep(0, { ok: false, err: 'inbox: unexpected argument "--wait"' }, 15).step).toBe('poll')
+  expect(waitStep(0, { ok: false, err: 'no reply from the control channel' }, 5000).step).toBe('poll')
+  // The engine's timeout covers the broker's 60 s hold and the client's margins.
+  expect(INBOX_WAIT_MS).toBeGreaterThan(90_000)
 })

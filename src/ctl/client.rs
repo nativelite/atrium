@@ -82,7 +82,17 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         }
     };
 
-    match crate::ipc::request(&address, &request) {
+    // `inbox --wait` is the one verb the server may hold (up to
+    // `HOLD_DEADLINE`) before answering; its client budgets for that. Every
+    // other verb keeps the short budgets, so a wedged endpoint still fails fast.
+    let held =
+        args.first().map(String::as_str) == Some("inbox") && args.iter().any(|a| a == "--wait");
+    let outcome = if held {
+        crate::ipc::request_held(&address, &request, crate::ipc::HOLD_DEADLINE)
+    } else {
+        crate::ipc::request(&address, &request)
+    };
+    match outcome {
         Ok(reply) => {
             // A `board` result renders as a table (unless --json); everything else
             // prints its JSON reply verbatim.
@@ -553,6 +563,13 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         }
         Some("inbox") => {
             pairs.push(("cmd", s("inbox")));
+            // `--wait`: hold until a delivery lands. The only flag the verb
+            // takes; anything else is a usage error, not silently a poll.
+            match args.get(1).map(String::as_str) {
+                None => {}
+                Some("--wait") if args.len() == 2 => pairs.push(("wait", Value::Bool(true))),
+                Some(other) => return Err(format!("inbox: unexpected argument {other:?}")),
+            }
         }
         Some("answer") => {
             pairs.push(("cmd", s("answer")));
@@ -592,7 +609,8 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         None => {
             return Err(
                 "needs a subcommand: spawn | list | send | status | kill | audit | board | bus | \
-                 respawn | hello | report | whoami | answer | wait | inbox | ask | asked | who"
+                 respawn | hello | report | whoami | answer | wait | inbox [--wait] | ask | \
+                 asked | who"
                     .to_string(),
             )
         }

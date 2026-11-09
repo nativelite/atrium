@@ -15,7 +15,7 @@ import { fit, parseView } from './view'
 import { WAIT_SLICES, WAIT_SLICE_S, reportedAnswer, slug, spawnPointer, spawnedPane, subagentPrompt } from './agents'
 import { ASK_REPLY_CAP, askPrompt, askReplyText, captionDue, captionRequest, clipCaption, toolCaption } from './caption'
 import { TOOLS, TOOL_PREFIX, argvFor, ctlTimeoutFor, isAtriumTool } from './control'
-import { INBOX_POLL_MS, acceptedCaps, inboxItems, parseReply } from './ctl'
+import { INBOX_POLL_MS, INBOX_WAIT_MS, acceptedCaps, inboxItems, parseReply, waitStep } from './ctl'
 import type { Reply } from './ctl'
 import { guardVerdict, isAbsolute, join, pathOf, splitParent } from './guard'
 import { ROLE_SECTION_ID, parseWho, roleSection } from './role'
@@ -70,7 +70,11 @@ type State = {
   accepted: ReadonlySet<string>
   reporter: Reporter | undefined
   who: Who | undefined
-  /** The inbox poll, while the session is interactive and the cap was accepted. */
+  /**
+   * The inbox, while the session is interactive and the cap was accepted: the
+   * held `inbox --wait` loop, or the timed poll it falls back to. `cancel`
+   * ends either.
+   */
   inbox: { cancel: () => void } | undefined
   inboxBusy: boolean
   viewTimer: { cancel: () => void } | undefined
@@ -197,19 +201,61 @@ async function pollInbox($: EngineInterface): Promise<void> {
   if (state.inboxBusy) return
   state.inboxBusy = true
   try {
-    const reply = await ctl($, ['inbox'])
-    for (const item of inboxItems(reply)) {
-      if (item.kind === 'ask') {
-        void answerAsk($, item.id, item.text)
-        continue
-      }
-      // Resolves when the turn starts, which may be a while: do not wait.
-      void $.prompt.submit({ text: item.text, asUser: true }).catch(err => {
-        $.ui.log(`atrium: delivery not submitted: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
-      })
-    }
+    deliver($, await ctl($, ['inbox']))
   } finally {
     state.inboxBusy = false
+  }
+}
+
+/** Submit each item of an `inbox` reply: prompts through the engine's queue, asks to a fork. */
+function deliver($: EngineInterface, reply: Reply): void {
+  for (const item of inboxItems(reply)) {
+    if (item.kind === 'ask') {
+      void answerAsk($, item.id, item.text)
+      continue
+    }
+    // Resolves when the turn starts, which may be a while: do not wait.
+    void $.prompt.submit({ text: item.text, asUser: true }).catch(err => {
+      $.ui.log(`atrium: delivery not submitted: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+    })
+  }
+}
+
+/**
+ * Native delivery without a poll: one `atrium ctl inbox --wait` at a time,
+ * which the broker holds until a delivery lands (or its hold runs out, then it
+ * answers with no items), re-issued the moment it returns. An atrium that does
+ * not hold the request answers at once; `waitStep` sees that and this falls
+ * back to the timed poll, so an older broker or client is polled, not spun on.
+ * Returns the handle that ends the loop.
+ */
+function waitInbox($: EngineInterface): { cancel: () => void } {
+  let stopped = false
+  let poll: { cancel: () => void } | undefined
+  const loop = async (): Promise<void> => {
+    let strikes = 0
+    while (!stopped) {
+      const started = Date.now()
+      const reply = await ctl($, ['inbox', '--wait'], INBOX_WAIT_MS)
+      if (stopped) return
+      deliver($, reply)
+      const next = waitStep(strikes, reply, Date.now() - started)
+      strikes = next.strikes
+      if (next.step === 'poll') {
+        $.ui.log(`atrium: inbox --wait not held (${reply.ok ? 'answered at once' : reply.err ?? 'no reply'}); polling every ${INBOX_POLL_MS} ms`, { to: 'debug' })
+        poll = $.clock.every(INBOX_POLL_MS, () => {
+          void pollInbox($)
+        })
+        return
+      }
+    }
+  }
+  void loop()
+  return {
+    cancel: () => {
+      stopped = true
+      poll?.cancel()
+    },
   }
 }
 
@@ -323,9 +369,7 @@ export const register: Register = on => {
     }
     if (state.accepted.has('inbox') && e.isInteractive) {
       state.inbox?.cancel()
-      state.inbox = $.clock.every(INBOX_POLL_MS, () => {
-        void pollInbox($)
-      })
+      state.inbox = waitInbox($)
     }
     if (state.accepted.has('tools')) {
       for (const t of TOOLS) {

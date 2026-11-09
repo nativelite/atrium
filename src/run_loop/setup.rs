@@ -256,6 +256,8 @@ impl<'a> RunState<'a> {
         // pane (started at the top of each tick), all ringing one doorbell.
         let (bell, wake) = atrium::events::doorbell();
         let keys = atrium::events::KeyReader::start(term.input(), bell.clone()).ok();
+        // The ctl endpoint's accept thread rings the same bell on a connect.
+        atrium::ipc::set_bell(bell.clone());
 
         Ok(RunState {
             term,
@@ -271,6 +273,7 @@ impl<'a> RunState<'a> {
             ctl_extra_allow,
             ctl_listener,
             ctl_audit,
+            held_inboxes: Vec::new(),
             active,
             scanner,
             mouse_on,

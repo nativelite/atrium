@@ -103,10 +103,13 @@ const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 /// so every pane spawned afterward is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
 /// env. Returns the [`atrium::ipc::Listener`] to poll, or `None` on a bind failure
 /// (surfaced in the bar, non-fatal). `CTL_ADDRESS` is a `OnceLock`, so only the
-/// first successful bind per process publishes the address.
+/// first successful bind per process publishes the address. The listener's
+/// accept thread rings the run loop's doorbell on every connect
+/// (`atrium::ipc::set_bell`), so a request is served when it arrives, not on
+/// the next tick; the loop's per-tick poll stays as the fallback.
 fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<atrium::ipc::Listener> {
     let addr = atrium::ipc::default_address();
-    match atrium::ipc::Listener::bind(&addr) {
+    match atrium::ipc::bind(&addr) {
         Ok(l) => {
             let _ = CTL_ADDRESS.set(addr);
             Some(l)

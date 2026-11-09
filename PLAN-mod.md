@@ -32,9 +32,11 @@ panes (the human when they share none). `MultiEdit` is not a tool in the
 engine of the day; `NotebookEdit` is covered instead.
 
 Deviations from the design as written: `wait --for answer` moved from N1 to
-N7 and is a client-side poll, and `inbox` is a poll too (every 1.5 s from the
-mod) rather than a held connection, so the server stays one request, one
-reply; the
+N7 and is a client-side poll; `inbox` was a poll too (every 1.5 s from the
+mod) until issue #15 gave it `--wait`, a request the broker holds (one reply
+per request still, answered when a delivery lands or after 60 s; the mod
+re-issues it at once and falls back to the poll on an atrium that answers at
+once), so the one-request-one-reply server stands and the poll is gone; the
 `claude -p` child option is closed by the spawn policy (a teammate may choose
 no claude flag beyond model, effort and resume), so a subagent pane is always
 an interactive claude that is sent its task; the mod offers only the caps it

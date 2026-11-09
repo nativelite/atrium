@@ -50,8 +50,59 @@ export function inboxItems(reply: Reply): InboxItem[] {
   return out
 }
 
-/** How often the mod asks for its deliveries, in milliseconds. */
+/**
+ * How often the mod asks for its deliveries when it has to poll, in
+ * milliseconds: the fallback for an atrium that does not hold `inbox --wait`.
+ */
 export const INBOX_POLL_MS = 1500
+
+/**
+ * How long one `atrium ctl inbox --wait` may run. The broker holds the request
+ * for up to 60 s and then answers with no items (the client budgets 60 s plus
+ * its usual margins); this is above both, so the engine's own timeout fires
+ * only on a broker that stopped answering altogether.
+ */
+export const INBOX_WAIT_MS = 100_000
+
+/**
+ * A `--wait` that came back with nothing this quickly was not held: an older
+ * atrium (client or broker) that does not know the flag answered a plain poll.
+ * A held request that found nothing takes the whole hold.
+ */
+export const INBOX_FAST_MS = 500
+
+/** How many such fast empty answers in a row mean `--wait` is not understood. */
+export const INBOX_FAST_STRIKES = 3
+
+/** What the wait loop does after one `inbox --wait` reply. */
+export type WaitStep = 'again' | 'poll'
+
+/**
+ * Judge one `inbox --wait` reply that took `elapsedMs`, carrying `strikes`
+ * fast empties so far: `again` re-issues the wait at once, `poll` gives up on
+ * `--wait` and falls back to the timed poll. The verdict and the new strike
+ * count.
+ *
+ * - Items, or a slow empty answer (the hold ran out): the flag works; strikes
+ *   reset.
+ * - A fast empty answer: a strike; three in a row is an older atrium that
+ *   answered a poll, and polling it on purpose beats a hot loop.
+ * - `ok:false` naming the flag as an unexpected argument: an older client;
+ *   poll at once.
+ * - Any other refusal (the channel is gone, the hold pool is full, the hold
+ *   timed out at the transport): the timed poll is the safe cadence to retry
+ *   at; it comes back to `--wait` on the next `session.start`.
+ */
+export function waitStep(strikes: number, reply: Reply, elapsedMs: number): { step: WaitStep; strikes: number } {
+  if (reply.ok !== true) {
+    return { step: 'poll', strikes }
+  }
+  if (inboxItems(reply).length > 0 || elapsedMs >= INBOX_FAST_MS) {
+    return { step: 'again', strikes: 0 }
+  }
+  const next = strikes + 1
+  return { step: next >= INBOX_FAST_STRIKES ? 'poll' : 'again', strikes: next }
+}
 
 /** The `accepted` list of a `hello` reply, as strings only. */
 export function acceptedCaps(reply: Reply): ReadonlySet<string> {

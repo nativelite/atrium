@@ -70,5 +70,6 @@ pub use reply::{
 };
 pub use request::{
     parse_request, AgentId, AnswerReq, AskReq, AskedReq, AuditReq, BoardOp, BusOp, Cmd, HelloReq,
-    KillReq, ReportReq, Request, RespawnReq, SendReq, SpawnReq, StatusReq, WhoReq, MAX_TTL_MS,
+    InboxReq, KillReq, ReportReq, Request, RespawnReq, SendReq, SpawnReq, StatusReq, WhoReq,
+    MAX_TTL_MS,
 };
