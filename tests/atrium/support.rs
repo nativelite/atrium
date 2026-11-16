@@ -80,6 +80,18 @@ pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     visible.windows(needle.len().max(1)).any(|w| w == needle)
 }
 
+/// [`contains`] for a needle that has spaces in it. atrium repaints a tile by
+/// moving the cursor over blank cells instead of writing them, so text with
+/// spaces can reach the host as `a`, a cursor move, `b`: the same words on the
+/// screen, with no space byte between them. Spaces are dropped from both sides
+/// before the comparison.
+pub(crate) fn contains_shown(haystack: &[u8], needle: &[u8]) -> bool {
+    let squeeze = |s: &[u8]| -> Vec<u8> { s.iter().copied().filter(|&b| b != b' ').collect() };
+    let visible = squeeze(&strip_csi_bytes(haystack));
+    let needle = squeeze(needle);
+    visible.windows(needle.len().max(1)).any(|w| w == needle)
+}
+
 pub(crate) fn wait_exit(p: &mut pty::Pty, secs: u64) -> i32 {
     let end = Instant::now() + Duration::from_secs(secs);
     let mut buf = [0u8; 8192];

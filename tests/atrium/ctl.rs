@@ -438,7 +438,7 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
         .unwrap();
     let out = read_until(&mut p, b"\"items\":[", Duration::from_secs(20));
     assert!(
-        contains(
+        contains_shown(
             &out,
             b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-marker-one\"}"
         ),
@@ -494,13 +494,11 @@ fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
     read_until(&mut p, b"\"queued\"", Duration::from_secs(20));
     // The waiter's window shows the held reply, answered when the send landed.
     p.write(b"\x012").unwrap();
-    let out = read_until(
-        &mut p,
-        b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}",
-        Duration::from_secs(20),
-    );
+    // Waited for by its last word: the header's spaces may reach the host as
+    // cursor moves (see `contains_shown`).
+    let out = read_until(&mut p, b"inbox-wait-marker\"}", Duration::from_secs(20));
     assert!(
-        contains(
+        contains_shown(
             &out,
             b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}"
         ),
