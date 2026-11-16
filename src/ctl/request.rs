@@ -31,7 +31,7 @@ impl std::fmt::Display for AgentId {
 }
 
 /// A parsed control request.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Request {
     /// The agent id of the pane that issued this (from `ATRIUM_PANE`), if any. This
     /// is *self-reported* and used only as a hint; the server authenticates the
@@ -47,6 +47,20 @@ pub struct Request {
     /// token is ever accepted in the other's place.
     pub operator_token: Option<String>,
     pub cmd: Cmd,
+}
+
+/// Written by hand so that a `{:?}` of a request can never print a
+/// credential: both tokens show only whether they are there.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |t: &Option<String>| t.as_ref().map(|_| "<redacted>");
+        f.debug_struct("Request")
+            .field("caller", &self.caller)
+            .field("token", &redact(&self.token))
+            .field("operator_token", &redact(&self.operator_token))
+            .field("cmd", &self.cmd)
+            .finish()
+    }
 }
 
 /// The command set (C1: spawn/list; C2: send/status; C3: kill/audit).

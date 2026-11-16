@@ -139,6 +139,10 @@ pub(super) fn fleet_up_on(
     // coordinating fleet without ctl fails silently — panes come up and publish
     // into nothing — and that has already cost a run.
     let allow_ctl = allow_ctl || fleet.allow_ctl.unwrap_or(false);
+    // A token file with the control plane off: no operator could connect.
+    if let Err(line) = atrium::operator::require_ctl(allow_ctl) {
+        return fail(&line);
+    }
     if headless.is_some() {
         let yes = std::env::var_os("ATRIUM_YES").is_some();
         if let Err(line) = headless_gate(allow_ctl, yes) {

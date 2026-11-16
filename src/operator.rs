@@ -43,7 +43,11 @@ pub const LABEL_PREFIX: &str = "operator:";
 /// A token file larger than this is not a token file.
 const MAX_FILE_BYTES: u64 = 64 * 1024;
 const MAX_OPERATORS: usize = 64;
-const MAX_NAME_LEN: usize = 32;
+/// Shorter than any token, so nothing that passes as a token passes as a
+/// name: a file with the two swapped is refused, not loaded with the token as
+/// the label the audit log prints.
+const MAX_NAME_LEN: usize = 24;
+const _: () = assert!(MAX_NAME_LEN < MIN_TOKEN_LEN);
 /// A token with fewer distinct characters than this is a placeholder, not a
 /// secret (`0000…`, `xxxx…`).
 const MIN_DISTINCT: usize = 8;
@@ -79,6 +83,8 @@ pub const VERBS: &[&str] = &[
     "ask",
     "asked",
     "who",
+    "ping",
+    "metrics",
 ];
 
 /// The verbs whose reply carries a model's words or the paths it edited. Like
@@ -278,7 +284,7 @@ impl Operators {
     /// ```
     ///
     /// Strict, because a typo here is a hole or a lockout: an unknown or
-    /// repeated key, a missing one, a name outside `[A-Za-z0-9_-]{1,32}`, a
+    /// repeated key, a missing one, a name outside `[A-Za-z0-9_-]{1,24}`, a
     /// token under [`MIN_TOKEN_LEN`] characters or holding anything but
     /// `A-Z a-z 0-9 . _ ~ + / = -`, an unknown verb, a pane's own verb, a name
     /// or a token used twice, and an empty list are all errors. No error text
@@ -309,14 +315,21 @@ impl Operators {
         }
         let mut entries: Vec<Operator> = Vec::with_capacity(items.len());
         for (i, item) in items.iter().enumerate() {
+            // An entry is named by its position in every error, never by its
+            // `name`: in a file with the two swapped, the name is the token.
             let op = parse_entry(item).map_err(|e| format!("operator #{}: {e}", i + 1))?;
-            if entries.iter().any(|have| have.name == op.name) {
-                return Err(format!("operator name {:?} appears twice", op.name));
-            }
-            if let Some(twin) = entries.iter().find(|have| have.token == op.token) {
+            if let Some(j) = entries.iter().position(|have| have.name == op.name) {
                 return Err(format!(
-                    "operators {:?} and {:?} share one token; each needs its own",
-                    twin.name, op.name
+                    "operators #{} and #{} have the same name",
+                    j + 1,
+                    i + 1
+                ));
+            }
+            if let Some(j) = entries.iter().position(|have| have.token == op.token) {
+                return Err(format!(
+                    "operators #{} and #{} share one token; each needs its own",
+                    j + 1,
+                    i + 1
                 ));
             }
             entries.push(op);
@@ -354,36 +367,37 @@ fn parse_entry(item: &Value) -> Result<Operator, String> {
     }
     let token = field("token")?
         .as_str()
-        .ok_or_else(|| format!("{name:?}: \"token\" must be a string"))?;
-    check_token(token).map_err(|why| format!("{name:?}: the token {why}"))?;
+        .ok_or_else(|| "\"token\" must be a string".to_string())?;
+    check_token(token).map_err(|why| format!("the token {why}"))?;
     let listed = field("verbs")?
         .as_array()
-        .ok_or_else(|| format!("{name:?}: \"verbs\" must be an array of strings"))?;
+        .ok_or_else(|| "\"verbs\" must be an array of strings".to_string())?;
     // After the three known keys are each found once, any member left over is
     // a key that is not one of them. Its name is not echoed: a misplaced
     // token must not be printed back.
     if members.len() != 3 {
-        return Err(format!("{name:?}: unknown key; {keys}"));
+        return Err(format!("unknown key; {keys}"));
     }
     let mut verbs: Vec<String> = Vec::with_capacity(listed.len());
     for v in listed {
         let v = v
             .as_str()
-            .ok_or_else(|| format!("{name:?}: \"verbs\" must be an array of strings"))?;
+            .ok_or_else(|| "\"verbs\" must be an array of strings".to_string())?;
+        // `v` is echoed only once it is known to be a verb's own word.
         if let Some(why) = pane_only(v) {
             return Err(format!(
-                "{name:?}: verb {v:?} cannot be granted to an operator: {why}"
+                "verb {v:?} cannot be granted to an operator: {why}"
             ));
         }
         if !VERBS.contains(&v) {
             return Err(format!(
-                "{name:?}: unknown verb {} (the verbs are: {})",
+                "unknown verb {} (the verbs are: {})",
                 quote_short(v),
                 grantable().join(", ")
             ));
         }
         if verbs.iter().any(|have| have == v) {
-            return Err(format!("{name:?}: verb {v:?} is named twice"));
+            return Err(format!("verb {v:?} is named twice"));
         }
         verbs.push(v.to_string());
     }
@@ -562,28 +576,20 @@ pub fn pick_client_token(text: &str, name: Option<&str>) -> Result<String, Strin
         return Ok(body.to_string());
     }
     let ops = Operators::parse(body)?;
-    let names = || {
-        ops.entries
-            .iter()
-            .map(|o| o.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    // No name from the file is echoed here either; the caller's own
+    // `--operator` value is theirs to see.
     let pick = match name {
-        Some(n) => ops.entries.iter().find(|o| o.name == n).ok_or_else(|| {
-            format!(
-                "names no operator {} (it names: {})",
-                quote_short(n),
-                names()
-            )
-        })?,
+        Some(n) => ops
+            .entries
+            .iter()
+            .find(|o| o.name == n)
+            .ok_or_else(|| format!("names no operator {}", quote_short(n)))?,
         None => match ops.entries.as_slice() {
             [one] => one,
             _ => {
                 return Err(format!(
-                    "names {} operators ({}); pick one with --operator <name>",
-                    ops.entries.len(),
-                    names()
+                    "names {} operators; pick one with --operator <name>",
+                    ops.entries.len()
                 ))
             }
         },
@@ -591,13 +597,44 @@ pub fn pick_client_token(text: &str, name: Option<&str>) -> Result<String, Strin
     Ok(pick.token.clone())
 }
 
-/// A pane role an operator's label could be mistaken for. The board and the
-/// bus show who wrote an entry by label, and a pane's label is its role, so a
-/// pane spawned as `operator:bridge` would sign its posts as that operator.
-/// (The audit log is not fooled either way: it records the authenticated
-/// caller, not a label.)
+/// Is `role` one a `ctl spawn` may not give a pane, because the board and the
+/// bus would show its posts under a label that reads as an operator's?
+///
+/// A pane's label is its role. An operator's is `operator:<name>`, and a
+/// request with no pane behind it is labelled `operator`. So a role is
+/// refused when, with whitespace and the characters [`text_safe`] scrubs
+/// (control, zero-width, direction) removed:
+///
+/// * its first eight characters read as `operator` — each is that letter in
+///   either case, or is **not ASCII** and so could be drawn like it (the
+///   Cyrillic U+043E, the fullwidth U+FF4F) — and it ends there or goes on
+///   with anything but an ASCII letter, digit, `_` or `-` (a `:`, the
+///   fullwidth colon U+FF1A, a `.`, any other mark); or
+/// * it holds a `:` together with any character that is not an ASCII letter,
+///   digit, `_`, `-`, `.` or `:`.
+///
+/// `operators`, `operator_2` and `co-operator` are ordinary roles. The rule
+/// errs toward refusing: an eight-character role in a non-Latin script reads
+/// as a look-alike to it. The audit log is not fooled either way: it records
+/// the authenticated caller, not a label.
+///
+/// [`text_safe`]: crate::modstate::text_safe
 pub fn role_reserved(role: &str) -> bool {
-    role.to_ascii_lowercase().starts_with(LABEL_PREFIX)
+    let kept: Vec<char> = role
+        .chars()
+        .filter(|c| !c.is_whitespace() && !has_unsafe(c.encode_utf8(&mut [0; 4])))
+        .collect();
+    let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
+    let reads_as_operator = kept.len() >= 8
+        && "operator"
+            .chars()
+            .zip(&kept)
+            .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+        && !kept
+            .get(8)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'));
+    let colon_with_marks = kept.contains(&':') && kept.iter().any(|c| !word(*c) && *c != ':');
+    reads_as_operator || colon_with_marks
 }
 
 // ---- vetting what an operator sends ---------------------------------------
@@ -619,6 +656,9 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             }
             if let Some(role) = &sp.role {
                 word("role", role)?;
+                if role_reserved(role) {
+                    return Err("role is reserved: it reads as an operator's label".to_string());
+                }
             }
             if let Some(identity) = &sp.identity {
                 plain("identity", identity, 128)?;
@@ -632,11 +672,35 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             for a in &sp.argv {
                 plain("argv", a, 4096)?;
             }
+            // The command is a bare name, found on PATH. The spawn allowlist
+            // looks at the file stem alone and a command with a separator is
+            // run as given, so `\\host\share\claude.exe` or `./x/claude` would
+            // pass as `claude` and run a binary of the caller's choosing,
+            // which honours no posture flag. An empty argv is the server's
+            // default (claude).
+            if let Some(program) = sp.argv.first() {
+                word("argv[0]", program).map_err(|_| {
+                    "argv[0] must be a bare command name (no path, no drive): 1 to 64 of \
+                     A-Z a-z 0-9 . _ -"
+                        .to_string()
+                })?;
+            }
             Ok(())
         }
         Cmd::Send(sr) => {
             plain("target", &sr.target, 128)?;
-            lines("text", &sr.text)
+            lines("text", &sr.text)?;
+            // What is typed is meant as a prompt. An agent CLI gives a leading
+            // `!` or `/` a meaning of its own (a shell line, a command of the
+            // CLI), which is not the agent acting under its trust mode.
+            if sr.text.trim_start().starts_with(['!', '/']) {
+                return Err(
+                    "text may not start with ! or /: an agent CLI reads those as a shell line \
+                     or a command of its own, not as a prompt"
+                        .to_string(),
+                );
+            }
+            Ok(())
         }
         Cmd::Ask(a) => {
             plain("target", &a.target, 128)?;
@@ -693,7 +757,13 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
         // No text of the caller's reaches a handler or the log from these: a
         // `report` is refused before it is applied, and its label holds only
         // a status word, a number and a length.
-        Cmd::List | Cmd::Audit(_) | Cmd::Whoami | Cmd::Inbox(_) | Cmd::Report(_) => Ok(()),
+        Cmd::List
+        | Cmd::Audit(_)
+        | Cmd::Whoami
+        | Cmd::Inbox(_)
+        | Cmd::Report(_)
+        | Cmd::Ping
+        | Cmd::Metrics => Ok(()),
         // A verb added after this was written has not been read for what it
         // carries. Refused until it is added above.
         #[allow(
@@ -789,6 +859,42 @@ pub const MISPLACED: &str = "--operator-token-file goes first: \
      atrium --operator-token-file <path> [session flags] [command] \
      (or set ATRIUM_OPERATOR_TOKEN_FILE to the path)";
 
+/// The flag before the word `ctl`: it would be taken as the host's and
+/// dropped, and the request sent without the credential.
+const BEFORE_CTL: &str = "--operator-token-file goes after `ctl` for the client: \
+     atrium ctl --operator-token-file <path> [--operator <name>] <verb> ...";
+
+/// The flag after a plain launch's own flags, wherever it sits: right after
+/// them, or among the hosted command's arguments. Either way atrium would
+/// start a session without the operators the caller meant it to have, so it
+/// stops and says where the flag goes ([`MISPLACED`]). `rest` is what is left
+/// once atrium's own flags are parsed: the hosted command and its arguments.
+pub fn misplaced(rest: &[String]) -> Result<(), String> {
+    if rest.iter().any(|a| is_flag(a)) {
+        return Err(MISPLACED.to_string());
+    }
+    Ok(())
+}
+
+/// A token file with the control plane off is a session no operator can
+/// reach, started by someone who meant otherwise: refused at startup, on
+/// every path that hosts one, once `allow_ctl` is final.
+pub fn require_ctl(allow_ctl: bool) -> Result<(), String> {
+    ctl_required(allow_ctl, session())
+}
+
+/// [`require_ctl`] for a given set of operators.
+pub fn ctl_required(allow_ctl: bool, ops: &Operators) -> Result<(), String> {
+    if allow_ctl || ops.is_empty() {
+        return Ok(());
+    }
+    Err(
+        "an operator token file was given but the control plane is off: add --allow-ctl \
+         (or \"allow_ctl\": true in the fleet), or drop the file"
+            .to_string(),
+    )
+}
+
 /// Take [`ENV_FILE`] out of this process's environment and return what it
 /// held. Every pane atrium spawns inherits atrium's environment, so the
 /// variable is gone before the first one exists. This hides the *path* from a
@@ -850,6 +956,9 @@ fn strip_flag(args: Vec<String>) -> Result<(Option<PathBuf>, Vec<String>), Strin
 pub fn host_startup(args: Vec<String>) -> Result<Vec<String>, String> {
     let from_env = take_env();
     let (from_flag, rest) = strip_flag(args)?;
+    if from_flag.is_some() && rest.first().map(String::as_str) == Some("ctl") {
+        return Err(BEFORE_CTL.to_string());
+    }
     if hosts_no_session(&rest) {
         return Ok(rest);
     }

@@ -490,3 +490,22 @@ fn ping_is_alive_when_the_loop_answers() {
     assert_eq!(ping, Ping::Alive(pong));
     assert_eq!(ping.exit_code(), 0);
 }
+
+/// A parsed request printed with `{:?}` shows that a credential is there,
+/// never what it is.
+#[test]
+fn a_requests_debug_output_redacts_both_tokens() {
+    let line = format!(
+        r#"{{"caller":3,"token":"the-panes-own-token","operator_token":"{OPERATOR_TOKEN}","cmd":"kill","target":"3"}}"#
+    );
+    let req = crate::ctl::parse_request(&line).expect("parses");
+    let shown = format!("{req:?} {req:#?}");
+    assert!(!shown.contains(OPERATOR_TOKEN), "{shown}");
+    assert!(!shown.contains("the-panes-own-token"), "{shown}");
+    assert!(
+        shown.contains("<redacted>") && shown.contains("Kill"),
+        "{shown}"
+    );
+    let bare = crate::ctl::parse_request(r#"{"cmd":"list"}"#).expect("parses");
+    assert!(format!("{bare:?}").contains("token: None"));
+}

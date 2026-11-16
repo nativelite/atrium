@@ -508,10 +508,12 @@ fn launch() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Found here, the operator flag was written after another session flag,
-    // where it would be taken for the command to host. Say where it goes.
-    if rest.first().is_some_and(|a| atrium::operator::is_flag(a)) {
-        eprintln!("atrium: {}", atrium::operator::MISPLACED);
+    // Found here, the operator flag was written after another session flag or
+    // after the command, where it would be taken for the command to host or
+    // handed to it, and the session would start without its operators. Say
+    // where it goes.
+    if let Err(msg) = atrium::operator::misplaced(&rest) {
+        eprintln!("atrium: {msg}");
         return ExitCode::FAILURE;
     }
     // `atrium [--identity X] [--trust <policy>] [--allow-ctl] up <name>` is the
@@ -535,6 +537,11 @@ fn launch() -> ExitCode {
     } else {
         rest
     };
+    // A token file with the control plane off: no operator could connect.
+    if let Err(msg) = atrium::operator::require_ctl(allow_ctl) {
+        eprintln!("atrium: {msg}");
+        return ExitCode::FAILURE;
+    }
     // The last session in this project crashed: offer to pick it back up before
     // starting a fresh one. Ahead of the skip confirmation, because a resume
     // settles its own posture (and asks its own questions).

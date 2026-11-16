@@ -83,14 +83,17 @@ pub(crate) fn apply_ctl_as(
             // truncation wrote 59 of a 64-character token into a log that
             // `ctl audit` hands to an unauthenticated reader. Record the shape
             // and the parse error, which is what debugging actually needs, and
-            // nothing that was in the payload.
-            audit.record(
-                None,
-                "bad-request",
-                &format!("<unparseable, {} bytes>", line.len()),
-                false,
-                &e,
-            );
+            // nothing that was in the payload: the error's own words, without
+            // the request values it quotes (`bad_request_note`).
+            let detail = format!("<unparseable, {} bytes>", line.len());
+            let note = bad_request_note(&e);
+            // A request that could not be parsed may still say whose it is.
+            // An operator's is recorded under its name (or as a failed
+            // attempt), like every other request an operator token comes with.
+            match operator_of_unparsed(line, operators) {
+                Some(by) => audit.record_as(&by, "bad-request", &detail, false, &note),
+                None => audit.record(None, "bad-request", &detail, false, &note),
+            };
             return (reply, CtlEffect::Nothing);
         }
     };
@@ -188,6 +191,40 @@ pub(crate) fn apply_ctl_as(
     (reply, effect)
 }
 
+/// What the audit log keeps of a parse error: its own words, and none of the
+/// request's. `parse_request` quotes the value it could not take (`unknown
+/// command "…"`, `(got Some("…"))`), and that value is whatever the caller
+/// sent, of any length, with any character in it. The note is the text before
+/// the first quote or parenthesis, scrubbed and cut to 80 characters; the
+/// caller still gets the full error in its reply.
+fn bad_request_note(err: &str) -> String {
+    let head = err.split(['"', '(', '\'']).next().unwrap_or("");
+    let head: String = atrium::modstate::text_safe(head).chars().take(80).collect();
+    let head = head.trim().trim_end_matches(':').trim_end();
+    if head.is_empty() {
+        "malformed request".to_string()
+    } else {
+        head.to_string()
+    }
+}
+
+/// The audit label for a request that failed to parse, when it carries an
+/// `operator_token` field: `operator:<name>` if the token matches (compared
+/// in constant time, as everywhere), `operator:?` if it does not or is not a
+/// string. `None` when there is no such field, or the line is not JSON at all
+/// and so says nothing about whose it is.
+fn operator_of_unparsed(line: &str, operators: &atrium::operator::Operators) -> Option<String> {
+    let v = json::parse(line).ok()?;
+    let field = v.get("operator_token")?;
+    Some(
+        field
+            .as_str()
+            .and_then(|presented| operators.authenticate(presented))
+            .map(atrium::operator::Operator::label)
+            .unwrap_or_else(|| atrium::operator::UNKNOWN_LABEL.to_string()),
+    )
+}
+
 /// The reply to a request whose operator token matches no operator. One text
 /// whether the session has no token file at all or the token is simply wrong,
 /// so the reply tells a prober nothing about which.
@@ -268,6 +305,13 @@ fn apply_operator(
         Verdict::Listed => true,
         Verdict::OpenRead => false,
     };
+    // The two probes are answered and not recorded, for an operator as for
+    // anyone: a liveness check every few seconds would push every real action
+    // out of the ring, and they hand out nothing of any pane's. The token was
+    // still checked above, and a wrong one was recorded.
+    if matches!(req.cmd, Cmd::Ping | Cmd::Metrics) {
+        return (dispatch_ctl(req, None, false, cx), CtlEffect::Nothing);
+    }
     if let Cmd::Audit(ar) = &req.cmd {
         // Recorded before the reply is built, so the reader sees its own read.
         cx.audit.record_as(&label, "audit", "read", true, "");
@@ -281,7 +325,7 @@ fn apply_operator(
         // What a caller with no token is served, by the same code.
         dispatch_ctl(req, None, false, cx)
     } else {
-        dispatch_operator(req.cmd, &label, cx)
+        dispatch_operator(req.cmd, op, cx)
     };
     let (ok, note) = audit_outcome(&reply);
     cx.audit.record_as(&label, action, &detail, ok, &note);
@@ -293,7 +337,8 @@ fn apply_operator(
 /// handler has been read for a caller with no pane:
 ///
 /// * **Reach.** An operator acts across the whole session, so the subtree
-///   guard is given `privileged`: `send`, `kill`, `respawn`, `ask`, and the
+///   guard is given `privileged`: `kill`, `respawn`, `send` and `ask` (those
+///   two for agent panes only, see [`not_an_agent`]), and the
 ///   model-output reads reach any pane. `caller` is `None` throughout — an
 ///   operator is never passed off as some pane.
 /// * **`spawn` is the exception.** It is run as a top-level caller *without*
@@ -309,13 +354,27 @@ fn apply_operator(
 ///   operator's label, never a pane's.
 /// * **Everything else is refused**, by the last arm: a verb added later does
 ///   not reach an operator until it is added here.
-fn dispatch_operator(cmd: Cmd, label: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
+fn dispatch_operator(
+    cmd: Cmd,
+    op: &atrium::operator::Operator,
+    cx: &mut CtlSession<'_>,
+) -> ctl::Reply {
+    let label = &op.label();
+    let wake = OperatorWake {
+        may_send: op.verbs().iter().any(|v| v == "send"),
+    };
     match cmd {
         Cmd::Spawn(sp) => spawn(sp, None, false, cx),
-        Cmd::Send(sr) => send(sr, None, true, cx),
+        Cmd::Send(sr) => match not_an_agent(cx.windows, &sr.target) {
+            Some(refusal) => refusal,
+            None => send(sr, None, true, cx),
+        },
         Cmd::Kill(kr) => kill(kr, None, true, cx),
         Cmd::Respawn(rr) => respawn(rr, None, true, cx),
-        Cmd::Ask(a) => ask(a, None, true, cx),
+        Cmd::Ask(a) => match not_an_agent(cx.windows, &a.target) {
+            Some(refusal) => refusal,
+            None => ask(a, None, true, cx),
+        },
         Cmd::Answer(a) => answer(a, None, true, cx),
         Cmd::Asked(a) => asked(a, None, true, cx),
         Cmd::Who(w) => who(w, None, true, cx),
@@ -326,7 +385,7 @@ fn dispatch_operator(cmd: Cmd, label: &str, cx: &mut CtlSession<'_>) -> ctl::Rep
             | ctl::BoardOp::Release { .. }),
         ) => board(op, None, Some(label), cx),
         Cmd::Bus(op @ (ctl::BusOp::Pub { .. } | ctl::BusOp::Resolve { .. })) => {
-            bus(op, None, true, Some(label), cx)
+            bus(op, None, true, Some((label, wake)), cx)
         }
         other => ctl::reply_err(&format!(
             "{:?} is not open to operators",
@@ -335,12 +394,58 @@ fn dispatch_operator(cmd: Cmd, label: &str, cx: &mut CtlSession<'_>) -> ctl::Rep
     }
 }
 
+/// Is this pane an agent's: is the command it was spawned with an agent CLI
+/// (`claude`, a claude alias, `codex`, …)? The test is the command, not what
+/// the process is doing now.
+fn is_agent_pane(p: &Pane) -> bool {
+    let program = p.argv.first().map(String::as_str).unwrap_or(&p.title);
+    atrium::bind::is_agent_stem(&atrium::bind::command_stem(program))
+}
+
+/// The refusal for an operator's `send` or `ask` whose target is not an
+/// agent's pane. Text sent to a pane is typed into it and submitted. Into an
+/// agent that is a prompt, and what the agent then does is bounded by its
+/// trust mode. Into a shell it is a command line, run with no gate at all:
+/// `send 0 "curl … | sh"` would be command execution under any trust. So an
+/// operator's text reaches agent panes only. (A target that does not resolve
+/// is left to the handler, which says so.)
+fn not_an_agent(windows: &[Window], target: &str) -> Option<ctl::Reply> {
+    let id = ctl::resolve_target(target, &ctl_candidates(windows)).ok()?;
+    let pane = pane_by_agent(windows, id)?;
+    (!is_agent_pane(pane)).then(|| {
+        ctl::reply_err(&format!(
+            "pane {id} is not an agent's pane: an operator's text is typed only into a pane \
+             whose command is an agent (it would be a command line to a shell)"
+        ))
+    })
+}
+
+/// How an operator's `bus pub` may wake panes. A wake is a framed line typed
+/// into a pane, so it follows the rule for an operator's text, and one more:
+///
+/// * it is typed into **agent panes only** ([`is_agent_pane`]); a shell that
+///   is addressed, or that subscribed, is not woken;
+/// * a pane the event merely **addresses** (`--to`) is woken only when the
+///   operator's entry also names `send`. Choosing which pane gets text typed
+///   into it is what `send` grants; `bus pub` alone reaches the panes that
+///   subscribed to the topic, which asked for it.
+///
+/// The event is on the bus either way, for `bus feed`.
+#[derive(Clone, Copy)]
+struct OperatorWake {
+    may_send: bool,
+}
+
 /// A `ctl spawn` whose role would read as an operator's label on the board
-/// and the bus (`operator:<name>`): refused for every caller.
+/// and the bus (`operator`, `operator:<name>`, or a look-alike of either; see
+/// [`atrium::operator::role_reserved`]): refused for every caller.
 fn reserved_role(sp: &ctl::SpawnReq) -> Option<ctl::Reply> {
     let role = sp.role.as_deref()?;
     atrium::operator::role_reserved(role).then(|| {
-        ctl::reply_err("a role may not start with \"operator:\": that prefix names operator tokens")
+        ctl::reply_err(
+            "this role is reserved: \"operator\" and \"operator:<name>\" (and anything that \
+             reads like them) name callers that are not panes",
+        )
     })
 }
 
@@ -1179,10 +1284,11 @@ fn bus(
     op: ctl::BusOp,
     caller: Option<AgentId>,
     privileged: bool,
-    operator: Option<&str>,
+    operator: Option<(&str, OperatorWake)>,
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
     let (windows, bus, pending) = (&*cx.windows, &mut *cx.bus, &mut *cx.pending);
+    let (operator, operator_wake) = (operator.map(|o| o.0), operator.map(|o| o.1));
     // The bus is SHARED like the board. The server derives `who` (the
     // caller's role, else its pane, else the operator) so a worker
     // publishes and subscribes *as itself* — it cannot forge another
@@ -1231,6 +1337,17 @@ fn bus(
                     },
                 );
                 for (tid, text) in wakes {
+                    if let Some(rule) = operator_wake {
+                        let Some(pane) = pane_by_agent(windows, tid) else {
+                            continue;
+                        };
+                        let subscribed = bus
+                            .subscriptions(&pane_label(tid, pane.role.as_deref()))
+                            .is_some_and(|t| t.contains(&e.topic) || t.contains("*"));
+                        if !is_agent_pane(pane) || !(subscribed || rule.may_send) {
+                            continue;
+                        }
+                    }
                     queue_send(pending, tid, text, SendOrigin::BusWake);
                 }
                 ctl::reply_bus_published(atrium::bus::event_to_value(&e), subs)

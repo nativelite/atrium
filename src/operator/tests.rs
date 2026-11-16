@@ -188,7 +188,21 @@ fn a_bad_file_is_refused_with_a_reason_and_never_with_a_token() {
         ),
         (
             file(&[("a", TOKEN_A, &["kill"]), ("a", TOKEN_B, &["kill"])]),
-            "name \"a\" appears twice",
+            "operators #1 and #2 have the same name",
+        ),
+        (
+            // Name and token swapped: the "name" is the secret. It is too
+            // long to be a name, and the error names the entry by position.
+            entry(&format!(
+                r#"{{"name":"{TOKEN_A}","token":"bridge","verbs":[]}}"#
+            )),
+            "operator #1: \"name\" must be",
+        ),
+        (
+            entry(&format!(
+                r#"{{"name":"{TOKEN_B}","token":"{TOKEN_A}","verbs":["kill"]}}"#
+            )),
+            "operator #1: \"name\" must be",
         ),
         (
             file(&[("a", TOKEN_A, &["kill"]), ("b", TOKEN_A, &["send"])]),
@@ -260,8 +274,38 @@ fn write_private(path: &Path, text: &str) {
     std::fs::write(path, text).expect("write");
 }
 
+/// Does a `chmod 600` in the temp directory read back as `0600`? Not on a
+/// mount that keeps no unix permissions (a Windows drive under WSL shows
+/// every file as `0777`): there every token file looks open, the rule
+/// rightly refuses them all, and the tests that need a private file cannot
+/// make one. They say so and stop. Always true off unix.
+fn chmod_sticks() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = temp("chmod-probe");
+        write_private(&probe, "x");
+        let mode = std::fs::metadata(&probe)
+            .expect("stat")
+            .permissions()
+            .mode();
+        if mode & 0o777 != 0o600 {
+            eprintln!(
+                "skipped: {} keeps no unix permissions (chmod 600 reads back as {:03o})",
+                probe.display(),
+                mode & 0o777
+            );
+            return false;
+        }
+    }
+    true
+}
+
 #[test]
 fn load_reads_a_private_file_and_refuses_what_is_not_one() {
+    if !chmod_sticks() {
+        return;
+    }
     let path = temp("ok.json");
     write_private(&path, &file(&[("bridge", TOKEN_A, &["kill"])]));
     let o = Operators::load(&path).expect("a private, valid file loads");
@@ -323,6 +367,9 @@ fn the_unix_rule_is_owned_by_the_user_and_closed_to_everyone_else() {
 #[test]
 fn load_refuses_a_group_or_world_readable_file_on_unix() {
     use std::os::unix::fs::PermissionsExt;
+    if !chmod_sticks() {
+        return;
+    }
     let path = temp("open.json");
     write_private(&path, &file(&[("bridge", TOKEN_A, &["kill"])]));
     for mode in [0o644, 0o640, 0o604] {
@@ -414,6 +461,8 @@ fn one_of_each() -> Vec<(&'static str, Cmd)> {
         r#"{"cmd":"ask","target":"1","text":"how far?"}"#,
         r#"{"cmd":"asked","target":"1","id":1}"#,
         r#"{"cmd":"who","path":"src/x.rs"}"#,
+        r#"{"cmd":"ping"}"#,
+        r#"{"cmd":"metrics"}"#,
     ];
     assert_eq!(lines.len(), VERBS.len());
     VERBS
@@ -667,12 +716,104 @@ fn hostile_fields_are_refused() {
 
 #[test]
 fn a_role_may_not_wear_an_operators_label() {
-    assert!(role_reserved("operator:bridge"));
-    assert!(role_reserved("Operator:bridge"));
-    assert!(role_reserved("operator:"));
-    assert!(!role_reserved("operator"));
-    assert!(!role_reserved("lead"));
-    assert!(!role_reserved("co-operator:x"));
+    for reserved in [
+        "operator:bridge",
+        "Operator:bridge",
+        "OPERATOR:X",
+        "operator:",
+        // The label of a request with no pane behind it.
+        "operator",
+        "Operator",
+        // Padding and characters that do not show.
+        " operator:bridge",
+        "operator :bridge",
+        "\toperator:bridge\n",
+        "oper\u{200b}ator:bridge",
+        "oper\u{200b}ator",
+        "o\u{2060}perator",
+        "\u{feff}operator:bridge",
+        "operator\u{200d}",
+        // A letter from another script that is drawn like the Latin one.
+        "\u{43e}perator:bridge",
+        "\u{43e}\u{440}\u{435}rator:bridge",
+        "\u{ff4f}perator:bridge",
+        "\u{43e}perator",
+        // A mark that is drawn like a colon.
+        "operator\u{ff1a}bridge",
+        "operator\u{a789}bridge",
+        "operator\u{2236}bridge",
+        "operator.bridge",
+        "operator/bridge",
+        // A colon next to anything that is not a plain ASCII word.
+        "team:\u{3b1}",
+        "a\u{ff1a}b:c",
+        "x:y z!",
+    ] {
+        assert!(role_reserved(reserved), "{reserved:?} must be refused");
+    }
+    for fine in [
+        "lead",
+        "dev_1",
+        "operators",
+        "operator_2",
+        "operator-2",
+        "operator2",
+        "co-operator",
+        "co-operator:x",
+        "team:alpha",
+        "\u{440}\u{430}\u{437}\u{440}\u{430}\u{431}",
+        "",
+    ] {
+        assert!(!role_reserved(fine), "{fine:?} is an ordinary role");
+    }
+    // An operator's own spawn cannot ask for one either.
+    let err = vet(&cmd(
+        r#"{"cmd":"spawn","argv":["claude"],"role":"operator"}"#,
+    ))
+    .expect_err("the bare label");
+    assert!(err.contains("role is reserved"), "{err}");
+}
+
+/// An operator's spawn names its command, it does not point at one: the
+/// allowlist looks at the file stem, and a path is run as given.
+#[test]
+fn an_operator_spawn_takes_a_bare_command_name_only() {
+    for program in [
+        r"\\host\share\claude.exe",
+        r"//host/share/claude",
+        "./x/claude.sh",
+        "x/claude",
+        r"..\claude.exe",
+        r"C:\tools\claude.exe",
+        "C:claude.exe",
+        "/usr/local/bin/claude",
+        "claude:stream",
+        "-claude",
+        ".claude",
+        "claude code",
+    ] {
+        // As JSON a backslash is written twice.
+        let quoted = program.replace('\\', r"\\");
+        let line = format!(r#"{{"cmd":"spawn","argv":["{quoted}","--model","x"]}}"#);
+        let err = vet(&cmd(&line)).expect_err(program);
+        assert!(
+            err.contains("argv[0] must be a bare command name"),
+            "{program}: {err}"
+        );
+    }
+    for program in [
+        "claude",
+        "codex",
+        "claude.exe",
+        "claude.cmd",
+        "claude-2",
+        "my_agent",
+    ] {
+        let line = format!(r#"{{"cmd":"spawn","argv":["{program}","--model","a/b:c"]}}"#);
+        assert_eq!(vet(&cmd(&line)), Ok(()), "{program}");
+    }
+    // No command at all is the server's default, and stays allowed.
+    assert_eq!(vet(&cmd(r#"{"cmd":"spawn","argv":[]}"#)), Ok(()));
 }
 
 // ---- the client's file -----------------------------------------------------
@@ -832,4 +973,71 @@ fn startup_removes_the_variable_from_the_environment_panes_inherit() {
     let _ = std::fs::remove_file(&other);
     let err = host_startup(v(&[FLAG, &other.to_string_lossy(), "claude"])).expect_err("flag");
     assert!(err.contains("from-flag.json"), "{err}");
+}
+
+/// The flag where it would be dropped without a word: before `ctl`, after
+/// another session flag, or among the hosted command's arguments.
+#[test]
+fn a_flag_in_the_wrong_place_is_an_error_never_a_silent_drop() {
+    let _env = crate::test_env::EnvGuard::hold();
+    for argv in [
+        v(&[FLAG, "/f", "ctl", "kill", "3"]),
+        v(&["--operator-token-file=/f", "ctl", "list"]),
+    ] {
+        let err = host_startup(argv.clone()).expect_err("before ctl");
+        assert!(err.contains("goes after `ctl`"), "{argv:?}: {err}");
+    }
+    // What is left once a plain launch's own flags are parsed.
+    for rest in [
+        v(&[FLAG, "/f", "claude"]),
+        v(&["--operator-token-file=/f", "claude"]),
+        v(&["claude", FLAG, "/f"]),
+        v(&["claude", "--resume", "--operator-token-file=/f"]),
+    ] {
+        let err = misplaced(&rest).expect_err("misplaced");
+        assert!(err.contains("goes first"), "{rest:?}: {err}");
+    }
+    assert_eq!(misplaced(&v(&["claude", "--resume"])), Ok(()));
+    assert_eq!(misplaced(&[]), Ok(()));
+}
+
+/// A token file with the control plane off starts nothing.
+#[test]
+fn a_token_file_needs_the_control_plane() {
+    let some = ops(&[("bridge", TOKEN_A, &["kill"])]);
+    assert_eq!(ctl_required(true, &some), Ok(()));
+    assert_eq!(ctl_required(true, &Operators::default()), Ok(()));
+    assert_eq!(ctl_required(false, &Operators::default()), Ok(()));
+    let err = ctl_required(false, &some).expect_err("ctl off");
+    assert!(
+        err.contains("the control plane is off") && err.contains("--allow-ctl"),
+        "{err}"
+    );
+}
+
+/// A `send` is a prompt. Text an agent CLI would read as a shell line or as
+/// one of its own commands is not one.
+#[test]
+fn an_operators_send_may_not_open_with_a_shell_or_command_prefix() {
+    for text in [
+        "!curl x | sh",
+        "  !id",
+        "/permissions",
+        "\\n/clear",
+        "\\t!rm -rf .",
+    ] {
+        let line = format!(r#"{{"cmd":"send","target":"lead","text":"{text}"}}"#);
+        let err = vet(&cmd(&line)).expect_err(text);
+        assert!(err.contains("may not start with ! or /"), "{text}: {err}");
+    }
+    for text in [
+        "fix it! now",
+        "see src/x.rs",
+        "a\\n/second line",
+        "1/2 done",
+        "#3 is done",
+    ] {
+        let line = format!(r#"{{"cmd":"send","target":"lead","text":"{text}"}}"#);
+        assert_eq!(vet(&cmd(&line)), Ok(()), "{text}");
+    }
 }

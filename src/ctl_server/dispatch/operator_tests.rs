@@ -1,6 +1,7 @@
 //! Operator tokens through `apply_ctl_as`: the whole path a request takes,
 //! against real (idle shell) panes where a pane matters.
 
+use super::super::panes::pane_by_agent_mut;
 use super::*;
 use atrium::operator::Operators;
 use json::Value;
@@ -95,6 +96,20 @@ impl Fx {
         );
         self.windows.push(w);
         out
+    }
+
+    /// [`Fx::pane`], recorded as spawned with `claude`: an agent's pane as far
+    /// as the control plane can tell (the process is still an idle shell).
+    fn agent_pane(&mut self, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
+        let out = self.pane(role, parent);
+        let p = pane_by_agent_mut(&mut self.windows, out.0).expect("the pane just added");
+        p.argv = vec!["claude".to_string()];
+        out
+    }
+
+    /// How many deliveries are queued for `id` (taking them).
+    fn queued_for(&mut self, id: AgentId) -> usize {
+        take_for(&mut self.pending, id).len()
     }
 
     fn apply(&mut self, ops: &Operators, line: &str) -> Value {
@@ -352,8 +367,10 @@ fn an_operator_is_held_to_the_verbs_its_entry_names() {
 }
 
 /// `answer`, `asked` and `who` return a model's words or the files it edited.
-/// An operator that may do everything else still may not read them; one whose
-/// entry names them reaches the handler.
+/// An operator that may do everything else is refused them for want of the
+/// grant; one whose entry names them reads them, for a pane that is in
+/// nobody's subtree: here one that has left the fleet, which only the pane
+/// that spawned it could otherwise read.
 #[test]
 fn model_output_verbs_are_off_unless_the_entry_names_them() {
     let mut fx = Fx::new();
@@ -362,29 +379,52 @@ fn model_output_verbs_are_off_unless_the_entry_names_them() {
         .filter(|v| !atrium::operator::MODEL_OUTPUT.contains(v))
         .collect();
     let ops = operators(&wide);
-    // Pane 7 reported an edit and has since left the fleet.
-    fx.mods.touch(7, &["src/x.rs".to_string()], None, 1);
+    // Pane 7, spawned by pane 3, said hello, answered, replied to a question,
+    // edited a file, and exited.
+    let caps = ["ask".to_string(), "inbox".to_string()];
+    fx.mods.hello(7, Some(3), "1.0", None, &caps, 1);
+    let report = atrium::modstate::Report {
+        answer: Some("forty-two".to_string()),
+        ..Default::default()
+    };
+    fx.mods.report(7, &report, 2);
+    let ask = fx.mods.ask(7, Some(3), "how far?", 3).expect("an ask");
+    fx.mods.take_asks(7);
+    assert!(fx.mods.reply(7, ask, "nearly there", 4));
+    fx.mods.touch(7, &["src/x.rs".to_string()], None, 5);
+
+    let asked = format!(r#""cmd":"asked","target":"7","id":{ask}"#);
     for (body, verb) in [
         (r#""cmd":"answer","target":"7""#, "answer"),
-        (r#""cmd":"asked","target":"7","id":1"#, "asked"),
+        (asked.as_str(), "asked"),
         (r#""cmd":"who","path":"src/x.rs""#, "who"),
     ] {
+        // Refused for the grant, by name, and nothing of the pane's is in it.
         let v = fx.apply(&ops, &op(BRIDGE, body));
-        assert!(err(&v).contains(&format!("may not use {verb:?}")), "{v}");
-        assert_eq!(s(&fx.last(), "by"), "operator:bridge");
+        let why = err(&v);
+        assert!(
+            why.contains(&format!("operator \"bridge\" may not use {verb:?}"))
+                && why.contains("does not name it"),
+            "{why}"
+        );
+        assert!(!v.to_string().contains("forty-two") && !v.to_string().contains("nearly"));
+        let e = fx.last();
+        assert_eq!(s(&e, "by"), "operator:bridge");
+        assert_eq!(e.get("ok").and_then(Value::as_bool), Some(false));
 
-        // `reader` names them: the request reaches the handler, which answers
-        // about the (absent) pane rather than refusing the operator.
         let v = fx.apply(&ops, &op(READER, body));
+        assert!(ok(&v), "{verb}: {v}");
         let e = fx.last();
         assert_eq!(s(&e, "by"), "operator:reader");
-        if verb == "who" {
-            // The whole session's view: a pane in nobody's subtree is in it.
-            let panes = v.get("panes").and_then(Value::as_array).expect("panes");
-            assert_eq!(panes.len(), 1, "{v}");
-            assert_eq!(panes[0].get("pane").and_then(Value::as_i64), Some(7));
-        } else {
-            assert!(err(&v).contains("no pane with id"), "{v}");
+        assert_eq!(e.get("ok").and_then(Value::as_bool), Some(true));
+        match verb {
+            "answer" => assert_eq!(s(&v, "answer"), "forty-two"),
+            "asked" => assert_eq!(s(&v, "reply"), "nearly there"),
+            _ => {
+                let panes = v.get("panes").and_then(Value::as_array).expect("panes");
+                assert_eq!(panes.len(), 1, "{v}");
+                assert_eq!(panes[0].get("pane").and_then(Value::as_i64), Some(7));
+            }
         }
     }
     fx.assert_no_secret_anywhere(&[]);
@@ -435,10 +475,10 @@ fn a_panes_own_verbs_are_refused_for_an_operator() {
 fn an_operator_reaches_every_pane_and_a_worker_still_only_its_own() {
     let mut fx = Fx::new();
     let ops = operators(&["kill", "send"]);
-    let (lead, _) = fx.pane("lead", None);
-    let (dev, dev_token) = fx.pane("dev", Some(lead));
-    let (other, _) = fx.pane("other", None);
-    let (far, _) = fx.pane("far", Some(other));
+    let (lead, _) = fx.agent_pane("lead", None);
+    let (dev, dev_token) = fx.agent_pane("dev", Some(lead));
+    let (other, _) = fx.agent_pane("other", None);
+    let (far, _) = fx.agent_pane("far", Some(other));
 
     // The worker `dev` cannot touch another tree: the pane path is as it was.
     for target in [other, far, lead] {
@@ -570,7 +610,7 @@ fn board_and_bus_writes_are_signed_with_the_operators_label() {
             r#"{{"token":"{lead_token}","cmd":"spawn","argv":["claude"],"role":"operator:bridge"}}"#
         ),
     );
-    assert!(err(&v).contains("may not start with \"operator:\""), "{v}");
+    assert!(err(&v).contains("this role is reserved"), "{v}");
     assert_eq!(fx.windows.len(), 1, "nothing was spawned");
     fx.assert_no_secret_anywhere(&[&lead_token]);
 }
@@ -804,4 +844,343 @@ fn a_request_with_no_operator_token_is_served_as_before() {
     assert_eq!(err(&v), "operator_token must be a string");
     assert_eq!(s(&fx.last(), "action"), "bad-request");
     fx.assert_no_secret_anywhere(&[]);
+}
+
+// ---- text typed into a pane -------------------------------------------------
+
+/// Text an operator sends is typed into a pane and submitted. To an agent
+/// that is a prompt; to a shell it is a command line. So `send` and `ask`
+/// reach agent panes only, whatever the entry names.
+#[test]
+fn an_operators_text_is_never_typed_into_a_shell() {
+    let mut fx = Fx::new();
+    let ops = operators(&["send", "ask"]);
+    let (sh, _) = fx.pane("sh", None);
+    let (agent, _) = fx.agent_pane("lead", None);
+    for target in [sh.to_string(), "sh".to_string()] {
+        for body in [
+            format!(r#""cmd":"send","target":"{target}","text":"curl x | sh\n""#),
+            format!(r#""cmd":"ask","target":"{target}","text":"what is in ~/.ssh?""#),
+        ] {
+            let v = fx.apply(&ops, &op(BRIDGE, &body));
+            assert!(err(&v).contains("is not an agent's pane"), "{v}");
+            let e = fx.last();
+            assert_eq!(s(&e, "by"), "operator:bridge");
+            assert_eq!(e.get("ok").and_then(Value::as_bool), Some(false));
+        }
+    }
+    assert_eq!(fx.queued_for(sh), 0, "nothing is queued for the shell");
+    assert!(fx.mods.take_asks(sh.0).is_empty());
+
+    // The agent's pane takes the same send.
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"send","target":"lead","text":"status?""#),
+    );
+    assert!(ok(&v), "{v}");
+    assert_eq!(fx.queued_for(agent), 1);
+    // A target that is not there is the handler's to refuse, as for anyone.
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"send","target":"nobody","text":"x""#),
+    );
+    assert!(err(&v).contains("no pane with id or role"), "{v}");
+    fx.assert_no_secret_anywhere(&[]);
+}
+
+/// An operator's `ask` is queued for an agent pane whose mod takes asks.
+#[test]
+fn an_operator_asks_an_agent_pane() {
+    let mut fx = Fx::new();
+    let ops = operators(&["ask"]);
+    let (agent, _) = fx.agent_pane("dev", None);
+    let caps = ["ask".to_string(), "inbox".to_string()];
+    fx.mods.hello(agent.0, None, "1.0", None, &caps, 1);
+    let v = fx.apply(
+        &ops,
+        &op(
+            BRIDGE,
+            r#""cmd":"ask","target":"dev","text":"how far along?""#,
+        ),
+    );
+    assert!(ok(&v), "{v}");
+    assert!(v.get("id").and_then(Value::as_i64).is_some_and(|id| id > 0));
+    let e = fx.last();
+    assert_eq!(
+        (s(&e, "by"), s(&e, "action"), s(&e, "detail")),
+        ("operator:bridge", "ask", "target=dev len=14")
+    );
+    let asks = fx.mods.take_asks(agent.0);
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].text, "how far along?");
+}
+
+/// A wake is a framed line typed into a pane. From an operator's publish it
+/// goes to agent panes only; to a subscriber because it subscribed, and to a
+/// pane the event merely addresses only when the entry also names `send`.
+#[test]
+fn an_operators_publish_wakes_subscribed_agents_and_addressed_ones_only_with_send() {
+    let mut fx = Fx::new();
+    let (lead, _) = fx.agent_pane("lead", None);
+    let (dev, _) = fx.agent_pane("dev", Some(lead));
+    let (sh, _) = fx.pane("sh", None);
+    let topic = ["ops".to_string()];
+    fx.bus.subscribe("dev", &topic);
+    fx.bus.subscribe("sh", &topic);
+    let body = r#""cmd":"bus","op":"pub","topic":"ops","fields":{"to":"lead,sh","msg":"ship it"},"create":true"#;
+
+    // `bus pub` alone: the subscribed agent, and nobody the event only names.
+    let v = fx.apply(&operators(&["bus pub"]), &op(BRIDGE, body));
+    assert!(ok(&v), "{v}");
+    assert_eq!(
+        v.get("event").map(|e| s(e, "from")),
+        Some("operator:bridge")
+    );
+    assert_eq!(fx.queued_for(dev), 1, "the subscriber is woken");
+    assert_eq!(
+        fx.queued_for(lead),
+        0,
+        "addressed, not subscribed, no send grant"
+    );
+    assert_eq!(fx.queued_for(sh), 0, "a shell is never typed into");
+
+    // With `send` as well, the addressed agent is woken too. The shell,
+    // addressed and subscribed both, still is not.
+    let v = fx.apply(&operators(&["bus pub", "send"]), &op(BRIDGE, body));
+    assert!(ok(&v), "{v}");
+    assert_eq!(fx.queued_for(dev), 1);
+    assert_eq!(
+        fx.queued_for(lead),
+        1,
+        "session-wide: a root pane it did not spawn"
+    );
+    assert_eq!(fx.queued_for(sh), 0);
+    assert_eq!(
+        fx.bus.tail(usize::MAX).len(),
+        2,
+        "both events are on the bus"
+    );
+}
+
+// ---- respawn, and the rest of the board ------------------------------------
+
+/// An operator respawns a pane it did not spawn; the pane keeps its role and
+/// its own mode, which is never above the launch trust.
+#[test]
+fn an_operator_respawns_any_pane_at_its_own_mode() {
+    let mut fx = Fx::new();
+    let ops = operators(&["respawn"]);
+    let (lead, _) = fx.pane("lead", None);
+    let (old, old_token) = fx.pane("worker", Some(lead));
+    let v = fx.apply(&ops, &op(BRIDGE, r#""cmd":"respawn","target":"worker""#));
+    assert!(ok(&v), "{v}");
+    let new = AgentId(v.get("pane").and_then(Value::as_i64).expect("pane") as usize);
+    assert_ne!(new, old, "a new process under a new agent id");
+    assert!(pane_by_agent(&fx.windows, old).is_none());
+    let p = pane_by_agent(&fx.windows, new).expect("the respawned pane");
+    assert_eq!(p.role.as_deref(), Some("worker"));
+    assert_eq!((p.parent, p.depth), (Some(lead), 1));
+    assert_eq!(p.mode, trust_mode());
+    assert_ne!(
+        p.token.as_deref(),
+        Some(old_token.as_str()),
+        "a fresh token"
+    );
+    let e = fx.last();
+    assert_eq!(
+        (s(&e, "by"), s(&e, "action"), s(&e, "detail")),
+        ("operator:bridge", "respawn", "target=worker worktree=-")
+    );
+    // Without the grant it is refused like any other write.
+    let v = fx.apply(
+        &operators(&["kill"]),
+        &op(BRIDGE, r#""cmd":"respawn","target":"worker""#),
+    );
+    assert!(err(&v).contains("may not use \"respawn\""), "{v}");
+    fx.assert_no_secret_anywhere(&[&old_token]);
+}
+
+#[test]
+fn an_operator_claims_releases_and_deletes_on_the_board() {
+    let mut fx = Fx::new();
+    let ops = operators(&["board set", "board claim", "board release", "board del"]);
+    let set = r#""cmd":"board","op":"set","key":"deploy","fields":{"status":"go"}"#;
+    assert!(ok(&fx.apply(&ops, &op(BRIDGE, set))));
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"board","op":"claim","key":"deploy""#),
+    );
+    assert_eq!(v.get("granted").and_then(Value::as_bool), Some(true), "{v}");
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"board","op":"release","key":"deploy""#),
+    );
+    assert_eq!(
+        v.get("released").and_then(Value::as_bool),
+        Some(true),
+        "{v}"
+    );
+    assert_eq!(s(&fx.last(), "detail"), "release deploy");
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"board","op":"del","key":"deploy""#),
+    );
+    assert_eq!(v.get("deleted").and_then(Value::as_bool), Some(true), "{v}");
+    assert!(fx.board.get("deploy").is_none());
+    let e = fx.last();
+    assert_eq!(
+        (
+            s(&e, "by"),
+            s(&e, "detail"),
+            e.get("ok").and_then(Value::as_bool)
+        ),
+        ("operator:bridge", "del deploy", Some(true))
+    );
+    // Each is its own grant.
+    let only_set = operators(&["board set"]);
+    assert!(ok(&fx.apply(&only_set, &op(BRIDGE, set))));
+    for (body, verb) in [
+        (
+            r#""cmd":"board","op":"release","key":"deploy""#,
+            "board release",
+        ),
+        (r#""cmd":"board","op":"del","key":"deploy""#, "board del"),
+    ] {
+        let v = fx.apply(&only_set, &op(BRIDGE, body));
+        assert!(err(&v).contains(&format!("may not use {verb:?}")), "{v}");
+    }
+    assert!(fx.board.get("deploy").is_some());
+}
+
+// ---- spawn: the command is a name ------------------------------------------
+
+/// A command with a path in it would pass the allowlist on its file stem and
+/// be run as given. An operator's spawn is refused before the allowlist is
+/// asked, and the path is not copied into the log.
+#[test]
+fn an_operator_cannot_spawn_a_path() {
+    let mut fx = Fx::new();
+    let ops = operators(&["spawn"]);
+    for body in [
+        r#""cmd":"spawn","argv":["\\\\host\\share\\claude.exe"]"#,
+        r#""cmd":"spawn","argv":["./x/claude.sh"]"#,
+        r#""cmd":"spawn","argv":["C:\\tools\\claude.exe"]"#,
+        r#""cmd":"spawn","argv":["/tmp/claude"]"#,
+    ] {
+        let v = fx.apply(&ops, &op(BRIDGE, body));
+        assert!(
+            err(&v).contains("argv[0] must be a bare command name"),
+            "{body}: {v}"
+        );
+        let e = fx.last();
+        assert_eq!(s(&e, "by"), "operator:bridge");
+        assert_eq!(s(&e, "detail"), "<fields withheld: refused>");
+    }
+    assert!(fx.windows.is_empty(), "nothing was spawned");
+    // The bare name passes the vetting and meets the next guard (the cap).
+    fx.max_depth = 0;
+    let v = fx.apply(&ops, &op(BRIDGE, r#""cmd":"spawn","argv":["claude"]"#));
+    assert!(err(&v).contains("exceeds --max-depth 0"), "{v}");
+}
+
+// ---- a request that does not parse -----------------------------------------
+
+/// A request that fails to parse is still recorded under the operator whose
+/// token it carries, and the log keeps the error's words without the request
+/// values it quotes, whoever sent it.
+#[test]
+fn an_unparseable_request_is_attributed_and_its_values_stay_out_of_the_log() {
+    let mut fx = Fx::new();
+    let ops = operators(&["kill"]);
+
+    let v = fx.apply(
+        &ops,
+        &op(BRIDGE, r#""cmd":"frobnicate\u001b]0;pwned\u0007""#),
+    );
+    assert!(err(&v).contains("unknown command"), "{v}");
+    let e = fx.last();
+    assert_eq!(
+        (s(&e, "by"), s(&e, "action"), s(&e, "note")),
+        ("operator:bridge", "bad-request", "unknown command")
+    );
+    assert_eq!(e.get("caller"), Some(&Value::Null));
+
+    // A token that matches nobody, and one that is not a string.
+    for line in [
+        op("not-a-token", r#""cmd":"frobnicate""#),
+        format!(r#"{{"operator_token":["{BRIDGE}"],"cmd":"list"}}"#),
+        r#"{"operator_token":7,"cmd":"kill"}"#.to_string(),
+    ] {
+        let v = fx.apply(&ops, &line);
+        assert!(!ok(&v), "{v}");
+        let e = fx.last();
+        assert_eq!(
+            (s(&e, "by"), s(&e, "action")),
+            ("operator:?", "bad-request")
+        );
+    }
+    assert_eq!(s(&fx.last(), "note"), "operator_token must be a string");
+
+    // No operator field: anonymous as before, and the quoted value is gone
+    // from the note for this caller too.
+    for (line, note) in [
+        (
+            r#"{"cmd":"spawn","argv":["claude"],"mode":"pwned\u001b[2J"}"#,
+            "unknown mode",
+        ),
+        (
+            r#"{"cmd":"board","op":"pwned"}"#,
+            "board op must be set|get|list|del|claim|release",
+        ),
+        (r#"{"cmd":"pwned"}"#, "unknown command"),
+        (
+            r#"{"cmd":"spawn","argv":["claude"],"window":false,"size":"pwned"}"#,
+            "--size",
+        ),
+    ] {
+        let v = fx.apply(&ops, line);
+        assert!(!ok(&v), "{v}");
+        let e = fx.last();
+        assert_eq!(e.get("by"), None, "{e}");
+        assert_eq!(s(&e, "note"), note);
+    }
+    // Not JSON at all says nothing about whose it is.
+    let v = fx.apply(&ops, &format!(r#"{{"operator_token":"{BRIDGE}","cmd":"#));
+    assert!(err(&v).contains("bad request json"), "{v}");
+    let e = fx.last();
+    assert_eq!(e.get("by"), None);
+    assert!(s(&e, "note").starts_with("bad request json: line 1"), "{e}");
+
+    let log: Vec<String> = fx.log().iter().map(Value::to_string).collect();
+    assert!(!log.iter().any(|l| l.contains("pwned")), "{log:?}");
+    fx.assert_no_secret_anywhere(&[]);
+}
+
+// ---- the probes ------------------------------------------------------------
+
+/// `ping` and `metrics` are answered for an operator token as for no token,
+/// and like everyone's they are not recorded. The token is still checked.
+#[test]
+fn the_probes_answer_an_operator_and_leave_no_row() {
+    let mut fx = Fx::new();
+    let ops = operators(&[]);
+    let none = Operators::default();
+    for body in [r#""cmd":"ping""#, r#""cmd":"metrics""#] {
+        let anonymous = fx.apply(&none, &format!("{{{body}}}"));
+        assert!(ok(&anonymous), "{anonymous}");
+        let v = fx.apply(&ops, &op(BRIDGE, body));
+        assert!(ok(&v), "{v}");
+        assert_eq!(
+            v.as_object()
+                .map(|o| o.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()),
+            anonymous
+                .as_object()
+                .map(|o| o.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>()),
+            "the same reply shape"
+        );
+    }
+    assert!(fx.log().is_empty(), "a probe is answered, not recorded");
+    let v = fx.apply(&ops, &op("not-a-token", r#""cmd":"ping""#));
+    assert_eq!(err(&v), UNKNOWN_OPERATOR);
+    assert_eq!(s(&fx.last(), "by"), "operator:?");
 }
