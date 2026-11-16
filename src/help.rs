@@ -52,12 +52,14 @@ Mouse capture is off so text selection works; Ctrl+A m turns it on.
     )
 }
 
-/// The target triple this binary was built for, put together from the
-/// compiler's own `cfg` values (no build script hands us `TARGET`). It is the
-/// rustc triple on the targets atrium ships for: `x86_64`/`aarch64` with
-/// `pc-windows-msvc`, `pc-windows-gnu`, `unknown-linux-gnu`,
-/// `unknown-linux-musl` and `apple-darwin`.
+/// The target triple this binary was built for: the `TARGET` rustc was given,
+/// handed over by `build.rs`. Should a build ever run without the script, it
+/// is put together from the compiler's `cfg` values instead, which matches
+/// the rustc triple on the targets atrium ships for.
 pub fn target_triple() -> String {
+    if let Some(target) = option_env!("ATRIUM_BUILD_TARGET").filter(|t| !t.is_empty()) {
+        return target.to_string();
+    }
     let vendor = if cfg!(target_vendor = "apple") {
         "apple"
     } else if cfg!(target_vendor = "pc") {
@@ -81,9 +83,11 @@ pub fn target_triple() -> String {
     format!("{}-{vendor}-{os}{env}", std::env::consts::ARCH)
 }
 
-/// The commit this binary was built from, when the build was told: the
-/// `ATRIUM_BUILD_COMMIT` environment variable at compile time. atrium has no
-/// build script, so nothing asks git; an ordinary `cargo install` has none.
+/// The commit this binary was built from, when the build knew it: twelve hex
+/// characters of `HEAD` when `build.rs` ran in a git checkout of atrium, or
+/// whatever `ATRIUM_BUILD_COMMIT` a packager set at compile time. A crates.io
+/// install has neither. It is the commit the tree was at; local changes on
+/// top of it are not reported.
 pub fn build_commit() -> Option<&'static str> {
     option_env!("ATRIUM_BUILD_COMMIT").filter(|c| !c.is_empty())
 }

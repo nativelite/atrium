@@ -524,16 +524,7 @@ static SESSION_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::
 
 /// Note that a session's run loop starts now: what `ping` and `metrics`
 /// measure uptime from, and where the session's delivered-wake count begins.
-/// To be called once per [`crate::run_loop`] run, before its first tick.
-///
-/// OPEN (0.47 item N): nothing calls this yet. The call belongs in
-/// `run_loop::run`, which is outside item N's files; until the integrator
-/// adds `crate::ctl_server::mark_session_start();` there, uptime reads `0`.
-/// Drop this `allow` with that line.
-#[allow(
-    dead_code,
-    reason = "run_loop::run is to call this; that file is outside item N"
-)]
+/// Called once per [`crate::run_loop`] run, before its first tick.
 pub(crate) fn mark_session_start() {
     *SESSION_START.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
     super::sends::reset_wakes_delivered();

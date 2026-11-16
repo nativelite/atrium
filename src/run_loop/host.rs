@@ -131,6 +131,15 @@ impl Host<'_> {
     }
 }
 
+/// Take a headless session's termination events before its first pane is
+/// spawned, so a Ctrl+C that lands between the spawn and the loop still goes
+/// through the teardown. [`Host::arm`] does the same when the loop starts;
+/// arming twice installs once.
+pub(crate) fn arm_headless() {
+    #[cfg(windows)]
+    console::install();
+}
+
 /// One line on stderr, for a session with no bar: `atrium: <note>`, with
 /// anything that is not printable text replaced (a note can carry a path or a
 /// pane's words, and stderr is as likely a log file as a terminal). A stderr
@@ -196,6 +205,13 @@ mod console {
     }
 
     pub(super) fn install() {
+        // Once per process: `fleet up` arms ahead of its panes and the loop
+        // arms again when it starts.
+        static ARMED: std::sync::Once = std::sync::Once::new();
+        ARMED.call_once(install_handler);
+    }
+
+    fn install_handler() {
         // SAFETY: registers a handler that stores to a static and sleeps; it
         // captures nothing, and stays valid for the life of the process.
         let ok = unsafe { SetConsoleCtrlHandler(Some(on_event), 1) };

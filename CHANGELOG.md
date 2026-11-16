@@ -49,11 +49,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`by` in an audit entry** (additive): `"by":"operator:<name>"` on an
   operator's entry, whose `caller` is `null`. A pane's entry is unchanged.
 - **`atrium --version --json`.** One object on one line for a script or a bug
-  report: `{"version":"…","commit":…,"target":"…"}`. `commit` is the
-  `ATRIUM_BUILD_COMMIT` the build was given, and `null` when it was given
-  none (atrium has no build script, so an ordinary `cargo install` has none).
-  `target` is put together from the compiler's `cfg` values and is the rustc
-  triple on the targets atrium ships for. Plain `--version` is unchanged.
+  report: `{"version":"…","commit":…,"target":"…"}`. `commit` is twelve
+  hex characters of `HEAD` when the binary was built in a git checkout of
+  atrium (a std-only `build.rs` asks git), or the `ATRIUM_BUILD_COMMIT` a
+  packager set, and `null` otherwise (a crates.io install). It is the commit
+  the tree was at; local changes on top are not reported. `target` is the
+  triple rustc was given. Plain `--version` is unchanged.
+- **Said once in the bar: "running inside tmux; outer TMUX hidden from
+  panes"**, when atrium started inside a real tmux and kept its `TMUX` from
+  the panes (#22).
+- **A ctl socket named while the control plane is off is said, not silent.**
+  `--ctl-socket` or `ATRIUM_CTL_SOCKET` names the endpoint and does not open
+  it; without `--allow-ctl` atrium prints one line and binds nothing.
 - **A stable, configurable ctl endpoint: `--ctl-socket <path>` and
   `ATRIUM_CTL_SOCKET`** (#23). The endpoint was always named after the process
   id, so a helper outside the session had to search the temp directory and
