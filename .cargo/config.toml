@@ -11,3 +11,8 @@ ATRIUM_STATE_DIR = { value = "target/test-state", relative = true }
 # A test session is killed at the end of its test, which to the store looks
 # exactly like a crash — the next test would be offered to resume it.
 ATRIUM_RESUME_OFFER = "0"
+# A claude pane loads the mod from the configured folder, and a launch
+# refreshes an installed one from the binary. Without this a test session with
+# a claude pane would read, and rewrite, the mod the operator installed; a test
+# that wants a mod installs one and names it itself.
+ATRIUM_MOD = { value = "target/test-mod", relative = true }

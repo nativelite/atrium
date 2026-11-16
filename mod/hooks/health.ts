@@ -117,7 +117,13 @@ export function scrub(err: unknown): string {
   return Array.from(line).slice(0, MESSAGE_CAP).join('')
 }
 
-/** A hook's name as a counter key: letters, digits, `.`, `_`, `-`; 40 at most. */
+/**
+ * A hook's name as a counter key: letters, digits, `.`, `_`, `-`; 40 at most.
+ * Two families: a hook's own name (`tool.call`, `guard`, `feature.inbox`) for
+ * what the mod's code threw, and `ctl.<site>` (`ctl.hello`, `ctl.report`) for
+ * an exchange with atrium that failed. atrium sets a mod aside on the first
+ * family alone: a slow or absent broker is not a broken mod.
+ */
 export function hookKey(hook: string): string {
   const key = hook.replace(/[^A-Za-z0-9._-]/g, '').slice(0, 40)
   return key === '' ? 'other' : key

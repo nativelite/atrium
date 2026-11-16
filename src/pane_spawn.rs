@@ -577,15 +577,38 @@ fn spawn_pane_as(
     // is installed and the session allows it (`atrium mod install`; a fleet's
     // or the config's `mod: false`). It reports the pane's status for certain
     // through `atrium ctl`, so it also learns which atrium to run.
-    if atrium::modfiles::session_enabled() {
-        base_env.extend(atrium::modfiles::pane_env(
-            atrium::bind::is_claude_stem(&title),
-            atrium::modfiles::installed_dir().as_deref(),
+    //
+    // The decision has three parts (`atrium::modfiles`). The session uses the
+    // mod (`"mod": false` is off and silent: nothing below runs). Before the
+    // first claude pane, once: the installed files are compared with the
+    // binary's copy and rewritten where they differ, and the breaker's record
+    // is read against this claude's version, which may keep the mod off or
+    // say it is being tried again. And the breaker has not tripped, now or on
+    // that record. A pane that does get the mod is one the health check then
+    // expects a hello from (`atrium::modstate::note_injected`).
+    if atrium::bind::is_claude_stem(&title) && atrium::modfiles::session_enabled() {
+        let said = atrium::modfiles::launch_once(|| claude_version(&command[0]));
+        if !said.is_empty() {
+            *flash = Some((said.join(" \u{00B7} "), Instant::now()));
+        }
+        let installed = atrium::modfiles::installed_dir();
+        let env = atrium::modfiles::pane_env(
+            true,
+            atrium::modfiles::inject_dir(
+                true,
+                atrium::modfiles::session_tripped().is_some(),
+                installed.as_deref(),
+            ),
             std::env::var(atrium::modfiles::ENV_PLUGIN_DIRS)
                 .ok()
                 .as_deref(),
             std::env::current_exe().ok().as_deref(),
-        ));
+        );
+        // Only where there is a control plane to say hello on.
+        if !env.is_empty() && CTL_ADDRESS.get().is_some() {
+            atrium::modstate::note_injected(agent_id.0);
+        }
+        base_env.extend(env);
     }
     // Claude Code's teams backend: a claude pane in a ctl session is told it
     // runs inside tmux, with atrium's shim first on PATH to answer, so the
@@ -1063,6 +1086,19 @@ fn pane_env(
     );
     base_env.extend_from_slice(extra_env);
     (base_env, token, pane_cgroup)
+}
+
+/// What `claude --version` prints (its first line), asked once per session
+/// like the flags below and shared with the teammate-mode gate's run. The mod's
+/// breaker keys its record on it (`atrium::modfiles::TripRecord`). `None` when
+/// the program gave no answer in time.
+pub(crate) fn claude_version(program: &str) -> Option<String> {
+    let seen = std::cell::RefCell::new(None);
+    codex_probe(program, &["--version"], |out| {
+        *seen.borrow_mut() = out.lines().next().map(|l| l.trim().to_string());
+        true
+    });
+    seen.into_inner().filter(|v| !v.is_empty())
 }
 
 /// Does this claude take `--settings`? Asked of its `--help` once per session,

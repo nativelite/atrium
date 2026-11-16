@@ -15,9 +15,11 @@ mod wake;
 mod testutil;
 
 pub(crate) use dispatch::mark_session_start;
+pub(crate) use dispatch::mod_relaunch;
 pub(crate) use dispatch::{
     apply_ctl, decision_for_agent, inbox_items, CtlEffect, CtlSession, INBOX_NO_CAP,
 };
 pub(crate) use panes::{effective_mode, pane_label, status_label};
 pub(crate) use reply::truncate;
+pub(crate) use sends::screen_has;
 pub(crate) use sends::{flush_sends, PendingSend};

@@ -257,6 +257,8 @@ impl RunState<'_> {
 
         self.refresh_agents();
 
+        self.mod_health();
+
         self.resync_screen();
 
         // 5c. the host terminal's title and the needs-you ring (`attention`):
@@ -456,6 +458,173 @@ impl RunState<'_> {
             }
         }
         self.held_inboxes = keep;
+    }
+
+    /// The mod's health and its circuit breaker ([`atrium::modstate`]): expect
+    /// a hello from each pane the spawn path gave the mod, and act on what the
+    /// tick finds. A pane whose mod is set aside, or stopped collecting, runs
+    /// as one without a mod from here on (its queued sends are typed by the
+    /// very next [`flush_sends`]). When the breaker trips, new claude panes
+    /// launch without the mod and the trip is remembered
+    /// ([`atrium::modfiles::trip`]); a pane that never started is relaunched
+    /// once without it; a pane that is up is left alone, flagged, and a
+    /// decision on the bus offers its respawn.
+    fn mod_health(&mut self) {
+        use atrium::modstate::HealthEvent;
+        for pane in atrium::modstate::take_injected() {
+            self.mods.expect_mod(pane);
+        }
+        let now = atrium::session_store::now_ms();
+        let live: Vec<atrium::modstate::PaneSeen> = self
+            .windows
+            .iter()
+            .flat_map(|w| w.panes.iter())
+            .filter(|p| !p.exited)
+            .map(|p| atrium::modstate::PaneSeen {
+                pane: p.agent_id.0,
+                // The screen is read only for a pane still owed its first
+                // sight, and only until it is seen.
+                started: self.mods.awaiting_start(p.agent_id.0) && pane_started(p, &self.world),
+            })
+            .collect();
+        let events = self.mods.health_tick(now, &live);
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            // Headless, each line is said on stderr as it is raised; attached,
+            // the last one of the tick is the bar's, and the audit has all.
+            self.host.report_flash(&mut self.flash);
+            match event {
+                HealthEvent::Healthy { .. } => {
+                    if let Some(line) = atrium::modfiles::recovered() {
+                        self.ctl_audit.record(None, "mod-back", "", true, "");
+                        self.flash = Some((line, Instant::now()));
+                    }
+                }
+                HealthEvent::SetAside { pane, why } => {
+                    self.ctl_audit.record(
+                        None,
+                        "mod-set-aside",
+                        &format!("pane={pane}"),
+                        true,
+                        why.label(),
+                    );
+                    self.flash = Some((
+                        format!(
+                            "pane {pane}: mod set aside ({}); it runs as a pane without one \
+                             (sends are typed)",
+                            why.label()
+                        ),
+                        Instant::now(),
+                    ));
+                }
+                HealthEvent::InboxLost { pane } => {
+                    self.ctl_audit.record(
+                        None,
+                        "mod-inbox-lost",
+                        &format!("pane={pane}"),
+                        true,
+                        "",
+                    );
+                    self.flash = Some((
+                        format!(
+                            "pane {pane}: its mod stopped collecting deliveries; sends are \
+                             typed into it now"
+                        ),
+                        Instant::now(),
+                    ));
+                }
+                HealthEvent::Tripped {
+                    reason,
+                    never_started,
+                    running,
+                } => self.mod_tripped(&reason, &never_started, &running, now),
+            }
+        }
+        self.lay_mod_reports();
+        self.force_repaint = true;
+    }
+
+    /// The breaker tripped: see [`RunState::mod_health`].
+    fn mod_tripped(&mut self, reason: &str, never_started: &[usize], running: &[usize], now: u64) {
+        // The trip is kept against the Claude Code these panes run: one of
+        // them is asked its version (once a session, two seconds at most).
+        let program = never_started
+            .iter()
+            .chain(running)
+            .find_map(|id| {
+                self.windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .find(|p| p.agent_id.0 == *id)
+                    .and_then(|p| p.argv.first().cloned())
+            })
+            .unwrap_or_else(|| "claude".to_string());
+        // First, so the relaunches below already launch without the mod.
+        let remembered = atrium::modfiles::trip(reason, claude_version(&program).as_deref());
+        let mut relaunched = 0usize;
+        for pane in never_started {
+            let mut hold = None;
+            let reply = crate::ctl_server::mod_relaunch(
+                AgentId(*pane),
+                &mut CtlSession {
+                    windows: &mut self.windows,
+                    rows: self.rows,
+                    cols: self.cols,
+                    max_depth: self.max_depth,
+                    extra_allow: &self.ctl_extra_allow,
+                    pending: &mut self.pending_sends,
+                    held_inboxes: self.held_inboxes.len(),
+                    world: &self.world,
+                    session_identity: self.launch.identity,
+                    audit: &mut self.ctl_audit,
+                    board: &mut self.board,
+                    bus: &mut self.bus,
+                    mods: &mut self.mods,
+                    hold: &mut hold,
+                    flash: &mut self.flash,
+                },
+            );
+            if !matches!(reply, atrium::ctl::Reply::Err(_)) {
+                relaunched += 1;
+            }
+        }
+        if relaunched > 0 {
+            self.renderer.reset();
+        }
+        let labels: Vec<String> = running
+            .iter()
+            .filter_map(|id| {
+                self.windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .find(|p| p.agent_id.0 == *id)
+                    .map(|p| crate::ctl_server::pane_label(p.agent_id, p.role.as_deref()))
+            })
+            .collect();
+        let detail = format!(
+            "relaunched={relaunched} running={} remembered={remembered}",
+            labels.len()
+        );
+        self.ctl_audit
+            .record(None, "mod-breaker", &detail, true, reason);
+        if !labels.is_empty() {
+            if let Err(e) = self.bus.publish(
+                "atrium",
+                atrium::bus::Kind::DecisionNeeded,
+                None,
+                &[("msg".to_string(), trip_decision(reason, &labels))],
+                now,
+            ) {
+                self.ctl_audit
+                    .record(None, "mod-breaker", "decision not posted", false, &e);
+            }
+        }
+        self.flash = Some((
+            trip_line(reason, remembered, relaunched, labels.len()),
+            Instant::now(),
+        ));
     }
 
     /// Lay every fresh mod-reported status over the inferred snapshot

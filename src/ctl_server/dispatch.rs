@@ -604,6 +604,8 @@ fn metrics(cx: &CtlSession<'_>) -> ctl::Reply {
         bus_depth: cx.bus.tail(usize::MAX).len(),
         bus_last_seq: cx.bus.tail(1).last().map_or(0, |e| e.seq),
         open_decisions: cx.bus.pending_decisions().len(),
+        mod_failures: cx.mods.failures_total(),
+        mod_tripped: cx.mods.tripped().is_some() || atrium::modfiles::session_tripped().is_some(),
         ..ctl::Metrics::default()
     };
     // The same status `list` shows: the mod's own report, else the inference.
@@ -752,6 +754,12 @@ fn inbox(req: ctl::InboxReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     let Some(me) = caller else {
         return ctl::reply_err("inbox needs an authenticated pane (ATRIUM_TOKEN)");
     };
+    // The mod is asking for its deliveries: that is how the broker knows it
+    // is still collecting them (`modstate::INBOX_SILENT_MS`).
+    cx.mods.note_inbox(me.0, atrium::session_store::now_ms());
+    if let Some(refusal) = set_aside_refusal(cx.mods, me) {
+        return refusal;
+    }
     if !cx.mods.has_cap(me.0, "inbox") {
         return ctl::reply_err(INBOX_NO_CAP);
     }
@@ -846,11 +854,86 @@ fn answer(
         .status_for(id.0, atrium::session_store::now_ms())
         .map(|s| s.label());
     let report = cx.mods.report_for(id.0);
-    ctl::reply_answer(
-        id,
-        status,
-        report.and_then(|r| r.answer.as_ref().map(|(t, s)| (t.as_str(), *s))),
+    ctl::with_mod_health(
+        ctl::reply_answer(
+            id,
+            status,
+            report.and_then(|r| r.answer.as_ref().map(|(t, s)| (t.as_str(), *s))),
+        ),
+        mod_health(cx.mods, id),
     )
+}
+
+/// Relaunch `pane` in place, as `ctl respawn` does, on atrium's own
+/// authority: what the breaker does, once, to a pane that was launched with
+/// the mod and never started. By the time this runs the breaker has tripped
+/// (`atrium::modfiles::trip`), so the spawn path gives the new process no
+/// plugin folder, and its new agent id is one the health check never
+/// expected: it cannot be relaunched a second time.
+pub(crate) fn mod_relaunch(pane: AgentId, cx: &mut CtlSession<'_>) -> ctl::Reply {
+    let reply = respawn(
+        ctl::RespawnReq {
+            target: pane.to_string(),
+            worktree: None,
+            teammate: None,
+        },
+        None,
+        true,
+        cx,
+    );
+    let (ok, note) = audit_outcome(&reply);
+    cx.audit.record(
+        None,
+        "mod-relaunch",
+        &format!("pane={pane} without the mod"),
+        ok,
+        &note,
+    );
+    reply
+}
+
+/// The refusal a pane gets once its mod was set aside
+/// ([`atrium::modstate::ModState::aside`]): it starts with
+/// [`atrium::modstate::MOD_SET_ASIDE`], which the mod reads and stops asking.
+fn set_aside_refusal(mods: &atrium::modstate::ModState, pane: AgentId) -> Option<ctl::Reply> {
+    mods.aside(pane.0).map(|why| {
+        ctl::reply_err(&format!(
+            "{}: {}; atrium treats pane {pane} as one without a mod (sends are typed, \
+             status comes from the status hooks or by inference)",
+            atrium::modstate::MOD_SET_ASIDE,
+            why.label()
+        ))
+    })
+}
+
+/// A pane's mod as `status <target>` and `answer` show it: its state, its
+/// version, and the failures it reported of itself. `None` for a pane that
+/// has no mod and was not launched with one.
+pub(crate) fn mod_health(
+    mods: &atrium::modstate::ModState,
+    pane: AgentId,
+) -> Option<ctl::ModHealth> {
+    let info = mods.info(pane.0);
+    let failures = mods.failures_for(pane.0);
+    let (state, why) = match mods.aside(pane.0) {
+        Some(why) => ("set-aside", Some(why.label().to_string())),
+        None if mods.inbox_lost(pane.0) => ("no-inbox", None),
+        None if info.is_some() => ("ok", None),
+        None if mods.expects(pane.0) => ("pending", None),
+        None if failures.is_some() => ("ok", None),
+        None => return None,
+    };
+    Some(ctl::ModHealth {
+        state: state.to_string(),
+        why,
+        version: info.map(|i| i.version.clone()),
+        failures: failures.map_or(0, atrium::modstate::PaneFailures::total),
+        hooks: failures
+            .map(|f| f.counts.iter().map(|(h, n)| (h.clone(), *n)).collect())
+            .unwrap_or_default(),
+        class: failures.and_then(|f| f.class.map(|c| c.label().to_string())),
+        error: failures.and_then(|f| f.message.clone()),
+    })
 }
 
 /// `ctl hello`: the caller's mod announces itself. The pane is the token's,
@@ -879,6 +962,55 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
         return ctl::reply_err("report needs an authenticated pane (ATRIUM_TOKEN)");
     };
     let now = atrium::session_store::now_ms();
+    // What the mod counted of its own failures. It is a pane's word about
+    // itself: kept for `status` and `metrics`, and able to set aside this
+    // pane's mod and no other's. The panes above it are the broker's own
+    // record of the spawn tree, which the breaker needs to tell one voice
+    // from two (`modstate::ModState::failures_reported`).
+    if let Some(f) = &r.failures {
+        let parents = ctl_parents(cx.windows);
+        let mut above: Vec<usize> = Vec::new();
+        let mut at = me;
+        while let Some(parent) = parents
+            .iter()
+            .find(|(id, _)| *id == at)
+            .and_then(|(_, p)| *p)
+        {
+            if above.len() >= 64 || above.contains(&parent.0) {
+                break;
+            }
+            above.push(parent.0);
+            at = parent;
+        }
+        if let Some(why) = cx.mods.failures_reported(me.0, &above, f, now) {
+            cx.audit.record(
+                Some(me),
+                "mod-set-aside",
+                &format!("pane={me}"),
+                true,
+                why.label(),
+            );
+        }
+    }
+    // A pane whose mod was set aside is a pane without one. What such a pane
+    // still reports is what a pane without a mod reports: a bare status, from
+    // atrium's own status hooks (`atrium::status_hooks`), which speak through
+    // this verb with no mod at all. Anything only a mod sends (an answer, a
+    // caption, usage, touched files, an ask's reply, its failures) is the mod
+    // still talking: refused whole, in words that tell it to stop.
+    let mod_only = r.answer.is_some()
+        || r.doing.is_some()
+        || r.context_pct.is_some()
+        || r.cost_usd.is_some()
+        || r.turns.is_some()
+        || !r.touched.is_empty()
+        || r.ask.is_some()
+        || r.failures.is_some();
+    if mod_only {
+        if let Some(refusal) = set_aside_refusal(cx.mods, me) {
+            return refusal;
+        }
+    }
     let seq = cx.mods.report(me.0, &r, now);
     // A reply to a queued question: accepted only from the pane it was put to.
     // A refusal is the reply, but the rest of the report — a status, a
@@ -1201,7 +1333,10 @@ fn status(
                 .status_for(id.0, atrium::session_store::now_ms())
                 .and_then(|_| cx.mods.report_for(id.0))
                 .and_then(|r| r.doing.as_ref().map(|(d, _)| d.as_str()));
-            ctl::reply_status_one(id, status, idle, doing)
+            ctl::with_mod_health(
+                ctl::reply_status_one(id, status, idle, doing),
+                mod_health(cx.mods, id),
+            )
         }
     }
 }
@@ -1813,3 +1948,6 @@ mod effect_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod mod_health_tests;

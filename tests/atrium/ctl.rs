@@ -1275,6 +1275,17 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
 /// config and its spawn log live in the scratch directory, not the user's.
 /// Returns the pty, the scratch directory and its guard.
 fn spawn_atrium_ctl_claude_standin(tag: &str) -> (pty::Pty, std::path::PathBuf, StandinDir) {
+    spawn_atrium_ctl_claude_standin_mod(tag, false)
+}
+
+/// [`spawn_atrium_ctl_claude_standin`], and with `with_mod` the mod installed
+/// in the scratch directory and named by `ATRIUM_MOD`, so the stand-in is
+/// launched as a claude pane with the mod: one whose "mod" never loads, since
+/// a shell loads no plugin.
+fn spawn_atrium_ctl_claude_standin_mod(
+    tag: &str,
+    with_mod: bool,
+) -> (pty::Pty, std::path::PathBuf, StandinDir) {
     let dir = std::env::temp_dir().join(format!("atrium-standin-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -1314,22 +1325,35 @@ fn spawn_atrium_ctl_claude_standin(tag: &str) -> (pty::Pty, std::path::PathBuf, 
     ));
     let path = std::env::join_paths(dirs).unwrap();
     let text = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+    let mut env = vec![
+        ("PATH".to_string(), path.to_string_lossy().into_owned()),
+        (
+            "ATRIUM_STATE_DIR".to_string(),
+            text(dir.join("state").join("sessions")),
+        ),
+        ("ATRIUM_CONFIG".to_string(), text(dir.join("config.json"))),
+        ("ATRIUM_SPAWN_LOG".to_string(), text(dir.join("spawn.log"))),
+        ("PROMPT".to_string(), "$G".to_string()),
+        ("PS1".to_string(), "> ".to_string()),
+    ];
+    if with_mod {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+            .args(["mod", "install", "--at", &text(dir.join("mod"))])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        env.push(("ATRIUM_MOD".to_string(), text(dir.join("mod"))));
+    }
     let mut p = pty::Pty::spawn_full(
         env!("CARGO_BIN_EXE_atrium"),
         &["--allow-ctl", "claude"],
         24,
         100,
-        &[
-            ("PATH".to_string(), path.to_string_lossy().into_owned()),
-            (
-                "ATRIUM_STATE_DIR".to_string(),
-                text(dir.join("state").join("sessions")),
-            ),
-            ("ATRIUM_CONFIG".to_string(), text(dir.join("config.json"))),
-            ("ATRIUM_SPAWN_LOG".to_string(), text(dir.join("spawn.log"))),
-            ("PROMPT".to_string(), "$G".to_string()),
-            ("PS1".to_string(), "> ".to_string()),
-        ],
+        &env,
         None,
     )
     .unwrap();
@@ -1351,6 +1375,96 @@ fn list_tree(p: &pty::Pty) -> Vec<json::Value> {
                 .map(<[json::Value]>::to_vec)
         })
         .unwrap_or_default()
+}
+
+/// One token-free read of the session `p` hosts, as JSON.
+fn host_read(p: &pty::Pty, args: &[&str]) -> json::Value {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let line = atrium::ctl::build_request(&args, None).unwrap();
+    let reply = atrium::ipc::request(&atrium::ipc::address_for(p.pid()), &line)
+        .expect("the channel answers a host");
+    json::parse(&reply).expect("a reply is JSON")
+}
+
+/// A claude pane launched with the mod whose mod never says hello (PLAN
+/// 0.48.0, S2): the stand-in is a shell under claude's name, so atrium gives
+/// it the plugin folder and nothing ever loads it. Until its hello window
+/// runs out the pane's mod is `pending`; thirty seconds after its prompt
+/// hint is on screen it is `set-aside`, said on the bar, and the pane is one
+/// without a mod from then on: a hello that comes late is granted nothing,
+/// and a send to it is typed into it under atrium's header, not left waiting
+/// for an inbox nobody collects.
+#[test]
+fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed() {
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin_mod("nohello", true);
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let state = |p: &pty::Pty| -> Option<String> {
+        host_read(p, &["status", "0"])
+            .get("mod")
+            .and_then(|m| m.get("state"))
+            .and_then(json::Value::as_str)
+            .map(str::to_string)
+    };
+    assert_eq!(
+        state(&p).as_deref(),
+        Some("pending"),
+        "the pane was launched with the mod and owes a hello"
+    );
+    // The hint a claude shows at its prompt, put on the stand-in's screen:
+    // the moment atrium takes the agent as started and the window opens.
+    p.write(b"echo ? for shortcuts\r\n").unwrap();
+    let mut buf = [0u8; 8192];
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    while state(&p).as_deref() != Some("set-aside") {
+        assert!(
+            std::time::Instant::now() < end,
+            "the pane was never set aside: {:?}",
+            host_read(&p, &["status", "0"]).to_string()
+        );
+        // Keep draining, as a terminal would.
+        let _ = p.read_timeout(&mut buf, Duration::from_millis(250));
+    }
+    let why = host_read(&p, &["status", "0"]);
+    assert_eq!(
+        why.get("mod")
+            .and_then(|m| m.get("why"))
+            .and_then(json::Value::as_str),
+        Some("no hello within its window"),
+        "{why}"
+    );
+    // One pane is one voice: the breaker stays shut.
+    let metrics = host_read(&p, &["metrics"]);
+    assert_eq!(
+        metrics.get("mod_tripped").and_then(json::Value::as_i64),
+        Some(0),
+        "{metrics}"
+    );
+    // A hello now is too late: recorded, and granted nothing.
+    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
+        .unwrap();
+    let said = read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    assert!(
+        contains(&said, b"\"accepted\":[]"),
+        "a late hello is granted nothing: {:?}",
+        String::from_utf8_lossy(&said)
+    );
+    // So a send is typed into the pane, under atrium's header.
+    p.write(format!("\"{atrium}\" ctl send 0 nohello-marker\r\n").as_bytes())
+        .unwrap();
+    let mut out = Vec::new();
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !contains_shown(&out, b"[atrium: from pane 0] nohello-marker") {
+        assert!(
+            std::time::Instant::now() < end,
+            "the send was not typed into the pane: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        if let Ok(Some(n)) = p.read_timeout(&mut buf, Duration::from_millis(250)) {
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
 }
 
 /// Claude Code **2.1.325**'s teammate launch, call for call, through the real

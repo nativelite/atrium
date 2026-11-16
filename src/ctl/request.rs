@@ -347,12 +347,22 @@ impl Cmd {
             Cmd::Report(r) => (
                 "report",
                 format!(
-                    "status={} context={} answer_len={}",
+                    "status={} context={} answer_len={}{}",
                     r.status.map(|s| s.label()).unwrap_or("-"),
                     r.context_pct
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "-".to_string()),
-                    r.answer.as_ref().map(|a| a.chars().count()).unwrap_or(0)
+                    r.answer.as_ref().map(|a| a.chars().count()).unwrap_or(0),
+                    // The mod's own failures: how many and of which class,
+                    // never the message (it is a pane's text).
+                    r.failures
+                        .as_ref()
+                        .map(|x| format!(
+                            " fails={} class={}",
+                            x.counts.iter().fold(0u64, |a, (_, n)| a.saturating_add(*n)),
+                            x.class.map(|c| c.label()).unwrap_or("-")
+                        ))
+                        .unwrap_or_default()
                 ),
             ),
             Cmd::Whoami => ("whoami", String::new()),
@@ -933,6 +943,46 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 }
                 _ => return Err("a reply names its ask: report ask=<id> reply=<text>".to_string()),
             };
+            // What the mod counted of its own failures: `fail` (counts per
+            // hook), with the last one's `fail_class` and `fail_msg`. Hostile
+            // like every field: the counts parse strictly or the request is
+            // refused, the class is one of five words, and the message is
+            // scrubbed and cut where it is stored.
+            let failures = match (v.get("fail"), v.get("fail_class"), v.get("fail_msg")) {
+                (None, None, None) => None,
+                (Some(Value::String(counts)), class, message) => {
+                    let class = match class {
+                        None => None,
+                        Some(c) => Some(
+                            c.as_str()
+                                .and_then(crate::modstate::FailClass::parse)
+                                .ok_or_else(|| {
+                                    "fail_class is api, timeout, ctl, shape or hook".to_string()
+                                })?,
+                        ),
+                    };
+                    let message = match message {
+                        None => None,
+                        Some(m) => Some(
+                            m.as_str()
+                                .ok_or_else(|| "fail_msg must be text".to_string())?
+                                .to_string(),
+                        ),
+                    };
+                    Some(crate::modstate::FailureReport {
+                        counts: crate::modstate::parse_fail_counts(counts)?,
+                        class,
+                        message,
+                    })
+                }
+                _ => {
+                    return Err(
+                        "a failure report names its counts: report fail=<hook>:<n>[,...] \
+                         [fail_class=<class>] [fail_msg=<text>]"
+                            .to_string(),
+                    )
+                }
+            };
             let r = ReportReq {
                 status,
                 reason,
@@ -943,11 +993,12 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 doing,
                 touched,
                 ask,
+                failures,
             };
             if r == ReportReq::default() {
                 return Err(
                     "report needs at least one of status, reason, context, cost, turns, answer, \
-                     doing, touched or ask+reply"
+                     doing, touched, fail or ask+reply"
                         .to_string(),
                 );
             }

@@ -4,8 +4,10 @@
 use crate::*;
 
 /// `atrium mod install [--at <dir>]` — write the mod built into this binary to
-/// the configured folder (or `<dir>`); `atrium mod status` — what is installed
-/// and whether this machine's claude panes will load it.
+/// the configured folder (or `<dir>`); `atrium mod status` — what is installed,
+/// whether this machine's claude panes will load it, whether the circuit
+/// breaker backed it out, and what a running session's mods reported;
+/// `atrium mod retry` — forget a trip, so the next session loads the mod.
 pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
     use atrium::modfiles;
     match args.first().map(String::as_str) {
@@ -62,14 +64,81 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
             }
         }
         Some("status") => {
-            let (line, _) = modfiles::describe(&modfiles::status(), modfiles::session_enabled());
+            let enabled = modfiles::session_enabled();
+            let (line, _) = modfiles::describe(&modfiles::status(), enabled);
             println!("{line}");
+            println!(
+                "enabled: {}",
+                if enabled {
+                    "yes (a fleet may still say \"mod\": false for its own session)"
+                } else {
+                    "no: \"mod\": false in config.json; nothing is loaded, checked or said"
+                }
+            );
+            println!(
+                "built in: mod {} ({})",
+                modfiles::embedded_version(),
+                modfiles::embedded_hash()
+            );
+            // The breaker's memory, against the claude on PATH now.
+            let claude = claude_version("claude");
+            match atrium::session_store::state_root() {
+                Some(root) => {
+                    for line in modfiles::breaker_lines(
+                        &modfiles::read_record(&root),
+                        claude.as_deref(),
+                        atrium::session_store::now_ms(),
+                    ) {
+                        println!("{line}");
+                    }
+                }
+                None => println!(
+                    "breaker: no state directory on this machine; a trip lasts one session"
+                ),
+            }
+            println!("{}", session_line());
             println!(
                 "claude panes atrium spawns get {}=<that folder> and {}=<this atrium>; \
                  any claude loads it with --plugin-dir <that folder>",
                 modfiles::ENV_PLUGIN_DIRS,
                 modfiles::ENV_BIN
             );
+            ExitCode::SUCCESS
+        }
+        Some("retry") => {
+            if let Some(extra) = args.get(1) {
+                eprintln!("atrium mod retry: unexpected argument {extra:?}");
+                return ExitCode::FAILURE;
+            }
+            let Some(root) = atrium::session_store::state_root() else {
+                println!("mod retry: no state directory on this machine, so nothing is remembered");
+                return ExitCode::SUCCESS;
+            };
+            match modfiles::read_record(&root) {
+                modfiles::RecordRead::None => {
+                    println!("mod retry: the breaker is closed; nothing to forget");
+                }
+                was => {
+                    if !modfiles::clear_record(&root) {
+                        eprintln!(
+                            "atrium mod retry: cannot remove {}",
+                            modfiles::record_path(&root).display()
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    match was {
+                        modfiles::RecordRead::Tripped(r) => println!(
+                            "mod retry: forgot the trip against Claude Code {} and mod {} ({})",
+                            r.claude, r.mod_version, r.reason
+                        ),
+                        _ => println!("mod retry: removed an unreadable record"),
+                    }
+                    println!(
+                        "the next session loads the mod into its claude panes again; a session \
+                         already running keeps what it decided"
+                    );
+                }
+            }
             ExitCode::SUCCESS
         }
         Some(a) if atrium::help::wants(a) => {
@@ -80,5 +149,82 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
             eprint!("{}", atrium::help::MOD);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// What a running session says of its mods, in one line: the failures they
+/// reported and whether its breaker tripped, read from `ctl metrics` (counts
+/// only, served without a token) at the session this shell is in, or the one
+/// session running on this machine. Bounded at two seconds.
+fn session_line() -> String {
+    let address = match std::env::var(atrium::ctl::ENV_ADDRESS)
+        .ok()
+        .filter(|a| !a.is_empty())
+        .map_or_else(atrium::ipc::discover_one, Ok)
+    {
+        Ok(a) => a,
+        Err(_) => {
+            return "session: none reachable from here (failure counts are a running session's)"
+                .to_string()
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let asked = std::thread::Builder::new()
+        .name("atrium-mod-status".to_string())
+        .spawn(move || {
+            let _ = tx.send(atrium::ipc::request(&address, r#"{"cmd":"metrics"}"#));
+        });
+    if asked.is_err() {
+        return "session: could not be asked".to_string();
+    }
+    match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+        Ok(Ok(reply)) => session_line_of(&reply),
+        _ => "session: did not answer within 2 s".to_string(),
+    }
+}
+
+/// [`session_line`] from a `metrics` reply. An atrium older than the counters
+/// answers without them, and that is said rather than read as zero.
+pub(crate) fn session_line_of(reply: &str) -> String {
+    let v = json::parse(reply).ok();
+    let num = |k: &str| {
+        v.as_ref()
+            .and_then(|v| v.get(k))
+            .and_then(json::Value::as_i64)
+    };
+    match (num("mod_failures"), num("mod_tripped")) {
+        (Some(failures), Some(tripped)) => format!(
+            "session: {failures} failure{} reported by its mods; breaker {} \
+             (`atrium ctl status <pane>` shows one pane's mod)",
+            if failures == 1 { "" } else { "s" },
+            if tripped != 0 {
+                "tripped: new claude panes launch without the mod"
+            } else {
+                "closed"
+            }
+        ),
+        _ => "session: reachable, and its atrium does not report mod health (older than 0.48)"
+            .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_session_line_reads_the_counters_and_says_when_there_are_none() {
+        let healthy = session_line_of(r#"{"ok":true,"mod_failures":0,"mod_tripped":0}"#);
+        assert!(
+            healthy.contains("0 failures") && healthy.contains("closed"),
+            "{healthy}"
+        );
+        let tripped = session_line_of(r#"{"ok":true,"mod_failures":1,"mod_tripped":1}"#);
+        assert!(
+            tripped.contains("1 failure reported") && tripped.contains("tripped"),
+            "{tripped}"
+        );
+        assert!(session_line_of(r#"{"ok":true,"uptime_ms":5}"#).contains("older than 0.48"));
+        assert!(session_line_of("not json").contains("older than 0.48"));
     }
 }

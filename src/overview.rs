@@ -29,6 +29,9 @@ pub(crate) struct OverviewNode {
     pub(crate) doing: Option<String>,
     /// The pane edits a file another live pane edits too.
     pub(crate) colliding: bool,
+    /// The flag on the pane's mod: set aside, or still loaded after the
+    /// breaker backed the mod out (`atrium::modstate::NOTE_*`).
+    pub(crate) mod_note: Option<&'static str>,
     /// The Claude Code team this pane leads, by name, while its team directory
     /// is live: the overview lists that team's tasks under this row.
     pub(crate) leads_team: Option<String>,
@@ -116,6 +119,7 @@ pub(crate) fn overview_nodes_with(
                 agent_id: p.agent_id.0,
                 doing,
                 colliding: facts.is_some_and(|f| f.colliding),
+                mod_note: world.mod_note_for(p.session_id.as_deref()),
                 leads_team,
             });
         }
@@ -581,6 +585,10 @@ pub(crate) fn render_overview_panel_with(
                         " \x1b[1;38;2;255;200;70m\u{26A1}\x1b[0m"
                     } else {
                         ""
+                    };
+                    let bolt = match n.mod_note.filter(|_| !n.exited) {
+                        Some(note) => format!("{bolt} \x1b[33m[{note}]\x1b[0m"),
+                        None => bolt.to_string(),
                     };
                     let cursor = if selected {
                         "\x1b[1;38;5;37m\u{25B8}\x1b[0m"

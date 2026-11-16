@@ -17,10 +17,12 @@ function atrium(on: On, ctl: Ctl): { calls: string[][]; ran: string[] } {
   const env: Record<string, string> = { ATRIUM_CTL: 'pipe', ATRIUM_TOKEN: 'tok', ATRIUM_BIN: 'atrium' }
   on('env.get', (_, e) => ({ value: env[e.name] }))
   on('process.run', async (_, e) => {
-    const args = e.argv.slice(2)
+    // argv is `<bin> ctl --json <verb> ...`.
+    expect(e.argv.slice(1, 3)).toEqual(['ctl', '--json'])
+    const args = e.argv.slice(3)
     calls.push([...args])
     const answer = await ctl(args[0] ?? '', args.slice(1), calls.filter(c => c[0] === args[0]).length)
-    return { value: { exitCode: 0, stdout: typeof answer === 'string' ? answer : `${JSON.stringify(answer)}\n`, stderr: '' } }
+    return { value: { exitCode: 0, stdout: typeof answer === 'string' ? answer : `${JSON.stringify(answer)}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.version', () => ({ value: { version: '9.9.9' } }))
@@ -94,7 +96,7 @@ test('a hello that hangs past its deadline: the session starts, the tool call ru
   await clock.settle()
   expect(calls.filter(c => c[0] === 'hello').length).toBe(2)
   const said = reported(calls)
-  expect(said.fail).toBe('hello:1')
+  expect(said.fail).toBe('ctl.hello:1')
   expect(said.fail_class).toBe('timeout')
 })
 
@@ -152,8 +154,8 @@ test('a reply of the wrong shape: the tool call runs and the failure is counted'
   await $.turn.start({ prompt: 'x' } as never).catch(() => undefined)
   await clock.settle()
   const said = reported(calls)
-  expect(said.fail).toContain('whoami:1')
-  expect(said.fail).toContain('report:1')
+  expect(said.fail).toContain('ctl.whoami:1')
+  expect(said.fail).toContain('ctl.report:1')
 })
 
 test('a hello whose accepted list is not a list switches the mod off, and tool calls run', async ($, on) => {
@@ -223,7 +225,7 @@ test('outside atrium the mod does nothing at all', async ($, on) => {
   on('env.get', () => ({ value: undefined }))
   on('process.run', (_, e) => {
     calls.push(e.argv.join(' '))
-    return { value: { exitCode: 0, stdout: '', stderr: '' } }
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('tool.call', () => ({ result: { ran: true } }))

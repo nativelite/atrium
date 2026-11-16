@@ -264,7 +264,9 @@ async function ctl($: EngineInterface, site: string, args: readonly string[], ti
   let reply: Reply
   try {
     const bin = (await $.env.get('ATRIUM_BIN')) || 'atrium'
-    const ran = await within($, $.process.run([bin, 'ctl', ...args], { timeoutMs }), timeoutMs + WATCHDOG_MS)
+    // `--json`: the reply line itself. Without it `list`, `status`, `board` and
+    // `bus feed` print a table for a person, which is no reply to read.
+    const ran = await within($, $.process.run([bin, 'ctl', '--json', ...args], { timeoutMs }), timeoutMs + WATCHDOG_MS)
     reply = ran === LATE ? { ok: false, err: `no reply within ${timeoutMs} ms`, fault: 'timeout' } : parseReply(ran)
   } catch (e) {
     const cls = classify(e)
@@ -274,6 +276,7 @@ async function ctl($: EngineInterface, site: string, args: readonly string[], ti
       fault: cls === 'timeout' ? 'timeout' : 'ctl',
     }
     if (cls === 'api') {
+      // The engine has no `$.process.run`: the mod's own failure, not atrium's.
       fail($, site, e, 'api', site !== 'report')
       return reply
     }
@@ -285,7 +288,9 @@ async function ctl($: EngineInterface, site: string, args: readonly string[], ti
     if (reply.ok !== true && String(reply.err ?? '').startsWith(SET_ASIDE)) goInert($, 'atrium set it aside', false)
   } else {
     // A report that could not be made is not retried by another report.
-    fail($, site, reply.fault === 'timeout' ? 'no reply in time' : reply.fault === 'shape' ? 'not a reply' : 'could not be asked', reply.fault, site !== 'report')
+    // Counted under `ctl.<site>`: an exchange with atrium that failed, which
+    // atrium shows and never holds against the mod's hooks.
+    fail($, `ctl.${site}`, reply.fault === 'timeout' ? 'no reply in time' : reply.fault === 'shape' ? 'not a reply' : 'could not be asked', reply.fault, site !== 'report')
   }
   return reply
 }
@@ -450,7 +455,7 @@ async function pollInbox($: EngineInterface): Promise<void> {
 
 /** Submit each item of an `inbox` reply: prompts through the engine's queue, asks to a fork. */
 function deliver($: EngineInterface, reply: Reply): void {
-  if (reply.ok === true && !Array.isArray(reply.items)) fail($, 'inbox', 'an inbox reply with no items', 'shape')
+  if (reply.ok === true && !Array.isArray(reply.items)) fail($, 'ctl.inbox', 'an inbox reply with no items', 'shape')
   for (const item of inboxItems(reply)) {
     if (item.kind === 'ask') {
       void settle($, 'ask', () => answerAsk($, item.id, item.text))
@@ -514,7 +519,7 @@ async function refreshWho($: EngineInterface, timeoutMs: number = DEADLINE.repor
   const reply = await ctl($, 'whoami', ['whoami'], timeoutMs)
   const parsed = parseWho(reply)
   if (parsed !== undefined) state.who = parsed
-  else if (reply.ok === true) fail($, 'whoami', 'a whoami reply that names no pane', 'shape')
+  else if (reply.ok === true) fail($, 'ctl.whoami', 'a whoami reply that names no pane', 'shape')
 }
 
 /**
@@ -628,7 +633,7 @@ async function sendReport($: EngineInterface, fields: Fields): Promise<void> {
  * stands alone: one that fails is counted and the rest go on.
  */
 async function activate($: EngineInterface, hello: Reply, interactive: boolean): Promise<void> {
-  if (!Array.isArray(hello.accepted)) fail($, 'hello', 'a hello reply with no accepted list', 'shape')
+  if (!Array.isArray(hello.accepted)) fail($, 'ctl.hello', 'a hello reply with no accepted list', 'shape')
   state.accepted = acceptedCaps(hello)
   if (state.accepted.size === 0) {
     // atrium granted nothing (it set this pane aside, or knows none of the

@@ -22,6 +22,7 @@ fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> Overv
         agent_id: 0,
         doing: None,
         colliding: false,
+        mod_note: None,
         leads_team: None,
     }
 }

@@ -360,6 +360,81 @@ pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::Ag
     }
 }
 
+/// A window's badge with the flag on its pane's mod beside it: `mod off` for
+/// a pane whose mod was set aside, `mod backed out` for one that still runs
+/// with the mod loaded after the breaker tripped.
+pub(crate) fn mod_flagged_badge(
+    badge: Option<String>,
+    note: Option<&'static str>,
+) -> Option<String> {
+    match (badge, note) {
+        (Some(b), Some(n)) => Some(format!("{b} \u{00B7} {n}")),
+        (None, Some(n)) => Some(n.to_string()),
+        (b, None) => b,
+    }
+}
+
+/// Is the agent in `pane` up, as far as atrium can tell: its vendor's prompt
+/// hint is on its screen (what a queued send waits for, `vendors::prompt_marker`),
+/// or a status is known for its session (its transcript exists, or its status
+/// hooks spoke)? The moment the mod's hello window starts
+/// (`atrium::modstate::HELLO_WINDOW_MS`). A pane showing a startup dialog
+/// (folder trust, a login) is not up, however long it sits there.
+pub(crate) fn pane_started(pane: &Pane, world: &atrium::vendors::AgentState) -> bool {
+    if world.status_for(pane.session_id.as_deref()).is_some() {
+        return true;
+    }
+    atrium::vendors::vendor_for_stem(&pane.title)
+        .and_then(atrium::vendors::prompt_marker)
+        .is_some_and(|hint| crate::ctl_server::screen_has(pane.term.screen(), hint))
+}
+
+/// The one line the bar says when the breaker trips.
+pub(crate) fn trip_line(
+    reason: &str,
+    remembered: bool,
+    relaunched: usize,
+    running: usize,
+) -> String {
+    let mut line = format!(
+        "mod backed out: {reason}. New claude panes launch without it{}",
+        if remembered {
+            ", in later sessions too until Claude Code or the mod changes"
+        } else {
+            " for this session"
+        }
+    );
+    if relaunched > 0 {
+        line.push_str(&format!(
+            "; {relaunched} pane{} that had not started {} relaunched without it",
+            if relaunched == 1 { "" } else { "s" },
+            if relaunched == 1 { "was" } else { "were" }
+        ));
+    }
+    if running > 0 {
+        line.push_str(&format!(
+            "; {running} running pane{} left as {} (see the bus)",
+            if running == 1 { "" } else { "s" },
+            if running == 1 { "it is" } else { "they are" }
+        ));
+    }
+    line.push_str(". `atrium mod status` says more");
+    line
+}
+
+/// The decision posted when the breaker trips with panes still running the
+/// mod: atrium does not restart a working agent, it offers.
+pub(crate) fn trip_decision(reason: &str, running: &[String]) -> String {
+    format!(
+        "the mod was backed out ({reason}). {} still run{} with it loaded and {} left alone: \
+         respawn one with `atrium ctl respawn <pane>` to drop the mod from it, or resolve this \
+         to leave them",
+        running.join(", "),
+        if running.len() == 1 { "s" } else { "" },
+        if running.len() == 1 { "is" } else { "are" }
+    )
+}
+
 /// Phase 7 of the loop: one bar entry per window — its focused pane's title,
 /// identity and role, whether it is active, and what it flags.
 pub(crate) fn bar_infos(
@@ -374,9 +449,12 @@ pub(crate) fn bar_infos(
             title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
             // The pane's own title (`OSC 0`/`2`, kept by its emulator), as
             // its badge; never when it only repeats the program.
-            badge: w
-                .bar_pane()
-                .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
+            badge: mod_flagged_badge(
+                w.bar_pane()
+                    .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
+                w.bar_pane()
+                    .and_then(|p| world.mod_note_for(p.session_id.as_deref())),
+            ),
             active: i == active,
             // A window is "waiting" when a bound agent pane in it is blocked
             // on the human (§4.2 rung 3). Status only.
@@ -666,5 +744,63 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The breaker's one bar line says why, what happens to new panes, for
+    /// how long, and what became of the panes that were there.
+    #[test]
+    fn the_trip_line_says_why_how_long_and_what_became_of_each_pane() {
+        use super::trip_line;
+        let line = trip_line("2 claude panes loaded it and never said hello", true, 1, 2);
+        assert!(line.starts_with("mod backed out: 2 claude panes loaded it and never said hello."));
+        assert!(
+            line.contains("until Claude Code or the mod changes"),
+            "{line}"
+        );
+        assert!(
+            line.contains("1 pane that had not started was relaunched without it"),
+            "{line}"
+        );
+        assert!(line.contains("2 running panes left as they are"), "{line}");
+        assert!(line.ends_with("`atrium mod status` says more"), "{line}");
+        let session_only = trip_line("why", false, 0, 0);
+        assert!(session_only.contains("for this session"), "{session_only}");
+        assert!(!session_only.contains("relaunched") && !session_only.contains("running"));
+        let two = trip_line("why", true, 2, 1);
+        assert!(
+            two.contains("2 panes that had not started were relaunched"),
+            "{two}"
+        );
+        assert!(two.contains("1 running pane left as it is"), "{two}");
+    }
+
+    /// A working pane is offered a respawn on the bus, by name, never given one.
+    #[test]
+    fn the_trip_decision_names_the_panes_and_offers_a_respawn() {
+        use super::trip_decision;
+        let one = trip_decision("why", &["2 (builder)".to_string()]);
+        assert!(
+            one.contains("2 (builder) still runs with it loaded and is left alone"),
+            "{one}"
+        );
+        assert!(one.contains("atrium ctl respawn <pane>"), "{one}");
+        let two = trip_decision("why", &["1".to_string(), "2".to_string()]);
+        assert!(
+            two.contains("1, 2 still run with it loaded and are left alone"),
+            "{two}"
+        );
+    }
+
+    /// The bar flags a pane's mod beside whatever badge it already had.
+    #[test]
+    fn a_flag_on_the_mod_joins_the_windows_badge() {
+        use super::mod_flagged_badge as badge;
+        assert_eq!(badge(None, None), None);
+        assert_eq!(badge(Some("build".into()), None), Some("build".to_string()));
+        assert_eq!(badge(None, Some("mod off")), Some("mod off".to_string()));
+        assert_eq!(
+            badge(Some("build".into()), Some("mod backed out")),
+            Some("build \u{00B7} mod backed out".to_string())
+        );
     }
 }

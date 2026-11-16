@@ -1220,6 +1220,11 @@ fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             "reason" => pairs.push(("reason", Value::String(val))),
             "answer" => pairs.push(("answer", Value::String(val))),
             "doing" => pairs.push(("doing", Value::String(val))),
+            // The mod's own failure counts, as it wrote them: the server
+            // parses and bounds them (`modstate::parse_fail_counts`).
+            "fail" => pairs.push(("fail", Value::String(val))),
+            "fail_class" => pairs.push(("fail_class", Value::String(val))),
+            "fail_msg" => pairs.push(("fail_msg", Value::String(val))),
             "reply" => pairs.push(("reply", Value::String(val))),
             "ask" => {
                 let n = parse_whole(&val)
@@ -1257,7 +1262,7 @@ fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             other => {
                 return Err(format!(
                     "report: unknown field {other:?} (use status, reason, context, cost, turns, \
-                     answer, doing, touched, ask, reply)"
+                     answer, doing, touched, ask, reply, fail, fail_class, fail_msg)"
                 ))
             }
         }
