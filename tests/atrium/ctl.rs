@@ -1265,6 +1265,298 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
     let _ = wait_exit(&mut p, 15);
 }
 
+/// A session whose first pane runs under **claude's name**: a stand-in on an
+/// absolute `PATH` entry that answers `--version` and `--help` (atrium asks
+/// both of a claude before it adds flags) and is otherwise the platform's
+/// interactive shell, whatever arguments it is given. To the control plane it
+/// is a claude agent's pane, so it gets `TMUX`, `TMUX_PANE` and a `PATH` led by
+/// the tmux shim, as a real Claude Code lead does; to the test it is a shell
+/// that runs what is typed. The session's state (the shim file among it), its
+/// config and its spawn log live in the scratch directory, not the user's.
+/// Returns the pty, the scratch directory and its guard.
+fn spawn_atrium_ctl_claude_standin(tag: &str) -> (pty::Pty, std::path::PathBuf, StandinDir) {
+    let dir = std::env::temp_dir().join(format!("atrium-standin-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = StandinDir(dir.clone());
+    #[cfg(windows)]
+    std::fs::write(
+        dir.join("claude.cmd"),
+        "@echo off\r\n\
+         if \"%~1\"==\"--version\" (\r\n\
+         echo 0.0.1 stand-in\r\n\
+         exit /b 0\r\n\
+         )\r\n\
+         if \"%~1\"==\"--help\" exit /b 0\r\n\
+         cmd /Q\r\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("claude");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             case \"$1\" in\n\
+             --version) echo '0.0.1 stand-in'; exit 0 ;;\n\
+             --help) exit 0 ;;\n\
+             esac\n\
+             exec /bin/sh -i\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::write(dir.join("config.json"), "{}").unwrap();
+    let mut dirs = vec![dir.clone()];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(dirs).unwrap();
+    let text = |p: std::path::PathBuf| p.to_string_lossy().into_owned();
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--allow-ctl", "claude"],
+        24,
+        100,
+        &[
+            ("PATH".to_string(), path.to_string_lossy().into_owned()),
+            (
+                "ATRIUM_STATE_DIR".to_string(),
+                text(dir.join("state").join("sessions")),
+            ),
+            ("ATRIUM_CONFIG".to_string(), text(dir.join("config.json"))),
+            ("ATRIUM_SPAWN_LOG".to_string(), text(dir.join("spawn.log"))),
+            ("PROMPT".to_string(), "$G".to_string()),
+            ("PS1".to_string(), "> ".to_string()),
+        ],
+        None,
+    )
+    .unwrap();
+    read_until(&mut p, b"1:claude", Duration::from_secs(30));
+    (p, dir, guard)
+}
+
+/// The session's pane tree, read as a host would: over the channel found by
+/// pid, with no token (`list` is a read).
+fn list_tree(p: &pty::Pty) -> Vec<json::Value> {
+    let line = atrium::ctl::build_request(&["list".to_string()], None).unwrap();
+    let reply = atrium::ipc::request(&atrium::ipc::address_for(p.pid()), &line)
+        .expect("the channel answers a host");
+    json::parse(&reply)
+        .ok()
+        .and_then(|v| {
+            v.get("tree")
+                .and_then(json::Value::as_array)
+                .map(<[json::Value]>::to_vec)
+        })
+        .unwrap_or_default()
+}
+
+/// Claude Code **2.1.325**'s teammate launch, call for call, through the real
+/// shim (the `tmux` that atrium puts first on a claude pane's `PATH`): the
+/// reads, `split-window … -- cat` (a placeholder, not a pane running `cat`),
+/// the style and title calls, `set-option … remain-on-exit failed`, then
+/// `respawn-pane -k -t %1 -- '<one shell command line>'` with a command line
+/// of that release's shape, and later `kill-pane`.
+///
+/// The line names a claude that does not exist, forwards a config directory,
+/// and asks for `acceptEdits`. What starts is the lead's own claude (the
+/// stand-in), as a child of the lead with the role `--agent-name` gave, under
+/// the same pane id the split printed, with the session's posture (none: no
+/// `--trust`) and none of the line's variables; the spawn log shows the
+/// command atrium built. The sequence was read from the installed 2.1.325
+/// binary; this test stands in for the lead, it does not run one.
+#[test]
+fn the_tmux_shim_serves_claude_code_2_1_325s_placeholder_and_respawn() {
+    let (mut p, dir, _guard) = spawn_atrium_ctl_claude_standin("teams325");
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_string_lossy();
+    // The word as Claude Code quotes it: bare, or in single quotes.
+    let quoted_cwd = if cwd.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '.' | '/' | ':' | '=' | '@' | '+' | ',' | '-')
+    }) {
+        cwd.to_string()
+    } else {
+        format!("'{cwd}'")
+    };
+    assert!(
+        !cwd.contains(['\'', '"', '%', '$', '`', '!']),
+        "the checkout's path would need more quoting than this test writes: {cwd}"
+    );
+    let key = "1763200000000.MCowBQYDK2VwAyEAq3x1Zb0m2m1Yw6i8cQ9fYt5n0u7JH2k4L-_dV3sT1aE";
+    let teammate = format!(
+        "cd {quoted_cwd} && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 CLAUDE_CODE_TASK_LIST_ID=e2e CLAUDE_CONFIG_DIR=/evil-from-the-string ANTHROPIC_PROFILE='' ANTHROPIC_CONFIG_DIR='' CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS= /nonexistent/bin/claude --agent-id researcher@e2e --agent-name researcher --team-name e2e --agent-color blue --parent-session-id 0b9f6c1e-2a67-4c58-9d0e-6f4f8a1d2c33 --lead-verify-key {key} --permission-mode acceptEdits --model claude-opus-4-5"
+    );
+    // The lead's calls, in its order, each one checked. `pct` is how the
+    // script's own language writes a literal percent sign.
+    let calls = |pct: &str, q: &str| -> Vec<String> {
+        vec![
+            format!("tmux -S sock display-message -t {pct}0 -p {q}#{{window_id}}/W{q}"),
+            format!("tmux -S sock list-panes -t @0 -F {q}#{{pane_id}}{q}"),
+            format!(
+                "tmux -S sock split-window -d -t {pct}0 -h -l 70{pct} -P -F {q}#{{pane_id}}/S{q} -- cat"
+            ),
+            format!("tmux -S sock set-option -p -t {pct}1 window-style bg=default,fg=blue"),
+            format!("tmux -S sock set-option -p -t {pct}1 pane-border-style fg=blue"),
+            format!("tmux -S sock set-option -p -t {pct}1 pane-active-border-style fg=blue"),
+            format!("tmux -S sock select-pane -t {pct}1 -T researcher"),
+            format!(
+                "tmux -S sock set-option -p -t {pct}1 pane-border-format {q}#[fg=blue,bold] #{{pane_title}} #[default]{q}"
+            ),
+            format!("tmux -S sock set-option -w -t @0 pane-border-status top"),
+            format!("tmux -S sock list-panes -t @0 -F {q}#{{pane_id}}=#{{pane_title}}/H{q}"),
+            format!("tmux -S sock set-option -p -t {pct}1 remain-on-exit failed"),
+            format!("tmux -S sock respawn-pane -k -t {pct}1 -- \"{teammate}\""),
+            format!("tmux -S sock list-panes -t @0 -F {q}#{{pane_id}}=#{{pane_title}}/T{q}"),
+        ]
+    };
+    let (launch_script, kill_script, run_launch, run_kill);
+    if cfg!(windows) {
+        launch_script = dir.join("launch.cmd");
+        kill_script = dir.join("kill.cmd");
+        let mut body = String::from("@echo off\r\n");
+        for call in calls("%%", "\"") {
+            body.push_str(&format!("{call} || exit /b 1\r\n"));
+        }
+        body.push_str("echo TEAM-SEQ-DONE\r\n");
+        std::fs::write(&launch_script, body).unwrap();
+        std::fs::write(
+            &kill_script,
+            "@echo off\r\ntmux -S sock kill-pane -t %%1 || exit /b 1\r\necho TEAM-KILL-DONE\r\n",
+        )
+        .unwrap();
+        run_launch = format!("\"{}\"\r\n", launch_script.display());
+        run_kill = format!("\"{}\"\r\n", kill_script.display());
+    } else {
+        launch_script = dir.join("launch.sh");
+        kill_script = dir.join("kill.sh");
+        let mut body = String::from("set -e\n");
+        for call in calls("%", "'") {
+            body.push_str(&format!("{call}\n"));
+        }
+        body.push_str("echo TEAM-SEQ-DONE\n");
+        std::fs::write(&launch_script, body).unwrap();
+        std::fs::write(
+            &kill_script,
+            "set -e\ntmux -S sock kill-pane -t %1\necho TEAM-KILL-DONE\n",
+        )
+        .unwrap();
+        run_launch = format!("sh '{}'\r\n", launch_script.display());
+        run_kill = format!("sh '{}'\r\n", kill_script.display());
+    }
+    p.write(run_launch.as_bytes()).unwrap();
+    let out = read_until(&mut p, b"TEAM-SEQ-DONE", Duration::from_secs(90));
+    let shown = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
+    assert!(
+        contains(&out, b"TEAM-SEQ-DONE"),
+        "every call of the 2.1.325 sequence exits 0: {shown:?}"
+    );
+    assert!(contains(&out, b"@0/W"), "the window id is read: {shown:?}");
+    assert!(
+        contains(&out, b"%1/S"),
+        "split-window -- cat prints the placeholder's id: {shown:?}"
+    );
+    assert!(
+        contains(&out, b"%1=waiting/H"),
+        "the placeholder counts in list-panes, as nobody's agent: {shown:?}"
+    );
+    assert!(
+        contains(&out, b"%1=researcher/T"),
+        "after respawn-pane the same id is the teammate: {shown:?}"
+    );
+    // The tree, as the session has it: pane 1 is a claude pane, the lead's
+    // child, with the role the line's --agent-name gave.
+    let tree = list_tree(&p);
+    let mate = tree
+        .iter()
+        .find(|n| n.get("id").and_then(json::Value::as_i64) == Some(1))
+        .unwrap_or_else(|| panic!("pane 1 is in the tree: {tree:?}"));
+    assert_eq!(mate.get("parent").and_then(json::Value::as_i64), Some(0));
+    assert_eq!(
+        mate.get("role").and_then(json::Value::as_str),
+        Some("researcher")
+    );
+    assert_eq!(
+        mate.get("title").and_then(json::Value::as_str),
+        Some("claude")
+    );
+    assert_eq!(
+        tree.len(),
+        2,
+        "the placeholder became the teammate: {tree:?}"
+    );
+    // The command atrium built for it: the lead's own claude with the
+    // table's flags, and nothing else of the line.
+    let log = std::fs::read_to_string(dir.join("spawn.log")).unwrap_or_default();
+    let built = log
+        .lines()
+        .find(|l| l.contains("--agent-id researcher@e2e"))
+        .unwrap_or_else(|| panic!("the teammate's launch is in the spawn log: {log}"));
+    assert!(built.starts_with("[claude] "), "{built}");
+    let standin = dir.join(if cfg!(windows) {
+        "claude.cmd"
+    } else {
+        "claude"
+    });
+    assert!(
+        built
+            .to_lowercase()
+            .contains(&standin.to_string_lossy().to_lowercase()),
+        "the program is the lead's own claude, pinned on PATH: {built}"
+    );
+    for kept in [
+        "--agent-name researcher",
+        "--team-name e2e",
+        "--agent-color blue",
+        "--parent-session-id 0b9f6c1e-2a67-4c58-9d0e-6f4f8a1d2c33",
+        "--model claude-opus-4-5",
+        "--session-id ",
+    ] {
+        assert!(built.contains(kept), "{kept}: {built}");
+    }
+    for gone in [
+        "/nonexistent/bin/claude",
+        "acceptEdits",
+        "evil-from-the-string",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        assert!(!built.contains(gone), "{gone}: {built}");
+    }
+    // No permission flag: the session has no `--trust`. (atrium's own
+    // directive text names the flags, so each is looked for as an argument.)
+    assert!(
+        !built.contains("--permission-mode plan")
+            && !built.contains("--permission-mode auto")
+            && !built.contains("--dangerously-skip-permissions --"),
+        "{built}"
+    );
+    // The lead ends its teammate by the id the split printed.
+    p.write(run_kill.as_bytes()).unwrap();
+    let out = read_until(&mut p, b"TEAM-KILL-DONE", Duration::from_secs(30));
+    assert!(
+        contains(&out, b"TEAM-KILL-DONE"),
+        "kill-pane -t %1 exits 0: {:?}",
+        String::from_utf8_lossy(&strip_csi_bytes(&out))
+    );
+    let gone_by = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        // Keep the pty drained while the session reaps the pane.
+        let _ = read_until(&mut p, b"\x00never", Duration::from_millis(200));
+        let tree = list_tree(&p);
+        if tree.len() == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < gone_by,
+            "the killed teammate is reaped: {tree:?}"
+        );
+    }
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// The host-read surface: a request with no token and no caller (a host
 /// terminal reading over the channel it found by pid) gets the whole bus from
 /// `bus feed`, not the operator's empty subscription view, and each event

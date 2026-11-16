@@ -124,6 +124,15 @@ pub(crate) struct Pane {
     pub(crate) norms: Option<String>,
     /// The fleet context-store variables this pane was given, for the same reason.
     pub(crate) context_env: Vec<(String, String)>,
+    /// A **teammate placeholder**: the pane Claude Code 2.1.325's
+    /// `split-window … -- cat` reserves through the tmux shim (`ctl spawn`
+    /// with `hold`). It runs atrium's own binary in a mode that only waits
+    /// (`atrium --tmux-hold`), has no token and no ctl environment, and is
+    /// not an agent's pane. Its owner is its `parent`: the one pane whose
+    /// `respawn-pane` may turn it into a teammate, once, which clears this
+    /// mark. Set by the hold spawn and by nothing else; while it is set, no
+    /// other respawn touches the pane.
+    pub(crate) placeholder: bool,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are

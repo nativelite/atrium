@@ -228,6 +228,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         mod_enabled: None,
         teams: None,
         commands: None,
+        teams_env: None,
         title: None,
         notify: None,
         subagents: None,
@@ -295,6 +296,7 @@ fn codex_blocks_are_disclosed_per_distinct_block_and_flagged_off_codex() {
         mod_enabled: None,
         teams: None,
         commands: None,
+        teams_env: None,
         title: None,
         notify: None,
         subagents: None,
@@ -428,4 +430,31 @@ fn the_command_allowlist_line_has_no_run_of_spaces() {
         "atrium fleet: slash commands a pane may run in another agent's pane (`ctl command`): \
          /compact; each is a grant to every pane that can reach one"
     );
+}
+
+/// The variables a fleet lets a Claude Code lead set on its teammates are in
+/// the banner when there are any, and not otherwise.
+#[test]
+fn a_teams_env_list_is_disclosed_in_the_banner_when_it_is_not_empty() {
+    let fleet = |body: &str| {
+        let roster =
+            format!(r#"{{"fleets":{{"a":{{{body}"agents":[{{"name":"x","cmd":["claude"]}}]}}}}}}"#);
+        atrium::fleet::parse(&roster)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(super::teams_env_line(&fleet("")), None);
+    assert_eq!(super::teams_env_line(&fleet(r#""teams_env": [],"#)), None);
+    let line = super::teams_env_line(&fleet(
+        r#""teams_env": ["ANTHROPIC_BASE_URL", "HTTPS_PROXY"],"#,
+    ))
+    .expect("a line");
+    assert_eq!(
+        line,
+        "atrium fleet: variables a Claude Code lead may set on its teammates (`teams_env`): \
+         ANTHROPIC_BASE_URL, HTTPS_PROXY; each is taken from a pane's request"
+    );
+    assert!(!line.contains("  "), "{line:?}");
 }

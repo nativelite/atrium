@@ -1,7 +1,7 @@
 //! `ctl spawn`: a visible worker in a new window, or `--here` beside the caller.
 
 use super::dispatch::CtlSession;
-use super::panes::{ctl_candidates, effective_mode, pane_by_agent, role_holder};
+use super::panes::{ctl_candidates, effective_mode, is_claude_pane, pane_by_agent, role_holder};
 use crate::*;
 use atrium::ctl;
 
@@ -55,6 +55,8 @@ fn adopt_worker(
     pane.parent = caller;
     pane.depth = new_depth;
     pane.worktree = sp.worktree.clone();
+    // The one place the mark is set: a hold spawn's pane, owned by `caller`.
+    pane.placeholder = sp.hold;
     atrium::ctl::reply_spawned(
         pane.agent_id,
         sp.role.as_deref(),
@@ -170,22 +172,30 @@ pub(crate) fn spawn_worker_here(
         Err(reply) => return reply,
     };
     let mut flash = None;
-    match spawn_pane_full(
-        PaneSpec {
-            command: &sp.argv,
-            id: new_id,
-            identity: sp.identity.as_deref(),
-            cwd: wt_cwd.as_deref(),
-            mode,
-            extra_env: &[],
-            extra_norms: wt_norms.as_deref(),
-            deny: &[],
-            codex: None,
-        },
-        pr.max(1),
-        pc.max(1),
-        &mut flash,
-    ) {
+    // A hold spawn's pane is a placeholder: atrium's own waiting program,
+    // not the request's command (it has none). Everything after this, the
+    // adoption, the anchor, the share, the focus, is the worker's path.
+    let spawned = if sp.hold {
+        spawn_hold_pane(new_id, pr.max(1), pc.max(1))
+    } else {
+        spawn_pane_full(
+            PaneSpec {
+                command: &sp.argv,
+                id: new_id,
+                identity: sp.identity.as_deref(),
+                cwd: wt_cwd.as_deref(),
+                mode,
+                extra_env: &[],
+                extra_norms: wt_norms.as_deref(),
+                deny: &[],
+                codex: None,
+            },
+            pr.max(1),
+            pc.max(1),
+            &mut flash,
+        )
+    };
+    match spawned {
         Ok(mut pane) => {
             let reply = adopt_worker(&mut pane, sp, caller, new_depth, note);
             // Re-tile the window into a balanced near-square grid over all its
@@ -322,6 +332,101 @@ fn is_executable_file(file: &std::path::Path) -> bool {
     file.is_file()
 }
 
+/// What the placeholder guard knows of the calling pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldCaller {
+    /// Its recorded command is claude ([`is_claude_pane`]).
+    pub(crate) claude: bool,
+    pub(crate) can_spawn: bool,
+    pub(crate) depth: usize,
+}
+
+/// The refusal for a hold spawn from anything but a claude agent's pane.
+pub(crate) const HOLD_NEEDS_CLAUDE: &str =
+    "hold refused: a teammate placeholder is made by a claude pane's own Claude Code, \
+     through atrium's tmux shim (`split-window … -- cat`), and by nothing else: not by an \
+     operator, a shell, another agent CLI or a placeholder";
+
+/// May this caller have a teammate placeholder, and at what depth? The guard
+/// for `ctl spawn` with `hold`. Pure.
+///
+/// A placeholder runs atrium's own waiting program, so there is no command
+/// to vet; what is left of a spawn's guards is who asks and how many panes
+/// there are:
+///
+/// * the caller is a **claude agent's pane** (the tmux shim's only user), in
+///   a session that puts the shim into claude panes (`teams` not `off`);
+/// * it **may create teammates** (`can_spawn`), as for any spawn;
+/// * the **depth cap** and the **pane cap** hold, as for any spawn: the
+///   teammate will stand exactly where the placeholder does.
+pub(crate) fn hold_allowed(
+    caller: Option<HoldCaller>,
+    teams_on: bool,
+    max_depth: usize,
+    live: usize,
+    cap: usize,
+) -> Result<usize, String> {
+    let Some(caller) = caller.filter(|c| c.claude) else {
+        return Err(HOLD_NEEDS_CLAUDE.to_string());
+    };
+    if !teams_on {
+        return Err(
+            "hold refused: this session keeps Claude Code's teammates in-process (teams: off)"
+                .to_string(),
+        );
+    }
+    if !caller.can_spawn {
+        return Err("this agent is not permitted to create teammates \
+             (set \"can_spawn\": true for it in the fleet file)"
+            .to_string());
+    }
+    let attempted = caller.depth + 1;
+    if attempted > max_depth {
+        return Err(ctl::SpawnDenied::DepthExceeded {
+            attempted,
+            max: max_depth,
+        }
+        .message());
+    }
+    if live >= cap {
+        return Err(format!(
+            "pane cap reached ({live}/{cap}) — reap an agent or raise it with ATRIUM_MAX_PANES"
+        ));
+    }
+    Ok(attempted)
+}
+
+/// `ctl spawn` with `hold`: a teammate placeholder beside the caller, placed
+/// exactly as a `--here` worker is (anchor, share, focus), running atrium's
+/// own waiting program ([`spawn_hold_pane`]).
+fn spawn_hold(
+    sp: &atrium::ctl::SpawnReq,
+    caller: Option<AgentId>,
+    cx: &mut CtlSession<'_>,
+) -> atrium::ctl::Reply {
+    let facts = caller
+        .and_then(|c| pane_by_agent(cx.windows, c))
+        .map(|p| HoldCaller {
+            claude: is_claude_pane(p),
+            can_spawn: p.can_spawn,
+            depth: p.depth,
+        });
+    let live = cx.windows.iter().map(|w| w.panes.len()).sum::<usize>();
+    let new_depth = match hold_allowed(
+        facts,
+        atrium::tmux_shim::session_enabled(),
+        cx.max_depth,
+        live,
+        atrium::resources::effective_cap(),
+    ) {
+        Ok(depth) => depth,
+        Err(why) => return ctl::reply_err(&why),
+    };
+    // No posture: the pane is not an agent's (`Off` adds nothing to a
+    // command that is not one).
+    spawn_worker_here(cx, sp, caller, new_depth, ctl::TrustMode::Off, None)
+}
+
 /// `ctl spawn`: the guards, in order — may this caller create teammates, is the
 /// role free, is the argv one a teammate may run, the effective trust mode, the
 /// depth cap, the pane cap, and credential delegation — then a new window, or
@@ -332,6 +437,11 @@ pub(crate) fn spawn(
     privileged: bool,
     cx: &mut CtlSession<'_>,
 ) -> atrium::ctl::Reply {
+    // A placeholder is its own request with its own guard: it names no
+    // command, so none of the command's checks below has anything to check.
+    if sp.hold {
+        return spawn_hold(&sp, caller, cx);
+    }
     let windows = &mut *cx.windows;
     let max_depth = cx.max_depth;
     let (extra_allow, session_identity) = (cx.extra_allow, cx.session_identity);

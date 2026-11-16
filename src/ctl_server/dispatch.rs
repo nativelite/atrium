@@ -41,6 +41,10 @@ pub(crate) struct CtlSession<'a> {
     /// delivery lands. The run loop parks the connection instead of sending
     /// the (empty) reply, and answers it from [`inbox_items`] later.
     pub(crate) hold: &'a mut Option<AgentId>,
+    /// The bar's one-line notice: a handler that has something the human
+    /// should see once (what a teammate launch did not pass on) puts it
+    /// here, as the delivery flush does with its own.
+    pub(crate) flash: &'a mut Option<(String, Instant)>,
 }
 
 /// Is this decision addressed to a live teammate (a `to=<role>` field naming a
@@ -402,6 +406,14 @@ fn dispatch_operator(
 /// the process is doing now. A pane's recorded command is set when atrium
 /// starts it and by nothing else: no ctl request rewrites it (`respawn` replays
 /// it), so the answer holds for the pane's life.
+///
+/// One pane's command is set twice, and still by atrium alone: a **teammate
+/// placeholder** (`Pane::placeholder`), which starts as atrium's own waiting
+/// program (not an agent's pane) and becomes a claude teammate when its lead's
+/// `respawn-pane` is served (`respawn::teammate`). That happens once, only to
+/// a placeholder, only for the pane that made it, and the command it gets is
+/// the lead pane's own recorded one, never a request's. For every pane that
+/// is not an unclaimed placeholder the sentence above holds as written.
 pub(super) fn is_agent_pane(p: &Pane) -> bool {
     let program = p.argv.first().map(String::as_str).unwrap_or(&p.title);
     atrium::bind::is_agent_stem(&atrium::bind::command_stem(program))
@@ -1662,6 +1674,9 @@ mod operator_tests;
 mod ceiling_tests;
 
 #[cfg(test)]
+mod teammate_tests;
+
+#[cfg(test)]
 mod effect_tests {
     use super::*;
 
@@ -1755,6 +1770,7 @@ mod effect_tests {
             held_inboxes: 2,
             world: &world,
             session_identity: None,
+            flash: &mut None,
             audit: &mut audit,
             board: &mut board,
             bus: &mut bus,

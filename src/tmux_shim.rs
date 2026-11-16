@@ -22,14 +22,30 @@
 //! A teammate therefore becomes an ordinary atrium pane: a child of the lead
 //! in the spawn tree, under its trust ceiling, with the status border, the
 //! overview row, the board and the bus.
+//!
+//! Two Claude Code releases were read, and they start a teammate differently.
+//! 2.1.289 passes the teammate's argv on the split, which is a `ctl spawn`.
+//! 2.1.325 splits with the placeholder `cat`, then sends `respawn-pane` with
+//! the teammate as one shell command line. The placeholder is a `ctl spawn`
+//! with `hold` (a pane running atrium's own [`hold_main`], never `cat`), and
+//! the respawn is a `ctl respawn` with the line as `teammate`; the server
+//! never runs that line. What it honours of it is [`teammate`]'s policy.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod teammate;
+
+pub use teammate::{
+    env_not_passed, is_env_name, not_passed_note, parse_teams_env, plain_path, session_teams_env,
+    set_session_teams_env, teammate_audit, teammate_cwd, teams_env_refusal, teams_env_value_ok,
+    vet_teammate, Asked, Flag, Shape, Take, Teammate, ATRIUM_OWN_FLAGS, ENV_AGENT_TEAMS,
+    ENV_CLAUDECODE, ENV_TASK_LIST, FLAGS, TEAMS_ENV_VALUE_MAX,
+};
 pub use tmuxproto::{
-    agent_name, expand, needs_broker, parse, parse_target, run, sh_words, Broker, Host, Node,
-    Outcome, PaneView, Target, Verb, View, WINDOW_ID,
+    agent_name, expand, needs_broker, parse, parse_target, parse_teammate_command, run, sh_words,
+    Broker, Host, Node, Outcome, PaneView, Target, TeammateCommand, Verb, View, WINDOW_ID,
 };
 
 /// Who answers: `#{session_name}` is `atrium`, `tmux -V` says `tmux 3.5a-atrium`.
@@ -46,6 +62,63 @@ pub const ENV_CLAUDE_TRUECOLOR: &str = "CLAUDE_CODE_TMUX_TRUECOLOR";
 /// The hidden flag `atrium --tmux-shim <tmux args…>` that reaches [`main`]
 /// without renaming the binary (tests, and a hand probe).
 pub const FLAG: &str = "--tmux-shim";
+
+/// The hidden flag `atrium --tmux-hold`: what a teammate placeholder runs
+/// ([`hold_main`]). The server starts it itself, from its own executable; no
+/// request names it.
+pub const HOLD_FLAG: &str = "--tmux-hold";
+
+/// A placeholder pane's title. Not an agent's name, by intent: a pane is an
+/// agent's by its recorded command, and a placeholder is nobody's agent.
+pub const HOLD_TITLE: &str = "waiting";
+
+/// What a placeholder shows until its teammate starts.
+pub const HOLD_LINE: &str = "waiting for a teammate (Claude Code is starting it)";
+
+/// The placeholder's whole program: say what the pane is for, then wait to
+/// be killed. It reads nothing (what is typed into it goes nowhere), holds
+/// no ctl environment and no token, and never returns.
+pub fn hold_main() -> ! {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[2m{HOLD_LINE}\x1b[0m\r\n");
+    let _ = out.flush();
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
+}
+
+/// The `atrium ctl` arguments for a placeholder: `spawn --here --hold`, with
+/// the split's focus, anchor and size as an agent split would carry them.
+pub fn hold_args(focus: bool, beside: Option<usize>, size: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = vec!["spawn".into(), "--here".into(), "--hold".into()];
+    if !focus {
+        args.push("--no-focus".into());
+    }
+    if let Some(b) = beside {
+        args.push("--beside".into());
+        args.push(b.to_string());
+    }
+    // As for a spawn: a `-l` the `--size` grammar refuses is dropped, so the
+    // split still happens, equal.
+    if let Some(sz) = size.filter(|s| crate::ctl::parse_spawn_size(s).is_ok()) {
+        args.push("--size".into());
+        args.push(sz.to_string());
+    }
+    args
+}
+
+/// The `atrium ctl` arguments for `respawn-pane -t %<id> -- <command>`: a
+/// `respawn` of that pane with the command line as its `--teammate`,
+/// untouched. The server parses and vets it; nothing here reads it.
+pub fn respawn_args(id: usize, command: &str) -> Vec<String> {
+    vec![
+        "respawn".into(),
+        id.to_string(),
+        "--teammate".into(),
+        command.to_string(),
+    ]
+}
 
 /// Claude Code's own flag for how teammates are shown. atrium passes it as
 /// `auto` (split panes when inside tmux, which an atrium claude pane now is;
@@ -210,6 +283,29 @@ impl Broker for CtlBroker {
     fn send(&mut self, id: usize, text: &str) -> Result<(), String> {
         let t = id.to_string();
         self.call(&["send", &t, text]).map(|_| ())
+    }
+    /// Claude Code 2.1.325's `split-window … -- cat`: a placeholder pane,
+    /// which the server starts itself (its own binary in [`hold_main`]).
+    fn hold(
+        &mut self,
+        focus: bool,
+        beside: Option<usize>,
+        size: Option<&str>,
+    ) -> Result<usize, String> {
+        let owned = hold_args(focus, beside, size);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let v = self.call(&args)?;
+        v.get("pane")
+            .and_then(json::Value::as_i64)
+            .and_then(|p| usize::try_from(p).ok())
+            .ok_or_else(|| "spawn reply named no pane".to_string())
+    }
+    /// Claude Code 2.1.325's `respawn-pane`: the server turns the caller's
+    /// own placeholder into the teammate, or refuses.
+    fn respawn(&mut self, id: usize, command: &str) -> Result<(), String> {
+        let owned = respawn_args(id, command);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        self.call(&args).map(|_| ())
     }
 }
 

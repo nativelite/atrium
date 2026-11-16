@@ -316,6 +316,12 @@ fn launch() -> ExitCode {
     if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
         return atrium::tmux_shim::main(&args[1..]);
     }
+    // A teammate placeholder (`--tmux-hold`): the pane Claude Code 2.1.325
+    // reserves before it starts a teammate. It says what it is and waits to
+    // be killed; it never reaches the session code below.
+    if args.first().map(String::as_str) == Some(atrium::tmux_shim::HOLD_FLAG) {
+        atrium::tmux_shim::hold_main();
+    }
     // Operator tokens (`--operator-token-file <path>` first, or
     // ATRIUM_OPERATOR_TOKEN_FILE): the file is read and checked once, here,
     // before any dispatch, so every path that hosts a session (a plain launch,

@@ -313,6 +313,93 @@ pub(crate) fn spawn_pane_full(
     cols: u16,
     flash: &mut Option<(String, Instant)>,
 ) -> std::io::Result<Pane> {
+    spawn_pane_as(spec, None, rows, cols, flash)
+}
+
+/// [`spawn_pane_full`] into a **given agent id** instead of a fresh one: the
+/// teammate that takes over a placeholder keeps the placeholder's id, because
+/// Claude Code goes on naming the pane by the `%N` its `split-window`
+/// printed (`kill-pane`, its team file). The id is the placeholder's own,
+/// which no other pane has or will have, and the placeholder held no token
+/// and no ctl environment, so nothing of the old process answers to it.
+pub(crate) fn spawn_pane_in_slot(
+    spec: PaneSpec,
+    slot: AgentId,
+    rows: u16,
+    cols: u16,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Pane> {
+    spawn_pane_as(spec, Some(slot), rows, cols, flash)
+}
+
+/// A **teammate placeholder** pane: atrium's own executable in its hold mode
+/// (`atrium --tmux-hold`, [`atrium::tmux_shim::hold_main`]), which prints one
+/// line and waits to be killed. The program is `current_exe()` and the one
+/// flag, never anything a request carried. Unlike every other pane it gets
+/// **no ctl environment and no token** (so it can make no request, and no
+/// request authenticates as it), no identity and no agent treatment; it does
+/// carry the session marker and joins the session job and cgroup, so it is
+/// reaped with the session like any pane.
+pub(crate) fn spawn_hold_pane(id: usize, rows: u16, cols: u16) -> std::io::Result<Pane> {
+    let exe = std::env::current_exe()?;
+    let command = vec![
+        exe.to_string_lossy().into_owned(),
+        atrium::tmux_shim::HOLD_FLAG.to_string(),
+    ];
+    let r = rows.max(1);
+    let c = cols.max(1);
+    let agent_id = next_agent_id();
+    let pane_cgroup = atrium::cgroup::session();
+    let env = pane_base_env(atrium::orphan::session_key().as_ref(), None, None);
+    let pty = start_pty(&command, r, c, &env, None)?;
+    atrium::orphan::stamp(pty.pid());
+    if let Some(cg) = pane_cgroup {
+        cg.assign(pty.pid());
+    }
+    Ok(Pane {
+        inbox: None,
+        id,
+        pty,
+        term: vterm::Term::new(r as usize, c as usize),
+        filter: atrium::filter::Passthrough::new(),
+        title: atrium::tmux_shim::HOLD_TITLE.to_string(),
+        activity: false,
+        last_activity: std::time::Instant::now(),
+        draft: atrium::deliver::Draft::default(),
+        exited: false,
+        session_id: None,
+        launch_ms: agsess::sessions::now_ms(),
+        cwd: None,
+        identity: None,
+        agent_id,
+        token: None,
+        role: None,
+        parent: None,
+        depth: 0,
+        // A placeholder creates nothing; it could not ask anyway.
+        can_spawn: false,
+        painted: false,
+        mouse_wanted: false,
+        paste_wanted: false,
+        argv: command,
+        worktree: None,
+        deny: Vec::new(),
+        mode: atrium::ctl::TrustMode::Off,
+        kickoff: false,
+        norms: None,
+        context_env: Vec::new(),
+        placeholder: true,
+    })
+}
+
+/// The spawn core behind [`spawn_pane_full`] and [`spawn_pane_in_slot`].
+fn spawn_pane_as(
+    spec: PaneSpec,
+    slot: Option<AgentId>,
+    rows: u16,
+    cols: u16,
+    flash: &mut Option<(String, Instant)>,
+) -> std::io::Result<Pane> {
     let PaneSpec {
         command,
         id,
@@ -480,7 +567,9 @@ pub(crate) fn spawn_pane_full(
     // Stamp the process-global agent id now — it is both the pane's spawn-tree
     // key and the `ATRIUM_PANE` value injected below, so an agent inside can
     // attribute its own `ctl spawn` calls back to this pane.
-    let agent_id = next_agent_id();
+    // A teammate taking over a placeholder keeps that pane's id
+    // ([`spawn_pane_in_slot`]); every other pane gets the next one.
+    let agent_id = slot.unwrap_or_else(next_agent_id);
     let (mut base_env, token, pane_cgroup) = pane_env(agent_id, extra_env);
     // The mod: a claude pane loads atrium's plugin of function hooks when it
     // is installed and the session allows it (`atrium mod install`; a fleet's
@@ -583,6 +672,7 @@ pub(crate) fn spawn_pane_full(
         kickoff: false,
         norms: extra_norms.map(str::to_string),
         context_env: atrium::context::restorable_env(extra_env),
+        placeholder: false,
     })
 }
 
@@ -1056,6 +1146,20 @@ fn identity_env(
         ));
     }
     merged
+}
+
+/// The variables the identity `name` resolves to, for a **comparison only**
+/// (which of a teammate command's dropped assignments the teammate has
+/// anyway). The values are credentials: the caller compares and drops them,
+/// as [`identity_env`] does at the spawn. A name that does not resolve gives
+/// nothing; the spawn is what reports that.
+pub(crate) fn identity_values(name: &str) -> Vec<(String, String)> {
+    name.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|part| akey::resolve(part).ok())
+        .flatten()
+        .collect()
 }
 
 /// Start `effective` on a `r x c` pty with `env` in `cwd`.

@@ -189,3 +189,71 @@ fn a_ctl_spawn_is_pinned_to_an_executable_on_an_absolute_path_entry() {
     assert!(pin_to_path("zzagent", None, None).is_err());
     let _ = std::fs::remove_dir_all(&abs);
 }
+
+// ---- the teammate placeholder (`spawn` with `hold`) ---------------------------
+
+fn claude_lead() -> HoldCaller {
+    HoldCaller {
+        claude: true,
+        can_spawn: true,
+        depth: 0,
+    }
+}
+
+/// A placeholder is for a claude agent's pane: every other caller is refused
+/// before anything else is looked at.
+#[test]
+fn only_a_claude_agents_pane_may_have_a_placeholder() {
+    assert_eq!(hold_allowed(Some(claude_lead()), true, 3, 1, 8), Ok(1));
+    // No pane behind the request (an operator, a stale token), or a pane
+    // that is not claude's (a shell, codex, a placeholder).
+    for caller in [
+        None,
+        Some(HoldCaller {
+            claude: false,
+            ..claude_lead()
+        }),
+    ] {
+        assert_eq!(
+            hold_allowed(caller, true, 3, 1, 8),
+            Err(HOLD_NEEDS_CLAUDE.to_string())
+        );
+    }
+    // A session with teams off has no shim to ask.
+    let e = hold_allowed(Some(claude_lead()), false, 3, 1, 8).unwrap_err();
+    assert!(e.contains("teams: off"), "{e}");
+}
+
+/// What is left of a spawn's guards applies as for any spawn: the right to
+/// create teammates, the depth cap and the pane cap.
+#[test]
+fn a_placeholder_is_held_to_the_spawn_caps() {
+    let e = hold_allowed(
+        Some(HoldCaller {
+            can_spawn: false,
+            ..claude_lead()
+        }),
+        true,
+        3,
+        1,
+        8,
+    )
+    .unwrap_err();
+    assert!(e.contains("not permitted to create teammates"), "{e}");
+    // The teammate will stand where the placeholder does: one below its lead.
+    let deep = HoldCaller {
+        depth: 3,
+        ..claude_lead()
+    };
+    assert_eq!(hold_allowed(Some(deep), true, 4, 1, 8), Ok(4));
+    let e = hold_allowed(Some(deep), true, 3, 1, 8).unwrap_err();
+    assert!(e.contains("exceeds --max-depth 3"), "{e}");
+    let e = hold_allowed(Some(claude_lead()), true, 0, 1, 8).unwrap_err();
+    assert!(e.contains("exceeds --max-depth 0"), "{e}");
+    // A placeholder is a pane: it counts, and it is refused at the cap.
+    assert_eq!(hold_allowed(Some(claude_lead()), true, 3, 7, 8), Ok(1));
+    for live in [8, 9] {
+        let e = hold_allowed(Some(claude_lead()), true, 3, live, 8).unwrap_err();
+        assert!(e.contains("pane cap reached"), "{e}");
+    }
+}
