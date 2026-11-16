@@ -1,5 +1,6 @@
 //! The `atrium ctl` client: argv to a request, send it, print the reply.
 
+use super::render::render_metrics;
 use super::render::{render_board, render_bus};
 use super::reply::{obj, s};
 use super::{
@@ -23,6 +24,14 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         eprintln!("atrium ctl: needs a command");
         eprint!("{}", crate::help::CTL);
         return ExitCode::FAILURE;
+    }
+    // `ping` is a liveness probe: it answers for itself, in one line and
+    // within its own timeout, before anything below can speak or wait.
+    let verb = args
+        .iter()
+        .find(|a| !matches!(a.as_str(), "--json" | "--no-color" | "--quiet"));
+    if verb.map(String::as_str) == Some("ping") {
+        return ping_cmd(args);
     }
     let Some(address) = std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty()) else {
         eprintln!(
@@ -108,6 +117,11 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
                         Some(view) => println!("{view}"),
                         None => println!("{reply}"),
                     },
+                    // Prometheus text, which ends in its own newline.
+                    (Some("metrics"), false) => match render_metrics(&reply) {
+                        Some(text) => print!("{text}"),
+                        None => println!("{reply}"),
+                    },
                     _ => println!("{reply}"),
                 }
             }
@@ -132,6 +146,187 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The default `ping --timeout`, in milliseconds: a run loop that is alive
+/// answers within a tick, so a second is already generous.
+pub const PING_DEFAULT_TIMEOUT_MS: u64 = 1_000;
+/// The longest `ping --timeout` accepted, in milliseconds.
+pub const PING_MAX_TIMEOUT_MS: u64 = 30_000;
+
+/// Parse `ping [--timeout <ms>]` (the argv after the global flags) into the
+/// probe's bound.
+pub fn parse_ping(args: &[String]) -> Result<std::time::Duration, String> {
+    let mut timeout_ms = PING_DEFAULT_TIMEOUT_MS;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--timeout" => {
+                let t = value_at(args, i + 1, "--timeout needs a number of milliseconds")?;
+                timeout_ms = parse_whole(t)
+                    .map_err(|()| "--timeout must be a whole number of milliseconds".to_string())?
+                    .filter(|ms| (1..=PING_MAX_TIMEOUT_MS).contains(ms))
+                    .ok_or_else(|| {
+                        format!("--timeout {t} must be 1..{PING_MAX_TIMEOUT_MS} milliseconds")
+                    })?;
+                i += 2;
+            }
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    Ok(std::time::Duration::from_millis(timeout_ms))
+}
+
+/// How a `ping` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ping {
+    /// The session's run loop answered; the reply line, as it came.
+    Alive(String),
+    /// Nothing is bound at the address (or no address was given).
+    NoEndpoint(String),
+    /// Something is at the address and refused the connection: on unix, the
+    /// socket file of an atrium that is gone.
+    Refused,
+    /// No answer within the bound: nobody took the connection, or the run
+    /// loop behind it is not turning.
+    TimedOut(std::time::Duration),
+    /// The exchange failed some other way, or what came back was not a ping
+    /// reply.
+    Failed(String),
+}
+
+impl Ping {
+    /// The process exit code: `0` only for [`Ping::Alive`], `1` otherwise.
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Ping::Alive(_) => 0,
+            _ => 1,
+        }
+    }
+
+    /// The one line that says why the probe failed (the reply itself when it
+    /// did not).
+    pub fn line(&self) -> String {
+        match self {
+            Ping::Alive(reply) => reply.clone(),
+            Ping::NoEndpoint(why) => format!("no endpoint: {why}"),
+            Ping::Refused => "connection refused: nothing is listening at the endpoint".to_string(),
+            Ping::TimedOut(bound) => format!(
+                "timeout: the run loop did not answer within {} ms",
+                bound.as_millis()
+            ),
+            // One line, whatever the text was.
+            Ping::Failed(why) => why.replace(['\r', '\n'], " "),
+        }
+    }
+}
+
+/// Probe the session at `address`: is its run loop answering, within
+/// `timeout`? Never waits longer than `timeout`, whatever the endpoint does.
+pub fn ping(address: &str, request: &str, timeout: std::time::Duration) -> Ping {
+    let (address, request) = (address.to_string(), request.to_string());
+    ping_with(timeout, move || {
+        // On Windows the transport retries a missing pipe name for its whole
+        // deadline (right for a client started before its atrium); a probe
+        // asks once.
+        if !nlipc::endpoint_exists(&address) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("nothing is bound at {address}"),
+            ));
+        }
+        crate::ipc::request(&address, &request)
+    })
+}
+
+/// [`ping`] over any exchange. The exchange runs on a thread of its own and
+/// this waits for it at most `timeout`. The transport's write and read have
+/// budgets, but they are its own (a 5 s stall, 30 s in total), on Windows the
+/// connect retries a missing or busy pipe inside that total, and on unix the
+/// connect is one blocking call with no deadline at all (nativelite-ipc
+/// 0.2). Bounding the wait from outside holds for all of it at once. A
+/// timed-out exchange is abandoned where it stands; the process is a probe and
+/// exits on the caller's return.
+fn ping_with(
+    timeout: std::time::Duration,
+    exchange: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+) -> Ping {
+    use std::io::ErrorKind;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+    let (tx, rx) = channel();
+    let spawned = std::thread::Builder::new()
+        .name("atrium-ctl-ping".to_string())
+        .spawn(move || {
+            let _ = tx.send(exchange());
+        });
+    if let Err(e) = spawned {
+        return Ping::Failed(format!("could not start the probe: {e}"));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(reply)) => ping_reply(reply),
+        Ok(Err(e)) => match e.kind() {
+            ErrorKind::NotFound => Ping::NoEndpoint(e.to_string()),
+            ErrorKind::ConnectionRefused => Ping::Refused,
+            _ => Ping::Failed(e.to_string()),
+        },
+        Err(RecvTimeoutError::Timeout) => Ping::TimedOut(timeout),
+        Err(RecvTimeoutError::Disconnected) => Ping::Failed("the probe died".to_string()),
+    }
+}
+
+/// Is this reply line a run loop's answer to `ping`: `ok` true with an
+/// `uptime_ms`? A refusal carries its `err`; anything else is not an answer.
+fn ping_reply(reply: String) -> Ping {
+    let Ok(v) = json::parse(&reply) else {
+        return Ping::Failed("the endpoint answered, but not with a ping reply".to_string());
+    };
+    match v.get("ok").and_then(Value::as_bool) {
+        Some(true) if v.get("uptime_ms").and_then(Value::as_i64).is_some() => Ping::Alive(reply),
+        Some(false) => Ping::Failed(format!(
+            "refused: {}",
+            v.get("err").and_then(Value::as_str).unwrap_or("no reason")
+        )),
+        _ => Ping::Failed("the endpoint answered, but not with a ping reply".to_string()),
+    }
+}
+
+/// `atrium ctl ping [--timeout <ms>]`: exit `0` and print the reply when the
+/// session's run loop answered; otherwise exit `1` with one line on stderr
+/// (no endpoint, connection refused, timeout). `--quiet` prints no reply.
+fn ping_cmd(args: &[String]) -> ExitCode {
+    let quiet = args.iter().any(|a| a == "--quiet");
+    let own: Vec<String> = args
+        .iter()
+        .filter(|a| !matches!(a.as_str(), "--json" | "--no-color" | "--quiet"))
+        .cloned()
+        .collect();
+    let outcome = match parse_ping(&own) {
+        Err(msg) => {
+            eprintln!("atrium ctl ping: {msg} (usage: atrium ctl ping [--timeout <ms>])");
+            return ExitCode::FAILURE;
+        }
+        Ok(timeout) => match std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty()) {
+            None => Ping::NoEndpoint(format!("{ENV_ADDRESS} is unset")),
+            Some(address) => {
+                let caller = std::env::var(ENV_PANE)
+                    .ok()
+                    .and_then(|p| p.parse::<usize>().ok());
+                match build_request(&own[..1], caller) {
+                    Ok(request) => ping(&address, &request, timeout),
+                    Err(e) => Ping::Failed(e.to_string()),
+                }
+            }
+        },
+    };
+    match &outcome {
+        Ping::Alive(reply) => {
+            if !quiet {
+                println!("{reply}");
+            }
+        }
+        failed => eprintln!("atrium ctl ping: {}", failed.line()),
+    }
+    ExitCode::from(outcome.exit_code())
 }
 
 /// What `wait` waits for.
@@ -550,6 +745,17 @@ fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String>
         Some("spawn") => spawn_req(args, &mut pairs)?,
         Some("list") => {
             pairs.push(("cmd", s("list")));
+        }
+        Some("ping") => {
+            // `--timeout` is the client's own bound ([`parse_ping`]); the
+            // request carries nothing but the verb.
+            pairs.push(("cmd", s("ping")));
+        }
+        Some("metrics") => {
+            if let Some(extra) = args.get(1) {
+                return Err(format!("metrics: unexpected argument {extra:?}"));
+            }
+            pairs.push(("cmd", s("metrics")));
         }
         Some("send") => send_req(args, &mut pairs)?,
         Some("status") => status_req(args, &mut pairs)?,

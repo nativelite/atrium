@@ -311,6 +311,7 @@ impl RunState<'_> {
                                 max_depth: self.max_depth,
                                 extra_allow: &self.ctl_extra_allow,
                                 pending: &mut self.pending_sends,
+                                held_inboxes: self.held_inboxes.len(),
                                 world: &self.world,
                                 session_identity: self.launch.identity,
                                 audit: &mut self.ctl_audit,

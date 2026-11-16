@@ -58,6 +58,8 @@ Targets are a pane **id** (its numeric agent id) or a **role** label (`dev_1`); 
 | `atrium ctl bus feed [--since <seq>]` | Pull the caller's subscribed events with `seq > since` (no echo of your own); returns a `cursor` to resume from. | `{"ok":true,"feed":[{"seq":7,"topic":"deploy",…}],"cursor":7}` |
 | `atrium ctl bus resolve <seq>` | Mark a `decision_needed` event answered (clears the bar/panel escalation). | `{"ok":true,"seq":7,"resolved":true}` |
 | `atrium ctl bus topics` | List the active topics with how many panes subscribe to each — discoverability before you `sub`. | `{"ok":true,"topics":[{"topic":"deploy","subs":2},…]}` |
+| `atrium ctl ping [--timeout <ms>]` | Is the session answering? Exit `0` when its run loop replied, exit `1` with one line (no endpoint, connection refused, timeout) otherwise; never waits past the timeout (1000 ms by default, 30000 at most). Needs no token; made for a liveness probe (see [reading from a host](#reading-the-control-plane-from-a-host)). | `{"ok":true,"atrium":"0.47.0","uptime_ms":90500}` |
+| `atrium ctl metrics` | The session's counters in the Prometheus text exposition format (`--json`: the raw reply): panes by state, wakes delivered, held inboxes, bus depth and last seq, open decisions, uptime. Counts only; needs no token. | `atrium_panes{state="working"} 2` … or `{"ok":true,"atrium":"0.47.0","uptime_ms":90500,"panes":{…},…}` |
 | `atrium ctl hello mod=<v> [engine=<v>] [caps=<a,b,…>]` | A pane's mod announces itself; the broker answers with the capabilities it accepts. About the caller only. | `{"ok":true,"pane":3,"accepted":["status","answer",…]}` |
 | `atrium ctl report [status=<s>] [reason=<r>] [context=<pct>] [cost=<usd>] [turns=<n>] [answer=<text>] [doing=<caption>] [touched=<path>]… [ask=<id> reply=<text>]` | A pane's mod reports its own status, usage or last answer; its **caption** (`doing`, a few words on what it is doing now; empty clears it); the real paths it **touched** with an edit (one `touched=` per path); or its **reply** to a queued question. About the caller only; a `target` is refused, and a reply is accepted only for an ask put to that pane. | `{"ok":true,"pane":3}` |
 | `atrium ctl whoami` | What the caller is: pane, role, parent, depth, mode, worktree, cwd, deny rules, whether it may spawn, its mod, the board item whose `owner`/`builder` names its role and that item's `files`, and the session's subagent policy. | `{"ok":true,"pane":3,"role":"builder",…,"item":"M1","files":[…],"subagents":"panes"}` |
@@ -134,7 +136,7 @@ The multiplier: many workers, coordinated by a few of them, driven by one human,
 
 ## Reading the control plane from a host
 
-A terminal or dashboard that hosts atrium can read the session's state over the control channel instead of the `ATRIUM_BUS` sidecar, which it still writes. The channel is `\.\pipetrium-ctl-<pid>` on Windows and the `0600` socket named by `ATRIUM_CTL` elsewhere; one JSON line in, one JSON line out, one request per connection. The verbs that need **no token** are the reads: `list`, `status`, `audit`, `board get`, `board list`, `bus feed`, `bus topics`. Everything that mutates the fleet or its shared state, and every verb that returns a model's words (`answer`, `asked`, `inbox`, `who`), needs the caller pane's `ATRIUM_TOKEN` and is scoped to that pane's subtree.
+A terminal or dashboard that hosts atrium can read the session's state over the control channel instead of the `ATRIUM_BUS` sidecar, which it still writes. The channel is `\.\pipetrium-ctl-<pid>` on Windows and the `0600` socket named by `ATRIUM_CTL` elsewhere; one JSON line in, one JSON line out, one request per connection. The verbs that need **no token** are the reads: `list`, `status`, `audit`, `board get`, `board list`, `bus feed`, `bus topics`, and from 0.47.0 `ping` and `metrics`. Everything that mutates the fleet or its shared state, and every verb that returns a model's words (`answer`, `asked`, `inbox`, `who`), needs the caller pane's `ATRIUM_TOKEN` and is scoped to that pane's subtree.
 
 What a host may rely on, from 0.43.0 on:
 
@@ -145,6 +147,24 @@ What a host may rely on, from 0.43.0 on:
 - **`list` names the atrium that answered**: `"atrium":"<version>"`. Key feature expectations on that, never on the presence of a key.
 - **Status words are the agsess vocabulary** (`working`, `waiting-approval`, `waiting-prompt`, `idle`, `errored`, `ended`) or `null` for an unbound pane; `idle_ms` is milliseconds since the pane's last activity.
 - **The sidecar stays.** `ATRIUM_BUS` and `ATRIUM_BOARD` keep their snapshot format; a host that cannot reach the channel (ctl off, or a sandbox between) falls back to them.
+- **`ping` is the liveness probe** (0.47.0). The reply is `{"ok":true,"atrium":"<version>","uptime_ms":N}`, and it is the run loop that writes it, so an answer means the loop is turning. `atrium ctl ping [--timeout <ms>]` exits `0` on that answer and prints it; otherwise it exits `1` with one line on stderr that starts `no endpoint` (`ATRIUM_CTL` unset, or nothing bound there), `connection refused` (a unix socket left by an atrium that is gone) or `timeout` (the endpoint took the connection and the loop did not answer). It asks once (on Windows every other verb retries a missing pipe name for up to 30 s), and the timeout bounds the whole exchange, connect included: 1000 ms by default, 30000 at most. A request that fails any other way, or an answer that is not a ping reply (an atrium older than 0.47.0 refuses the verb), is also exit `1`.
+- **`metrics` is counts, and only counts** (0.47.0). The reply is `{"ok":true,"atrium":"<version>","uptime_ms":N,"panes":{"working":N,"waiting-approval":N,"waiting-prompt":N,"idle":N,"errored":N,"ended":N,"unbound":N},"wakes_delivered":N,"held_inboxes":N,"bus_depth":N,"bus_last_seq":N,"open_decisions":N}`: every state key is always there (`unbound` is a pane with no status, the `null` of `list`), `wakes_delivered` counts bus wake lines handed to a pane since the session started (typed into it, or taken by its mod; events that land together for one pane are one line), `held_inboxes` the `inbox --wait` connections open now, `bus_depth` the events in the ring (512 at most), `bus_last_seq` the newest event's `seq` (`0` before the first) and `open_decisions` the unresolved `decision_needed` events. `atrium ctl metrics` prints them in the Prometheus text exposition format, and `--json` prints the reply itself:
+
+  ```text
+  # HELP atrium_build_info The atrium that answered, as the version label; the value is always 1.
+  # TYPE atrium_build_info gauge
+  atrium_build_info{version="0.47.0"} 1
+  # HELP atrium_uptime_seconds Seconds since the session's run loop started.
+  # TYPE atrium_uptime_seconds gauge
+  atrium_uptime_seconds 90.500
+  # HELP atrium_panes Panes by state; unbound is a pane with no agent status.
+  # TYPE atrium_panes gauge
+  atrium_panes{state="working"} 2
+  atrium_panes{state="unbound"} 1
+  ```
+
+  and in the same way `atrium_wakes_delivered_total` (a counter), `atrium_held_inboxes`, `atrium_bus_depth`, `atrium_bus_last_seq` and `atrium_open_decisions` (gauges), with one `atrium_panes` line per state. The only labels are `version` and `state`, and `state` takes the seven fixed names: no role, title or other text a pane chose is ever a label or a value.
+- **Probes are not audited.** `ping` and `metrics` are answered without an entry in the audit log: asked every few seconds for the life of a session, they would push every real action out of its ring. Every other read is still recorded.
 
 The exact reply shapes are pinned by tests in `src/ctl/tests.rs` (`golden_*`); a change that breaks one is a wire change and goes in the changelog as such.
 
