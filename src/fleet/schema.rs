@@ -68,6 +68,12 @@ pub struct Fleet {
     /// `both`, `bell`, `toast` or `off`. The config's `"notify"` fills an
     /// absent key; absent everywhere, `both`.
     pub notify: Option<crate::attention::Notify>,
+    /// `commands`: the slash commands `atrium ctl command` may deliver to an
+    /// agent's pane in this fleet (`["/compact", "/clear"]`). `Some` replaces
+    /// the config's `"commands"`, an empty list included; absent, the
+    /// config's fills it. The launch banner shows the list: each entry is a
+    /// grant to every pane that can reach another.
+    pub commands: Option<Vec<String>>,
     /// How the model's subagents run in this fleet's claude panes:
     /// `panes` (visible panes, the default), `native` or `deny`
     /// ([`crate::modstate::Subagents`]).
@@ -368,6 +374,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
             ))
         }
     };
+    let commands = crate::ctl::parse_commands(get("commands"), &format!("fleet {name:?}"))?;
     let subagents = match get("subagents") {
         Some(v) => {
             let word = v.as_str().ok_or_else(|| {
@@ -542,6 +549,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         teams,
         title,
         notify,
+        commands,
         subagents,
         subagents_keep,
         captions,

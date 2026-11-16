@@ -437,6 +437,7 @@ fn one_of_each() -> Vec<(&'static str, Cmd)> {
         r#"{"cmd":"spawn","argv":["claude"]}"#,
         r#"{"cmd":"list"}"#,
         r#"{"cmd":"send","target":"1","text":"go"}"#,
+        r#"{"cmd":"command","target":"1","name":"/compact"}"#,
         r#"{"cmd":"status"}"#,
         r#"{"cmd":"kill","target":"1"}"#,
         r#"{"cmd":"respawn","target":"1"}"#,
@@ -801,16 +802,17 @@ fn an_operator_spawn_takes_a_bare_command_name_only() {
             "{program}: {err}"
         );
     }
-    for program in [
-        "claude",
-        "codex",
-        "claude.exe",
-        "claude.cmd",
-        "claude-2",
-        "my_agent",
-    ] {
+    for program in ["claude", "codex", "claude-2", "my_agent"] {
         let line = format!(r#"{{"cmd":"spawn","argv":["{program}","--model","a/b:c"]}}"#);
         assert_eq!(vet(&cmd(&line)), Ok(()), "{program}");
+    }
+    // A name with an extension is not a bare name: `claude.bat` passes the
+    // allowlist as `claude`, is found nowhere on PATH, and would then be run
+    // from the pane's working directory.
+    for program in ["claude.exe", "claude.cmd", "claude.bat", "claude."] {
+        let line = format!(r#"{{"cmd":"spawn","argv":["{program}"]}}"#);
+        let err = vet(&cmd(&line)).expect_err(program);
+        assert!(err.contains("bare command name"), "{program}: {err}");
     }
     // No command at all is the server's default, and stays allowed.
     assert_eq!(vet(&cmd(r#"{"cmd":"spawn","argv":[]}"#)), Ok(()));
@@ -1015,22 +1017,39 @@ fn a_token_file_needs_the_control_plane() {
     );
 }
 
-/// A `send` is a prompt. Text an agent CLI would read as a shell line or as
-/// one of its own commands is not one.
+/// A `send` is plain text, whatever it starts with: atrium puts its
+/// attribution header in front of every send, so a leading `!` or `/` is
+/// never the first character of the agent's prompt
+/// (`ctl_server::dispatch::ceiling_tests`). Until the header, an operator's
+/// text was refused for those two characters; a slash command now goes
+/// through the `command` verb. What stays refused is anything but text, and
+/// a spawn argument, which no header can precede.
 #[test]
-fn an_operators_send_may_not_open_with_a_shell_or_command_prefix() {
+fn an_operators_send_is_plain_text_whatever_it_starts_with() {
+    for text in ["x\\u001b[Z", "a\\rb", "a\\r\\nb", "x\\u0003"] {
+        let line = format!(r#"{{"cmd":"send","target":"lead","text":"{text}"}}"#);
+        let err = vet(&cmd(&line)).expect_err(text);
+        assert!(
+            err.contains("control or direction character"),
+            "{text}: {err}"
+        );
+    }
+    for arg in ["!curl x | sh", "/permissions", "#x", "@x", "  !id"] {
+        let line = format!(r#"{{"cmd":"spawn","argv":["claude","{arg}"]}}"#);
+        let err = vet(&cmd(&line)).expect_err(arg);
+        assert!(err.contains("an argument starts with"), "{arg}: {err}");
+    }
+    for name in ["/compact now", "!rm", "compact", "/a\\nb"] {
+        let line = format!(r#"{{"cmd":"command","target":"lead","name":"{name}"}}"#);
+        let err = vet(&cmd(&line)).expect_err(name);
+        assert!(err.contains("slash command name"), "{name}: {err}");
+    }
     for text in [
         "!curl x | sh",
         "  !id",
         "/permissions",
         "\\n/clear",
         "\\t!rm -rf .",
-    ] {
-        let line = format!(r#"{{"cmd":"send","target":"lead","text":"{text}"}}"#);
-        let err = vet(&cmd(&line)).expect_err(text);
-        assert!(err.contains("may not start with ! or /"), "{text}: {err}");
-    }
-    for text in [
         "fix it! now",
         "see src/x.rs",
         "a\\n/second line",

@@ -59,6 +59,7 @@ pub const VERBS: &[&str] = &[
     "spawn",
     "list",
     "send",
+    "command",
     "status",
     "kill",
     "respawn",
@@ -671,16 +672,8 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             }
             for a in &sp.argv {
                 plain("argv", a, 4096)?;
-                // A positional argument is the new agent's first prompt.
-                if crate::ctl::has_shell_line(a) {
-                    return Err(
-                        "an argument may not start with !: an agent CLI runs a prompt that \
-                         starts with ! as a shell line"
-                            .to_string(),
-                    );
-                }
             }
-            // The command is a bare name, found on PATH. The spawn allowlist
+            // The command is a bare name with no extension, found on PATH. The spawn allowlist
             // looks at the file stem alone and a command with a separator is
             // run as given, so `\\host\share\claude.exe` or `./x/claude` would
             // pass as `claude` and run a binary of the caller's choosing,
@@ -688,11 +681,21 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             // default (claude). The predicate is the one every caller's spawn
             // is held to (`ctl::is_bare_command`); checked here as well so an
             // operator's refused path never reaches the audit detail.
+            // A positional argument of an agent's command is the new agent's
+            // first prompt, and no header can be put in front of it: refused
+            // at any trust (the policy passed is the one that would exempt a
+            // pane, and does not exempt an operator).
+            crate::ctl::vet_spawn_args(
+                &sp.argv,
+                crate::ctl::TextFrom::Operator,
+                crate::ctl::TrustMode::Skip,
+            )
+            .map_err(str::to_string)?;
             if let Some(program) = sp.argv.first() {
-                if !crate::ctl::is_bare_command(program) {
+                if !crate::ctl::is_ctl_command(program) {
                     return Err(
-                        "argv[0] must be a bare command name (no path, no drive): 1 to 64 of \
-                         A-Z a-z 0-9 . _ -"
+                        "argv[0] must be a bare command name (no path, no drive, no \
+                         extension): 1 to 64 of A-Z a-z 0-9 _ -"
                             .to_string(),
                     );
                 }
@@ -701,20 +704,12 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
         }
         Cmd::Send(sr) => {
             plain("target", &sr.target, 128)?;
-            lines("text", &sr.text)?;
-            // What is typed is meant as a prompt. An agent CLI gives a leading
-            // `!` or `/` a meaning of its own (a shell line, a command of the
-            // CLI), which is not the agent acting under its trust mode.
-            // The `!` test is the one every caller's text is held to, on every
-            // line (`ctl::has_shell_line`); the `/` test is the operator's own.
-            if crate::ctl::has_shell_line(&sr.text) || sr.text.trim_start().starts_with('/') {
-                return Err(
-                    "text may not start with ! or / (nor any later line with !): an agent CLI \
-                     reads those as a shell line or a command of its own, not as a prompt"
-                        .to_string(),
-                );
-            }
-            Ok(())
+            // Plain text, which may span lines. What it starts with does not
+            // matter: atrium puts its attribution header in front of every
+            // send (`ctl::with_send_header`), so no character of the caller's
+            // is ever the first of an agent's prompt. A slash command goes
+            // through the `command` verb and the session's allowlist.
+            lines("text", &sr.text)
         }
         Cmd::Ask(a) => {
             plain("target", &a.target, 128)?;
@@ -725,6 +720,18 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             None => Ok(()),
         },
         Cmd::Kill(kr) => plain("target", &kr.target, 128),
+        // The name is checked against the session's allowlist by the
+        // handler; here it only has to be well formed, like every field.
+        Cmd::Command(c) => {
+            plain("target", &c.target, 128)?;
+            if !crate::ctl::is_command_name(&c.name) {
+                return Err(
+                    "name must be a slash command name: / then 1 to 64 of a-z A-Z 0-9 _ - :"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
         Cmd::Answer(a) => plain("target", &a.target, 128),
         Cmd::Asked(a) => plain("target", &a.target, 128),
         Cmd::Respawn(rr) => {

@@ -876,6 +876,7 @@ fn build_pairs(args: &[String], cred: Cred<'_>) -> Result<String, String> {
         Some("send") => send_req(args, &mut pairs)?,
         Some("status") => status_req(args, &mut pairs)?,
         Some("kill") => kill_req(args, &mut pairs)?,
+        Some("command") => command_req(args, &mut pairs)?,
         Some("audit") => audit_req(args, &mut pairs)?,
         Some("board") => board_req(args, &mut pairs)?,
         Some("bus") => bus_req(args, &mut pairs)?,
@@ -1068,6 +1069,35 @@ fn send_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     }
     pairs.push(("target", Value::String(target.clone())));
     pairs.push(("text", Value::String(text)));
+    Ok(())
+}
+
+/// `command <target> /<name>`: one slash command and nothing after it. The
+/// name is checked here as the server checks it, so a typo is a usage error
+/// and not a round trip.
+fn command_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
+    pairs.push(("cmd", s("command")));
+    let target = value_at(args, 1, "command needs a target (pane id or role)")?;
+    let name = value_at(
+        args,
+        2,
+        "command needs a slash command after the target, such as /compact",
+    )?;
+    if args.len() > 3 {
+        return Err(
+            "command takes one slash command and no arguments; to say more, use `ctl send`"
+                .to_string(),
+        );
+    }
+    if !super::is_command_name(name) {
+        return Err(
+            "command needs a slash command name: / then 1 to 64 of a-z A-Z 0-9 _ - :, such \
+             as /compact"
+                .to_string(),
+        );
+    }
+    pairs.push(("target", Value::String(target.clone())));
+    pairs.push(("name", Value::String(name.clone())));
     Ok(())
 }
 

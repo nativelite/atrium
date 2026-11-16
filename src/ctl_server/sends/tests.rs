@@ -274,3 +274,86 @@ fn nothing_is_typed_into_a_non_agent_pane_below_skip() {
     }
     assert!(may_type_into(false, Skip));
 }
+
+/// One `send`, one prompt. Whatever form a delivery takes, no byte of a
+/// two-line text can submit before the Enter that follows it: a paste
+/// carries its line break between the markers, a flat delivery has none
+/// left, and the raw form is only for a pane that is not an agent's (a
+/// `skip` session) or a one-word command.
+#[test]
+fn a_line_break_inside_a_delivery_cannot_submit_on_any_path() {
+    let text = "[atrium: from lead] line one\n!line two\r\nthree\rfour\tfive";
+    let flat = delivery_bytes(text, TypeAs::Flat);
+    assert_eq!(
+        String::from_utf8(flat.clone()).unwrap(),
+        "[atrium: from lead] line one \u{21b5} !line two \u{21b5} three \u{21b5} four five"
+    );
+    assert!(
+        !flat.iter().any(|b| *b < 0x20 || *b == 0x7f),
+        "no control byte at all in a flat delivery"
+    );
+    for odd in ["a\u{b}b", "a\u{c}b", "a\u{85}b", "a\u{2028}b", "a\u{2029}b"] {
+        assert_eq!(
+            String::from_utf8(delivery_bytes(odd, TypeAs::Flat)).unwrap(),
+            "a \u{21b5} b"
+        );
+    }
+    let pasted = delivery_bytes("a\n!b", TypeAs::Paste);
+    if cfg!(unix) {
+        assert_eq!(pasted, b"\x1b[200~a\n!b\x1b[201~");
+    }
+    assert_eq!(delivery_bytes("/compact", TypeAs::Raw), b"/compact");
+    for how in [TypeAs::Flat, TypeAs::Paste, TypeAs::Raw] {
+        assert!(!delivery_bytes("a\nb", how).ends_with(b"\r"), "{how:?}");
+    }
+}
+
+/// Which form each pane gets: an agent's pane a paste where its CLI takes
+/// one (unix) and one flat line everywhere else, Windows always; raw only
+/// for a pane that is not an agent's and for a command.
+#[test]
+fn an_agents_pane_is_typed_as_a_paste_or_as_one_line_never_raw() {
+    for origin in [SendOrigin::Ctl, SendOrigin::BusWake] {
+        for paste in [false, true] {
+            let how = type_as(true, origin, paste);
+            assert_ne!(how, TypeAs::Raw, "{origin:?} paste={paste}");
+            if cfg!(windows) || !paste {
+                assert_eq!(how, TypeAs::Flat);
+            } else {
+                assert_eq!(how, TypeAs::Paste);
+            }
+            assert_eq!(type_as(false, origin, paste), TypeAs::Raw);
+        }
+    }
+    assert_eq!(type_as(true, SendOrigin::Command, true), TypeAs::Raw);
+}
+
+/// An unbound agent CLI that never showed its prompt is not typed into when
+/// the wait runs out: the delivery is dropped (`flush_sends`), where it used
+/// to be typed into whatever the pane was showing.
+#[test]
+fn a_prompt_that_never_came_drops_the_delivery_instead_of_typing_it() {
+    let mut dialog = vterm::Term::new(6, 40);
+    dialog.feed(b"Do you trust the files in this folder?\r\n 1. Yes\r\n 2. No\r\n");
+    let mut prompt = vterm::Term::new(6, 40);
+    prompt.feed(b"> \r\n  ? for shortcuts\r\n");
+    for title in ["codex", "claude"] {
+        assert!(prompt_never_came(title, dialog.screen(), SEND_PROMPT_WAIT));
+        assert!(!prompt_never_came(
+            title,
+            dialog.screen(),
+            SEND_PROMPT_WAIT - Duration::from_secs(1)
+        ));
+        assert!(!prompt_never_came(
+            title,
+            prompt.screen(),
+            SEND_PROMPT_WAIT * 2
+        ));
+    }
+    // A program with no hint to wait for is not held to one.
+    assert!(!prompt_never_came(
+        "bash",
+        dialog.screen(),
+        SEND_PROMPT_WAIT * 2
+    ));
+}

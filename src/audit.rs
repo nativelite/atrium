@@ -41,6 +41,19 @@ pub fn field(s: &str) -> String {
     scrub(s, FIELD_MAX)
 }
 
+/// A path field for a detail: scrubbed like [`field`], but a long one keeps
+/// its **end**, behind a `…`: the file name is what a reader of `who path=`
+/// needs, and it is the last thing in a path.
+pub fn field_tail(s: &str) -> String {
+    let clean = crate::modstate::text_safe(s);
+    let n = clean.chars().count();
+    if n <= FIELD_MAX {
+        return clean;
+    }
+    let tail: String = clean.chars().skip(n - FIELD_MAX).collect();
+    format!("…{tail}")
+}
+
 /// One recorded ctl request and its outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -410,6 +423,15 @@ mod tests {
             ("target=dev len=7", "pane=1")
         );
         assert_eq!(field(&"x".repeat(FIELD_MAX)), "x".repeat(FIELD_MAX));
+        // A path keeps its end, the file name.
+        let path = format!("/w/{}/src/main.rs", "d/".repeat(200));
+        let kept = field_tail(&path);
+        assert!(
+            kept.starts_with('…') && kept.ends_with("/src/main.rs"),
+            "{kept}"
+        );
+        assert_eq!(kept.chars().count(), FIELD_MAX + 1);
+        assert_eq!(field_tail("src/\u{1b}x.rs"), "src/ x.rs");
         assert_eq!(
             field(&"x".repeat(FIELD_MAX + 1)).chars().count(),
             FIELD_MAX + 1

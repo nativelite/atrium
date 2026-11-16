@@ -100,7 +100,7 @@ pub fn is_bare_command(program: &str) -> bool {
 /// echoed; it is whatever the caller sent.
 pub const SPAWN_NEEDS_BARE_COMMAND: &str =
     "spawn refused: the command must be a bare name found on PATH (`claude`, `codex`), \
-     not a path. ctl checks a command by its file name and a path is run as given, so a \
+     not a path, and with no extension. ctl checks a command by its file name and a path is run as given, so a \
      path could start any program, outside the session's trust ceiling. Use the bare \
      name, with its directory on PATH where atrium was launched; a command that needs a \
      path belongs in a fleet file, which a person writes and approves";
@@ -149,78 +149,284 @@ pub fn text_may_land(
         }
 }
 
-/// The refusal for a pane's `ctl send` that [`text_may_land`] turned away:
-/// the reason, and the ways on.
+/// The refusal for a pane's `ctl send` (or `command`) that [`text_may_land`]
+/// turned away: the reason, and the ways on. It names the agent CLIs atrium
+/// knows and no setting: a pane running a command the human allowed with
+/// `ATRIUM_CTL_ALLOW` is not made an agent's by any alias list.
 pub fn send_into_non_agent_refusal(target: AgentId) -> String {
     format!(
-        "pane {target} is not an agent's pane: whatever is typed into a shell or another \
-         program is run by it as a command, with no permission gate, which would step over \
-         the session's trust ceiling. Send to an agent's pane (a claude wrapper is named in \
-         `claude_aliases` / ATRIUM_CLAUDE_ALIASES); have the human type it in that pane; or \
-         launch the session at `--trust skip`, where nothing is gated"
+        "pane {target} is not an agent's pane: text is typed only into the agent CLIs atrium \
+         knows ({}, or a claude alias), because a shell or any other program runs what is \
+         typed into it as a command, with no permission gate, which would step over the \
+         session's trust ceiling. The ways on: have the human type it in that pane; run a \
+         mod in that pane that takes its inbox (the text is then handed over, not typed); \
+         or launch the session at `--trust skip`, where nothing is gated",
+        bind::AGENT_STEMS.join(", ")
     )
 }
 
-/// Would an agent CLI take part of `text` as a **shell line**? Claude Code
-/// runs a prompt that starts with `!` as a shell command, directly: no model
-/// decision, no permission prompt. So text a ctl caller chose, put at the start
-/// of an agent's prompt, is command execution under any trust mode, exactly as
-/// typing into a shell pane is. True when:
+/// Is `program` a command a **ctl request** may name: a bare name
+/// ([`is_bare_command`]) with no `.` in it?
 ///
-/// * the first character of **any line** that is not whitespace (or an
-///   invisible format character) is `!`. Every line, not only the first: typed
-///   without bracketed paste (always on Windows) a newline can submit, and the
-///   next line then opens a fresh prompt. A control character ends a line here
-///   as a newline does: `x` then Ctrl+U or a backspace empties the input, and
-///   what follows starts it again;
-/// * or the text holds a `!` anywhere **and** a control character other than
-///   a newline, a carriage return or a tab. An escape sequence can move the
-///   cursor (`cmd`, Home, `!`), so where the `!` sits in the text says nothing
-///   about where it lands in the input line.
-///
-/// A `!` inside a line of plain text (`wow!`, `a != b`) is not one. Pure.
-pub fn has_shell_line(text: &str) -> bool {
-    if !text.contains('!') {
-        return false;
-    }
-    let breaks = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
-    if text
-        .chars()
-        .any(|c| breaks(c) && !matches!(c, '\n' | '\r' | '\t'))
-    {
-        return true;
-    }
-    let skipped = |c: char| {
-        c.is_whitespace() || crate::modstate::text_safe(c.encode_utf8(&mut [0; 4])) == " "
-    };
-    text.split(breaks)
-        .any(|line| line.chars().find(|c| !skipped(*c)) == Some('!'))
+/// The dot matters on Windows. `claude.bat`, `claude.exe` (where claude is an
+/// npm `.cmd` shim) or `claude.` pass the stem allowlist as `claude`, are
+/// found nowhere on `PATH`, and are then handed to the system unresolved: a
+/// batch file runs under `cmd.exe`, which looks in the pane's working
+/// directory first, so a text file named `claude.bat` in the project (or in
+/// the worktree a spawn names) would run with no posture at all. With no dot
+/// there is no extension for the caller to choose: the name is looked up on
+/// `PATH` with the system's own extensions ([`crate::resolve::resolve`]).
+pub fn is_ctl_command(program: &str) -> bool {
+    is_bare_command(program) && !program.contains('.')
 }
 
-/// May `text`, chosen by a ctl caller, be put at an agent's prompt: a `send`,
-/// or an argument of a `ctl spawn` command (a positional one is the new
-/// agent's first prompt)? `Err` is the refusal, with the reason and the way
-/// on. An operator's text is refused at any trust; a pane's unless the
-/// session's launch trust is `skip`, where nothing is gated anyway. Pure.
-pub fn vet_prompt_text(
-    text: &str,
+/// The first character of `text` that is neither whitespace nor one of the
+/// characters that do not show ([`crate::modstate::text_safe`]'s set).
+fn first_shown(text: &str) -> Option<char> {
+    text.chars().find(|c| {
+        !c.is_whitespace() && crate::modstate::text_safe(c.encode_utf8(&mut [0; 4])) != " "
+    })
+}
+
+/// The characters an agent CLI gives a meaning of its own at the start of a
+/// prompt: `!` a shell line, `/` a command of the CLI, `#` a memory note, `@`
+/// a file or agent mention. This one is a list, and it guards one place only:
+/// the arguments of a `ctl spawn` command, where a positional argument is the
+/// new agent's first prompt and atrium cannot put a header in front of it.
+/// Everywhere else the rule is structural (see [`send_header`]).
+pub const PROMPT_LEADERS: [char; 4] = ['!', '/', '#', '@'];
+
+/// May `arg`, an argument of a `ctl spawn` command, be passed to the new
+/// agent? Refused when its first shown character is one of
+/// [`PROMPT_LEADERS`]: for an operator at any trust, for a pane unless the
+/// session's launch trust is `skip`. Pure.
+pub fn vet_spawn_arg(
+    arg: &str,
     from: TextFrom,
     policy: super::TrustMode,
 ) -> Result<(), &'static str> {
     let exempt = from == TextFrom::Pane && policy == super::TrustMode::Skip;
-    if !exempt && has_shell_line(text) {
-        return Err(SHELL_LINE_REFUSED);
+    if !exempt && first_shown(arg).is_some_and(|c| PROMPT_LEADERS.contains(&c)) {
+        return Err(SPAWN_ARG_REFUSED);
     }
     Ok(())
 }
 
-/// The refusal for text [`vet_prompt_text`] turned away.
-pub const SHELL_LINE_REFUSED: &str =
-    "refused: a line of this text starts with `!` (or the text mixes `!` with control \
-     characters). An agent CLI runs a line that starts with `!` as a shell command, with \
-     no permission gate, which would step over the session's trust ceiling. Say what you \
-     want done in words, or have the human type it in that pane (a pane's own request is \
-     taken as written in a session launched at `--trust skip`)";
+/// [`vet_spawn_arg`] over the arguments of a spawn command, when the command
+/// is an **agent CLI** (by its stem, as the allowlist reads it). Only there
+/// is a positional argument a prompt. A command the human allowed beside the
+/// agents (`ATRIUM_CTL_ALLOW`: a shell, a tool) takes its arguments as it
+/// always did: `cmd /Q` is a flag, and that command's pane is not one text is
+/// typed into either. Pure but for the session's claude aliases.
+pub fn vet_spawn_args(
+    argv: &[String],
+    from: TextFrom,
+    policy: super::TrustMode,
+) -> Result<(), &'static str> {
+    let Some(program) = argv.first() else {
+        return Ok(());
+    };
+    if !bind::is_agent_stem(&bind::command_stem(program)) {
+        return Ok(());
+    }
+    argv.iter()
+        .skip(1)
+        .try_for_each(|arg| vet_spawn_arg(arg, from, policy))
+}
+
+/// The refusal for an argument [`vet_spawn_arg`] turned away.
+pub const SPAWN_ARG_REFUSED: &str =
+    "spawn refused: an argument starts with `!`, `/`, `#` or `@`. A positional argument is \
+     the new agent's first prompt, and an agent CLI reads a prompt that starts with one of \
+     those as a shell line, a command of its own, a memory note or a mention, not as a \
+     task, which would step over the session's trust ceiling. Start the prompt with a \
+     word; or spawn the agent and `ctl send` it the text";
+
+/// Vet the text of a `ctl send` and return it as it will be delivered. Pure.
+///
+/// A pane's text, below `skip`, and an operator's at any trust, may hold
+/// **no control character but a newline and a tab**, and none of the
+/// characters that reorder or hide text. What is delivered is typed into a
+/// terminal program: `ESC [ Z` (Shift+Tab) cycles Claude Code's permission
+/// mode, `ESC [ 201 ~` ends a bracketed paste early, a CSI-u sequence can
+/// spell any key, Ctrl+C, Esc and the arrows drive a dialog. None of those
+/// is text. `\r\n` is taken as `\n` for a pane (a Windows caller's line
+/// ending); a bare `\r` is an Enter and is refused. An operator's text is
+/// held to its own vetting before this ([`crate::operator::vet`]), which
+/// refuses every `\r`.
+///
+/// At `skip` a pane's text is delivered as written: nothing is gated there.
+pub fn vet_send_text(
+    text: &str,
+    from: TextFrom,
+    policy: super::TrustMode,
+) -> Result<String, &'static str> {
+    if from == TextFrom::Pane && policy == super::TrustMode::Skip {
+        return Ok(text.to_string());
+    }
+    let text = match from {
+        TextFrom::Pane => text.replace("\r\n", "\n"),
+        TextFrom::Operator => text.to_string(),
+    };
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+        .collect();
+    if crate::modstate::text_safe(&flat) != flat {
+        return Err(SEND_CONTROL_REFUSED);
+    }
+    Ok(text)
+}
+
+/// The refusal for text [`vet_send_text`] turned away.
+pub const SEND_CONTROL_REFUSED: &str =
+    "refused: the text holds a control character (an escape, a carriage return on its \
+     own, Ctrl+C, …) or a character that reorders or hides text. What is sent is typed \
+     into the agent's terminal, where those are keys, not text: they can switch its \
+     permission mode or answer a dialog, which would step over the session's trust \
+     ceiling. Send plain text (newlines and tabs are fine); a pane's text is taken as \
+     written only in a session launched at `--trust skip`";
+
+/// The opening of the attribution header, which a body may not reproduce.
+const HEADER_FRAME: &str = "[atrium:";
+
+/// Longest a sender's label is shown in a header.
+const HEADER_LABEL_MAX: usize = 48;
+
+/// The attribution header atrium puts in front of every `ctl send` that is
+/// delivered into an agent's prompt: `[atrium: from <label>] `, on the same
+/// line as the start of the text.
+///
+/// This is what makes a `send` a message and never a command of the agent
+/// CLI: **the first character of the prompt is atrium's `[`, whatever the
+/// caller sent**, so a text that starts with `!`, `/`, `#` or `@` is read as
+/// text. No list of special characters is involved, and none has to be kept
+/// up with the CLIs.
+///
+/// `label` is the sender as the broker knows it (a pane's role or `pane N`,
+/// `operator:<name>`), never a field of the request. It is scrubbed of
+/// control and direction characters, cut to 48 characters, and its `[` and
+/// `]` become `(` and `)`, so a role cannot close the frame or open another.
+pub fn send_header(label: &str) -> String {
+    let label: String = crate::modstate::text_safe(label)
+        .chars()
+        .take(HEADER_LABEL_MAX)
+        .map(|c| match c {
+            '[' => '(',
+            ']' => ')',
+            c => c,
+        })
+        .collect();
+    format!("{HEADER_FRAME} from {}] ", label.trim())
+}
+
+/// `text` as delivered into an agent's prompt: [`send_header`], then the
+/// text with any imitation of the frame defanged (`[atrium:` becomes
+/// `(atrium:`), so a later line cannot pass for a second message from someone
+/// else. One frame per delivery, the real one. Pure.
+pub fn with_send_header(label: &str, text: &str) -> String {
+    format!(
+        "{}{}",
+        send_header(label),
+        text.replace(HEADER_FRAME, "(atrium:")
+    )
+}
+
+// ---- the `command` verb ------------------------------------------------------
+
+/// Is `name` a well-formed slash command name: `/` then 1 to 64 of
+/// `a-z A-Z 0-9 _ - :`? No space, so no argument; nothing a shell or a
+/// terminal reads specially. The form of every entry of the `commands`
+/// allowlist and of the name a `ctl command` request carries.
+pub fn is_command_name(name: &str) -> bool {
+    name.strip_prefix('/').is_some_and(|rest| {
+        (1..=64).contains(&rest.len())
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
+    })
+}
+
+/// Parse a `commands` allowlist (the user config's or a fleet's): an array of
+/// slash command names, each [`is_command_name`]. `whose` names the file and
+/// key for the error. Absent or `null` is `None` (not set), which is not the
+/// same as `[]` (set, and empty: a fleet's `[]` replaces the config's list).
+pub fn parse_commands(v: Option<&json::Value>, whose: &str) -> Result<Option<Vec<String>>, String> {
+    let items = match v {
+        None | Some(json::Value::Null) => return Ok(None),
+        Some(json::Value::Array(items)) => items,
+        Some(_) => {
+            return Err(format!(
+                "{whose}: \"commands\" must be an array of slash command names, such as \
+                 [\"/compact\", \"/clear\"]"
+            ))
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in items {
+        let name = item
+            .as_str()
+            .filter(|n| is_command_name(n))
+            .ok_or_else(|| {
+                format!(
+                    "{whose}: every entry of \"commands\" is a slash command name: / then 1 to \
+                 64 of a-z A-Z 0-9 _ - : (no arguments), such as \"/compact\""
+                )
+            })?;
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    Ok(Some(out))
+}
+
+/// The session's command allowlist, set once at launch from a fleet
+/// ([`set_session_commands`]).
+static SESSION_COMMANDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record the session's command allowlist (a fleet's `commands`, already
+/// filled from the config where the fleet set none). First call wins: it is
+/// made before any pane exists, and nothing a ctl request says reaches it.
+pub fn set_session_commands(commands: Vec<String>) {
+    let _ = SESSION_COMMANDS.set(commands);
+}
+
+/// The slash commands `ctl command` may deliver in this session: the fleet's
+/// list when one was launched, else the user config's `commands`. Empty by
+/// default.
+pub fn session_commands() -> Vec<String> {
+    SESSION_COMMANDS
+        .get()
+        .cloned()
+        .unwrap_or_else(|| crate::config::get().commands.clone())
+}
+
+/// May `name` be delivered by `ctl command`, given the session's allowlist?
+/// `Err` is the refusal. Pure.
+pub fn vet_command(name: &str, allowed: &[String]) -> Result<(), String> {
+    if !is_command_name(name) {
+        return Err(
+            "command refused: it takes one slash command name and no arguments (/ then 1 \
+             to 64 of a-z A-Z 0-9 _ - :), such as /compact. To say more, use `ctl send`"
+                .to_string(),
+        );
+    }
+    if allowed.is_empty() {
+        return Err(format!(
+            "command refused: no slash command is allowed in this session. The human \
+             lists the ones a pane may run in a teammate, as \"commands\": [{name:?}] in \
+             the fleet file or in the user config; a ctl request cannot add to that list"
+        ));
+    }
+    if !allowed.iter().any(|a| a == name) {
+        return Err(format!(
+            "command refused: {name} is not on this session's command allowlist ({}). The \
+             human sets it, as \"commands\" in the fleet file or the user config",
+            allowed.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 /// Permission-posture flags that **atrium** owns, not the spawning agent. A hosted
 /// agent running `atrium ctl spawn -- claude …` must not be able to hand its

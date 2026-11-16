@@ -61,6 +61,9 @@ pub enum Reply {
     BusPublished {
         event: Value,
         subscribers: usize,
+        /// What the publisher should know about the delivery; absent when
+        /// there is nothing to say.
+        note: Option<String>,
     },
     BusSubscribed(Vec<String>),
     BusFeed {
@@ -275,11 +278,21 @@ impl Reply {
                 ("key", s(key)),
                 ("released", Value::Bool(*released)),
             ]),
-            Reply::BusPublished { event, subscribers } => obj(vec![
-                ok,
-                ("event", event.clone()),
-                ("subscribers", i(*subscribers)),
-            ]),
+            Reply::BusPublished {
+                event,
+                subscribers,
+                note,
+            } => {
+                let mut members = vec![
+                    ok,
+                    ("event", event.clone()),
+                    ("subscribers", i(*subscribers)),
+                ];
+                if let Some(n) = note {
+                    members.push(("note", s(n)));
+                }
+                obj(members)
+            }
             Reply::BusSubscribed(topics) => obj(vec![
                 ok,
                 (
@@ -631,7 +644,22 @@ pub fn reply_board_release(key: &str, released: bool) -> Reply {
 /// unaffected — and the client turns a `0` into a STDERR warning
 /// ([`zero_sub_warning`]), never touching this stdout JSON.
 pub fn reply_bus_published(event: Value, subscribers: usize) -> Reply {
-    Reply::BusPublished { event, subscribers }
+    Reply::BusPublished {
+        event,
+        subscribers,
+        note: None,
+    }
+}
+
+/// [`reply_bus_published`] with a `note`: what the publisher should know
+/// about the delivery, such as a pane that was not woken because it is not an
+/// agent's. An additive key, present only when there is something to say.
+pub fn reply_bus_published_noted(event: Value, subscribers: usize, note: Option<String>) -> Reply {
+    Reply::BusPublished {
+        event,
+        subscribers,
+        note,
+    }
 }
 
 /// `{"ok":true,"subscribed":[<topic>,…]}` — the caller's full topic set after a

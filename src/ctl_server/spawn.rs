@@ -246,6 +246,58 @@ pub(crate) fn spawn_worker_here(
     }
 }
 
+/// The file a ctl spawn's bare command names on `PATH`, as an absolute path:
+/// what a Windows spawn runs in place of the name.
+///
+/// A name left for the system to find is not found on `PATH` alone. A name
+/// atrium's own lookup misses is handed over as it is, and `CreateProcess`
+/// then searches atrium's working directory, and `cmd.exe` (which runs a
+/// batch shim) the pane's: a file named for an agent that is not installed,
+/// dropped in the project or in the worktree a spawn names, would run with
+/// no posture. So the lookup is done here, over the **absolute** directories
+/// of `PATH` only (an empty or relative entry is the current directory under
+/// another name), with the system's own extensions, and a name it does not
+/// find is refused.
+///
+/// `Ok(None)` for a command that already is a path: the only one that reaches
+/// here is the caller's own recorded command (a spawn with none given), which
+/// a fleet file or the launch approved as written. Pure over its inputs.
+#[cfg_attr(
+    not(windows),
+    allow(dead_code, reason = "applied to Windows spawns; tested everywhere")
+)]
+pub(crate) fn pin_to_path(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&str>,
+) -> Result<Option<String>, String> {
+    if command.contains(['/', '\\']) {
+        return Ok(None);
+    }
+    let dirs: Vec<std::path::PathBuf> = path
+        .map(|p| {
+            std::env::split_paths(p)
+                .filter(|d| d.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    let exts: Vec<String> = pathext
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    match atrium::resolve::resolve(command, &dirs, &exts) {
+        Some(found) => Ok(Some(found.to_string_lossy().into_owned())),
+        None => Err(format!(
+            "spawn refused: {command:?} was not found in any directory of PATH (relative and \
+             empty entries, which mean the current directory, are not searched). A ctl spawn \
+             runs the file its command names on PATH and nothing else; install it, or put \
+             its directory on PATH before launching atrium"
+        )),
+    }
+}
+
 /// `ctl spawn`: the guards, in order — may this caller create teammates, is the
 /// role free, is the argv one a teammate may run, the effective trust mode, the
 /// depth cap, the pane cap, and credential delegation — then a new window, or
@@ -327,19 +379,17 @@ pub(crate) fn spawn(
     if sp
         .argv
         .first()
-        .is_some_and(|program| !ctl::is_bare_command(program))
+        .is_some_and(|program| !ctl::is_ctl_command(program))
     {
         return ctl::reply_err(ctl::SPAWN_NEEDS_BARE_COMMAND);
     }
-    // A positional argument of an agent's command is its first prompt, and an
-    // agent CLI runs a prompt that starts with `!` as a shell line: the same
-    // rule as for a `send` ([`ctl::vet_prompt_text`]), on every argument.
-    // (An operator's argv was refused for this at any trust, by its vetting.)
-    let policy = trust_mode();
-    for arg in sp.argv.iter().skip(1) {
-        if let Err(why) = ctl::vet_prompt_text(arg, ctl::TextFrom::Pane, policy) {
-            return ctl::reply_err(why);
-        }
+    // A positional argument of an agent's command is its first prompt, and
+    // atrium cannot put its header in front of that one: an argument that
+    // starts with a character the agent CLI reads specially is refused
+    // ([`ctl::vet_spawn_arg`]), on every argument. (An operator's argv was
+    // refused for this at any trust, by its vetting.)
+    if let Err(why) = ctl::vet_spawn_args(&sp.argv, ctl::TextFrom::Pane, trust_mode()) {
+        return ctl::reply_err(why);
     }
     let mut notes: Vec<String> = Vec::new();
     if sp.argv.is_empty() {
@@ -409,6 +459,18 @@ pub(crate) fn spawn(
         privileged,
     ) {
         return ctl::reply_err(&msg);
+    }
+    // On Windows the command is pinned to the file it names on PATH, and
+    // that file is what is spawned; see [`pin_to_path`].
+    #[cfg(windows)]
+    {
+        let path = std::env::var_os("PATH");
+        let pathext = std::env::var("PATHEXT").ok();
+        match pin_to_path(&sp.argv[0], path.as_deref(), pathext.as_deref()) {
+            Ok(Some(pinned)) => sp.argv[0] = pinned,
+            Ok(None) => {}
+            Err(why) => return ctl::reply_err(&why),
+        }
     }
     if sp.new_window {
         spawn_worker_window(cx, &sp, caller, new_depth, effective, note)

@@ -78,6 +78,9 @@ pub enum Cmd {
     /// Terminate a target pane **and its whole subtree** (design §5: a kill
     /// tears down descendants, so a lead's `kill` reaps its ICs too).
     Kill(KillReq),
+    /// `command`: one allowlisted slash command, delivered to an agent's pane
+    /// as its own prompt line.
+    Command(CommandReq),
     /// Report the ctl request log (subtree-scoped for a worker), most recent
     /// `tail` entries or all of the in-memory ring.
     Audit(AuditReq),
@@ -176,6 +179,7 @@ impl Cmd {
         match self {
             Cmd::List | Cmd::Status(_) | Cmd::Audit(_) => true,
             Cmd::Spawn(_) | Cmd::Send(_) | Cmd::Kill(_) | Cmd::Respawn(_) => false,
+            Cmd::Command(_) => false,
             // A mod's reports write broker state, and `whoami` answers about
             // the caller, which an unauthenticated request does not have.
             Cmd::Hello(_) | Cmd::Report(_) | Cmd::Whoami => false,
@@ -248,6 +252,20 @@ impl Cmd {
                 )
             }
             Cmd::Kill(kr) => ("kill", format!("target={}", f(&kr.target))),
+            // The name is logged whole only when it is well formed (it is then
+            // one of a short alphabet); anything else is shown by its length.
+            Cmd::Command(c) => (
+                "command",
+                if crate::ctl::is_command_name(&c.name) {
+                    format!("target={} name={}", f(&c.target), c.name)
+                } else {
+                    format!(
+                        "target={} name=<malformed, {} chars>",
+                        f(&c.target),
+                        c.name.chars().count()
+                    )
+                },
+            ),
             Cmd::Audit(_) => ("audit", String::new()),
             Cmd::Board(op) => (
                 "board",
@@ -326,7 +344,7 @@ impl Cmd {
                 format!("target={} len={}", f(&a.target), a.text.chars().count()),
             ),
             Cmd::Asked(a) => ("asked", format!("target={} id={}", f(&a.target), a.id)),
-            Cmd::Who(w) => ("who", format!("path={}", f(&w.path))),
+            Cmd::Who(w) => ("who", format!("path={}", crate::audit::field_tail(&w.path))),
             Cmd::Ping => ("ping", String::new()),
             Cmd::Metrics => ("metrics", String::new()),
         }
@@ -396,6 +414,15 @@ pub struct RespawnReq {
 pub struct AuditReq {
     /// Show only the most recent `n` entries; `None` = the whole in-memory ring.
     pub tail: Option<usize>,
+}
+
+/// A `command` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandReq {
+    /// Pane id (numeric) or role label to deliver to.
+    pub target: String,
+    /// The slash command, `/<name>`, with no arguments.
+    pub name: String,
 }
 
 /// A `send` request's payload.
@@ -666,6 +693,26 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .ok_or_else(|| "kill needs a target".to_string())?
                 .to_string();
             Cmd::Kill(KillReq { target })
+        }
+        Some("command") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "command needs a target".to_string())?
+                .to_string();
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "command needs a name (a slash command, such as /compact)".to_string()
+                })?
+                .to_string();
+            // The request is the bare name. A field that would carry more is
+            // refused, never dropped: this release delivers no arguments.
+            if v.get("args").is_some() || v.get("text").is_some() || v.get("argv").is_some() {
+                return Err("command takes a name and no arguments".to_string());
+            }
+            Cmd::Command(CommandReq { target, name })
         }
         Some("respawn") => {
             let target = v

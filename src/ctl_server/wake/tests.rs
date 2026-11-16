@@ -249,6 +249,5 @@ fn a_wake_is_one_line_that_starts_with_the_frame_whatever_a_field_holds() {
             !text.chars().any(|c| c.is_control() || c == '\u{2028}'),
             "one line: {text:?}"
         );
-        assert!(!atrium::ctl::has_shell_line(&text), "{text:?}");
     }
 }

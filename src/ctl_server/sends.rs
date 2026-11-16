@@ -43,6 +43,9 @@ pub(crate) enum SendOrigin {
     /// A bus event delivered to a pane that was addressed or subscribed: a
     /// framed, sanitized headline (see [`wake_text`]).
     BusWake,
+    /// `ctl command`: one allowlisted slash command, typed as it is (no
+    /// header, no paste) so the agent CLI reads it as its own command.
+    Command,
 }
 
 /// How long after writing the task text we send the Enter that submits it.
@@ -137,6 +140,84 @@ pub(crate) fn may_type_into(agent_pane: bool, policy: atrium::ctl::TrustMode) ->
     atrium::ctl::text_may_land(agent_pane, false, atrium::ctl::TextFrom::Pane, policy)
 }
 
+/// How a delivery's text is written into a pane's pty. The Enter that
+/// submits it is written afterwards, once, by [`flush_sends`]; so the one
+/// question for each form is whether a line break **inside** the text could
+/// submit early and let a later line open a fresh prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypeAs {
+    /// A bracketed paste, `ESC[200~ text ESC[201~`: the text is one insertion
+    /// and its line breaks are text. For a TUI that parses the markers (codex,
+    /// claude, an app that turned the mode on), on unix.
+    Paste,
+    /// One line: every line break becomes ` ↵ ` and a tab a space, so no byte
+    /// that could submit, complete or move is written before the Enter. For
+    /// an agent's pane where no paste can be relied on: every agent pane on
+    /// Windows (the console host turns input into key records and the markers
+    /// have no key to become), and an agent CLI that did not ask for paste
+    /// mode on unix.
+    Flat,
+    /// The text as it is. Only for a pane that is not an agent's (reached in
+    /// a `skip` session alone, where a shell is typed into as before) and for
+    /// a `ctl command`, whose text is one validated word.
+    Raw,
+}
+
+/// The form a delivery into this pane takes. Pure.
+pub(crate) fn type_as(agent_pane: bool, origin: SendOrigin, paste: bool) -> TypeAs {
+    if !agent_pane || origin == SendOrigin::Command {
+        TypeAs::Raw
+    } else if cfg!(unix) && paste {
+        TypeAs::Paste
+    } else {
+        TypeAs::Flat
+    }
+}
+
+/// What a line break becomes in a [`TypeAs::Flat`] delivery.
+pub(crate) const FLAT_BREAK: &str = " \u{21b5} ";
+
+/// The bytes written for `text` in the form `how`. Pure.
+pub(crate) fn delivery_bytes(text: &str, how: TypeAs) -> Vec<u8> {
+    match how {
+        TypeAs::Paste => typed_bytes(text, true),
+        TypeAs::Raw => text.as_bytes().to_vec(),
+        TypeAs::Flat => {
+            let mut out = String::with_capacity(text.len());
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\r' => {
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                        out.push_str(FLAT_BREAK);
+                    }
+                    '\n' | '\u{b}' | '\u{c}' | '\u{85}' | '\u{2028}' | '\u{2029}' => {
+                        out.push_str(FLAT_BREAK)
+                    }
+                    '\t' => out.push(' '),
+                    c => out.push(c),
+                }
+            }
+            out.into_bytes()
+        }
+    }
+}
+
+/// Has an unbound pane of a known agent CLI gone the whole
+/// [`SEND_PROMPT_WAIT`] without showing its prompt hint? Then whatever is on
+/// its screen is not a prompt (a sign-in, a dialog atrium has no marker for, a
+/// hung start), and a delivery typed there would be keystrokes into it: a
+/// digit in a role picks a numbered option, the Enter confirms the
+/// highlighted one. The delivery is dropped instead, and the bar says so.
+/// (Until 0.47.0 it was typed after the wait.)
+pub(crate) fn prompt_never_came(title: &str, screen: &ansi::Screen, waited: Duration) -> bool {
+    atrium::vendors::vendor_for_stem(title)
+        .and_then(atrium::vendors::prompt_marker)
+        .is_some_and(|hint| waited >= SEND_PROMPT_WAIT && !screen_has(screen, hint))
+}
+
 pub(crate) fn typed_bytes(text: &str, paste_wanted: bool) -> Vec<u8> {
     if cfg!(unix) && paste_wanted {
         let mut v = Vec::with_capacity(text.len() + 12);
@@ -195,12 +276,15 @@ pub(super) fn queue_send(
         }
     }
     let cap = match origin {
-        SendOrigin::Ctl => MAX_PENDING_PER_TARGET,
+        SendOrigin::Ctl | SendOrigin::Command => MAX_PENDING_PER_TARGET,
         SendOrigin::BusWake => MAX_PENDING_WAKES_PER_TARGET,
     };
     if pending
         .iter()
-        .filter(|ps| ps.target == target && ps.origin == origin)
+        .filter(|ps| {
+            ps.target == target
+                && (ps.origin == SendOrigin::BusWake) == (origin == SendOrigin::BusWake)
+        })
         .count()
         >= cap
     {
@@ -293,7 +377,7 @@ pub(crate) fn flush_sends(
                                 format!(
                                     "a delivery for pane {} was dropped: it is not an agent's \
                                      pane, and nothing is typed into a shell below --trust skip",
-                                    p.id
+                                    p.agent_id
                                 ),
                                 now,
                             ));
@@ -322,6 +406,23 @@ pub(crate) fn flush_sends(
                         // prompt is up, not a loading screen that happens to
                         // sit still.
                         let waited = now.duration_since(ps.queued_at);
+                        // An unbound agent CLI that never showed its prompt:
+                        // not typed into whatever it is showing instead.
+                        if world.status_for(sid).is_none()
+                            && dialog.is_none()
+                            && prompt_never_came(&p.title, p.term.screen(), waited)
+                        {
+                            *flash = Some((
+                                format!(
+                                    "a delivery for pane {} was dropped: its prompt did not \
+                                     appear in {} s (answer what it is showing, then send again)",
+                                    p.agent_id,
+                                    SEND_PROMPT_WAIT.as_secs()
+                                ),
+                                now,
+                            ));
+                            return false;
+                        }
                         let settled = p.painted
                             && now.duration_since(p.last_activity) >= SEND_SETTLE
                             && prompt_up(&p.title, p.term.screen(), waited);
@@ -350,7 +451,8 @@ pub(crate) fn flush_sends(
                         let paste = p.paste_wanted
                             || atrium::vendors::vendor_for_stem(&p.title)
                                 .is_some_and(atrium::vendors::takes_paste);
-                        let wire = typed_bytes(&ps.text, paste);
+                        let how = type_as(super::dispatch::is_agent_pane(p), ps.origin, paste);
+                        let wire = delivery_bytes(&ps.text, how);
                         let bytes = &wire[..];
                         match p.pty.write(&bytes[ps.written..]) {
                             Ok(0) => {} // took nothing this tick; try the next
@@ -430,6 +532,14 @@ pub(super) fn wakes_delivered() -> u64 {
 /// A new session starts counting from zero.
 pub(super) fn reset_wakes_delivered() {
     WAKES_DELIVERED.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Age every queued delivery by `by`, as if it had waited that long.
+#[cfg(test)]
+pub(crate) fn backdate(pending: &mut [PendingSend], by: Duration) {
+    for ps in pending {
+        ps.queued_at = ps.queued_at.checked_sub(by).expect("a clock that old");
+    }
 }
 
 #[cfg(test)]

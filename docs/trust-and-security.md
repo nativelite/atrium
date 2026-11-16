@@ -48,15 +48,18 @@ mid-session.
 
 A mode caps what an agent does through its own tools. The control plane is another way to act, so the ceiling is held there too, for every pane, below `skip`:
 
-- **A spawn starts an agent CLI found on `PATH`.** The command of a `ctl spawn` is a bare name; a path of any kind (`\\host\share\claude.exe`, `./x/claude.sh`, `C:\tmp\claude.exe`, `/tmp/claude`) is refused, because it would pass the allowlist on its file name and start a program that ignores the flags above. A fleet file's `cmd` may be a path: a person wrote it.
+- **A spawn starts an agent CLI found on `PATH`.** The command of a `ctl spawn` is a bare name with no extension; a path of any kind (`\\host\share\claude.exe`, `./x/claude.sh`, `/tmp/claude`) and a dotted name (`claude.bat`) are refused, because either would pass the allowlist on its file name and start a program that ignores the flags above. On Windows atrium resolves the name itself over the absolute directories of `PATH` and spawns that file; a name it does not find is refused, never left for the system to look for in the working directory. A fleet file's `cmd` may be a path: a person wrote it.
 - **Text is typed only into an agent's pane.** A `ctl send` or a bus wake into a shell is a command line, run with no gate. A pane whose command is not an agent CLI takes neither, unless its own mod collects its deliveries (`inbox`: nothing is typed).
-- **No line of a `send`, and no argument of a spawned command, starts with `!`.** Claude Code runs such a prompt as a shell command with no permission prompt. A pane may send a `/` command into its own subtree.
+- **No character a caller chose is the first of an agent's prompt.** Every `send` into an agent is delivered behind atrium's header, `[atrium: from <sender>] `, so a text that starts with `!` (a shell line in Claude Code, run with no permission prompt), `/`, `#` or `@` is read as text. One `send` is one prompt: its line breaks travel inside a paste or are flattened, and never submit. The text is plain: no control character but a newline and a tab, so it cannot press Shift+Tab, Esc or Ctrl+C.
+- **A send cannot answer a dialog.** A delivery waits for the target's prompt; one that would have been typed into an agent that never showed its prompt is dropped.
+- **A slash command needs the human's list.** `ctl command` delivers `/<name>` only when the `commands` allowlist (user config or fleet, empty by default, shown in the launch banner) holds it. Each entry is a grant to every pane that can reach another: `/permissions` or `/add-dir` there is that power, in the target's pane.
+- **A spawned agent's arguments are not prompts in disguise.** An argument of an agent CLI's command may not open with `!`, `/`, `#` or `@`. This one is a list: no header can go in front of an argument.
 
-At `skip` these three are lifted for a pane's request: every command already runs with no gate, so there is nothing to step over. That includes a wake typed into a shell pane that subscribed or is addressed, which the shell runs as a line (`… & calc` on `cmd.exe`). With no `--trust` at all they hold: the agents run under their own permission settings, and a command typed into a shell would sidestep those just the same. An [operator](control-plane.md#operator-tokens-a-caller-that-is-not-a-pane) is held to all three at any trust. What you type at the keyboard is not a ctl request.
+At `skip` the rules about where text lands and what it may hold are lifted for a pane's request: every command already runs with no gate, so there is nothing to step over. That includes a wake typed into a shell pane that subscribed or is addressed, which the shell runs as a line (`… & calc` on `cmd.exe`). The header is still put on, and `command` still needs the list. With no `--trust` at all the rules hold: the agents run under their own permission settings, and a command typed into a shell would sidestep those just the same. An [operator](control-plane.md#operator-tokens-a-caller-that-is-not-a-pane) is held to them at any trust. What you type at the keyboard is not a ctl request.
 
-What this does not cover: a bare name is looked up on the `PATH` atrium was launched with, and on Windows a name found nowhere on `PATH` falls to the system's own search, which includes atrium's working directory; whoever can write there, or change `PATH` before launch, chooses the program. And a pane's token is in the environment of that pane's processes, readable by other processes of the same user: the rules bound what any pane's token can do, not which process presents it.
+What this does not cover: a bare name is as trustworthy as the `PATH` atrium was launched with; on Windows an npm-installed claude is a `.cmd` shim that starts `node` by name, which `cmd.exe` looks for in the pane's working directory first (atrium pins the shim, not what it runs); an agent CLI atrium has no prompt hint for (gemini, aider, cursor-agent) is typed into after its screen has been still for two seconds, dialog or not. And a pane's token is in the environment of that pane's processes, readable by other processes of the same user: the rules bound what any pane's token can do, not which process presents it.
 
-See [what a pane's request is held to](control-plane.md#what-a-panes-request-is-held-to) for the exact tests and the refusals.
+See [what a pane's request is held to](control-plane.md#what-a-panes-request-is-held-to) for the exact tests, the bytes of each delivery and the refusals.
 
 ### Why the root pane is no longer carved out
 
@@ -305,9 +308,10 @@ limits, each one unit-tested as a pure function:
    atrium, with **`ATRIUM_CTL_ALLOW`** (comma-separated stems, for example for
    another agent CLI) or `ctl_allow` in the user-global `config.json`. It never
    weakens a session that didn't set it. The command is a **bare name** looked
-   up on `PATH`, for every caller: the allowlist reads the file stem, so a
-   path that ends in `claude` is refused rather than run as given. Its
-   arguments may not start a line with `!` below `skip`.
+   up on `PATH`, with no extension, for every caller: the allowlist reads
+   the file stem, so a path that ends in `claude`, or `claude.bat`, is refused
+   rather than run as given. An argument of an agent's command may not open
+   with `!`, `/`, `#` or `@`.
 3. **No count cap; a depth guard.** A fleet designed for 32 runs 32; width is
    unlimited. Only *recursion* is bounded, by **`--max-depth`** (default 6, `0`
    removes it): a spawn past the ceiling is refused, so a self-spawning agent
@@ -318,9 +322,11 @@ limits, each one unit-tested as a pure function:
    a sibling's. **You control everything**: a root pane (the one atrium opened, or
    any `ctl` run from outside a pane) is the operator and reaches every pane.
    Reaching a pane is not typing into it: below `skip`, `send` text and a wake
-   are typed only into an **agent's** pane (a shell would run them), and no
-   line of a `send` starts with `!` (an agent CLI would run it as a shell
-   line); see [what the ceiling covers](#what-the-ceiling-covers-on-the-control-plane).
+   are typed only into an **agent's** pane (a shell would run them); every
+   `send` arrives behind atrium's header, so it is a message and never a
+   command of the agent CLI; and a slash command is run with `ctl command`,
+   from a list the human wrote; see
+   [what the ceiling covers](#what-the-ceiling-covers-on-the-control-plane).
    One deliberate exception: a **bus wake** — the framed line an event becomes
    in the pane of a subscriber or an addressee (`bus pub --to`) — may also go
    *up* the tree, to the panes that spawned the publisher, and to any pane that
@@ -352,7 +358,8 @@ limits, each one unit-tested as a pure function:
    comes from a file the hosting atrium was given, names the verbs its holder
    may use, and never reaches a pane's environment. An operator reaches the
    whole session for those verbs, but its spawn is bounded by the launch trust
-   and takes a bare command name, and its text is typed only into agent panes.
+   and takes a bare command name, and its text is typed only into agent
+   panes, behind `[atrium: from operator:<name>] `.
    Every operator request is audited as `operator:<name>`. A pane and an
    operator are separate namespaces: neither token is ever taken for the
    other. File permissions keep other users out, not a same-user pane; the

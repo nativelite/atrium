@@ -126,7 +126,10 @@ teammates:
         --size <N%|N>             with --here: the new pane takes N% of the anchor, or N cells
                                   (--window, default); --mode plan|accept|automode|skip, capped at
                                   the session policy; --worktree names a git worktree to run in
-  send <target> <text...>         type a task into a teammate once it is idle (never mid-turn)
+  send <target> <text...>         type a task into a teammate once it is idle (never mid-turn);
+                                  it arrives marked with who sent it
+  command <target> /<name>        run one slash command in a teammate, when the human listed
+                                  it under `commands` (config or fleet); no arguments
   status [<target>]               what each teammate is doing (idle, working, waiting on you)
   list                            the spawn tree: every pane, its role, parent and depth
   kill <target>                   stop a teammate and drop its pane
@@ -314,6 +317,7 @@ mod tests {
                     "--mode",
                     "--worktree",
                     "send",
+                    "command",
                     "status",
                     "list",
                     "kill",

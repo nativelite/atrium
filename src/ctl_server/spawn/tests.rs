@@ -64,3 +64,66 @@ fn worktree_spawn_params_git_repo_yields_ok_and_creates_dir() {
     // Cleanup.
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+// -- pin_to_path: a ctl spawn runs the file its command names on PATH ---------
+
+/// A bare name is looked up over the absolute directories of PATH and
+/// becomes that file's full path; a name found in none is refused, and so is
+/// one that exists only in a relative or empty PATH entry (the current
+/// directory under another name). Extension matching is the file system's,
+/// so the lookup itself is exercised on Windows, where it is applied.
+#[cfg(windows)]
+#[test]
+fn a_ctl_spawn_is_pinned_to_the_file_its_command_names_on_path() {
+    // Under the working directory, so the same folder has a relative name.
+    let rel = std::path::PathBuf::from("target").join(format!("atrium-pin-{}", std::process::id()));
+    let abs = std::env::current_dir().unwrap().join(&rel);
+    let _ = std::fs::remove_dir_all(&abs);
+    std::fs::create_dir_all(&abs).unwrap();
+    std::fs::write(abs.join("zzagent.CMD"), "@echo shim").unwrap();
+    let exts = Some(".COM;.EXE;.BAT;.CMD");
+    let path_of = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+
+    // Found in an absolute entry: the full path, which is what is spawned.
+    let path = path_of(&[std::path::Path::new(r"C:\nowhere-atrium"), &abs]);
+    let pinned = pin_to_path("zzagent", Some(&path), exts)
+        .expect("found")
+        .expect("a bare name is pinned");
+    assert!(std::path::Path::new(&pinned).is_absolute(), "{pinned}");
+    assert!(pinned.to_lowercase().ends_with(r"\zzagent.cmd"), "{pinned}");
+
+    // The same folder by a relative name, the current directory, an empty
+    // entry: none of them is searched.
+    for dirs in [
+        vec![rel.as_path()],
+        vec![std::path::Path::new(".")],
+        vec![std::path::Path::new("")],
+        vec![std::path::Path::new(r"\rooted-but-no-drive")],
+    ] {
+        let why = pin_to_path("zzagent", Some(&path_of(&dirs)), exts).unwrap_err();
+        assert!(
+            why.contains("was not found in any directory of PATH"),
+            "{why}"
+        );
+    }
+    // Not installed at all, and no PATH at all.
+    assert!(pin_to_path("zznothere", Some(&path), exts).is_err());
+    assert!(pin_to_path("zzagent", None, exts).is_err());
+    let _ = std::fs::remove_dir_all(&abs);
+}
+
+/// The caller's own kind may be a path a fleet file approved: it is run as
+/// written, on every platform.
+#[test]
+fn a_recorded_path_is_left_as_the_fleet_file_wrote_it() {
+    for path in [
+        r"C:\tools\claude.cmd",
+        "/opt/tools/claude",
+        "./bin/claude",
+        r".\claude.cmd",
+    ] {
+        assert_eq!(pin_to_path(path, None, None), Ok(None), "{path}");
+    }
+    // A bare name is never passed through unresolved.
+    assert!(pin_to_path("zz-no-such-agent", None, None).is_err());
+}
