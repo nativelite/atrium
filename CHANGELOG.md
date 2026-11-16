@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Operator tokens: a control-plane credential for a caller that is not a
+  pane** (#24). `--operator-token-file <path>` (the first argument; anywhere
+  among `fleet up`'s and `recover`'s flags) or `ATRIUM_OPERATOR_TOKEN_FILE`
+  names a JSON file of operators, each with a `name`, a `token` and the
+  `verbs` it may use. A request that carries a matching `operator_token` may
+  use those verbs on any pane of the session and is audited as
+  `operator:<name>`, allowed or refused; a token that matches nobody is
+  audited as `operator:?`. Nothing is granted by default and there is no
+  wildcard: `answer`, `asked` and `who`, which return model output, work only
+  when the entry names them, and a pane's own verbs (`hello`, `report`,
+  `whoami`, `inbox`, `bus sub`, `bus unsub`) are refused for every operator.
+  An operator's `spawn` is a top-level caller's without privilege: capped at
+  the launch trust, under the agent allowlist, the argv vetting and the depth
+  and pane caps, with no identity but the session's own. The file is read
+  once at startup and atrium refuses to start on one that is, on unix, not
+  owned by its user or open to group or others, or that holds a token under
+  32 characters, a repeated name or token, or an unknown key or verb. The
+  token is compared in constant time, lives in its own request field (a pane
+  token is never accepted as an operator token, nor the reverse; a request
+  with both is refused), is removed from the environment panes inherit, and
+  is in no log or reply. Every field an operator sends is bounded and checked
+  for control characters before use. Client: `atrium ctl
+  --operator-token-file <path> [--operator <name>] <verb> …`. What the file's
+  permissions do and do not protect against is in `docs/control-plane.md`.
+- **`by` in an audit entry** (additive): `"by":"operator:<name>"` on an
+  operator's entry, whose `caller` is `null`. A pane's entry is unchanged.
+
+### Changed
+- `ctl spawn --role` refuses a role that starts with `operator:`, for every
+  caller: that prefix is how the board and the bus name an operator.
+
 ## [0.46.0] - 2026-11-09
 
 ### Added

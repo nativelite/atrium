@@ -51,11 +51,39 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     let args = &filtered[..];
     let color = !no_color && should_color();
 
+    // `--operator-token-file <path> [--operator <name>]`, before the verb: the
+    // request is an operator's, not this pane's (if it runs in one at all).
+    // The token is read from the file here and goes nowhere but the request.
+    let (operator, args) = match take_operator_flags(args) {
+        Ok(found) => found,
+        Err(msg) => {
+            eprintln!("atrium ctl: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let operator_token = match operator {
+        Some(file) => match crate::operator::client_token(
+            std::path::Path::new(&file.path),
+            file.name.as_deref(),
+        ) {
+            Ok(token) => Some(token),
+            Err(msg) => {
+                eprintln!("atrium ctl: {msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let cred = match &operator_token {
+        Some(token) => Cred::Operator(token),
+        None => Cred::Pane(caller),
+    };
+
     // `wait` is a client-side loop over `answer`/`status`: the server stays
     // one request, one reply, and a waiter that dies takes nothing with it.
     if args.first().map(String::as_str) == Some("wait") {
         return match parse_wait(args) {
-            Ok(spec) => wait_cmd(&address, caller, &spec),
+            Ok(spec) => wait_cmd(&address, cred, &spec),
             Err(msg) => {
                 eprintln!("atrium ctl: {msg}");
                 eprint!("{}", crate::help::CTL);
@@ -66,7 +94,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
     // `ask` queues the question, then polls `asked` for the reply the same way.
     if args.first().map(String::as_str) == Some("ask") {
         return match parse_ask(args) {
-            Ok(spec) => ask_cmd(&address, caller, &spec),
+            Ok(spec) => ask_cmd(&address, cred, &spec),
             Err(msg) => {
                 eprintln!("atrium ctl: {msg}");
                 eprint!("{}", crate::help::CTL);
@@ -75,7 +103,7 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         };
     }
 
-    let request = match build_request(args, caller) {
+    let request = match build_pairs(args, cred) {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("atrium ctl: {msg}");
@@ -239,12 +267,12 @@ pub fn wait_done(spec: &WaitSpec, reply: &str) -> bool {
 
 /// The `wait` loop: ask every [`WAIT_POLL_MS`] until [`wait_done`] or the
 /// timeout, printing the last reply (or a timeout error) as the result.
-fn wait_cmd(address: &str, caller: Option<usize>, spec: &WaitSpec) -> ExitCode {
+fn wait_cmd(address: &str, cred: Cred<'_>, spec: &WaitSpec) -> ExitCode {
     let verb = match spec.what {
         WaitFor::Answer => "answer",
         WaitFor::Idle | WaitFor::Exit => "status",
     };
-    let request = match build_request(&[verb.to_string(), spec.target.clone()], caller) {
+    let request = match build_pairs(&[verb.to_string(), spec.target.clone()], cred) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("atrium ctl: {e}");
@@ -352,10 +380,10 @@ pub fn ask_done(reply: &str) -> bool {
 
 /// The `ask` loop: queue the question, then poll `asked` every
 /// [`WAIT_POLL_MS`] until the reply or the timeout.
-fn ask_cmd(address: &str, caller: Option<usize>, spec: &AskSpec) -> ExitCode {
-    let queued = match build_request(
+fn ask_cmd(address: &str, cred: Cred<'_>, spec: &AskSpec) -> ExitCode {
+    let queued = match build_pairs(
         &["ask".to_string(), spec.target.clone(), spec.text.clone()],
-        caller,
+        cred,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -385,7 +413,7 @@ fn ask_cmd(address: &str, caller: Option<usize>, spec: &AskSpec) -> ExitCode {
         .and_then(|v| v.get("pane").and_then(Value::as_i64))
         .map(|n| n.to_string())
         .unwrap_or_else(|| spec.target.clone());
-    let poll = match build_request(&["asked".to_string(), pane, id.to_string()], caller) {
+    let poll = match build_pairs(&["asked".to_string(), pane, id.to_string()], cred) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("atrium ctl: {e}");
@@ -527,25 +555,99 @@ impl std::error::Error for UsageError {}
 /// line. Pure and testable. A router: `caller` and `token` first, then the
 /// subcommand's own builder below, each of which documents its grammar.
 pub fn build_request(args: &[String], caller: Option<usize>) -> Result<String, UsageError> {
-    build_pairs(args, caller).map_err(UsageError)
+    build_pairs(args, Cred::Pane(caller)).map_err(UsageError)
+}
+
+/// Whose request the client is building. No `Debug`: one arm holds a secret.
+#[derive(Clone, Copy)]
+enum Cred<'a> {
+    /// A pane's: its id (`ATRIUM_PANE`) and, read when the request is built,
+    /// its capability token (`ATRIUM_TOKEN`).
+    Pane(Option<usize>),
+    /// An operator's: the token read from `--operator-token-file`.
+    Operator(&'a str),
+}
+
+/// The operator flags of one `atrium ctl` run.
+#[derive(Debug, PartialEq, Eq)]
+struct OperatorFile {
+    path: String,
+    /// `--operator <name>`: which entry, when the file names several.
+    name: Option<String>,
+}
+
+/// Take `--operator-token-file <path>` and `--operator <name>` (either as
+/// `--flag value` or `--flag=value`) off the **front** of the arguments.
+/// Before the verb only: past it, everything is the verb's own, and `send`'s
+/// text may say anything. Each at most once; a name needs a file.
+fn take_operator_flags(args: &[String]) -> Result<(Option<OperatorFile>, &[String]), String> {
+    const FILE: &str = crate::operator::FLAG;
+    const NAME: &str = "--operator";
+    let mut path: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let (slot, flag, value, used) = if a == FILE || a == NAME {
+            let slot = if a == FILE { &mut path } else { &mut name };
+            let missing = format!("{a} needs a value");
+            (slot, a, value_at(args, i + 1, &missing)?.clone(), 2)
+        } else if let Some(v) = a.strip_prefix(FILE).and_then(|r| r.strip_prefix('=')) {
+            (&mut path, FILE, v.to_string(), 1)
+        } else if let Some(v) = a.strip_prefix(NAME).and_then(|r| r.strip_prefix('=')) {
+            (&mut name, NAME, v.to_string(), 1)
+        } else {
+            break;
+        };
+        if value.is_empty() {
+            return Err(format!("{flag} needs a value"));
+        }
+        if slot.replace(value).is_some() {
+            return Err(format!("{flag} may be given only once"));
+        }
+        i += used;
+    }
+    let rest = &args[i..];
+    match (path, name) {
+        (None, Some(_)) => Err(format!("{NAME} goes with {FILE} <path>")),
+        (None, None) => Ok((None, rest)),
+        (Some(_), _) if rest.is_empty() => Err("needs a command after the operator flags".into()),
+        (Some(path), name) => Ok((Some(OperatorFile { path, name }), rest)),
+    }
+}
+
+/// The head of a request: who it is from. `pane_token` is the `ATRIUM_TOKEN`
+/// of the pane the client runs in, if it runs in one.
+///
+/// One credential per request. An operator's request names no pane and
+/// carries no pane token, even when the client runs inside a pane and has
+/// one: the server refuses a request that carries both.
+fn credential_pairs(cred: Cred<'_>, pane_token: Option<String>) -> Result<Pairs, String> {
+    let mut pairs: Pairs = Vec::new();
+    match cred {
+        Cred::Pane(caller) => {
+            if let Some(c) = caller {
+                let c = i64::try_from(c).map_err(|_| format!("caller id {c} is out of range"))?;
+                pairs.push(("caller", Value::Number(Number::Int(c))));
+            }
+            if let Some(tok) = pane_token.filter(|t| !t.is_empty()) {
+                pairs.push(("token", Value::String(tok)));
+            }
+        }
+        Cred::Operator(token) => {
+            pairs.push(("operator_token", Value::String(token.to_string())));
+        }
+    }
+    Ok(pairs)
 }
 
 /// [`build_request`]'s body. The subcommand builders word their errors as plain
 /// strings; the public boundary types them once.
-fn build_pairs(args: &[String], caller: Option<usize>) -> Result<String, String> {
-    let mut pairs: Pairs = Vec::new();
-    if let Some(c) = caller {
-        let c = i64::try_from(c).map_err(|_| format!("caller id {c} is out of range"))?;
-        pairs.push(("caller", Value::Number(Number::Int(c))));
-    }
-    // The capability token authenticates the caller. It is env-sourced (like the
+fn build_pairs(args: &[String], cred: Cred<'_>) -> Result<String, String> {
+    // The capability token authenticates a pane. It is env-sourced (like the
     // endpoint address and the caller id in `ctl_cmd`); tests, which never set
     // `ATRIUM_TOKEN`, simply send no token and are treated as unauthenticated.
-    if let Ok(tok) = std::env::var(ENV_TOKEN) {
-        if !tok.is_empty() {
-            pairs.push(("token", Value::String(tok)));
-        }
-    }
+    let mut pairs = credential_pairs(cred, std::env::var(ENV_TOKEN).ok())?;
     match args.first().map(String::as_str) {
         Some("spawn") => spawn_req(args, &mut pairs)?,
         Some("list") => {

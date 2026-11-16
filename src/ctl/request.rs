@@ -41,6 +41,11 @@ pub struct Request {
     /// real caller identity by matching this against a pane's minted token; absent
     /// or non-matching ⇒ the request is unauthenticated.
     pub token: Option<String>,
+    /// An **operator token** ([`crate::operator`]): the credential of a caller
+    /// that is not a pane. Its own field, matched only against the session's
+    /// operators, as `token` is matched only against panes: neither kind of
+    /// token is ever accepted in the other's place.
+    pub operator_token: Option<String>,
     pub cmd: Cmd,
 }
 
@@ -519,6 +524,13 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
     let v = json::parse(line).map_err(|e| format!("bad request json: {e}"))?;
     let caller = v.get("caller").and_then(Value::as_i64).map(|n| n as usize);
     let token = v.get("token").and_then(Value::as_str).map(str::to_string);
+    // Present but not a string is an error, never an absence: a request that
+    // claims to be an operator's must not fall through to another identity.
+    let operator_token = match v.get("operator_token") {
+        None => None,
+        Some(Value::String(t)) => Some(t.clone()),
+        Some(_) => return Err("operator_token must be a string".to_string()),
+    };
     let cmd = match v.get("cmd").and_then(Value::as_str) {
         Some("spawn") => {
             let argv = match v.get("argv").and_then(Value::as_array) {
@@ -910,5 +922,10 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
         Some(other) => return Err(format!("unknown command {other:?}")),
         None => return Err("request has no \"cmd\"".to_string()),
     };
-    Ok(Request { caller, token, cmd })
+    Ok(Request {
+        caller,
+        token,
+        operator_token,
+        cmd,
+    })
 }

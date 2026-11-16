@@ -60,6 +60,16 @@ pub(crate) fn decision_for_agent(e: &atrium::bus::Event, windows: &[Window]) -> 
 /// `status`/`kill` with a target are subtree-scoped; `spawn --identity` is
 /// delegation-scoped.
 pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> (ctl::Reply, CtlEffect) {
+    apply_ctl_as(line, cx, atrium::operator::session())
+}
+
+/// [`apply_ctl`] against a given set of operators: the session's
+/// ([`atrium::operator::session`], loaded once at startup), or a test's.
+pub(crate) fn apply_ctl_as(
+    line: &str,
+    cx: &mut CtlSession<'_>,
+    operators: &atrium::operator::Operators,
+) -> (ctl::Reply, CtlEffect) {
     let (windows, audit) = (&*cx.windows, &mut *cx.audit);
     let req = match ctl::parse_request(line) {
         Ok(r) => r,
@@ -81,6 +91,14 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> (ctl::Reply, Ctl
             return (reply, CtlEffect::Nothing);
         }
     };
+    // A request that carries an operator token is an operator's, start to
+    // finish: it is authenticated, authorized, served and audited by
+    // `apply_operator` and never reaches the pane path below, whatever else it
+    // carries. A token that matches no operator is refused there; it does not
+    // fall back to a pane's identity or to an anonymous read.
+    if req.operator_token.is_some() {
+        return apply_operator(req, operators, cx);
+    }
     // Authenticate the caller by its capability token, not its self-reported id:
     // the caller *is* the pane whose minted token matches. This overwrites the
     // self-reported `caller`, so a pane cannot claim another pane's id or claim
@@ -155,6 +173,162 @@ pub(crate) fn apply_ctl(line: &str, cx: &mut CtlSession<'_>) -> (ctl::Reply, Ctl
     (reply, effect)
 }
 
+/// The reply to a request whose operator token matches no operator. One text
+/// whether the session has no token file at all or the token is simply wrong,
+/// so the reply tells a prober nothing about which.
+const UNKNOWN_OPERATOR: &str =
+    "unauthenticated: the operator token matches no operator of this session";
+
+/// Serve a request that carries an operator token ([`atrium::operator`]).
+///
+/// In order, and audited at whichever step ends it — as `operator:<name>` once
+/// the token has matched, as `operator:?` when it has not:
+///
+/// 1. **Authenticate.** The token is matched against the session's operators
+///    only, in constant time. A pane's `ATRIUM_TOKEN` in this field matches
+///    nothing. No match is a refusal, for reads too: a wrong credential is not
+///    an absent one.
+/// 2. **One credential.** A request that also carries a pane token is refused.
+///    Which identity it meant is not ours to guess.
+/// 3. **Vet.** Every field is bounded and checked ([`atrium::operator::vet`]):
+///    an operator may be a network peer.
+/// 4. **Authorize.** The verb must be one the operator's entry names, or one
+///    of the reads the endpoint serves to any caller; a pane's own verbs
+///    (`hello`, `report`, `whoami`, `inbox`, `bus sub`, `bus unsub`) are
+///    refused whatever the entry says.
+/// 5. **Serve.** A read is served exactly as it is to a caller with no token
+///    (`audit` aside: named in the entry, it is the whole log; not named, the
+///    empty view an anonymous caller gets). A write goes through
+///    [`dispatch_operator`].
+///
+/// Every request is recorded, an empty poll included: the exemption that
+/// keeps a mod's twice-a-second `inbox` out of the log is a pane's.
+fn apply_operator(
+    req: ctl::Request,
+    operators: &atrium::operator::Operators,
+    cx: &mut CtlSession<'_>,
+) -> (ctl::Reply, CtlEffect) {
+    use atrium::operator::Verdict;
+    let vetted = atrium::operator::vet(&req.cmd);
+    // The detail is built from the request's own fields. Fields that failed
+    // the vetting are not copied into the log.
+    let (action, detail) = match &vetted {
+        Ok(()) => req.cmd.audit_label(),
+        Err(_) => (
+            req.cmd.audit_label().0,
+            "<fields withheld: refused>".to_string(),
+        ),
+    };
+    let presented = req.operator_token.as_deref().unwrap_or("");
+    let Some(op) = operators.authenticate(presented) else {
+        cx.audit.record_as(
+            atrium::operator::UNKNOWN_LABEL,
+            action,
+            &detail,
+            false,
+            "unknown operator token",
+        );
+        return (ctl::reply_err(UNKNOWN_OPERATOR), CtlEffect::Nothing);
+    };
+    let label = op.label();
+    let refusal = if req.token.as_deref().is_some_and(|t| !t.is_empty()) {
+        Some(
+            "a request carries one credential: this one has an operator token and a pane token"
+                .to_string(),
+        )
+    } else if let Err(why) = vetted {
+        Some(format!("refused: {why}"))
+    } else {
+        None
+    };
+    let verdict = match refusal {
+        Some(why) => Verdict::Refused(why),
+        None => op.verdict(&req.cmd),
+    };
+    let listed = match verdict {
+        Verdict::Refused(why) => {
+            cx.audit.record_as(&label, action, &detail, false, &why);
+            return (ctl::reply_err(&why), CtlEffect::Nothing);
+        }
+        Verdict::Listed => true,
+        Verdict::OpenRead => false,
+    };
+    if let Cmd::Audit(ar) = &req.cmd {
+        // Recorded before the reply is built, so the reader sees its own read.
+        cx.audit.record_as(&label, "audit", "read", true, "");
+        return (
+            audit_reply(&*cx.audit, &*cx.windows, None, listed, ar.tail),
+            CtlEffect::Nothing,
+        );
+    }
+    let effect = CtlEffect::of(&req.cmd);
+    let reply = if req.cmd.is_read_only() {
+        // What a caller with no token is served, by the same code.
+        dispatch_ctl(req, None, false, cx)
+    } else {
+        dispatch_operator(req.cmd, &label, cx)
+    };
+    let (ok, note) = audit_outcome(&reply);
+    cx.audit.record_as(&label, action, &detail, ok, &note);
+    (reply, effect)
+}
+
+/// An operator's write, on the handlers written for panes. This table is the
+/// whole of how an operator maps onto them, and a verb is in it only once its
+/// handler has been read for a caller with no pane:
+///
+/// * **Reach.** An operator acts across the whole session, so the subtree
+///   guard is given `privileged`: `send`, `kill`, `respawn`, `ask`, and the
+///   model-output reads reach any pane. `caller` is `None` throughout — an
+///   operator is never passed off as some pane.
+/// * **`spawn` is the exception.** It is run as a top-level caller *without*
+///   privilege. The worker is a new window at depth 1 with no parent, so the
+///   depth cap, the pane cap, the agent allowlist and the argv vetting all
+///   apply as they do to a root pane's spawn; the trust mode is capped at the
+///   session's launch trust like everyone's ([`super::panes::effective_mode`]);
+///   and with no privilege the only identity it may run under is the session's
+///   own default — an operator cannot hand a worker any credential in the
+///   vault, which a root pane can. `--here` has no pane to sit beside and is
+///   refused by the vetting.
+/// * **Attribution.** Board entries and bus events are signed with the
+///   operator's label, never a pane's.
+/// * **Everything else is refused**, by the last arm: a verb added later does
+///   not reach an operator until it is added here.
+fn dispatch_operator(cmd: Cmd, label: &str, cx: &mut CtlSession<'_>) -> ctl::Reply {
+    match cmd {
+        Cmd::Spawn(sp) => spawn(sp, None, false, cx),
+        Cmd::Send(sr) => send(sr, None, true, cx),
+        Cmd::Kill(kr) => kill(kr, None, true, cx),
+        Cmd::Respawn(rr) => respawn(rr, None, true, cx),
+        Cmd::Ask(a) => ask(a, None, true, cx),
+        Cmd::Answer(a) => answer(a, None, true, cx),
+        Cmd::Asked(a) => asked(a, None, true, cx),
+        Cmd::Who(w) => who(w, None, true, cx),
+        Cmd::Board(
+            op @ (ctl::BoardOp::Set { .. }
+            | ctl::BoardOp::Del { .. }
+            | ctl::BoardOp::Claim { .. }
+            | ctl::BoardOp::Release { .. }),
+        ) => board(op, None, Some(label), cx),
+        Cmd::Bus(op @ (ctl::BusOp::Pub { .. } | ctl::BusOp::Resolve { .. })) => {
+            bus(op, None, true, Some(label), cx)
+        }
+        other => ctl::reply_err(&format!(
+            "{:?} is not open to operators",
+            atrium::operator::verb(&other)
+        )),
+    }
+}
+
+/// A `ctl spawn` whose role would read as an operator's label on the board
+/// and the bus (`operator:<name>`): refused for every caller.
+fn reserved_role(sp: &ctl::SpawnReq) -> Option<ctl::Reply> {
+    let role = sp.role.as_deref()?;
+    atrium::operator::role_reserved(role).then(|| {
+        ctl::reply_err("a role may not start with \"operator:\": that prefix names operator tokens")
+    })
+}
+
 /// What a served request may have done to the screen, so the loop repaints
 /// only as much as it must. Until 0.42.0 every request reset the renderer
 /// and forced a full repaint, a `2J` clear: with a mod polling `inbox` every
@@ -202,13 +376,16 @@ pub(crate) fn dispatch_ctl(
         Cmd::List => reply_tree(cx.windows, cx.world, cx.mods, None),
         Cmd::Status(sr) => status(sr, caller, privileged, cx),
         Cmd::Send(sr) => send(sr, caller, privileged, cx),
-        Cmd::Spawn(sp) => spawn(sp, caller, privileged, cx),
+        Cmd::Spawn(sp) => match reserved_role(&sp) {
+            Some(refusal) => refusal,
+            None => spawn(sp, caller, privileged, cx),
+        },
         Cmd::Kill(kr) => kill(kr, caller, privileged, cx),
         Cmd::Respawn(rr) => respawn(rr, caller, privileged, cx),
         // `audit` is handled in `apply_ctl` (it needs the log); never reaches here.
         Cmd::Audit(_) => ctl::reply_err("internal: audit dispatched to the wrong handler"),
-        Cmd::Board(op) => board(op, caller, cx),
-        Cmd::Bus(op) => bus(op, caller, privileged, cx),
+        Cmd::Board(op) => board(op, caller, None, cx),
+        Cmd::Bus(op) => bus(op, caller, privileged, None, cx),
         Cmd::Hello(h) => hello(h, caller, cx),
         Cmd::Report(r) => report(r, caller, cx),
         Cmd::Whoami => whoami(caller, cx),
@@ -862,7 +1039,15 @@ fn kill(
 }
 
 /// `ctl board`: read and write the shared task board.
-fn board(op: ctl::BoardOp, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
+///
+/// `operator` is the label of an operator-token caller (`operator:<name>`),
+/// which has no pane to derive one from; `None` for every other caller.
+fn board(
+    op: ctl::BoardOp,
+    caller: Option<AgentId>,
+    operator: Option<&str>,
+    cx: &mut CtlSession<'_>,
+) -> ctl::Reply {
     let (windows, board) = (&*cx.windows, &mut *cx.board);
     // The board is SHARED team state: any pane in the session reads and
     // writes the same source of truth (no subtree scoping — coordination
@@ -878,6 +1063,7 @@ fn board(op: ctl::BoardOp, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> 
                 // identity; this is the human-friendly fallback label.
                 .unwrap_or_else(|| format!("pane {}", p.agent_id.0 + 1))
         })
+        .or_else(|| operator.map(str::to_string))
         .or_else(|| Some("operator".to_string()));
     match op {
         ctl::BoardOp::Set { key, fields } => {
@@ -910,10 +1096,14 @@ fn board(op: ctl::BoardOp, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> 
 }
 
 /// `ctl bus`: publish, subscribe and read on the shared event bus.
+///
+/// `operator` is the label of an operator-token caller (`operator:<name>`),
+/// as for [`board`].
 fn bus(
     op: ctl::BusOp,
     caller: Option<AgentId>,
     privileged: bool,
+    operator: Option<&str>,
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
     let (windows, bus, pending) = (&*cx.windows, &mut *cx.bus, &mut *cx.pending);
@@ -925,6 +1115,7 @@ fn bus(
     let who = caller
         .and_then(|cid| pane_by_agent(windows, cid))
         .map(|p| pane_label(p.agent_id, p.role.as_deref()))
+        .or_else(|| operator.map(str::to_string))
         .unwrap_or_else(|| "operator".to_string());
     let now = agsess::sessions::now_ms();
     match op {
@@ -1031,6 +1222,9 @@ pub(crate) fn scope_denied(
         )))
     }
 }
+
+#[cfg(test)]
+mod operator_tests;
 
 #[cfg(test)]
 mod effect_tests {

@@ -154,3 +154,173 @@ fn a_usage_error_displays_its_message_and_is_an_error() {
     let boxed: Box<dyn std::error::Error> = Box::new(err);
     assert!(boxed.to_string().contains("frobnicate"));
 }
+
+// ---- operator tokens -------------------------------------------------------
+
+const OPERATOR_TOKEN: &str = "a3f1c29b7d5e4086a3f1c29b7d5e4086";
+
+/// An operator's request carries its token in `operator_token` and nothing of
+/// a pane: no `caller`, and no `token` even when the client runs in a pane
+/// whose `ATRIUM_TOKEN` is set.
+#[test]
+fn an_operator_request_carries_the_operator_token_and_no_pane_credential() {
+    let pairs = credential_pairs(
+        Cred::Operator(OPERATOR_TOKEN),
+        Some("the-panes-own-token".to_string()),
+    )
+    .expect("pairs");
+    let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+    assert_eq!(keys, ["operator_token"]);
+
+    let line = build_pairs(&v(&["kill", "3"]), Cred::Operator(OPERATOR_TOKEN)).expect("request");
+    let req = crate::ctl::parse_request(&line).expect("parses");
+    assert_eq!(req.operator_token.as_deref(), Some(OPERATOR_TOKEN));
+    assert_eq!((req.caller, req.token), (None, None));
+    assert_eq!(
+        req.cmd,
+        crate::ctl::Cmd::Kill(crate::ctl::KillReq {
+            target: "3".to_string()
+        })
+    );
+}
+
+/// A pane's request is what it was: its id and its own token, and never an
+/// `operator_token`.
+#[test]
+fn a_pane_request_never_carries_an_operator_token() {
+    let pairs = credential_pairs(Cred::Pane(Some(3)), Some("the-panes-own-token".to_string()))
+        .expect("pairs");
+    let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+    assert_eq!(keys, ["caller", "token"]);
+    let line = build_request(&v(&["list"]), Some(3)).expect("request");
+    assert_eq!(
+        crate::ctl::parse_request(&line)
+            .expect("parses")
+            .operator_token,
+        None
+    );
+}
+
+/// The server's parser: the field is a string or it is an error. Present but
+/// not a string must not read as absent, or the request would be served under
+/// some other identity.
+#[test]
+fn a_malformed_operator_token_is_a_bad_request_not_an_absent_one() {
+    for line in [
+        r#"{"cmd":"list","operator_token":1}"#,
+        r#"{"cmd":"list","operator_token":null}"#,
+        r#"{"cmd":"list","operator_token":["a3f1c29b7d5e4086a3f1c29b7d5e4086"]}"#,
+        r#"{"cmd":"list","operator_token":{"t":"x"}}"#,
+        r#"{"cmd":"list","operator_token":true}"#,
+    ] {
+        let err = crate::ctl::parse_request(line).expect_err(line);
+        assert_eq!(err, "operator_token must be a string");
+    }
+    // Empty is present: the server refuses it as a token that matches nobody.
+    let req = crate::ctl::parse_request(r#"{"cmd":"list","operator_token":""}"#).expect("parses");
+    assert_eq!(req.operator_token.as_deref(), Some(""));
+}
+
+/// The audit label of a request is built from its command alone: neither
+/// credential is in it, whatever the verb.
+#[test]
+fn audit_labels_hold_no_credential() {
+    for argv in [
+        v(&["kill", "3"]),
+        v(&["send", "lead", "ship", "it"]),
+        v(&["spawn", "--role", "dev", "--", "claude"]),
+        v(&["board", "set", "k", "status=done"]),
+        v(&["bus", "pub", "work", "msg=done"]),
+        v(&["answer", "3"]),
+        v(&["who", "src/x.rs"]),
+        v(&["audit"]),
+    ] {
+        let line = build_pairs(&argv, Cred::Operator(OPERATOR_TOKEN)).expect("request");
+        assert!(
+            line.contains(OPERATOR_TOKEN),
+            "the request itself carries it"
+        );
+        let (action, detail) = crate::ctl::parse_request(&line)
+            .expect("parses")
+            .cmd
+            .audit_label();
+        assert!(!action.contains(OPERATOR_TOKEN), "{action}");
+        assert!(!detail.contains(OPERATOR_TOKEN), "{detail}");
+    }
+}
+
+#[test]
+fn operator_flags_are_taken_off_the_front_only() {
+    let file = |path: &str, name: Option<&str>| OperatorFile {
+        path: path.to_string(),
+        name: name.map(str::to_string),
+    };
+    let args = v(&["--operator-token-file", "/run/op", "kill", "3"]);
+    let (found, rest) = take_operator_flags(&args).expect("file");
+    assert_eq!(found, Some(file("/run/op", None)));
+    assert_eq!(rest, &v(&["kill", "3"])[..]);
+
+    let args = v(&[
+        "--operator",
+        "bridge",
+        "--operator-token-file=/run/op",
+        "list",
+    ]);
+    let (found, rest) = take_operator_flags(&args).expect("name then file");
+    assert_eq!(found, Some(file("/run/op", Some("bridge"))));
+    assert_eq!(rest, &v(&["list"])[..]);
+
+    let args = v(&[
+        "--operator-token-file",
+        "/run/op",
+        "--operator=bridge",
+        "list",
+    ]);
+    let (found, _) = take_operator_flags(&args).expect("= form");
+    assert_eq!(found, Some(file("/run/op", Some("bridge"))));
+
+    // Past the verb the words are the verb's: a send whose text mentions the
+    // flag is a pane's send, untouched.
+    let args = v(&["send", "lead", "--operator-token-file", "/etc/passwd"]);
+    let (found, rest) = take_operator_flags(&args).expect("not ours");
+    assert_eq!(found, None);
+    assert_eq!(rest, &args[..]);
+
+    for (argv, want) in [
+        (v(&["--operator-token-file"]), "needs a value"),
+        (
+            v(&["--operator-token-file", "--operator", "x", "list"]),
+            "needs a value",
+        ),
+        (v(&["--operator-token-file=", "list"]), "needs a value"),
+        (
+            v(&["--operator", "bridge", "list"]),
+            "goes with --operator-token-file",
+        ),
+        (
+            v(&[
+                "--operator-token-file",
+                "/a",
+                "--operator-token-file",
+                "/b",
+                "list",
+            ]),
+            "only once",
+        ),
+        (
+            v(&[
+                "--operator-token-file",
+                "/a",
+                "--operator",
+                "x",
+                "--operator=y",
+                "list",
+            ]),
+            "only once",
+        ),
+        (v(&["--operator-token-file", "/a"]), "needs a command"),
+    ] {
+        let err = take_operator_flags(&argv).expect_err(want);
+        assert!(err.contains(want), "{argv:?}: {err}");
+    }
+}

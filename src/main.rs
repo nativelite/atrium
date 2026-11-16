@@ -275,6 +275,19 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
         return atrium::tmux_shim::main(&args[1..]);
     }
+    // Operator tokens (`--operator-token-file <path>` first, or
+    // ATRIUM_OPERATOR_TOKEN_FILE): the file is read and checked once, here,
+    // before any dispatch, so every path that hosts a session (a plain launch,
+    // `fleet up`, `up`, `recover`) has them and none starts on a file that
+    // fails a check. The variable leaves atrium's environment in the same step,
+    // before any pane exists to inherit it.
+    let args = match atrium::operator::host_startup(args) {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("atrium: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Watchdog mode: a re-exec of atrium that outlives this session and cleans up
     // if it dies in a way no handler can catch (SIGKILL, panic, OOM). Dispatched
     // before anything else — it must never touch the terminal.
@@ -436,6 +449,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Found here, the operator flag was written after another session flag,
+    // where it would be taken for the command to host. Say where it goes.
+    if rest.first().is_some_and(|a| atrium::operator::is_flag(a)) {
+        eprintln!("atrium: {}", atrium::operator::MISPLACED);
+        return ExitCode::FAILURE;
+    }
     // `atrium [--identity X] [--trust <policy>] [--allow-ctl] up <name>` is the
     // ergonomic alias for `atrium fleet up <name>`: the launch flags atrium just
     // parsed become the fleet's posture. Without this, `up` falls through to the

@@ -43,6 +43,7 @@ pub mod layout;
 pub mod memguard;
 pub mod modfiles;
 pub mod modstate;
+pub mod operator;
 pub mod orphan;
 pub mod reap;
 pub mod resolve;

@@ -24,6 +24,9 @@ session flags:
   --skip-permissions        the same as --trust skip
   --allow-ctl               switch the control plane on (atrium ctl in every pane)
   --max-depth <N>           how deep spawned teammates may spawn (default 6; 0 = unlimited)
+  --operator-token-file <path>
+                            named tokens for control-plane callers that are not panes; it is
+                            the first argument, or ATRIUM_OPERATOR_TOKEN_FILE holds the path
   --identity <name>, -I     run every pane under a vault identity (name only; see docs/identity.md)
   -n <N> | --grid <R>x<C>   open N copies of the command in a grid, or an exact R×C grid
   --reap-orphans            first kill pane groups whose atrium is gone (as `atrium reap`)
@@ -52,6 +55,10 @@ pub const CTL: &str = "\
 usage: atrium ctl <command> [args]    the control plane, run from inside a pane
        atrium ctl --json ...          print the raw JSON reply    --no-color   plain text
        atrium ctl --quiet ...         print no reply (for a hook); the exit code still answers
+       atrium ctl --operator-token-file <path> [--operator <name>] <command> [args]
+                                      from outside a pane, as a named operator: the verbs its
+                                      entry in the token file allows, on any pane, audited as
+                                      operator:<name> (ATRIUM_CTL names the endpoint)
 
 teammates:
   spawn [--role R] [--identity X] [--here | --window] [--mode M] [--worktree W] -- <cmd...>
@@ -101,6 +108,7 @@ pub const FLEET: &str = "\
 usage: atrium fleet <command> [args]    saved rosters of agents (atrium.fleet.json)
 
   up <name> [--allow-ctl] [--trust [<policy>]] [--skip-permissions] [--max-depth <N>]
+            [--operator-token-file <path>]
                                     bring the fleet up; the flags are the session flags
   init <template> [--agents <N>]    write ./atrium.fleet.json from a built-in (solo, pair, crew)
                                     or one of your own fleets in the user-global fleet.json;
@@ -150,7 +158,8 @@ usage: atrium recover [--list | --snapshot <path>] [session flags]   restore the
   --snapshot <path>     restore a specific snapshot file
 
 session flags (--trust, --skip-permissions, --allow-ctl, --max-depth) override what the
-snapshot recorded. A launch in a project whose last session crashed offers this itself.
+snapshot recorded; --operator-token-file <path> is read anew, never from the snapshot.
+A launch in a project whose last session crashed offers this itself.
 See docs/session-recovery.md.
 ";
 
@@ -211,6 +220,8 @@ mod tests {
                     "--json",
                     "--quiet",
                     "--no-color",
+                    "--operator-token-file",
+                    "--operator <name>",
                 ],
             ),
             (
@@ -221,6 +232,7 @@ mod tests {
                     "--trust",
                     "--skip-permissions",
                     "--max-depth",
+                    "--operator-token-file",
                     "init",
                     "--agents",
                     "ls",
@@ -237,6 +249,7 @@ mod tests {
                     "--trust",
                     "--allow-ctl",
                     "--max-depth",
+                    "--operator-token-file",
                 ],
             ),
         ];
@@ -251,6 +264,8 @@ mod tests {
             "--skip-permissions",
             "--allow-ctl",
             "--max-depth",
+            "--operator-token-file",
+            "ATRIUM_OPERATOR_TOKEN_FILE",
             "--identity",
             "-I",
             "-n",
