@@ -1,56 +1,85 @@
-# PLAN — 0.43.0
+# PLAN — 0.47.0, "runs in a container"
 
-The release after 0.42.0. 0.42.0 is what sits on `main` unreleased on
-2026-11-08: the codex startup-screen fix (50717aa), ctl requests that repaint
-only what they changed (8011dd9), Claude Code's own agent teams landing as
-atrium panes through the tmux-compatible shim (25a0ded, 29bdb45, 4efe488),
-and the `teams` setting (962398f). It ships once the live probe holds: a real
-Claude Code lead in `atrium --allow-ctl claude` spawns a split-pane teammate
-and it appears as an atrium pane with the lead as its parent.
+The release after 0.46.0. The November plan (0.43.0 through 0.46.0) is shipped;
+this one comes from a deployment report: atrium as the agent workspace inside
+containers, one session per container, attached to through an outer tmux, with
+a sidecar and a control endpoint that need to reach the session from outside a
+pane. 0.47.0 makes one session easy to host and to operate from outside.
+0.48.0 connects sessions to each other.
 
-Every 0.43.0 item is a GitHub issue on the `0.43.0` milestone; the issue is
-the unit of work and carries the detail. This file is the order and the
-dependencies. Founder decisions that shaped it (2026-11-08): both tmux shims
-share one std-only MIT protocol crate, after 0.42.0; `src/ipc` becomes
-`nativelite-ipc` after 0.42.0 and foldwave builds no transport of its own
-before then; the ctl doorbell and the held inbox connection are one ipc item
-with an adversarial review.
+Every item is a GitHub issue on the `0.47.0` milestone; the issue carries the
+detail. This file is the order, the file fences and the dependencies.
+
+Founder decisions that shaped it (2026-11-15):
+
+- **Bus federation uses a sidecar adapter.** atrium speaks a documented
+  line-JSON protocol on a local endpoint; NATS, Kafka, WebSocket and TLS live
+  in an adapter outside atrium. No transport client enters the tree
+  (`standards/zero-dependency.md`). It is 0.48.0.
+- **Headless is in.** `atrium fleet up --headless` reverses the README's
+  "detach is out of scope" for the run half; `atrium attach` follows in 0.48.0.
 
 ## Items
 
-| # | item | size | depends on | done-signal |
+| # | item | size | files (the fence) | done-signal |
 |---|---|---|---|---|
-| A ([#13](https://github.com/nativelite/atrium/issues/13)) | Shared tmux protocol crate; atrium's shim depends on it | M | new org repo; crates.io publish (founder) | `src/tmux_shim.rs` keeps only `Broker`/`CtlBroker`/env/ensure; the 12 shim tests pass against the crate; registry build of atrium compiles |
-| B ([#14](https://github.com/nativelite/atrium/issues/14)) | `nativelite-ipc`: extract `src/ipc` with its exploit replays | L | A published first, or lands in the same release train | atrium depends on the crate; replay tests green in the crate; adversarial review done |
-| C ([#15](https://github.com/nativelite/atrium/issues/15)) | ctl listener on the doorbell + held `inbox --wait` connection | L | B (do inside the crate, not during its move) | a ctl request is served without waiting a tick; the mod's 1.5 s poll is gone; `ctl wait`/`ask` hold a connection |
-| D ([#16](https://github.com/nativelite/atrium/issues/16)) | Hook-injected certainty status for unmodded claude panes | M | — | yellow border within one tick of a permission prompt on a claude pane without the mod; user-passed `--settings` never overridden |
-| E ([#17](https://github.com/nativelite/atrium/issues/17)) | Teams follow-ups: `--teammate-mode auto` on argv, e2e with the fake claude, first-split size | M | 0.42.0 probe result | e2e green; no settings.json edit needed for a fresh user |
-| F ([#18](https://github.com/nativelite/atrium/issues/18)) | agsess refresh O(bound sessions), snapshot on change, indexed status | M | — | refresh cost measured before/after; idle CPU and key echo re-benchmarked |
-| G ([#19](https://github.com/nativelite/atrium/issues/19)) | Title and needs-you notifications: build or retire | M or 0 | founder decision | `src/attention.rs` + the old M1–M5 plan, or the plan deleted |
-| H ([#20](https://github.com/nativelite/atrium/issues/20)) | Token-free ctl reads documented as a stable host-read surface | S | — | docs/control-plane.md states the promise; wire-golden tests pin the reply shapes |
-| I ([#21](https://github.com/nativelite/atrium/issues/21)) | Housekeeping: 15 ms tick docs, benches README, re-bench after 8011dd9, overlays without `2J` | S | — | numbers recorded in benches/README.md |
+| K ([#22](https://github.com/nativelite/atrium/issues/22)) | An inherited outer `TMUX`/`TMUX_PANE` never reaches a pane; `atrium --version --json` | S | `src/main.rs` (startup, version), `src/tmux_shim.rs`, `src/help.rs` | a pane without the shim has no `TMUX`; the shim's own values still arrive; `--version --json` prints version, commit when known, target |
+| L ([#23](https://github.com/nativelite/atrium/issues/23)) | A stable ctl endpoint: `--ctl-socket <path>` / `ATRIUM_CTL_SOCKET`, live-listener refusal, stale takeover, a discovery file | M | `../ipc` (main), `src/ipc.rs`, `src/main.rs` (`bind_ctl` only), `src/fleet_cli/up.rs` (the bind only), `docs/control-plane.md` | atrium binds the given path; a second atrium on the same path fails with a clear line; a stale file is taken over; panes get the path as `ATRIUM_CTL` |
+| M ([#24](https://github.com/nativelite/atrium/issues/24)) | Operator tokens: a file-borne credential for callers that are not panes, a verb allow-list, `by: operator:<name>` in the audit log | M, **severe** | new `src/operator.rs`, `src/ctl/request.rs`, `src/ctl/client.rs`, `src/ctl_server/dispatch.rs`, `src/audit.rs`, `docs/control-plane.md` | with the file, `ctl kill` from outside a pane works and is audited under the operator's name; without it, refused as today; model-output verbs stay off unless enabled; adversarial review done |
+| N ([#25](https://github.com/nativelite/atrium/issues/25)) | `ctl ping` and `ctl metrics` (Prometheus text), both token-free reads | S | `src/ctl/request.rs`, `src/ctl/client.rs`, `src/ctl/reply.rs`, `src/ctl_server/dispatch.rs` (new arms only), `docs/control-plane.md` | `ping` exits 0 only when the run loop answered; `metrics` lists panes by state, wakes, bus depth; golden tests pin both shapes |
+| O ([#26](https://github.com/nativelite/atrium/issues/26)) | 0.46.0 hardening: the Claude team snapshot lives in the session, not in a process-wide static | S | `src/claude_teams.rs`, the session state that owns it (`RunState`), `src/overview.rs`, the call sites | no `static WATCH`; the overview tests still pass |
+| P ([#27](https://github.com/nativelite/atrium/issues/27)) | Headless sessions: `atrium fleet up <name> --headless [--size RxC]` | L, **severe** | `../rawterm-rs` (main) or a seam in `src/run_loop/`, `src/fleet_cli/up.rs`, `src/fleet_cli/launch.rs`, `src/run_loop/setup.rs`, `src/run_loop/keys.rs`, `README.md` | a fleet starts with no terminal on stdin or stdout, `ctl list`/`status` answer, it outlives its starter, it ends on the last pane's exit or a termination signal with the teardown the attached path runs |
 
-## Order of attack
+M and N both add arms to `src/ctl/request.rs` and
+`src/ctl_server/dispatch.rs`; K, L and P each touch a different part of
+`src/main.rs` or `src/fleet_cli/up.rs`. The integrator expects small textual
+conflicts there and resolves them at merge.
 
-1. **H, I, D, F** are independent of the crate moves and can start at once,
-   each in its own session or fleet item. D and F touch `src/pane_spawn.rs` and
-   `src/vendors.rs` respectively; nothing else overlaps.
-2. **A** next: a move, not a rewrite. The publish is the gate.
-3. **B then C**: the ipc work is one train. C is the latency win users feel
-   (the polls go away); B is what foldwave is waiting on.
-4. **E** after the 0.42.0 probe says what the shim got wrong in practice.
-5. **G** whenever the founder decides.
+## Integrator's own work
+
+- Merge one branch at a time, `python dev.py check`, push `main`.
+- The adversarial review for M and P before their merge.
+- The container section in the docs once K, L, M, N and P have landed: a
+  non-root user, the memory guard without cgroup delegation, the container's
+  own memory limit, where `ATRIUM_BOARD` and `ATRIUM_BUS` persist, the liveness
+  probe on `ctl ping`, the sidecar on the stable socket.
+- Live probes left from 0.46.0: the codex hooks status against a live codex,
+  and the team board against a captured Claude Code team.
+- The cross-target `cargo check` for linux and macOS, and the WSL suite, before
+  the release.
+
+## Open, not in this release
+
+- nativelite-vterm keeps at most 64 notices between reads and drops the rest
+  without a count. A dropped-notice counter is a vterm change and a publish;
+  it waits for the next vterm release.
+- The guard group from `PLAN-mod.md` (R12 budgets, R10 approvals, R11 deny
+  propagation). R10's routed approvals and M's operator approvals are designed
+  together, after M has shown what an operator identity looks like in use.
+
+## 0.48.0, sketched
+
+- **`atrium bridge`**: mirrors chosen bus topics between the local session and
+  a line-JSON stream on stdio or a local socket. atrium owns origin tagging
+  (`<session>/<pane>`), the hop count that stops echo, resume from the last
+  acknowledged `seq`, wakes for local subscribers, and a remote `--decision`
+  whose resolution travels back. Remote events are data and never become ctl
+  commands. Inbound injection authenticates as an operator (M).
+- **A reference sidecar adapter** outside the atrium tree.
+- **`atrium attach <session>`** for a headless session (P).
+- A shared board namespace (`shared/…`) after the bus.
 
 ## Rules that still hold
 
-- Zero third-party dependencies; org crates only (`standards/zero-dependency.md`).
+- Zero third-party dependencies; org crates only.
 - Local `python dev.py check` green before every push; there is no CI.
-- Severe/critical (B, C) get a scope statement, a self-review and an
-  adversarial pass before the push, and the commit message says so.
+- Builders run only their module's tests; one full gate, the integrator's.
 - Every crates.io publish and every repo visibility change is the founder's.
+  L needs nativelite-ipc published before atrium 0.47.0; P needs
+  nativelite-rawterm published if the seam lands there.
 - The marketplace repo is public: skills and plugin syncs go with a release.
 
-## Release chain for 0.43.0
+## Release chain
 
-A's crate → (B's crate) → atrium 0.43.0 → marketplace plugin bump. If A or B
-slips, atrium 0.43.0 ships without them: D, E, F, H and I are self-contained.
+nativelite-ipc (L) → nativelite-rawterm (P, if touched) → atrium 0.47.0 →
+marketplace plugin bump if a skill changed.
