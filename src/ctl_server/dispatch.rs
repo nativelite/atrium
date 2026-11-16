@@ -25,6 +25,9 @@ pub(crate) struct CtlSession<'a> {
     /// Commands a ctl spawn may run beyond the built-in agent allowlist.
     pub(crate) extra_allow: &'a [String],
     pub(crate) pending: &'a mut Vec<PendingSend>,
+    /// How many `inbox --wait` connections the run loop holds open right
+    /// now: a number `metrics` reports.
+    pub(crate) held_inboxes: usize,
     pub(crate) world: &'a atrium::vendors::AgentState,
     /// The identity the session was launched under, if any.
     pub(crate) session_identity: Option<&'a str>,
@@ -147,6 +150,18 @@ pub(crate) fn apply_ctl_as(
         audit.record(caller, "audit", "read", true, "");
         return (
             audit_reply(audit, windows, caller, privileged, ar.tail),
+            CtlEffect::Nothing,
+        );
+    }
+
+    // `ping` and `metrics` are probes: a liveness check every few seconds and
+    // a scrape every fifteen, for as long as the session lives. Recorded, they
+    // would push every real action out of the audit ring and grow its file
+    // without end, and they hand out a version, an uptime and counts, nothing
+    // of any pane's. Answered, not recorded.
+    if matches!(req.cmd, Cmd::Ping | Cmd::Metrics) {
+        return (
+            dispatch_ctl(req, caller, privileged, cx),
             CtlEffect::Nothing,
         );
     }
@@ -394,7 +409,68 @@ pub(crate) fn dispatch_ctl(
         Cmd::Ask(a) => ask(a, caller, privileged, cx),
         Cmd::Asked(a) => asked(a, caller, privileged, cx),
         Cmd::Who(w) => who(w, caller, privileged, cx),
+        Cmd::Ping => ctl::reply_pong(uptime_ms()),
+        Cmd::Metrics => metrics(cx),
     }
+}
+
+/// When the session's run loop started; `None` until [`mark_session_start`].
+static SESSION_START: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Note that a session's run loop starts now: what `ping` and `metrics`
+/// measure uptime from, and where the session's delivered-wake count begins.
+/// To be called once per [`crate::run_loop`] run, before its first tick.
+///
+/// OPEN (0.47 item N): nothing calls this yet. The call belongs in
+/// `run_loop::run`, which is outside item N's files; until the integrator
+/// adds `crate::ctl_server::mark_session_start();` there, uptime reads `0`.
+/// Drop this `allow` with that line.
+#[allow(
+    dead_code,
+    reason = "run_loop::run is to call this; that file is outside item N"
+)]
+pub(crate) fn mark_session_start() {
+    *SESSION_START.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+    super::sends::reset_wakes_delivered();
+}
+
+/// Milliseconds since [`mark_session_start`]; `0` if no loop has started.
+fn uptime_ms() -> u64 {
+    let started = *SESSION_START.lock().unwrap_or_else(|e| e.into_inner());
+    started.map_or(0, |t| {
+        u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX)
+    })
+}
+
+/// `ctl metrics`: the session's counters, each read from state the broker
+/// already holds, at reply time: one pass over the panes, three reads of the
+/// bus ring (512 events at most), two stored numbers. Counts only: no pane's
+/// role, title or text is in the reply, so it is served without a token.
+fn metrics(cx: &CtlSession<'_>) -> ctl::Reply {
+    let mut m = ctl::Metrics {
+        uptime_ms: uptime_ms(),
+        wakes_delivered: super::sends::wakes_delivered(),
+        held_inboxes: cx.held_inboxes,
+        bus_depth: cx.bus.tail(usize::MAX).len(),
+        bus_last_seq: cx.bus.tail(1).last().map_or(0, |e| e.seq),
+        open_decisions: cx.bus.pending_decisions().len(),
+        ..ctl::Metrics::default()
+    };
+    // The same status `list` shows: the mod's own report, else the inference.
+    let now_ms = atrium::session_store::now_ms();
+    for p in cx.windows.iter().flat_map(|w| &w.panes) {
+        m.count_pane(
+            cx.mods
+                .status_for(p.agent_id.0, now_ms)
+                .map(|s| s.label())
+                .or_else(|| {
+                    cx.world
+                        .status_for(p.session_id.as_deref())
+                        .map(status_label)
+                }),
+        );
+    }
+    ctl::reply_metrics(m)
 }
 
 /// `ctl ask`: queue a question for a pane's mod, which answers it from a fork
@@ -1267,5 +1343,92 @@ mod effect_tests {
         ] {
             assert_eq!(CtlEffect::of(&cmd(line)), CtlEffect::Chrome, "{line}");
         }
+    }
+
+    /// A probe every few seconds and a scrape every fifteen must never cost a
+    /// repaint, and both are answered without a token.
+    #[test]
+    fn ping_and_metrics_are_token_free_reads_that_draw_nothing() {
+        for line in [r#"{"cmd":"ping"}"#, r#"{"cmd":"metrics"}"#] {
+            let c = cmd(line);
+            assert!(c.is_read_only(), "{line}");
+            assert_eq!(CtlEffect::of(&c), CtlEffect::Nothing, "{line}");
+        }
+    }
+
+    /// Both probes against a live session, with no token on the line: `ping`
+    /// carries the uptime since the loop's start, `metrics` the numbers the
+    /// broker holds, and neither repaints or leaves an audit entry.
+    #[test]
+    fn ping_and_metrics_answer_without_a_token_and_are_not_recorded() {
+        // The loop started a quarter of a second ago. Only the start is set
+        // here: `mark_session_start` also zeroes the wake count, which the
+        // delivery tests running beside this one read.
+        *SESSION_START.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(250));
+        let mut windows = Vec::new();
+        let mut pending = Vec::new();
+        let world = atrium::vendors::AgentState::default();
+        let mut audit = atrium::audit::Audit::new(16, None);
+        let mut board = atrium::board::Board::new();
+        let mut bus = atrium::bus::Bus::new();
+        let mut mods = atrium::modstate::ModState::default();
+        let mut hold = None;
+        let field = |k: &str, v: &str| vec![(k.to_string(), v.to_string())];
+        bus.publish("work", atrium::bus::Kind::Fyi, None, &field("msg", "a"), 1)
+            .unwrap();
+        let ask = bus
+            .publish(
+                "work",
+                atrium::bus::Kind::DecisionNeeded,
+                None,
+                &field("msg", "b"),
+                2,
+            )
+            .unwrap();
+        let mut cx = CtlSession {
+            windows: &mut windows,
+            rows: 24,
+            cols: 80,
+            max_depth: 3,
+            extra_allow: &[],
+            pending: &mut pending,
+            held_inboxes: 2,
+            world: &world,
+            session_identity: None,
+            audit: &mut audit,
+            board: &mut board,
+            bus: &mut bus,
+            mods: &mut mods,
+            hold: &mut hold,
+        };
+
+        let (reply, effect) = apply_ctl(r#"{"cmd":"ping"}"#, &mut cx);
+        assert_eq!(effect, CtlEffect::Nothing);
+        match reply {
+            ctl::Reply::Pong { uptime_ms } => {
+                assert!((250..600_000).contains(&uptime_ms), "{uptime_ms}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let (reply, effect) = apply_ctl(r#"{"cmd":"metrics"}"#, &mut cx);
+        assert_eq!(effect, CtlEffect::Nothing);
+        match reply {
+            ctl::Reply::Metrics(m) => {
+                assert!(m.uptime_ms >= 250, "{m:?}");
+                assert_eq!(m.panes, [0; ctl::PANE_STATES.len()]);
+                assert_eq!(m.held_inboxes, 2);
+                assert_eq!(m.bus_depth, 2);
+                assert_eq!(m.bus_last_seq, ask.seq);
+                assert_eq!(m.open_decisions, 1);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            cx.audit.latest_seq(),
+            0,
+            "a probe is not an action: nothing was recorded"
+        );
     }
 }

@@ -134,6 +134,60 @@ pub enum Reply {
         path: String,
         panes: Vec<WhoEntry>,
     },
+    /// `{"ok":true,"atrium":V,"uptime_ms":N}` — the run loop answered a `ping`.
+    Pong {
+        uptime_ms: u64,
+    },
+    /// `{"ok":true,"atrium":V,"uptime_ms":N,"panes":{<state>:N,…},…}` — the
+    /// session's counters, for `metrics`.
+    Metrics(Metrics),
+}
+
+/// The pane states a `metrics` reply counts under, in wire order: the status
+/// words of `list` and `status`, and `unbound` for a pane with none (a shell,
+/// an agent not yet bound). Fixed names, all always present, so a scraper's
+/// series never come and go, and so no label is ever text a pane supplied.
+pub const PANE_STATES: [&str; 7] = [
+    "working",
+    "waiting-approval",
+    "waiting-prompt",
+    "idle",
+    "errored",
+    "ended",
+    "unbound",
+];
+
+/// What a `metrics` reply carries: numbers the broker already holds, read at
+/// reply time. No role, title or text of any pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Metrics {
+    /// Milliseconds since the session's run loop started.
+    pub uptime_ms: u64,
+    /// Panes per state, in [`PANE_STATES`] order.
+    pub panes: [usize; PANE_STATES.len()],
+    /// Bus wake lines handed to a pane since the session started: typed into
+    /// it, or taken by its mod's `inbox`. Events that land together for one
+    /// pane coalesce into one line and count once.
+    pub wakes_delivered: u64,
+    /// `inbox --wait` connections held open right now.
+    pub held_inboxes: usize,
+    /// Events in the bus ring.
+    pub bus_depth: usize,
+    /// The newest event's `seq`; `0` before the first.
+    pub bus_last_seq: u64,
+    /// `decision_needed` events nobody has resolved.
+    pub open_decisions: usize,
+}
+
+impl Metrics {
+    /// Count one pane under its status word; `None`, or a word that is not in
+    /// [`PANE_STATES`], counts as `unbound`.
+    pub fn count_pane(&mut self, status: Option<&str>) {
+        let at = status
+            .and_then(|s| PANE_STATES.iter().position(|known| *known == s))
+            .unwrap_or(PANE_STATES.len() - 1);
+        self.panes[at] += 1;
+    }
 }
 
 /// One `inbox` item: a `send`'s text, a bus wake's framed line, or an `ask`'s
@@ -383,6 +437,29 @@ impl Reply {
                 ("seq", seq.map(u).unwrap_or(Value::Null)),
                 ("answer", opt_s(answer)),
             ]),
+            Reply::Pong { uptime_ms } => obj(vec![
+                ok,
+                ("atrium", s(env!("CARGO_PKG_VERSION"))),
+                ("uptime_ms", u(*uptime_ms)),
+            ]),
+            Reply::Metrics(m) => obj(vec![
+                ok,
+                ("atrium", s(env!("CARGO_PKG_VERSION"))),
+                ("uptime_ms", u(m.uptime_ms)),
+                (
+                    "panes",
+                    obj(PANE_STATES
+                        .iter()
+                        .zip(m.panes)
+                        .map(|(state, n)| (*state, i(n)))
+                        .collect()),
+                ),
+                ("wakes_delivered", u(m.wakes_delivered)),
+                ("held_inboxes", i(m.held_inboxes)),
+                ("bus_depth", i(m.bus_depth)),
+                ("bus_last_seq", u(m.bus_last_seq)),
+                ("open_decisions", i(m.open_decisions)),
+            ]),
             Reply::Tree(nodes) => obj(vec![
                 ok,
                 // The atrium that answered: a host terminal reading the
@@ -458,6 +535,18 @@ pub fn reply_asked(pane: AgentId, id: u64, reply: Option<&str>) -> Reply {
         id,
         reply: reply.map(str::to_string),
     }
+}
+
+/// `{"ok":true,"atrium":V,"uptime_ms":N}` — a `ping` answered by the run loop.
+pub fn reply_pong(uptime_ms: u64) -> Reply {
+    Reply::Pong { uptime_ms }
+}
+
+/// `{"ok":true,"atrium":V,"uptime_ms":N,"panes":{…},"wakes_delivered":N,
+/// "held_inboxes":N,"bus_depth":N,"bus_last_seq":N,"open_decisions":N}` — the
+/// session's counters.
+pub fn reply_metrics(metrics: Metrics) -> Reply {
+    Reply::Metrics(metrics)
 }
 
 /// `{"ok":true,"path":P,"panes":[...]}` — who touched a file.

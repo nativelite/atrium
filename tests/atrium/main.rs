@@ -13,6 +13,7 @@ mod support;
 mod cli;
 mod ctl;
 mod fleet;
+mod headless;
 mod process_tree;
 mod recover;
 #[cfg(any(windows, target_os = "linux"))]

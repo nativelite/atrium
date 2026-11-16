@@ -1074,6 +1074,286 @@ fn golden_error_reply_is_the_only_failure_shape() {
 }
 
 #[test]
+fn golden_ping_reply_names_the_atrium_and_its_uptime() {
+    assert_eq!(
+        reply_pong(90_500).to_json(),
+        format!(
+            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500}}"#,
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+}
+
+#[test]
+fn golden_metrics_reply_carries_every_state_and_counter() {
+    let mut m = Metrics {
+        uptime_ms: 90_500,
+        wakes_delivered: 12,
+        held_inboxes: 2,
+        bus_depth: 40,
+        bus_last_seq: 57,
+        open_decisions: 1,
+        ..Metrics::default()
+    };
+    for status in [
+        Some("working"),
+        Some("working"),
+        Some("waiting-approval"),
+        Some("idle"),
+        Some("errored"),
+        None,
+        // Not a status word: counted as unbound, never a key of its own.
+        Some("a\"b"),
+    ] {
+        m.count_pane(status);
+    }
+    assert_eq!(
+        reply_metrics(m).to_json(),
+        format!(
+            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500,"panes":{{"working":2,"waiting-approval":1,"waiting-prompt":0,"idle":1,"errored":1,"ended":0,"unbound":2}},"wakes_delivered":12,"held_inboxes":2,"bus_depth":40,"bus_last_seq":57,"open_decisions":1}}"#,
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+}
+
+/// `ping` and `metrics` round-trip argv → request → `Cmd`, need no token, and
+/// `metrics` takes no argument.
+#[test]
+fn ping_and_metrics_build_parse_and_are_read_only() {
+    for (argv, want) in [(&["ping"][..], Cmd::Ping), (&["metrics"][..], Cmd::Metrics)] {
+        let req = build_request(&v(argv), None).expect("build");
+        let cmd = parse_request(&req).expect("parse").cmd;
+        assert_eq!(cmd, want);
+        assert!(cmd.is_read_only(), "{argv:?} is a token-free read");
+        assert_eq!(cmd.audit_label(), (argv[0], String::new()));
+    }
+    assert!(build_request(&v(&["metrics", "extra"]), None).is_err());
+}
+
+/// One parsed line of Prometheus text exposition.
+#[derive(Debug, PartialEq)]
+enum Expo {
+    Help(String),
+    Type(String, String),
+    Sample {
+        name: String,
+        labels: Vec<(String, String)>,
+        value: f64,
+    },
+}
+
+fn metric_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == ':')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Parse one line by the exposition grammar, or say what is wrong with it:
+/// `# HELP <name> <text>`, `# TYPE <name> <counter|gauge>`, or
+/// `<name>[{<label>="<value>",…}] <number>` with only `\\`, `\"` and `\n`
+/// escapes inside a label value.
+fn expo_line(line: &str) -> Result<Expo, String> {
+    if let Some(rest) = line.strip_prefix("# HELP ") {
+        let (name, text) = rest.split_once(' ').ok_or("HELP without text")?;
+        if !metric_name(name) || text.is_empty() {
+            return Err(format!("bad HELP: {line:?}"));
+        }
+        return Ok(Expo::Help(name.to_string()));
+    }
+    if let Some(rest) = line.strip_prefix("# TYPE ") {
+        let (name, kind) = rest.split_once(' ').ok_or("TYPE without a type")?;
+        if !metric_name(name) || !matches!(kind, "counter" | "gauge") {
+            return Err(format!("bad TYPE: {line:?}"));
+        }
+        return Ok(Expo::Type(name.to_string(), kind.to_string()));
+    }
+    let name_end = line
+        .find(['{', ' '])
+        .ok_or_else(|| format!("no value: {line:?}"))?;
+    let name = &line[..name_end];
+    if !metric_name(name) {
+        return Err(format!("bad name: {line:?}"));
+    }
+    let mut labels = Vec::new();
+    let mut rest = &line[name_end..];
+    if let Some(mut body) = rest.strip_prefix('{') {
+        loop {
+            let eq = body.find("=\"").ok_or("label without =\"")?;
+            let label = &body[..eq];
+            if !metric_name(label) || label.contains(':') {
+                return Err(format!("bad label name: {line:?}"));
+            }
+            let mut value = String::new();
+            let mut chars = body[eq + 2..].char_indices();
+            let close = loop {
+                match chars.next().ok_or("unterminated label value")? {
+                    (at, '"') => break eq + 2 + at,
+                    (_, '\\') => match chars.next().ok_or("dangling backslash")?.1 {
+                        '\\' => value.push('\\'),
+                        '"' => value.push('"'),
+                        'n' => value.push('\n'),
+                        other => return Err(format!("bad escape \\{other}: {line:?}")),
+                    },
+                    (_, c) => value.push(c),
+                }
+            };
+            labels.push((label.to_string(), value));
+            body = &body[close + 1..];
+            if let Some(more) = body.strip_prefix(',') {
+                body = more;
+            } else {
+                rest = body.strip_prefix('}').ok_or("labels not closed")?;
+                break;
+            }
+        }
+    }
+    let value = rest
+        .strip_prefix(' ')
+        .ok_or_else(|| format!("no space before the value: {line:?}"))?;
+    let value = value
+        .parse::<f64>()
+        .map_err(|_| format!("bad value: {line:?}"))?;
+    Ok(Expo::Sample {
+        name: name.to_string(),
+        labels,
+        value,
+    })
+}
+
+/// A sample: its name, its labels in order, its value.
+type Sample = (String, Vec<(String, String)>, f64);
+
+/// Parse a whole exposition: it ends in a newline, has no blank line, every
+/// name is prefixed `atrium_`, and every sample follows its family's `HELP`
+/// and `TYPE`. Returns the samples.
+fn expo(text: &str) -> Vec<Sample> {
+    assert!(text.ends_with('\n'), "ends in a newline: {text:?}");
+    let (mut helped, mut typed, mut samples) = (Vec::new(), Vec::new(), Vec::new());
+    for line in text.strip_suffix('\n').unwrap().split('\n') {
+        match expo_line(line).unwrap_or_else(|e| panic!("{e}\nin:\n{text}")) {
+            Expo::Help(name) => helped.push(name),
+            Expo::Type(name, _) => typed.push(name),
+            Expo::Sample {
+                name,
+                labels,
+                value,
+            } => {
+                assert!(name.starts_with("atrium_"), "{name}");
+                assert!(helped.contains(&name), "{name} has no HELP before it");
+                assert!(typed.contains(&name), "{name} has no TYPE before it");
+                samples.push((name, labels, value));
+            }
+        }
+    }
+    samples
+}
+
+#[test]
+fn metrics_text_is_valid_prometheus_exposition() {
+    let mut m = Metrics {
+        uptime_ms: 90_500,
+        wakes_delivered: 12,
+        held_inboxes: 2,
+        bus_depth: 40,
+        bus_last_seq: 57,
+        open_decisions: 1,
+        ..Metrics::default()
+    };
+    m.count_pane(Some("working"));
+    m.count_pane(Some("waiting-approval"));
+    m.count_pane(None);
+    let text = render::render_metrics(&reply_metrics(m).to_json()).expect("renders");
+    let samples = expo(&text);
+    let value = |name: &str, labels: &[(&str, &str)]| {
+        let labels: Vec<(String, String)> = labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        samples
+            .iter()
+            .find(|(n, l, _)| n == name && *l == labels)
+            .unwrap_or_else(|| panic!("no {name}{labels:?} in:\n{text}"))
+            .2
+    };
+    assert_eq!(
+        value(
+            "atrium_build_info",
+            &[("version", env!("CARGO_PKG_VERSION"))]
+        ),
+        1.0
+    );
+    assert_eq!(value("atrium_uptime_seconds", &[]), 90.5);
+    assert_eq!(value("atrium_panes", &[("state", "working")]), 1.0);
+    assert_eq!(value("atrium_panes", &[("state", "waiting-approval")]), 1.0);
+    assert_eq!(value("atrium_panes", &[("state", "idle")]), 0.0);
+    assert_eq!(value("atrium_panes", &[("state", "unbound")]), 1.0);
+    assert_eq!(value("atrium_wakes_delivered_total", &[]), 12.0);
+    assert_eq!(value("atrium_held_inboxes", &[]), 2.0);
+    assert_eq!(value("atrium_bus_depth", &[]), 40.0);
+    assert_eq!(value("atrium_bus_last_seq", &[]), 57.0);
+    assert_eq!(value("atrium_open_decisions", &[]), 1.0);
+    // One series per fixed state, and no label but `version` and `state`.
+    let states: Vec<&str> = samples
+        .iter()
+        .filter(|(n, _, _)| n == "atrium_panes")
+        .map(|(_, l, _)| l[0].1.as_str())
+        .collect();
+    assert_eq!(states, PANE_STATES);
+    assert!(samples
+        .iter()
+        .flat_map(|(_, l, _)| l)
+        .all(|(k, _)| k == "version" || k == "state"));
+}
+
+/// Whatever answers at the endpoint, its reply cannot put a line of its own,
+/// or a pane's text, into the scrape: the version is escaped as a label value
+/// and a pane state the client does not know is not printed.
+#[test]
+fn metrics_text_escapes_the_version_and_prints_no_unknown_state() {
+    use json::Value;
+    use reply::obj;
+    let hostile = "1\"} 1\natrium_evil 9\n# \\";
+    let reply = obj(vec![
+        ("ok", Value::Bool(true)),
+        ("atrium", Value::String(hostile.to_string())),
+        ("uptime_ms", Value::Number(json::Number::Int(1))),
+        (
+            "panes",
+            obj(vec![
+                ("working", Value::Number(json::Number::Int(3))),
+                (
+                    "lead\"} 1\natrium_evil 9",
+                    Value::Number(json::Number::Int(7)),
+                ),
+            ]),
+        ),
+    ])
+    .to_string();
+    let text = render::render_metrics(&reply).expect("renders");
+    let samples = expo(&text);
+    assert!(samples.iter().all(|(n, _, _)| n != "atrium_evil"), "{text}");
+    let version = &samples
+        .iter()
+        .find(|(n, _, _)| n == "atrium_build_info")
+        .expect("build info")
+        .1;
+    assert_eq!(version[0], ("version".to_string(), hostile.to_string()));
+    assert_eq!(
+        samples
+            .iter()
+            .filter(|(n, _, _)| n == "atrium_panes")
+            .count(),
+        PANE_STATES.len()
+    );
+    assert_eq!(render::escape_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
+    // A refusal, or a reply of another verb, is not rendered at all.
+    assert!(render::render_metrics(r#"{"ok":false,"err":"no"}"#).is_none());
+    assert!(render::render_metrics(&reply_pong(5).to_json()).is_none());
+}
+
+#[test]
 fn spawn_no_focus_parses_and_defaults_to_focus() {
     let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     let line = build_request(

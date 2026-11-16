@@ -34,10 +34,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   permissions do and do not protect against is in `docs/control-plane.md`.
 - **`by` in an audit entry** (additive): `"by":"operator:<name>"` on an
   operator's entry, whose `caller` is `null`. A pane's entry is unchanged.
+- **`atrium --version --json`.** One object on one line for a script or a bug
+  report: `{"version":"…","commit":…,"target":"…"}`. `commit` is the
+  `ATRIUM_BUILD_COMMIT` the build was given, and `null` when it was given
+  none (atrium has no build script, so an ordinary `cargo install` has none).
+  `target` is put together from the compiler's `cfg` values and is the rustc
+  triple on the targets atrium ships for. Plain `--version` is unchanged.
+- **A stable, configurable ctl endpoint: `--ctl-socket <path>` and
+  `ATRIUM_CTL_SOCKET`** (#23). The endpoint was always named after the process
+  id, so a helper outside the session had to search the temp directory and
+  could not tell two sessions apart. The flag (which wins) or the variable now
+  names it: an absolute socket path on unix, a named-pipe name on Windows.
+  Panes receive the chosen address as `ATRIUM_CTL`. A path another session is
+  serving on is refused and the launch fails with a line saying so, before the
+  terminal is taken; a stale socket file left by a killed session is taken
+  over; a file that is not a socket is never removed. A path with a comma is
+  refused (the tmux shim's `TMUX` value cannot carry one). The `0600` mode and
+  the same-user peer checks are unchanged. Needs nativelite-ipc 0.2.2, where
+  the live-versus-stale decision lives.
+- **A discovery file for the running session's endpoint.** Every ctl session
+  writes `ctl/<pid>.endpoint` under the per-user state directory, removed on
+  exit and treated as stale when its endpoint no longer answers. `atrium ctl`
+  outside a pane, with no `ATRIUM_CTL`, uses it when exactly one session is
+  running (token-free reads only, since no pane token comes with it).
+- **`atrium ctl ping` and `atrium ctl metrics`, two token-free reads for a
+  host that runs atrium unattended (a container, a supervisor).** `ping
+  [--timeout <ms>]` exits `0` only when the session's run loop answered, and
+  prints its reply, `{"ok":true,"atrium":"<version>","uptime_ms":N}`;
+  otherwise it exits `1` with one line on stderr: no endpoint, connection
+  refused, or timeout. It asks once (on Windows the other verbs retry a
+  missing pipe name for up to 30 s), and the whole exchange (connect, write,
+  read) is bounded by the timeout, 1000 ms by default and 30000 at most, so
+  it is safe as a liveness probe.
+  `metrics` prints the Prometheus text exposition format: `atrium_build_info
+  {version="…"} 1`, `atrium_uptime_seconds`, `atrium_panes{state="…"}` (one
+  series per status word plus `unbound`, zeros included),
+  `atrium_wakes_delivered_total`, `atrium_held_inboxes`, `atrium_bus_depth`,
+  `atrium_bus_last_seq` and `atrium_open_decisions`; `--json` prints the raw
+  reply with the same numbers. The only labels are the version and the fixed
+  state names, never a pane's role or title. Neither verb repaints, and
+  neither is written to the audit log, which a probe every few seconds would
+  otherwise fill. Both reply shapes are pinned by `golden_*` tests.
+- **Headless sessions: `atrium fleet up <name> --headless [--size
+  <rows>x<cols>]`.** A fleet runs with no terminal on stdin or stdout, for a
+  service manager, a container or a job runner. No raw mode is entered,
+  nothing is read from stdin, stdout is never written to (frames are dropped
+  where they are made, so a full or closed pipe cannot stall the loop and a
+  log file gets no escape sequences), and nothing asks a terminal for its
+  size: the panes are laid out at `--size` (default `50x200`; rows 3 to 500,
+  columns 10 to 1000). The panes and their emulators run as they do attached,
+  so the ctl reads, sends from the session's own panes, the board, the bus
+  and the session snapshot all work (from outside a pane, a write needs an
+  operator token). What the status bar would have flashed goes to stderr, one line
+  each. `--headless` is refused, with the reason, without the control channel
+  (`--allow-ctl` or the fleet's `allow_ctl`: nothing else could reach the
+  session), without `ATRIUM_YES=1` (nobody is there for the banner's Enter),
+  at the `skip` posture whatever is set (full bypass is confirmed by a person
+  at a terminal, and `ATRIUM_YES` never stands in for that), and when the
+  endpoint cannot be bound. The resume offer is not made. The session ends when its last pane
+  exits or on a termination signal (`SIGTERM`, `SIGINT`, `SIGHUP`; on Windows
+  Ctrl+C, Ctrl+Break or the console closing, taken by a handler installed for
+  headless sessions only), through the teardown an attached session runs.
+  Flags go after the fleet's name (`atrium fleet up <name> --headless`); the
+  `atrium <flags> up <name>` alias does not take them. `atrium attach` is not
+  part of this: a headless session is reached through `ctl` only. The run loop
+  now runs on a host (`run_loop::Host`: the attached terminal, or nobody),
+  the seam an attach can plug into; an attached session asks its terminal
+  exactly what it did before.
 
 ### Changed
 - `ctl spawn --role` refuses a role that starts with `operator:`, for every
   caller: that prefix is how the board and the bus name an operator.
+
+### Fixed
+- **An outer tmux no longer reaches a pane (#22).** Started inside a real
+  tmux, atrium inherited `TMUX` and `TMUX_PANE`, and every pane without
+  atrium's own shim (ctl off, not claude, `teams: "off"`) inherited them in
+  turn, so Claude Code's agent teams there split the outer tmux window. The
+  hosting process now drops both at startup, before any pane exists; the only
+  `TMUX` a pane can carry is the one atrium's shim sets. The shim itself and
+  `atrium ctl` run inside a pane and are left alone.
 
 ## [0.46.0] - 2026-11-09
 

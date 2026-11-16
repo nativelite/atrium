@@ -289,6 +289,36 @@ grants** (resolved through symlinks) and waits for your Enter. Errors spawn
 nothing, never a partial fleet. Full spec and the JSON schema:
 [docs/fleets.md](docs/fleets.md).
 
+**Headless** runs a fleet with no terminal at all, for a service manager, a
+container or a job runner:
+
+```bash
+ATRIUM_YES=1 atrium fleet up review-crew --headless                # 50x200
+ATRIUM_YES=1 atrium fleet up review-crew --headless --size 40x160  # rows x cols
+```
+
+Nothing is read from stdin and nothing is drawn: stdout is never written to,
+and stderr carries the launch banner and, one line each, what the status bar
+would have flashed. The panes and their screens run as they do attached, and
+`atrium ctl` is the only way in. From outside a pane that means the token-free
+reads (`list`, `status`, `audit`, the board, the bus feed, `ping`, `metrics`);
+anything that changes the session (`send`, `kill`, `spawn`, a board or bus
+write) comes from one of its own panes, or from an operator holding a token
+(`--operator-token-file`). So `--headless` is refused without the control
+channel (`--allow-ctl`, or `"allow_ctl": true` in the fleet), and without
+`ATRIUM_YES=1`, since nobody is there to press Enter at the banner. It is
+refused at the `skip` posture whatever is set: full bypass is confirmed by a
+person at a terminal, and `ATRIUM_YES` never stands in for that. A crashed
+session is not offered back
+(`atrium recover` still has it). The session ends when its last pane exits, or
+on `SIGTERM`, `SIGINT` or `SIGHUP` (on Windows, Ctrl+C, Ctrl+Break or its
+console closing), through the same teardown as an attached session. Start it
+in a session of its own (`setsid`, a service unit, a container's init) if it
+should outlive the shell that started it (`nohup` alone is not enough: atrium
+takes `SIGHUP` itself, to tear its panes down). There is no `atrium attach` yet: a
+headless session cannot be looked at or typed into from a terminal, only
+reached through `ctl`.
+
 ## Coordinating agents: the control plane
 
 A fleet is a *saved* org chart; **`ctl`** builds one **live**. With `--allow-ctl`,
@@ -387,6 +417,7 @@ Claude Code's `teammateMode` to `auto` or `tmux`; details in
 | --- | --- |
 | `atrium [flags] [cmd...]` | start a session hosting `cmd` (default: your shell) |
 | `atrium fleet up <name>` / `ls` / `clean <name>` | bring up a saved roster / list rosters / reclaim a fleet's clean, merged worktrees |
+| `atrium fleet up <name> --headless [--size <rows>x<cols>]` | the same with no terminal, reached through `atrium ctl` alone ([headless](#running-many-agents-at-once)) |
 | `atrium fleet init <template> [--agents N]` / `ls --templates` | start a project's `atrium.fleet.json` from a built-in reference fleet (`solo`, `pair`, `crew`) or one of your own from the global `fleet.json` ([templates](docs/fleets.md#templates)) |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
 | `atrium mod install [--at <dir>]` / `status` | write the Claude Code plugin built into atrium (the mod) to its folder, so claude panes report their status for certain / what is installed |
@@ -469,7 +500,10 @@ pinned scroll region protects the status bar row. Deeper notes, including the
 win32-input-mode containment and running atrium nested inside another ConPTY,
 are in [docs/architecture.md](docs/architecture.md).
 
-**Deliberately out of scope in v1:** detach/reattach, scrollback, and config files
+**Deliberately out of scope in v1:** detaching from a running session and
+attaching to one (a fleet can *start* with no terminal, `fleet up --headless`,
+and be driven through `ctl`; a session started attached stays attached, and
+`atrium attach` does not exist yet), scrollback, and config files
 (later concerns); vendor integration beyond read-only status (pair with `akey`
 for keys and [`agtop`](https://github.com/nativelite/agtop) for a full session
 table); and agents launched *inside* a shell pane (`$ claude`), which atrium

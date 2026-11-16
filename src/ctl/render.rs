@@ -352,5 +352,125 @@ pub fn status_glyph(status: &str) -> &'static str {
     }
 }
 
+/// Render a `metrics` reply in the Prometheus text exposition format: for each
+/// family a `# HELP` and a `# TYPE` line, then its samples, every name
+/// prefixed `atrium_`, the text ending in a newline. `None` if the reply is
+/// not a metrics result (the caller falls back to the raw JSON).
+///
+/// The only labels are `version` (the reply's `atrium`, escaped) and `state`,
+/// whose values are [`PANE_STATES`] and nothing the reply names: a key this
+/// client does not know is not printed, so no reply can put a pane's text, or
+/// a line of its own, into the scrape.
+pub(super) fn render_metrics(reply: &str) -> Option<String> {
+    let v = json::parse(reply).ok()?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let panes = v.get("panes").filter(|p| p.as_object().is_some())?;
+    let uptime_ms = count(&v, "uptime_ms")?;
+    let mut out = String::new();
+    if let Some(version) = v.get("atrium").and_then(Value::as_str) {
+        family(
+            &mut out,
+            "atrium_build_info",
+            "gauge",
+            "The atrium that answered, as the version label; the value is always 1.",
+        );
+        out.push_str(&format!(
+            "atrium_build_info{{version=\"{}\"}} 1\n",
+            escape_label(version)
+        ));
+    }
+    family(
+        &mut out,
+        "atrium_uptime_seconds",
+        "gauge",
+        "Seconds since the session's run loop started.",
+    );
+    out.push_str(&format!(
+        "atrium_uptime_seconds {}.{:03}\n",
+        uptime_ms / 1000,
+        uptime_ms % 1000
+    ));
+    family(
+        &mut out,
+        "atrium_panes",
+        "gauge",
+        "Panes by state; unbound is a pane with no agent status.",
+    );
+    for state in super::reply::PANE_STATES {
+        out.push_str(&format!(
+            "atrium_panes{{state=\"{}\"}} {}\n",
+            escape_label(state),
+            count(panes, state).unwrap_or(0)
+        ));
+    }
+    for (key, name, kind, help) in [
+        (
+            "wakes_delivered",
+            "atrium_wakes_delivered_total",
+            "counter",
+            "Bus wake lines handed to a pane since the session started.",
+        ),
+        (
+            "held_inboxes",
+            "atrium_held_inboxes",
+            "gauge",
+            "inbox --wait connections held open.",
+        ),
+        (
+            "bus_depth",
+            "atrium_bus_depth",
+            "gauge",
+            "Events in the bus ring.",
+        ),
+        (
+            "bus_last_seq",
+            "atrium_bus_last_seq",
+            "gauge",
+            "The seq of the newest bus event; 0 before the first.",
+        ),
+        (
+            "open_decisions",
+            "atrium_open_decisions",
+            "gauge",
+            "decision_needed events nobody has resolved.",
+        ),
+    ] {
+        if let Some(n) = count(&v, key) {
+            family(&mut out, name, kind, help);
+            out.push_str(&format!("{name} {n}\n"));
+        }
+    }
+    Some(out)
+}
+
+/// A family's `# HELP` and `# TYPE` lines.
+fn family(out: &mut String, name: &str, kind: &str, help: &str) {
+    out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
+}
+
+/// A reply's whole, non-negative number under `key`.
+fn count(v: &Value, key: &str) -> Option<u64> {
+    v.get(key)
+        .and_then(Value::as_i64)
+        .and_then(|n| u64::try_from(n).ok())
+}
+
+/// A label value as the exposition format writes it between the quotes:
+/// backslash, double quote and line feed escaped (`\\`, `\"`, `\n`).
+pub(super) fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

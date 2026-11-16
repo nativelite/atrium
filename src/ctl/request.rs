@@ -98,6 +98,12 @@ pub enum Cmd {
     Asked(AskedReq),
     /// Who touched a file: every pane whose mod reported an edit of it.
     Who(WhoReq),
+    /// Did the run loop answer: the atrium's version and uptime. A liveness
+    /// probe; token-free.
+    Ping,
+    /// The session's counters (panes by state, wakes, held inboxes, the bus):
+    /// numbers only, token-free. The client renders them as Prometheus text.
+    Metrics,
 }
 
 /// An `inbox` request's payload.
@@ -170,6 +176,9 @@ impl Cmd {
             // Who touched a file names every edited path of every pane: for
             // a token-matched caller, and only over its own subtree.
             Cmd::Who(_) => false,
+            // A probe and a scrape: a version, an uptime and counts. No pane's
+            // role, title or words are in either reply.
+            Cmd::Ping | Cmd::Metrics => true,
             Cmd::Board(op) => match op {
                 BoardOp::Get { .. } | BoardOp::List => true,
                 BoardOp::Set { .. }
@@ -295,6 +304,8 @@ impl Cmd {
             ),
             Cmd::Asked(a) => ("asked", format!("target={} id={}", a.target, a.id)),
             Cmd::Who(w) => ("who", format!("path={}", w.path)),
+            Cmd::Ping => ("ping", String::new()),
+            Cmd::Metrics => ("metrics", String::new()),
         }
     }
 }
@@ -591,6 +602,8 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
             })
         }
         Some("list") => Cmd::List,
+        Some("ping") => Cmd::Ping,
+        Some("metrics") => Cmd::Metrics,
         Some("send") => {
             let target = v
                 .get("target")

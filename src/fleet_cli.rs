@@ -20,12 +20,17 @@ pub(crate) fn fleet_cmd(args: &[String]) -> ExitCode {
             Some(name) if !name.starts_with('-') => {
                 // Anything after the name is atrium's own meta-flags — `--allow-ctl`
                 // (so the fleet can coordinate over the control plane), `--trust
-                // <policy>`, `--max-depth`. Parsed with the shared parser.
-                match atrium::ctl::parse_flags(&args[2..]) {
-                    Ok((allow_ctl, max_depth, trust, rest)) if rest.is_empty() => {
-                        fleet_up(name, allow_ctl, max_depth, trust)
+                // <policy>`, `--max-depth`. Parsed with the shared parser, after
+                // `fleet up`'s own `--headless` / `--size` are taken out.
+                let parsed =
+                    launch::take_headless_flags(&args[2..]).and_then(|(headless, rest)| {
+                        atrium::ctl::parse_flags(&rest).map(|flags| (headless, flags))
+                    });
+                match parsed {
+                    Ok((headless, (allow_ctl, max_depth, trust, rest))) if rest.is_empty() => {
+                        up::fleet_up_on(name, allow_ctl, max_depth, trust, headless)
                     }
-                    Ok((_, _, _, rest)) => {
+                    Ok((_, (_, _, _, rest))) => {
                         eprintln!("atrium fleet up: unexpected argument {:?}", rest[0]);
                         ExitCode::FAILURE
                     }
