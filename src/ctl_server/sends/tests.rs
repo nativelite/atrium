@@ -164,7 +164,11 @@ fn take_for_hands_a_pane_its_untyped_deliveries_and_nothing_else() {
         SendOrigin::BusWake
     ));
     pending[0].written = 2; // the pty path began typing this one
+    let delivered = wakes_delivered();
     let taken = take_for(&mut pending, AgentId(1));
+    // The wake it took is one more delivered wake (`ctl metrics`); at least
+    // one, because other tests deliver theirs into the same count.
+    assert!(wakes_delivered() > delivered);
     assert_eq!(
         taken,
         vec![(

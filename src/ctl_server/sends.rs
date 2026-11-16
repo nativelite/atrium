@@ -350,6 +350,7 @@ pub(crate) fn flush_sends(
                     if let Some(p) = pane_by_agent_mut(windows, ps.target) {
                         let _ = p.pty.write(b"\r");
                         wrote = true;
+                        note_delivered(ps.origin);
                     }
                     false // delivered — drop
                 } else {
@@ -373,12 +374,35 @@ pub(crate) fn take_for(
     pending.retain(|ps| {
         if ps.target == target && ps.written == 0 {
             taken.push((ps.origin, ps.text.clone()));
+            note_delivered(ps.origin);
             false
         } else {
             true
         }
     });
     taken
+}
+
+/// Bus wake lines handed to a pane this session: submitted into its pty, or
+/// taken by its mod's `inbox`. What `ctl metrics` reports. One add per
+/// delivered wake, at the moment the entry leaves the queue; nothing is
+/// counted on a tick that delivers nothing.
+static WAKES_DELIVERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_delivered(origin: SendOrigin) {
+    if origin == SendOrigin::BusWake {
+        WAKES_DELIVERED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How many bus wake lines have been delivered since the session started.
+pub(super) fn wakes_delivered() -> u64 {
+    WAKES_DELIVERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A new session starts counting from zero.
+pub(super) fn reset_wakes_delivered() {
+    WAKES_DELIVERED.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

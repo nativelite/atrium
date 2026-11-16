@@ -121,7 +121,10 @@ teammates:
   kill <target>                   stop a teammate and drop its pane
   respawn <target> [--worktree W] restart a teammate's agent as a fresh session, in place
   audit [<N>]                     the last N control-plane requests and their outcomes
-  answer <target>                 a pane's last answer and status, as its mod reported them
+  ping [--timeout <ms>]           is the session answering: exit 0 with its version and uptime, or
+                                  exit 1 with one line (no endpoint, refused, timeout; 1000 ms)
+  metrics                         the session's counters as Prometheus text (--json: the raw reply)
+  answer <target>                a pane's last answer and status, as its mod reported them
   wait <target> [--for answer|idle|exit] [--timeout S] [--after SEQ]
                                   poll until the pane answers (seq past SEQ), is idle, or is gone
   ask <target> [--timeout S] <question...>
@@ -296,6 +299,9 @@ mod tests {
                     "kill",
                     "respawn",
                     "audit",
+                    "ping",
+                    "--timeout",
+                    "metrics",
                     "board set",
                     "board get",
                     "board claim",

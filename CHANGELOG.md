@@ -31,6 +31,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit and treated as stale when its endpoint no longer answers. `atrium ctl`
   outside a pane, with no `ATRIUM_CTL`, uses it when exactly one session is
   running (token-free reads only, since no pane token comes with it).
+- **`atrium ctl ping` and `atrium ctl metrics`, two token-free reads for a
+  host that runs atrium unattended (a container, a supervisor).** `ping
+  [--timeout <ms>]` exits `0` only when the session's run loop answered, and
+  prints its reply, `{"ok":true,"atrium":"<version>","uptime_ms":N}`;
+  otherwise it exits `1` with one line on stderr: no endpoint, connection
+  refused, or timeout. It asks once (on Windows the other verbs retry a
+  missing pipe name for up to 30 s), and the whole exchange (connect, write,
+  read) is bounded by the timeout, 1000 ms by default and 30000 at most, so
+  it is safe as a liveness probe.
+  `metrics` prints the Prometheus text exposition format: `atrium_build_info
+  {version="…"} 1`, `atrium_uptime_seconds`, `atrium_panes{state="…"}` (one
+  series per status word plus `unbound`, zeros included),
+  `atrium_wakes_delivered_total`, `atrium_held_inboxes`, `atrium_bus_depth`,
+  `atrium_bus_last_seq` and `atrium_open_decisions`; `--json` prints the raw
+  reply with the same numbers. The only labels are the version and the fixed
+  state names, never a pane's role or title. Neither verb repaints, and
+  neither is written to the audit log, which a probe every few seconds would
+  otherwise fill. Both reply shapes are pinned by `golden_*` tests.
 
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real
