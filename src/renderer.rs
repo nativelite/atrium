@@ -38,6 +38,8 @@ pub(crate) struct Scene<'a> {
     /// The command prompt's line while it is open.
     pub(crate) prompt: Option<&'a str>,
     pub(crate) coord: Coord<'a>,
+    /// The session's Claude Code teams, for the overview.
+    pub(crate) teams: &'a atrium::claude_teams::TeamWatch,
     /// This tick's repaint request.
     pub(crate) force_repaint: bool,
     /// Whether the active window's drain changed a tiled pane.
@@ -179,6 +181,7 @@ impl Renderer {
             selection,
             prompt,
             coord,
+            teams,
             mut force_repaint,
             tiled_dirty,
             pane_output,
@@ -220,13 +223,15 @@ impl Renderer {
             let count: usize = windows.iter().map(|w| w.panes.len()).sum();
             views.overview_sel = views.overview_sel.min(count.saturating_sub(1));
             if force_repaint {
-                let nodes = overview_nodes(windows, world);
+                let teams = teams.teams();
+                let nodes = overview_nodes_with(windows, world, &teams);
                 frame.extend_from_slice(
-                    render_overview_panel(
+                    render_overview_panel_with(
                         windows,
                         bus,
                         &nodes,
                         world.collisions(),
+                        &teams,
                         views.overview_sel,
                         rows,
                         cols,
