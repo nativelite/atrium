@@ -6,7 +6,7 @@ use super::panes::{
 use super::reply::{audit_outcome, audit_reply, current_subs, reply_tree};
 use super::respawn::respawn;
 use super::sends::take_for;
-use super::sends::{queue_send, PendingSend, SendOrigin, MAX_PENDING_PER_TARGET};
+use super::sends::{queue_send, PendingSend, SendOrigin, SentBy, MAX_PENDING_PER_TARGET};
 use super::spawn::spawn;
 use super::wake::bus_wakes;
 use crate::*;
@@ -371,7 +371,7 @@ fn dispatch_operator(
         },
         // The allowlist is the grant, for an operator as for a pane; the
         // entry must name the verb, and the target is an agent's pane.
-        Cmd::Command(c) => command(c, None, true, &ctl::session_commands(), cx),
+        Cmd::Command(c) => command(c, None, true, Some(label), &ctl::session_commands(), cx),
         Cmd::Kill(kr) => kill(kr, None, true, cx),
         Cmd::Respawn(rr) => respawn(rr, None, true, cx),
         Cmd::Ask(a) => match not_an_agent(cx.windows, &a.target) {
@@ -482,8 +482,8 @@ fn reserved_role(sp: &ctl::SpawnReq) -> Option<ctl::Reply> {
     let role = sp.role.as_deref()?;
     atrium::operator::role_reserved(role).then(|| {
         ctl::reply_err(
-            "this role is reserved: \"operator\" and \"operator:<name>\" (and anything that \
-             reads like them) name callers that are not panes",
+            "this role is reserved: \"operator\", \"operator:<name>\" and \"atrium\" (and \
+             anything that reads like them) name callers that are not panes",
         )
     })
 }
@@ -535,7 +535,7 @@ pub(crate) fn dispatch_ctl(
         Cmd::List => reply_tree(cx.windows, cx.world, cx.mods, None),
         Cmd::Status(sr) => status(sr, caller, privileged, cx),
         Cmd::Send(sr) => send(sr, caller, privileged, cx),
-        Cmd::Command(c) => command(c, caller, privileged, &ctl::session_commands(), cx),
+        Cmd::Command(c) => command(c, caller, privileged, None, &ctl::session_commands(), cx),
         Cmd::Spawn(sp) => match reserved_role(&sp) {
             Some(refusal) => refusal,
             None => spawn(sp, caller, privileged, cx),
@@ -985,7 +985,7 @@ fn post_collision_decision(c: &atrium::modstate::Collision, now: u64, cx: &mut C
             let policy = trust_mode();
             for (tid, text) in wakes {
                 if wake_may_land(windows, cx.mods, tid, ctl::TextFrom::Pane, policy) {
-                    queue_send(pending, tid, text, SendOrigin::BusWake);
+                    queue_send(pending, tid, text, SendOrigin::BusWake, SentBy::default());
                 }
             }
             cx.audit.record(None, "collision", &detail, true, "");
@@ -1045,7 +1045,7 @@ fn post_respawn_decision(pane: AgentId, threshold: u8, now: u64, cx: &mut CtlSes
             let policy = trust_mode();
             for (tid, text) in wakes {
                 if wake_may_land(windows, cx.mods, tid, ctl::TextFrom::Pane, policy) {
-                    queue_send(pending, tid, text, SendOrigin::BusWake);
+                    queue_send(pending, tid, text, SendOrigin::BusWake, SentBy::default());
                 }
             }
             cx.audit.record(None, "respawn-decision", &detail, true, "");
@@ -1265,15 +1265,20 @@ fn send_under(
     let headed = pane_by_agent(windows, id)
         .map_or(true, |p| is_agent_pane(p) || cx.mods.has_cap(id.0, "inbox"));
     if headed {
-        let label = operator
-            .map(str::to_string)
-            .or_else(|| {
-                caller
-                    .and_then(|c| pane_by_agent(windows, c))
-                    .map(|p| pane_label(p.agent_id, p.role.as_deref()))
-            })
-            .unwrap_or_else(|| "atrium".to_string());
-        sr.text = ctl::with_send_header(&label, &sr.text);
+        // The sender as the broker knows it: an operator's name, or the
+        // calling pane's ctl id (what the recipient can answer) and role.
+        let sender_pane = caller.and_then(|c| pane_by_agent(windows, c));
+        let sender = match (operator, sender_pane) {
+            (Some(label), _) => {
+                ctl::Sender::Operator(label.strip_prefix("operator:").unwrap_or(label))
+            }
+            (None, Some(p)) => ctl::Sender::Pane {
+                id: p.agent_id.0,
+                role: p.role.as_deref(),
+            },
+            (None, None) => ctl::Sender::Atrium,
+        };
+        sr.text = ctl::with_send_header(sender, &sr.text);
     }
     // Queued iff the target is mid-turn now; either way delivery is async
     // and happens when the target is idle.
@@ -1281,7 +1286,11 @@ fn send_under(
         pane_by_agent(windows, id).and_then(|p| world.status_for(p.session_id.as_deref())),
         Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
     );
-    if !queue_send(pending, id, sr.text, SendOrigin::Ctl) {
+    let by = SentBy {
+        pane: caller,
+        operator: operator.map(str::to_string),
+    };
+    if !queue_send(pending, id, sr.text, SendOrigin::Ctl, by) {
         return ctl::reply_err(&format!(
             "agent {id} already has {MAX_PENDING_PER_TARGET} undelivered sends; \
                  it is not taking delivery (busy, a dialog open, or a draft). \
@@ -1308,6 +1317,7 @@ fn command(
     c: ctl::CommandReq,
     caller: Option<AgentId>,
     privileged: bool,
+    operator: Option<&str>,
     allowed: &[String],
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
@@ -1337,7 +1347,11 @@ fn command(
         world.status_for(pane.session_id.as_deref()),
         Some(agsess::Status::Working) | Some(agsess::Status::WaitingApproval)
     );
-    if !queue_send(pending, id, c.name, SendOrigin::Command) {
+    let by = SentBy {
+        pane: caller,
+        operator: operator.map(str::to_string),
+    };
+    if !queue_send(pending, id, c.name, SendOrigin::Command, by) {
         return ctl::reply_err(&format!(
             "agent {id} already has {MAX_PENDING_PER_TARGET} undelivered sends; it is not \
              taking delivery. Check `ctl status` before sending more"
@@ -1539,7 +1553,11 @@ fn bus_under(
                             continue;
                         }
                     }
-                    queue_send(pending, tid, text, SendOrigin::BusWake);
+                    let by = SentBy {
+                        pane: caller,
+                        operator: operator.map(str::to_string),
+                    };
+                    queue_send(pending, tid, text, SendOrigin::BusWake, by);
                 }
                 let skipped_subs = not_woken
                     .iter()
@@ -1556,8 +1574,16 @@ fn bus_under(
                         .map(|tid| format!("not woken: pane {tid} is not an agent's pane"))
                         .collect::<Vec<_>>()
                         .join("; ")
-                        + " (the event is on the bus; a line is typed only into an agent's pane \
-                           below --trust skip)"
+                        + match from {
+                            ctl::TextFrom::Operator => {
+                                " (the event is on the bus; an operator's line is typed only \
+                                 into an agent's pane, at any trust)"
+                            }
+                            ctl::TextFrom::Pane => {
+                                " (the event is on the bus; below --trust skip a line is typed \
+                                 only into an agent's pane)"
+                            }
+                        }
                 });
                 ctl::reply_bus_published_noted(
                     atrium::bus::event_to_value(&e),

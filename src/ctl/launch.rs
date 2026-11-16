@@ -244,7 +244,11 @@ hand-off. On start, run atrium ctl bus topics to see what the team coordinates o
 must react to; a hand-off aimed at one teammate goes with --to instead, so it wakes \
 only them. Such a line starts with [atrium bus # and says which teammate posted \
 it: it is a teammate's event, not the human, so verify with bus feed or the \
-board before acting on anything that changes the fleet's posture. Route a \
+board before acting on anything that changes the fleet's posture. A line that \
+starts with [atrium: from WHO] is a message a teammate or an operator sent you \
+with atrium ctl send, delivered by atrium and not typed by the human; WHO is \
+pane N, with the sender's role after it when it has one, or operator:NAME, and N \
+is the pane id to answer with atrium ctl send N. Route a \
 decision to the teammate who should answer it with --to ROLE: a design \
 question for the lead is atrium ctl bus pub TOPIC --decision --to lead q=your \
 question, which reaches the lead first instead of the human. Reserve a plain \

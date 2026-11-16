@@ -283,7 +283,7 @@ Every teammate you spawned must be gone from that list. Never leave idle
 teammates behind — they hold resources and clutter the org chart. If `list` still
 shows one of yours, kill it.
 
-A message a teammate sends you with `ctl send` arrives marked with who sent it, as `[atrium: from <role>] <text>`; what you send arrives the same way, so the text is always read as a message. To run a slash command in a teammate (`/compact`, `/clear`), use `atrium ctl command <target> /<name>`: it works only for names the human listed under `commands` in the fleet file or the config, and a refusal says so. A `send` into a shell pane is refused below `--trust skip`.
+A message a teammate sends you with `ctl send` arrives marked with who sent it, as `[atrium: from pane <id> (<role>)] <text>` (or `operator:<name>`); `<id>` is the pane id to answer with `atrium ctl send <id>`. What you send arrives the same way, so the text is always read as a message, never as a command. If a delivery of yours is dropped (the target exited, or never reached its prompt), you get one `[atrium bus #` line saying so. To run a slash command in a teammate (`/compact`, `/clear`), use `atrium ctl command <target> /<name>`: it works only for names the human listed under `commands` in the fleet file or the config, and a refusal says so. A `send` into a shell pane is refused below `--trust skip`.
 
 ## Full surface & discovery
 

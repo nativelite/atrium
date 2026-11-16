@@ -23,13 +23,15 @@ fn sends_queued_for_a_respawned_pane_are_delivered_whole_to_its_new_process() {
         &mut pending,
         old,
         "resume from PLAN.md".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         other,
         "keep going".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     pending[0].written = 6;
     pending[0].text_written_at = Some(Instant::now());
@@ -54,21 +56,24 @@ fn a_target_that_never_takes_delivery_cannot_grow_the_queue_without_bound() {
             &mut pending,
             wedged,
             "task".into(),
-            SendOrigin::Ctl
+            SendOrigin::Ctl,
+            SentBy::default()
         ));
     }
     assert!(!queue_send(
         &mut pending,
         wedged,
         "one too many".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert_eq!(pending.len(), MAX_PENDING_PER_TARGET);
     assert!(queue_send(
         &mut pending,
         AgentId(2),
         "other".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
 }
 
@@ -82,7 +87,8 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
             &mut pending,
             t,
             format!("w{i}"),
-            SendOrigin::BusWake
+            SendOrigin::BusWake,
+            SentBy::default()
         ));
     }
     assert_eq!(pending.len(), 1, "coalesced");
@@ -96,7 +102,8 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
             &mut pending,
             t,
             "later".into(),
-            SendOrigin::BusWake
+            SendOrigin::BusWake,
+            SentBy::default()
         ));
     }
     pending.last_mut().unwrap().written = 1;
@@ -104,14 +111,16 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
         &mut pending,
         t,
         "one too many".into(),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     // A send is still accepted: wakes do not count against it.
     assert!(queue_send(
         &mut pending,
         t,
         "operator".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
 }
 
@@ -120,18 +129,26 @@ fn a_coalesced_wake_stops_growing_at_the_limit_and_points_at_the_feed() {
     let mut pending = Vec::new();
     let t = AgentId(1);
     let big = "x".repeat(WAKE_COALESCE_CHARS - 10);
-    assert!(queue_send(&mut pending, t, big, SendOrigin::BusWake));
+    assert!(queue_send(
+        &mut pending,
+        t,
+        big,
+        SendOrigin::BusWake,
+        SentBy::default()
+    ));
     assert!(queue_send(
         &mut pending,
         t,
         "y".repeat(50),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         t,
         "z".repeat(50),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     assert_eq!(pending.len(), 1);
     assert!(pending[0].text.ends_with("+more: atrium ctl bus feed"));
@@ -149,19 +166,22 @@ fn take_for_hands_a_pane_its_untyped_deliveries_and_nothing_else() {
         &mut pending,
         AgentId(1),
         "first".to_string(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         AgentId(2),
         "other".to_string(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         AgentId(1),
         "[atrium bus #1 fyi] second".to_string(),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     pending[0].written = 2; // the pty path began typing this one
     let delivered = wakes_delivered();
@@ -308,24 +328,35 @@ fn a_line_break_inside_a_delivery_cannot_submit_on_any_path() {
     }
 }
 
-/// Which form each pane gets: an agent's pane a paste where its CLI takes
-/// one (unix) and one flat line everywhere else, Windows always; raw only
-/// for a pane that is not an agent's and for a command.
+/// Which form each pane gets. An agent's pane: a paste on unix where its app
+/// or its CLI takes one, one flat line otherwise, and always flat on Windows;
+/// never raw. A pane that is not an agent's (a `skip` session): as it always
+/// was, a paste on unix when its app turned paste mode on, else raw. A
+/// command: raw everywhere.
 #[test]
 fn an_agents_pane_is_typed_as_a_paste_or_as_one_line_never_raw() {
     for origin in [SendOrigin::Ctl, SendOrigin::BusWake] {
-        for paste in [false, true] {
-            let how = type_as(true, origin, paste);
-            assert_ne!(how, TypeAs::Raw, "{origin:?} paste={paste}");
-            if cfg!(windows) || !paste {
-                assert_eq!(how, TypeAs::Flat);
-            } else {
-                assert_eq!(how, TypeAs::Paste);
+        for app in [false, true] {
+            for cli in [false, true] {
+                let how = type_as(true, origin, app, cli);
+                assert_ne!(how, TypeAs::Raw, "{origin:?} app={app} cli={cli}");
+                if cfg!(unix) && (app || cli) {
+                    assert_eq!(how, TypeAs::Paste);
+                } else {
+                    assert_eq!(how, TypeAs::Flat);
+                }
+                let shell = type_as(false, origin, app, cli);
+                if cfg!(unix) && app {
+                    assert_eq!(shell, TypeAs::Paste, "as before 0.47.0");
+                } else {
+                    assert_eq!(shell, TypeAs::Raw);
+                }
             }
-            assert_eq!(type_as(false, origin, paste), TypeAs::Raw);
         }
     }
-    assert_eq!(type_as(true, SendOrigin::Command, true), TypeAs::Raw);
+    for agent in [false, true] {
+        assert_eq!(type_as(agent, SendOrigin::Command, true, true), TypeAs::Raw);
+    }
 }
 
 /// An unbound agent CLI that never showed its prompt is not typed into when

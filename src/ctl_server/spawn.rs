@@ -247,25 +247,29 @@ pub(crate) fn spawn_worker_here(
 }
 
 /// The file a ctl spawn's bare command names on `PATH`, as an absolute path:
-/// what a Windows spawn runs in place of the name.
+/// what a spawn runs in place of the name, on every platform.
 ///
-/// A name left for the system to find is not found on `PATH` alone. A name
-/// atrium's own lookup misses is handed over as it is, and `CreateProcess`
-/// then searches atrium's working directory, and `cmd.exe` (which runs a
-/// batch shim) the pane's: a file named for an agent that is not installed,
-/// dropped in the project or in the worktree a spawn names, would run with
-/// no posture. So the lookup is done here, over the **absolute** directories
-/// of `PATH` only (an empty or relative entry is the current directory under
-/// another name), with the system's own extensions, and a name it does not
-/// find is refused.
+/// A name left for the system to find is not found on `PATH` alone. On
+/// Windows a name atrium's own lookup misses is handed over as it is, and
+/// `CreateProcess` then searches atrium's working directory, and `cmd.exe`
+/// (which runs a batch shim) the pane's. Elsewhere the child resolves the
+/// name itself, after it has changed into the pane's directory, so a relative
+/// `PATH` entry (`./node_modules/.bin`, `.`, an empty one) names a folder
+/// inside the project or the worktree a spawn asked for: a pane held to
+/// `accept` could plant `node_modules/.bin/codex` there and have a spawn run
+/// it with no posture. So the lookup is done here, over the **absolute**
+/// directories of `PATH` only, and a name it does not find is refused. On
+/// Windows it tries the system's extensions (`PATHEXT`); elsewhere the name
+/// as it is, which must be a regular file with an execute bit.
+///
+/// An absolute entry is searched wherever it points, a folder inside the
+/// project included (`/work/app/node_modules/.bin`): `PATH` is trusted as the
+/// human set it.
 ///
 /// `Ok(None)` for a command that already is a path: the only one that reaches
 /// here is the caller's own recorded command (a spawn with none given), which
-/// a fleet file or the launch approved as written. Pure over its inputs.
-#[cfg_attr(
-    not(windows),
-    allow(dead_code, reason = "applied to Windows spawns; tested everywhere")
-)]
+/// a fleet file or the launch approved as written. Pure over its inputs and
+/// the file system.
 pub(crate) fn pin_to_path(
     command: &str,
     path: Option<&std::ffi::OsStr>,
@@ -281,21 +285,41 @@ pub(crate) fn pin_to_path(
                 .collect()
         })
         .unwrap_or_default();
-    let exts: Vec<String> = pathext
-        .unwrap_or(".COM;.EXE;.BAT;.CMD")
-        .split(';')
-        .filter(|e| !e.is_empty())
-        .map(str::to_string)
-        .collect();
-    match atrium::resolve::resolve(command, &dirs, &exts) {
+    let found = if cfg!(windows) {
+        let exts: Vec<String> = pathext
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect();
+        atrium::resolve::resolve(command, &dirs, &exts)
+    } else {
+        dirs.iter()
+            .map(|d| d.join(command))
+            .find(|f| is_executable_file(f))
+    };
+    match found {
         Some(found) => Ok(Some(found.to_string_lossy().into_owned())),
         None => Err(format!(
             "spawn refused: {command:?} was not found in any directory of PATH (relative and \
              empty entries, which mean the current directory, are not searched). A ctl spawn \
              runs the file its command names on PATH and nothing else; install it, or put \
-             its directory on PATH before launching atrium"
+             its directory on PATH, as an absolute path, before launching atrium"
         )),
     }
+}
+
+/// A regular file the current user could execute (any execute bit).
+#[cfg(unix)]
+fn is_executable_file(file: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Off unix the extension decides what runs; this branch is not taken there.
+#[cfg(not(unix))]
+fn is_executable_file(file: &std::path::Path) -> bool {
+    file.is_file()
 }
 
 /// `ctl spawn`: the guards, in order — may this caller create teammates, is the
@@ -460,9 +484,8 @@ pub(crate) fn spawn(
     ) {
         return ctl::reply_err(&msg);
     }
-    // On Windows the command is pinned to the file it names on PATH, and
-    // that file is what is spawned; see [`pin_to_path`].
-    #[cfg(windows)]
+    // The command is pinned to the file it names on PATH, and that file is
+    // what is spawned and recorded; see [`pin_to_path`].
     {
         let path = std::env::var_os("PATH");
         let pathext = std::env::var("PATHEXT").ok();

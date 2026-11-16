@@ -171,3 +171,15 @@ fn flags_bad_max_depth_errors() {
     let err = parse_flags(&v(&["--max-depth", "lots"])).unwrap_err();
     assert!(err.contains("--max-depth"), "{err}");
 }
+
+/// An agent is told what the send header is without a skill: who it names,
+/// that it is not the human, and that the id in it is the one to answer.
+#[test]
+fn agent_directive_explains_the_send_header() {
+    for vendor in [agsess::Vendor::ClaudeCode, agsess::Vendor::Codex] {
+        let text = agent_ctl_directive(vendor);
+        assert!(text.contains("[atrium: from WHO]"), "{vendor:?}");
+        assert!(text.contains("not typed by the human"), "{vendor:?}");
+        assert!(text.contains("atrium ctl send N"), "{vendor:?}");
+    }
+}

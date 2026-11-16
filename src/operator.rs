@@ -614,6 +614,10 @@ pub fn pick_client_token(text: &str, name: Option<&str>) -> Result<String, Strin
 /// * it holds a `:` together with any character that is not an ASCII letter,
 ///   digit, `_`, `-`, `.` or `:`.
 ///
+/// The same test refuses a role that reads as `atrium`, the label of a
+/// delivery with no pane and no operator behind it and the word on every
+/// frame atrium writes (`atrium-dev` and `atrium_2` are ordinary roles).
+///
 /// `operators`, `operator_2` and `co-operator` are ordinary roles. The rule
 /// errs toward refusing: an eight-character role in a non-Latin script reads
 /// as a look-alike to it. The audit log is not fooled either way: it records
@@ -626,16 +630,50 @@ pub fn role_reserved(role: &str) -> bool {
         .filter(|c| !c.is_whitespace() && !has_unsafe(c.encode_utf8(&mut [0; 4])))
         .collect();
     let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-    let reads_as_operator = kept.len() >= 8
-        && "operator"
-            .chars()
-            .zip(&kept)
-            .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
-        && !kept
-            .get(8)
-            .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'));
+    // Does the role read as `name`: each letter that one in either case, or
+    // not ASCII (and so possibly drawn like it), ending there or going on
+    // with anything but an ASCII letter, digit, `_` or `-`?
+    let reads_as = |name: &str| {
+        let n = name.chars().count();
+        kept.len() >= n
+            && name
+                .chars()
+                .zip(&kept)
+                .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+            && !kept
+                .get(n)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'))
+    };
     let colon_with_marks = kept.contains(&':') && kept.iter().any(|c| !word(*c) && *c != ':');
-    reads_as_operator || colon_with_marks
+    // `atrium` is the label of a delivery with no pane and no operator
+    // behind it (`ctl::Sender::Atrium`), and the name on every frame atrium
+    // writes: not a pane's to wear either. It is a short word, so the
+    // look-alike test asks for one thing more than `operator`'s does: at
+    // least one of its letters must be there as itself (ASCII or fullwidth).
+    // A six-letter role in another script is an ordinary role.
+    let fullwidth = |c: char| match c {
+        '\u{ff21}'..='\u{ff3a}' => char::from_u32(c as u32 - 0xff21 + 'a' as u32).unwrap_or(c),
+        '\u{ff41}'..='\u{ff5a}' => char::from_u32(c as u32 - 0xff41 + 'a' as u32).unwrap_or(c),
+        c => c,
+    };
+    let folded: Vec<char> = kept.iter().map(|c| fullwidth(*c)).collect();
+    let reads_as_atrium = {
+        let name = "atrium";
+        let n = name.len();
+        folded.len() >= n
+            && name
+                .chars()
+                .zip(&folded)
+                .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+            && name
+                .chars()
+                .zip(&folded)
+                .any(|(want, got)| got.eq_ignore_ascii_case(&want))
+            && !folded
+                .get(n)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'))
+    };
+    reads_as("operator") || reads_as_atrium || colon_with_marks
 }
 
 // ---- vetting what an operator sends ---------------------------------------

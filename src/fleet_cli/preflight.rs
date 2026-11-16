@@ -476,7 +476,8 @@ pub(super) fn commands_line(fleet: &atrium::fleet::Fleet) -> Option<String> {
     let commands = fleet.commands.as_deref().unwrap_or(&[]);
     (!commands.is_empty()).then(|| {
         format!(
-            "atrium fleet: slash commands a pane may run in another agent's pane              (`ctl command`): {}; each is a grant to every pane that can reach one",
+            "atrium fleet: slash commands a pane may run in another agent's pane \
+             (`ctl command`): {}; each is a grant to every pane that can reach one",
             commands.join(", ")
         )
     })

@@ -409,3 +409,23 @@ fn the_banner_shows_the_fleets_command_allowlist() {
         "{line}"
     );
 }
+
+/// The banner line is one single-spaced line: a lost line continuation once
+/// left a run of spaces in the middle of it.
+#[test]
+fn the_command_allowlist_line_has_no_run_of_spaces() {
+    let roster =
+        r#"{"fleets":{"a":{"commands":["/compact"],"agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+    let fleet = atrium::fleet::parse(roster)
+        .unwrap()
+        .get("a")
+        .unwrap()
+        .clone();
+    let line = super::commands_line(&fleet).expect("a line");
+    assert!(!line.contains("  "), "{line:?}");
+    assert_eq!(
+        line,
+        "atrium fleet: slash commands a pane may run in another agent's pane (`ctl command`): \
+         /compact; each is a grant to every pane that can reach one"
+    );
+}

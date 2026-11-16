@@ -173,10 +173,12 @@ and what to do instead.
   text file in the project was enough; so did the name of an agent that is not
   installed, which the system looked for in atrium's working directory. Now
   the command a spawn request names must be 1 to 64 of `A-Z a-z 0-9 _ -`, not
-  starting with `-` (no `/`, `\`, `:` or `.`); on Windows atrium resolves it
-  over the absolute directories of `PATH` (relative and empty entries are not
-  searched), spawns that file by its full path, and refuses a name it does not
-  find. Not changed: a fleet file's `cmd` may still be a path (a person writes
+  starting with `-` (no `/`, `\`, `:` or `.`); atrium resolves it itself, on
+  every platform, over the absolute directories of `PATH` (relative and empty
+  entries are not searched: on macOS and Linux the child looked a bare name up
+  after changing into the pane's directory, so `./node_modules/.bin` ahead of
+  the real entry let a pane plant `node_modules/.bin/codex`), spawns that file
+  by its full path, and refuses a name it does not find. Not changed: a fleet file's `cmd` may still be a path (a person writes
   the file and the banner shows it); `respawn` replays a pane's recorded
   command, and no request can alter that record; a spawn with no command still
   starts the caller's own kind. To keep a path: put the command in a fleet
@@ -214,36 +216,59 @@ and what to do instead.
   model decision and no permission prompt, and reads `/` as a command of its
   own, `#` as a memory note and `@` as a mention. So a lead held to `plan`
   could `ctl send <worker> "!rm -rf x"`, or `"/permissions"`, into any pane of
-  its subtree. What is delivered is now `[atrium: from <sender>] ` and then
-  the text, where `<sender>` is the sending pane's role (or `pane N`), or
-  `operator:<name>`, as the broker knows it; a role cannot close or forge the
-  frame, and a `[atrium:` inside the text is defanged. No character a caller
-  chose is ever the first of an agent's prompt, so a text may start with
-  anything and is read as text; nothing is refused for how it starts, and the
-  operator's rule against a leading `!` or `/` is gone with the reason for it.
-  The header is on a pane's send to itself and on a send handed to a mod's
-  inbox too. If something of yours parsed a delivered send by its first
-  characters, it now finds the header first.
-- **One `send` is one prompt.** A line break inside the text can no longer
-  submit and let the next line open a fresh prompt. Into claude and codex on
-  macOS and Linux the text travels as one bracketed paste, as before. Where no
-  paste can be relied on (every agent pane on Windows, and an agent CLI that
-  did not ask for paste mode) each line break is now written as ` ↵ ` and a
-  tab as a space, so the text arrives as one line; before, the raw line breaks
-  were typed. A pane whose mod takes its inbox still gets the lines.
+  its subtree. What is delivered is now `[atrium: from <label>] ` and then
+  the text. The label is the broker's record of the sender: `pane 3 (lead)`
+  for a pane (its ctl id first, the number `ctl send` takes, then its role;
+  `pane 3` when it has none) or `operator:<name>`. A role cannot close or
+  forge the frame. On an empty prompt no character a caller chose is the
+  first one, so a text may start with anything and is read as text; nothing
+  is refused for how it starts, and the operator's rule against a leading `!`
+  or `/` is gone with the reason for it. The header is on a pane's send to
+  itself and on a send handed to a mod's inbox too. If something of yours
+  parsed a delivered send by its first characters, it now finds the header
+  first. `ctl spawn` now refuses `atrium` as a role, as it does `operator`.
+- **Neither of atrium's frames can be forged in a send or in a wake.** The
+  bus frame (`[atrium bus #…`) was defanged in a wake's own fields only, in
+  that exact spelling. In every caller-supplied text that reaches a prompt (a
+  send's text; a wake's body, detail, sender label and topic; the names in a
+  decision atrium posts) an opening square bracket or a look-alike that is
+  followed, after any whitespace or hidden characters, by `atrium` in any
+  case now becomes `(`. So a wake, which travels up the tree and to every
+  subscriber, cannot carry a `[atrium: from operator:x] …` line, and a send
+  cannot carry a second bus line.
+- **One `send` is one prompt, and one delivery at a time per pane.** A line
+  break inside the text can no longer submit and let the next line open a
+  fresh prompt. Into claude and codex on macOS and Linux (and an agent CLI
+  whose app turned paste mode on) the text travels as one bracketed paste, as
+  before. Into every agent's pane on Windows, and elsewhere into an agent CLI
+  that is neither and did not ask for paste mode, each line break is now
+  written as ` ↵ ` and a tab as a space, so the text arrives as one line;
+  before, the raw line breaks were typed. A pane whose mod takes its inbox
+  still gets the lines, and a pane that is not an agent's (a `skip` session)
+  is typed into exactly as before. Two deliveries for one pane that became
+  ready in the same moment were both typed before either Enter, so two sends
+  merged into one prompt; now a delivery waits while another for the same
+  pane is between its first byte and its Enter, and 1.5 s after it.
 - **A pane's `send` is plain text, below `skip`.** It carried any control
   character unfiltered: `ESC [ Z` (Shift+Tab) cycles Claude Code's permission
   mode, `ESC [ 201 ~` ends a paste early, Ctrl+C, Esc and the arrows drive a
   dialog. Refused now, like an operator's always was: no control character but
   a newline and a tab (`\r\n` is taken as a newline; a carriage return on its
-  own is refused), and none of the characters that reorder or hide text. At
-  `skip` a pane's text is delivered as written.
-- **A send can no longer answer a dialog.** A claude or codex pane with no
-  status yet is typed into once its prompt hint is on screen. If the hint had
-  not appeared after 300 s the text was typed anyway, into whatever the pane
-  was showing (a sign-in, a trust question), where a digit picks an option and
-  the Enter confirms it. That delivery is now dropped, and the bar names the
-  pane. Send again once the pane is at its prompt.
+  own is refused), and none of the characters that do not show as themselves
+  (bidi marks and overrides, zero-width characters, the soft hyphen, Hangul
+  fillers, variation selectors, tag characters; the list is in
+  `docs/control-plane.md`). At `skip` a pane's text is not vetted.
+- **A delivery is no longer typed into a claude or codex pane that never
+  showed its prompt, and a dropped delivery is reported.** A claude or codex
+  pane with no status yet is typed into once its prompt hint is on screen. If
+  the hint had not appeared after 300 s the text was typed anyway, into
+  whatever the pane was showing (a sign-in, a trust question), where a digit
+  picks an option and the Enter confirms it. That delivery is now dropped. A
+  dropped delivery (this one, one whose target exited, one for a pane text may
+  no longer be typed into) is said on the bar, recorded in the audit log as
+  `delivery-dropped` under its sender, and announced to a sending agent pane
+  by one `fyi` on the `atrium` topic. What a delivery can still be typed
+  into is listed under the limits below.
 - **A slash command needs a list you wrote.** With the header, `ctl send
   <pane> /clear` is text. The way to run a slash command in a teammate is the
   new `ctl command` (below), which delivers only names on the session's
@@ -265,11 +290,16 @@ and what to do instead.
   cut to 512 where the entry is made, for all callers. Ordinary entries read
   exactly as before.
 
-Not closed by this, and documented as limits: on Windows an npm-installed
-claude is a `.cmd` shim that starts `node` by name, which `cmd.exe` looks for
-in the pane's working directory first; and an agent CLI atrium has no prompt
-hint for (gemini, aider, cursor-agent) is typed into once its screen has been
-still for two seconds, whatever it is showing.
+Not closed by this, and documented as limits (`docs/control-plane.md`, "What
+this does not cover"): the header is first only on an empty prompt, and a
+human's draft untouched for 300 s has a delivery appended to it; an idle
+agent showing a picker of its own, and gemini, aider or cursor-agent two
+seconds after their screen went still, are typed into whatever they show;
+`PATH` is trusted as set, an absolute entry inside the project included; on
+Windows an npm-installed claude is a `.cmd` shim that starts `node` by name,
+which `cmd.exe` looks for in the pane's working directory first; and
+multi-line text into a Windows agent pane without the mod arrives as one
+line.
 
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real

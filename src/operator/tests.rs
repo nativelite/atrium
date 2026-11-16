@@ -1060,3 +1060,36 @@ fn an_operators_send_is_plain_text_whatever_it_starts_with() {
         assert_eq!(vet(&cmd(&line)), Ok(()), "{text}");
     }
 }
+
+/// `atrium` is the label of a delivery with no pane and no operator behind
+/// it, and the word on every frame atrium writes: not a role a `ctl spawn`
+/// may give, by the same test as `operator`.
+#[test]
+fn a_role_may_not_read_as_atrium() {
+    for role in [
+        "atrium",
+        "Atrium",
+        "ATRIUM",
+        " atrium ",
+        "a\u{200b}trium",
+        "atrium:",
+        "atrium:x",
+        "atrium.",
+        "\u{430}trium",
+        "atr\u{456}um",
+        "\u{ff41}trium",
+    ] {
+        assert!(role_reserved(role), "{role:?}");
+    }
+    for role in [
+        "atrium-dev",
+        "atrium_2",
+        "atriums",
+        "atrium2",
+        "the-atrium",
+        "atri",
+        "lead",
+    ] {
+        assert!(!role_reserved(role), "{role:?}");
+    }
+}

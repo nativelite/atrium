@@ -127,3 +127,58 @@ fn a_recorded_path_is_left_as_the_fleet_file_wrote_it() {
     // A bare name is never passed through unresolved.
     assert!(pin_to_path("zz-no-such-agent", None, None).is_err());
 }
+
+/// The same pin off Windows: the name as it is, over the absolute entries of
+/// PATH, and only a regular file with an execute bit. A relative entry
+/// (`./node_modules/.bin`, `.`, an empty one) is where a pane could plant a
+/// file named for an agent, in the project or in the worktree a spawn names:
+/// it is not searched.
+#[cfg(unix)]
+#[test]
+fn a_ctl_spawn_is_pinned_to_an_executable_on_an_absolute_path_entry() {
+    use std::os::unix::fs::PermissionsExt;
+    let rel = std::path::PathBuf::from("target").join(format!("atrium-pin-{}", std::process::id()));
+    let abs = std::env::current_dir().unwrap().join(&rel);
+    let _ = std::fs::remove_dir_all(&abs);
+    std::fs::create_dir_all(abs.join("bin")).unwrap();
+    std::fs::create_dir_all(abs.join("zzdir")).unwrap();
+    let exe = abs.join("bin").join("zzagent");
+    std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let plain = abs.join("bin").join("zzplain");
+    std::fs::write(&plain, "not a program").unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let path_of = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
+
+    let bin = abs.join("bin");
+    let path = path_of(&[std::path::Path::new("/nowhere-atrium"), &bin]);
+    assert_eq!(
+        pin_to_path("zzagent", Some(&path), None),
+        Ok(Some(exe.to_string_lossy().into_owned()))
+    );
+    // Not executable, a directory, not there: refused.
+    assert!(pin_to_path("zzplain", Some(&path), None).is_err());
+    assert!(pin_to_path("zzdir", Some(&path_of(&[&abs])), None).is_err());
+    assert!(pin_to_path("zznothere", Some(&path), None).is_err());
+    // The same folder by a relative name, `.`, an empty entry: not searched.
+    let rel_bin = rel.join("bin");
+    for dirs in [
+        vec![rel_bin.as_path()],
+        vec![std::path::Path::new(".")],
+        vec![std::path::Path::new("")],
+    ] {
+        let why = pin_to_path("zzagent", Some(&path_of(&dirs)), None).unwrap_err();
+        assert!(
+            why.contains("was not found in any directory of PATH"),
+            "{why}"
+        );
+    }
+    // A relative entry ahead of the real one does not shadow it.
+    let shadowed = path_of(&[rel_bin.as_path(), &bin]);
+    assert_eq!(
+        pin_to_path("zzagent", Some(&shadowed), None),
+        Ok(Some(exe.to_string_lossy().into_owned()))
+    );
+    assert!(pin_to_path("zzagent", None, None).is_err());
+    let _ = std::fs::remove_dir_all(&abs);
+}

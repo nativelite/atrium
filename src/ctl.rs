@@ -55,13 +55,13 @@ pub use launch::{
     agent_ctl_directive, parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG,
 };
 pub use policy::{
-    delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, is_bare_command,
-    is_command_name, is_ctl_command, parse_allow_list, parse_commands, resolve_target,
-    sanitize_spawn_argv, send_header, send_into_non_agent_refusal, session_commands,
-    set_session_commands, text_may_land, vet_command, vet_fleet_argv, vet_send_text, vet_spawn_arg,
-    vet_spawn_args, vet_spawn_argv, with_send_header, ArgvVerdict, SpawnDenied, TextFrom,
-    ENV_ALLOW, ENV_AUDIT, PROMPT_LEADERS, SEND_CONTROL_REFUSED, SPAWN_ARG_REFUSED,
-    SPAWN_NEEDS_BARE_COMMAND,
+    defang_frames, delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree,
+    is_bare_command, is_command_name, is_ctl_command, is_hidden_char, parse_allow_list,
+    parse_commands, resolve_target, sanitize_spawn_argv, send_header, send_into_non_agent_refusal,
+    sender_label, session_commands, set_session_commands, text_may_land, vet_command,
+    vet_fleet_argv, vet_send_text, vet_spawn_arg, vet_spawn_args, vet_spawn_argv, with_send_header,
+    ArgvVerdict, Sender, SpawnDenied, TextFrom, ENV_ALLOW, ENV_AUDIT, PROMPT_LEADERS,
+    SEND_CONTROL_REFUSED, SPAWN_ARG_REFUSED, SPAWN_NEEDS_BARE_COMMAND,
 };
 pub use render::{hyperlink, is_url, status_glyph, status_sgr};
 pub use reply::{

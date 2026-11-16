@@ -29,15 +29,32 @@ fn spawn_atrium_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
     (p, shell, flag)
 }
 
-/// [`spawn_atrium_ctl_shell`] with pane 0 running under an **agent's name**:
-/// the same shell, placed in a scratch directory as `aider` (a copy on
-/// Windows, a symlink elsewhere) and found through `PATH`. To the control
-/// plane that is an agent's pane, which is what text may be typed into; to
-/// the test it is still a shell that echoes what reaches its pty. So the
-/// tests that prove a delivery landed run the legitimate flow at the default
-/// trust, with nothing to confirm and nothing an outer session can cap.
-/// (`aider` is an agent stem atrium adds no arguments to.)
-fn spawn_atrium_ctl_agent_standin(tag: &str) -> (pty::Pty, &'static str, &'static str) {
+/// The scratch directory a stand-in agent lives in, removed when the test
+/// that made it ends (best effort: a still-running copy is left to the OS).
+struct StandinDir(std::path::PathBuf);
+
+impl Drop for StandinDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// [`spawn_atrium_ctl_shell`] with its panes running under an **agent's
+/// name**: the same shell, placed in a scratch directory as `aider` and found
+/// through `PATH` (the directory is absolute). On Windows it is a copy of the
+/// command interpreter; elsewhere a two-line script that execs `/bin/sh`
+/// with its arguments (a symlink would not do: a busybox `sh` reads its own
+/// name and fails as an unknown applet). To the control plane that is an
+/// agent's pane, which is what text may be typed into; to the test it is
+/// still a shell that echoes what reaches its pty. So the tests that prove a
+/// delivery landed run the legitimate flow at the default trust, with nothing
+/// to confirm and nothing an outer session can cap. (`aider` is an agent stem
+/// atrium adds no arguments to.) `launch` goes before the command (`-n 2`).
+fn spawn_atrium_ctl_agent_standin(
+    tag: &str,
+    launch: &[&str],
+    cols: u16,
+) -> (pty::Pty, &'static str, &'static str, StandinDir) {
     let (shell, flag): (&str, &str) = if cfg!(windows) {
         ("cmd", "/Q")
     } else {
@@ -46,6 +63,7 @@ fn spawn_atrium_ctl_agent_standin(tag: &str) -> (pty::Pty, &'static str, &'stati
     let dir = std::env::temp_dir().join(format!("atrium-standin-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
+    let guard = StandinDir(dir.clone());
     #[cfg(windows)]
     {
         let comspec =
@@ -53,26 +71,85 @@ fn spawn_atrium_ctl_agent_standin(tag: &str) -> (pty::Pty, &'static str, &'stati
         std::fs::copy(comspec, dir.join("aider.exe")).unwrap();
     }
     #[cfg(unix)]
-    std::os::unix::fs::symlink("/bin/sh", dir.join("aider")).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("aider");
+        std::fs::write(&script, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(
+        dir.is_absolute(),
+        "the stand-in is found on an absolute PATH entry"
+    );
     let mut dirs = vec![dir];
     dirs.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
     let path = std::env::join_paths(dirs).unwrap();
+    let mut args: Vec<&str> = vec!["--allow-ctl"];
+    args.extend(launch);
+    args.extend(["aider", flag]);
     let mut p = pty::Pty::spawn_full(
         env!("CARGO_BIN_EXE_atrium"),
-        &["--allow-ctl", "aider", flag],
+        &args,
         24,
-        100,
+        cols,
         &[
             ("ATRIUM_CTL_ALLOW".to_string(), shell.to_string()),
             ("PATH".to_string(), path.to_string_lossy().into_owned()),
+            // A short prompt, so a delivered line fits a half-width tile.
+            ("PROMPT".to_string(), "$G".to_string()),
+            ("PS1".to_string(), "> ".to_string()),
         ],
         None,
     )
     .unwrap();
     read_until(&mut p, b"1:aider", Duration::from_secs(15));
-    (p, shell, flag)
+    (p, shell, flag, guard)
+}
+
+/// A send typed into **another** agent's pane: two root panes under an
+/// agent's name, tiled side by side. The focused one sends a marker to each
+/// pane id; both arrive behind the header naming the same sender, so one of
+/// the two crossed from one pane into the other (the self-send test alone
+/// would not show that).
+#[test]
+fn ctl_send_is_typed_into_another_agents_pane_behind_the_header() {
+    let (mut p, _shell, _flag, _dir) = spawn_atrium_ctl_agent_standin("cross", &["-n", "2"], 160);
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let (a, b): (&str, &str) = if cfg!(windows) {
+        ("QZ^A7", "QZ^B8")
+    } else {
+        ("QZ'A'7", "QZ'B'8")
+    };
+    p.write(format!("\"{atrium}\" ctl send 0 {a}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"queued\"", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl send 1 {b}\r\n").as_bytes())
+        .unwrap();
+    let mut out = read_until(&mut p, b"QZB8", Duration::from_secs(25));
+    if !contains(&out, b"QZA7") {
+        out.extend(read_until(&mut p, b"QZA7", Duration::from_secs(25)));
+    }
+    let text = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        text.contains("QZA7") && text.contains("QZB8"),
+        "both panes received their send: {text:?}"
+    );
+    // The pane repaints word by word with cursor moves in between, so the
+    // spaces of a line are not in the byte stream: compare without them.
+    let squeezed = text.replace(' ', "");
+    let from = |pane: u8| {
+        squeezed
+            .matches(&format!("[atrium:frompane{pane}]"))
+            .count()
+    };
+    assert!(
+        (from(0) >= 2 && from(1) == 0) || (from(1) >= 2 && from(0) == 0),
+        "both deliveries are headed with the one sender's pane id: {text:?}"
+    );
 }
 
 /// Below `--trust skip`, a `ctl send` into a pane that is not an agent's is
@@ -363,7 +440,7 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
     assert!(
         contains(
             &out,
-            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 1] inbox-marker-one\"}"
+            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-marker-one\"}"
         ),
         "the send was handed over, not typed: {:?}",
         String::from_utf8_lossy(&out)
@@ -419,13 +496,13 @@ fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
     p.write(b"\x012").unwrap();
     let out = read_until(
         &mut p,
-        b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 1] inbox-wait-marker\"}",
+        b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}",
         Duration::from_secs(20),
     );
     assert!(
         contains(
             &out,
-            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 1] inbox-wait-marker\"}"
+            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}"
         ),
         "the held inbox was answered with the send: {:?}",
         String::from_utf8_lossy(&out)
@@ -609,7 +686,7 @@ fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
 /// `ctl_send_into_a_shell_pane_is_refused_below_skip`.)
 #[test]
 fn ctl_send_delivers_a_task_to_a_worker() {
-    let (mut p, _shell, _flag) = spawn_atrium_ctl_agent_standin("send");
+    let (mut p, _shell, _flag, _dir) = spawn_atrium_ctl_agent_standin("send", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
     let typed: &str = if cfg!(windows) {
         "WORKER^MARK7"
@@ -990,7 +1067,7 @@ fn ctl_audit_records_requests() {
 /// is not woken below `--trust skip`, `ctl_server::dispatch::ceiling_tests`).
 #[test]
 fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_subtree() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_agent_standin("sub");
+    let (mut p, shell, flag, _dir) = spawn_atrium_ctl_agent_standin("sub", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl bus --json sub work\r\n").as_bytes())
         .unwrap();
@@ -1040,7 +1117,7 @@ fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_s
 /// under an agent's name, as above.
 #[test]
 fn a_workers_to_wakes_the_pane_that_spawned_it() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_agent_standin("to");
+    let (mut p, shell, flag, _dir) = spawn_atrium_ctl_agent_standin("to", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl spawn --here --role w -- {shell} {flag}\r\n").as_bytes())
         .unwrap();
