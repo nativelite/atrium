@@ -3,7 +3,11 @@
 //! arrives or the terminal is lost, and then tears it down
 //! ([`RunState::teardown`]). One [`RunState::tick`] is one pass of the loop:
 //! each phase is a method, called in the order the loop has always run them.
+//!
+//! The loop runs on a [`Host`]: a terminal ([`run`]), or nobody
+//! (`fleet up --headless`, through [`run_on`]). See `host`.
 
+mod host;
 mod keys;
 mod resize;
 mod setup;
@@ -13,6 +17,7 @@ mod teardown;
 mod tests;
 
 use crate::*;
+pub(crate) use host::{stderr_line, Host};
 
 /// What a session is launched with: the three launch paths (a plain launch,
 /// `fleet up` and `recover`) each build one and hand it to [`run`]. Named fields,
@@ -57,11 +62,21 @@ pub(crate) struct RunArgs<'a> {
 /// Run one atrium session on `term` until it ends, and return the process's
 /// exit code: a failure only when the first window cannot start.
 pub(crate) fn run(term: &mut rawterm::Terminal, args: RunArgs<'_>) -> ExitCode {
-    let mut state = match RunState::start(term, args) {
+    run_on(Host::Attached(term), args)
+}
+
+/// [`run`] on any host: the attached terminal, or none (a headless session,
+/// which ends when its last pane exits or a termination signal arrives, since
+/// there is no operator to quit it and no terminal to lose).
+pub(crate) fn run_on(host: Host<'_>, args: RunArgs<'_>) -> ExitCode {
+    host.arm();
+    let mut state = match RunState::start(host, args) {
         Ok(state) => state,
         Err(code) => return code,
     };
     while state.tick() == Flow::Continue {}
+    // A note raised on the last tick has no later tick to be said on.
+    state.host.report_flash(&mut state.flash);
     state.teardown()
 }
 
@@ -78,7 +93,8 @@ enum Flow {
 /// used to be `run()`'s locals, under the same names; [`RunState::start`]
 /// explains each where it creates it.
 struct RunState<'a> {
-    term: &'a mut rawterm::Terminal,
+    /// Where frames go and input comes from: the terminal, or nobody.
+    host: Host<'a>,
     out: atrium::screen::Screen,
     rows: u16,
     cols: u16,
@@ -142,7 +158,7 @@ impl RunState<'_> {
         // pane teardown after the loop actually runs. Without it the default
         // action killed atrium outright and every hosted agent was orphaned onto
         // `init` — see `atrium::signals`.
-        if atrium::signals::terminating() {
+        if atrium::signals::terminating() || self.host.ending() {
             if std::env::var_os("ATRIUM_DEBUG").is_some() {
                 eprint!("[atrium-dbg signal-quit]\r\n");
             }
@@ -253,6 +269,10 @@ impl RunState<'_> {
                 let _ = self.out.write_all(&bytes);
             }
         }
+
+        // 5e. with no bar to flash on (a headless session), what a phase
+        //     flashed this tick is one line on stderr. Attached, a no-op.
+        self.host.report_flash(&mut self.flash);
 
         // 6-7. paint the active window and the bar as one synchronized frame.
         self.renderer.paint(

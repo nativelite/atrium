@@ -3,6 +3,121 @@
 
 use crate::*;
 
+/// The size a headless session is laid out in when `--size` does not say:
+/// `(rows, cols)`. Wide and tall enough that an agent's TUI is not wrapping
+/// into a corner nobody will ever look at.
+pub(crate) const HEADLESS_DEFAULT_SIZE: (u16, u16) = (50, 200);
+
+/// The sizes `--size` accepts. The floor is where a pane still has a row and a
+/// tile a column or two; the ceiling keeps one typo (`5000x200`) from asking
+/// every pane's emulator for a screen of millions of cells.
+const HEADLESS_ROWS: std::ops::RangeInclusive<u16> = 3..=500;
+const HEADLESS_COLS: std::ops::RangeInclusive<u16> = 10..=1000;
+
+/// Parse `--size`'s `<rows>x<cols>` (rows first, like the fleet's `grid`).
+pub(crate) fn parse_headless_size(spec: &str) -> Result<(u16, u16), String> {
+    let bad = || {
+        format!(
+            "--size wants <rows>x<cols> with {}-{} rows and {}-{} columns, like 50x200; got {spec:?}",
+            HEADLESS_ROWS.start(),
+            HEADLESS_ROWS.end(),
+            HEADLESS_COLS.start(),
+            HEADLESS_COLS.end(),
+        )
+    };
+    let (rows, cols) = spec.split_once(['x', 'X']).ok_or_else(bad)?;
+    // `u16::from_str` takes a leading `+`; a size is digits.
+    let number = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| s.parse::<u16>().ok())
+            .flatten()
+    };
+    match (number(rows), number(cols)) {
+        (Some(r), Some(c)) if HEADLESS_ROWS.contains(&r) && HEADLESS_COLS.contains(&c) => {
+            Ok((r, c))
+        }
+        _ => Err(bad()),
+    }
+}
+
+/// What [`take_headless_flags`] found: the headless size as `(rows, cols)`
+/// (`None` for an attached launch), and the tokens that are not its own.
+pub(crate) type HeadlessFlags = (Option<(u16, u16)>, Vec<String>);
+
+/// Take `fleet up`'s own flags, `--headless` and `--size <rows>x<cols>`, out
+/// of the tokens after the fleet's name. Returns the headless size (`None`
+/// for an attached launch) and the tokens left, in order, for the shared
+/// session-flag parser. `--size` without `--headless` is an error rather than
+/// a flag that silently does nothing: an attached session's size is its
+/// terminal's.
+pub(crate) fn take_headless_flags(args: &[String]) -> Result<HeadlessFlags, String> {
+    let mut headless = false;
+    let mut size: Option<(u16, u16)> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut set_size = |spec: &str| {
+        if size.is_some() {
+            return Err("--size given twice".to_string());
+        }
+        size = Some(parse_headless_size(spec)?);
+        Ok(())
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--headless" => headless = true,
+            "--size" => {
+                let spec = args.get(i + 1).ok_or("--size needs <rows>x<cols>")?;
+                set_size(spec)?;
+                i += 1;
+            }
+            s if s.starts_with("--size=") => set_size(&s["--size=".len()..])?,
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    match (headless, size) {
+        (true, size) => Ok((Some(size.unwrap_or(HEADLESS_DEFAULT_SIZE)), rest)),
+        (false, None) => Ok((None, rest)),
+        (false, Some(_)) => Err(
+            "--size sets a headless session's size; add --headless (an attached session is \
+             the size of its terminal)"
+                .to_string(),
+        ),
+    }
+}
+
+/// What a headless launch must have before anything is started, or the line
+/// that refuses it. Pure: `allow_ctl` is the resolved control-plane switch
+/// (the flag or the fleet's key) and `yes` is whether `ATRIUM_YES` is set.
+///
+/// - The control channel is the only way in. Without it the session could be
+///   neither read nor steered nor told to stop short of a signal.
+/// - A fleet launch asks a person twice: Enter at the banner, and `y` for a
+///   `skip` posture. Headless reads no stdin, so there is nobody to ask. An
+///   attached launch with no terminal on stdin goes ahead unasked; here the
+///   approval has to have been given, in advance, by the one switch that
+///   already means that (`ATRIUM_YES`), and its absence is a refusal with the
+///   reason rather than a silent yes.
+pub(crate) fn headless_gate(allow_ctl: bool, yes: bool) -> Result<(), String> {
+    if !allow_ctl {
+        return Err(
+            "atrium fleet: --headless needs the control channel, the only way to reach a \
+             session with no terminal: add --allow-ctl, or \"allow_ctl\": true to the fleet"
+                .to_string(),
+        );
+    }
+    if !yes {
+        return Err(
+            "atrium fleet: --headless cannot ask anyone to approve the launch (Enter at the \
+             banner, and the confirmation of a skip posture): set ATRIUM_YES=1 to approve it \
+             in advance"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// The argv and working directory one fleet agent is actually spawned with.
 ///
 /// Split out as a pure seam because this is the join between what the operator

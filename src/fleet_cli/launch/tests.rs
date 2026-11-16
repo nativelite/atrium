@@ -91,6 +91,108 @@ fn a_fleet_agent_is_launched_with_the_paths_that_were_disclosed() {
     assert!(!role.chars().any(|c| c.is_control()));
 }
 
+// -- headless flags ------------------------------------------------------
+
+fn argv(tokens: &[&str]) -> Vec<String> {
+    tokens.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn an_attached_launch_keeps_every_token_for_the_session_parser() {
+    let args = argv(&["--allow-ctl", "--trust", "accept"]);
+    assert_eq!(super::take_headless_flags(&args), Ok((None, args.clone())));
+}
+
+#[test]
+fn headless_alone_is_the_default_size_and_leaves_the_session_flags() {
+    assert_eq!(super::HEADLESS_DEFAULT_SIZE, (50, 200));
+    assert_eq!(
+        super::take_headless_flags(&argv(&["--allow-ctl", "--headless", "--max-depth", "2"])),
+        Ok((Some((50, 200)), argv(&["--allow-ctl", "--max-depth", "2"])))
+    );
+}
+
+#[test]
+fn size_is_rows_then_cols_in_either_spelling_and_either_order_of_flags() {
+    for tokens in [
+        &["--headless", "--size", "40x120"][..],
+        &["--size", "40x120", "--headless"][..],
+        &["--headless", "--size=40X120"][..],
+    ] {
+        assert_eq!(
+            super::take_headless_flags(&argv(tokens)),
+            Ok((Some((40, 120)), vec![])),
+            "{tokens:?}"
+        );
+    }
+}
+
+#[test]
+fn a_size_without_headless_or_without_a_value_or_twice_is_refused() {
+    let err = |tokens: &[&str]| super::take_headless_flags(&argv(tokens)).unwrap_err();
+    assert!(err(&["--size", "40x120"]).contains("--headless"));
+    assert!(err(&["--headless", "--size"]).contains("<rows>x<cols>"));
+    assert!(err(&["--headless", "--size", "40x120", "--size=50x200"]).contains("twice"));
+    // The value is consumed as the size, never left to be read as a flag.
+    assert!(err(&["--headless", "--size", "--allow-ctl"]).contains("--allow-ctl"));
+}
+
+#[test]
+fn a_size_is_two_whole_numbers_inside_the_bounds() {
+    let ok = super::parse_headless_size;
+    assert_eq!(ok("50x200"), Ok((50, 200)));
+    assert_eq!(ok("3x10"), Ok((3, 10)), "the floor");
+    assert_eq!(ok("500x1000"), Ok((500, 1000)), "the ceiling");
+    for bad in [
+        "",
+        "x",
+        "50",
+        "50x",
+        "x200",
+        "50x200x3",
+        "50*200",
+        "200,50",
+        " 50x200",
+        "50 x 200",
+        "+50x200",
+        "-5x200",
+        "5.0x200",
+        "0x0",
+        "2x200",
+        "50x9",
+        "501x200",
+        "50x1001",
+        "70000x200",
+        "50x200 ",
+    ] {
+        let err = ok(bad).expect_err(bad);
+        assert!(
+            err.contains("<rows>x<cols>") && err.contains(&format!("{bad:?}")),
+            "{bad:?} -> {err}"
+        );
+    }
+}
+
+#[test]
+fn headless_is_refused_without_the_control_channel() {
+    let err = super::headless_gate(false, true).unwrap_err();
+    assert!(
+        err.contains("--allow-ctl") && err.contains("allow_ctl"),
+        "{err}"
+    );
+}
+
+#[test]
+fn headless_is_refused_when_nobody_approved_the_launch_in_advance() {
+    let err = super::headless_gate(true, false).unwrap_err();
+    assert!(err.contains("ATRIUM_YES"), "{err}");
+    assert_eq!(super::headless_gate(true, true), Ok(()));
+    // Unreachable comes first: approving a session nobody can reach is no use.
+    assert!(super::headless_gate(false, false)
+        .unwrap_err()
+        .contains("--allow-ctl"));
+}
+
 /// The fleet banner says a governed flag in `cmd` is ignored, so the launch
 /// must actually drop it — with its value — and keep everything else.
 #[test]

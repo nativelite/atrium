@@ -6,17 +6,14 @@
 //! any spawn, the ctl endpoint before the first pane, the terminal taken before
 //! anything can draw — so the steps are called in the order they are written.
 
-use super::{RunArgs, RunState};
+use super::{Host, RunArgs, RunState};
 use crate::*;
 
 impl<'a> RunState<'a> {
     /// Open the session: publish its policy, take the screen, bind ctl, spawn
     /// the first window and start the loop's helpers. A first window that
     /// cannot start ends atrium with a failure, after restoring the screen.
-    pub(super) fn start(
-        term: &'a mut rawterm::Terminal,
-        args: RunArgs<'a>,
-    ) -> Result<Self, ExitCode> {
+    pub(super) fn start(host: Host<'a>, args: RunArgs<'a>) -> Result<Self, ExitCode> {
         let RunArgs {
             command,
             identity,
@@ -30,7 +27,7 @@ impl<'a> RunState<'a> {
             canonical_topics,
         } = args;
         publish_policy(trust, allow_ctl, max_depth, &canonical_topics);
-        let (out, rows, cols, size_watch) = take_screen(term);
+        let (out, rows, cols, size_watch) = take_screen(&host);
 
         // The initial pane can fail to spawn (command missing) *or* fail to resolve
         // its identity (no such target, vault locked). A spawn failure aborts atrium
@@ -87,10 +84,10 @@ impl<'a> RunState<'a> {
             open_board_and_bus(&canonical_topics);
         let (agents, world) = start_agent_watch();
         let (launch, safety_net, renderer) = start_helpers(command, identity);
-        let (bell, wake, keys) = wire_doorbell(term);
+        let (bell, wake, keys) = wire_doorbell(&host);
 
         Ok(RunState {
-            term,
+            host,
             out,
             rows,
             cols,
@@ -166,18 +163,18 @@ fn publish_policy(
 
 /// Take the screen: the output queue, the terminal's size (and the watcher that
 /// follows it), then the alt screen with the scroll region above the bar.
-/// Returns `(out, rows, cols, size_watch)`.
-fn take_screen(
-    term: &mut rawterm::Terminal,
-) -> (atrium::screen::Screen, u16, u16, atrium::screen::SizeWatch) {
+/// Returns `(out, rows, cols, size_watch)`. On a headless host the queue goes
+/// nowhere, the size is the one given and nothing watches it; the sequences
+/// below are written all the same, into that nowhere.
+fn take_screen(host: &Host<'_>) -> (atrium::screen::Screen, u16, u16, atrium::screen::SizeWatch) {
     // The terminal as a queue: a terminal that stops reading must not stop the
     // loop — keys, pane draining, ctl and the safety net all run on. See
     // `atrium::screen`; the view is repainted whole once it catches up.
-    let mut out = atrium::screen::Screen::stdout();
-    let (rows, cols) = term.size().unwrap_or((24, 80));
+    let mut out = host.screen();
+    let (rows, cols) = host.size();
     // Resizes are read from a watcher thread: on Windows the size query itself
     // blocks while the terminal isn't reading (see `SizeWatch`).
-    let size_watch = atrium::screen::SizeWatch::start((rows, cols));
+    let size_watch = host.size_watch((rows, cols));
     // Alt screen; scroll region above the bar so bottom-line newlines from the
     // passthrough stream can never push the bar away.
     // The host's title is saved first (xterm title stack), restored by
@@ -404,7 +401,7 @@ fn start_helpers<'a>(
 /// pane (started at the top of each tick), all ringing one doorbell — the ctl
 /// endpoint's accept thread included. Returns `(bell, wake, keys)`.
 fn wire_doorbell(
-    term: &mut rawterm::Terminal,
+    host: &Host<'_>,
 ) -> (
     atrium::events::Doorbell,
     atrium::events::Wake,
@@ -413,7 +410,7 @@ fn wire_doorbell(
     // What wakes the loop: keys on their own thread, and a reader thread per
     // pane (started at the top of each tick), all ringing one doorbell.
     let (bell, wake) = atrium::events::doorbell();
-    let keys = atrium::events::KeyReader::start(term.input(), bell.clone()).ok();
+    let keys = host.key_reader(bell.clone());
     // The ctl endpoint's accept thread rings the same bell on a connect.
     atrium::ipc::set_bell(bell.clone());
     (bell, wake, keys)
