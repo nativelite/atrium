@@ -23,13 +23,12 @@
 //! re-reads only a file whose stamp changed. A directory mtime alone would miss
 //! a task rewritten in place, which is how a status changes.
 //!
-//! The live snapshot is process-wide ([`refresh`] / [`snapshot`]): the run loop
-//! refreshes it in its agent-refresh phase and the overview reads it, without
-//! the renderer having to carry one more argument down to the panel.
+//! The watch belongs to the session: the run loop owns one, refreshes it in
+//! its agent-refresh phase ([`TeamWatch::refresh`]) and hands it to the
+//! renderer, which gives the overview its teams ([`TeamWatch::teams`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// What Claude Code prefixes a session-named team with.
@@ -498,26 +497,6 @@ fn list_tasks(
         files.insert(name, (stamp, task));
     }
     files
-}
-
-static WATCH: OnceLock<Mutex<TeamWatch>> = OnceLock::new();
-
-fn watch() -> &'static Mutex<TeamWatch> {
-    WATCH.get_or_init(|| Mutex::new(TeamWatch::new()))
-}
-
-/// The run loop's hook: refresh the process-wide watch for these lead session
-/// ids (gated to once a second). `true` when a team the overview shows changed.
-pub fn refresh(leads: &[&str]) -> bool {
-    watch()
-        .lock()
-        .map(|mut w| w.refresh(leads))
-        .unwrap_or(false)
-}
-
-/// A copy of every live team the process-wide watch knows, by name.
-pub fn snapshot() -> Vec<TeamState> {
-    watch().lock().map(|w| w.teams()).unwrap_or_default()
 }
 
 #[cfg(test)]

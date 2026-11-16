@@ -54,11 +54,25 @@ pub(crate) fn team_caption(
 /// order (windows in order, panes in order). Each carries its live agsess status
 /// and last action. This is the model the overview renders and the selection
 /// cursor indexes into — the same list at 3 agents and 300.
+///
+/// This form knows no Claude Code team: it is for the callers that only place
+/// the selection (which window, which pane), which no team changes. The panel
+/// is drawn from [`overview_nodes_with`].
 pub(crate) fn overview_nodes(
     windows: &[Window],
     world: &atrium::vendors::AgentState,
 ) -> Vec<OverviewNode> {
-    let teams = atrium::claude_teams::snapshot();
+    overview_nodes_with(windows, world, &[])
+}
+
+/// [`overview_nodes`] with the live Claude Code teams given (the session's
+/// [`atrium::claude_teams::TeamWatch`]): a lead's row names its team and a
+/// teammate with no caption takes its task's subject.
+pub(crate) fn overview_nodes_with(
+    windows: &[Window],
+    world: &atrium::vendors::AgentState,
+    teams: &[atrium::claude_teams::TeamState],
+) -> Vec<OverviewNode> {
     let mut nodes = Vec::new();
     for (wi, w) in windows.iter().enumerate() {
         for p in &w.panes {
@@ -82,7 +96,7 @@ pub(crate) fn overview_nodes(
             let doing = facts
                 .and_then(|f| f.doing.clone())
                 .filter(|d| !d.is_empty())
-                .or_else(|| team_caption(&label, team.as_deref(), &teams));
+                .or_else(|| team_caption(&label, team.as_deref(), teams));
             nodes.push(OverviewNode {
                 window: wi,
                 pane_id: p.id,
@@ -302,6 +316,10 @@ pub(crate) fn overview_scroll_start(total: usize, sel_row: usize, list_rows: usi
 /// selection cursor (`sel`). With multiple fleets open, each window's agents are
 /// grouped under an aggregated header. Diving into the selected agent (Enter) is
 /// handled by the caller. Absolute CUP per line; the bar row is left for the bar.
+///
+/// This form draws no Claude Code team, for the tests that have none; the
+/// renderer calls [`render_overview_panel_with`].
+#[cfg(test)]
 pub(crate) fn render_overview_panel(
     windows: &[Window],
     bus: &atrium::bus::Bus,
@@ -311,15 +329,14 @@ pub(crate) fn render_overview_panel(
     rows: u16,
     cols: u16,
 ) -> String {
-    let teams = atrium::claude_teams::snapshot();
-    render_overview_panel_with(windows, bus, nodes, collisions, &teams, sel, rows, cols)
+    render_overview_panel_with(windows, bus, nodes, collisions, &[], sel, rows, cols)
 }
 
-/// [`render_overview_panel`] with the live Claude Code teams given, so a test
-/// can hand one in: under a lead's row, the team block ([`team_line`]).
+/// [`render_overview_panel`] with the live Claude Code teams given: under a
+/// lead's row, the team block ([`team_line`]).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the panel's inputs plus the teams a test hands in; no struct is worth one caller"
+    reason = "the panel's inputs plus the session's teams; no struct is worth one caller"
 )]
 pub(crate) fn render_overview_panel_with(
     windows: &[Window],

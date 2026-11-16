@@ -129,6 +129,7 @@ impl<'a> RunState<'a> {
             keys,
             deliberate_exit: false,
             mods: atrium::modstate::ModState::default(),
+            teams: atrium::claude_teams::TeamWatch::new(),
         })
     }
 }

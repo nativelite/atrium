@@ -117,6 +117,10 @@ struct RunState<'a> {
     /// What each pane's mod reported; laid over `world` by
     /// [`RunState::lay_mod_reports`].
     mods: atrium::modstate::ModState,
+    /// Claude Code's own teams led from this session's panes: refreshed in
+    /// [`RunState::refresh_agents`] while the overview is up, read by the
+    /// overview's paint.
+    teams: atrium::claude_teams::TeamWatch,
     /// The question `Ctrl+A ?` last put to a pane, and its reply once given.
     ask: Option<crate::ask_panel::AskState>,
     /// What `Ctrl+A c`, splits and the command prompt launch under; its `job`
@@ -268,6 +272,7 @@ impl RunState<'_> {
                     board: &self.board,
                     bus: &self.bus,
                 },
+                teams: &self.teams,
                 force_repaint: self.force_repaint,
                 tiled_dirty,
                 pane_output: drained.pane_output,
@@ -547,7 +552,7 @@ impl RunState<'_> {
                 .filter(|p| !p.exited)
                 .filter_map(|p| p.session_id.as_deref())
                 .collect();
-            if atrium::claude_teams::refresh(&leads) {
+            if self.teams.refresh(&leads) {
                 self.force_repaint = true;
             }
         }
