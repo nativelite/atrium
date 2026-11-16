@@ -133,6 +133,12 @@ pub(crate) struct Pane {
     /// mark. Set by the hold spawn and by nothing else; while it is set, no
     /// other respawn touches the pane.
     pub(crate) placeholder: bool,
+    /// For a placeholder: the agent id of the pane that made it. Unlike
+    /// `parent` it is **not** moved when that pane is respawned under a new
+    /// id, so a placeholder whose maker's process is gone can no longer be
+    /// claimed (the new process under that pane never asked for it). `None`
+    /// for every other pane.
+    pub(crate) held_for: Option<AgentId>,
 }
 
 /// One window: a split tree over a set of panes, plus a zoom flag. Windows are

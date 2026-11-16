@@ -38,10 +38,11 @@ use std::process::ExitCode;
 mod teammate;
 
 pub use teammate::{
-    env_not_passed, is_env_name, not_passed_note, parse_teams_env, plain_path, session_teams_env,
-    set_session_teams_env, teammate_audit, teammate_cwd, teams_env_refusal, teams_env_value_ok,
-    vet_teammate, Asked, Flag, Shape, Take, Teammate, ATRIUM_OWN_FLAGS, ENV_AGENT_TEAMS,
-    ENV_CLAUDECODE, ENV_TASK_LIST, FLAGS, TEAMS_ENV_VALUE_MAX,
+    absolute_program, env_name_eq, env_not_passed, is_env_name, not_passed_note, parse_teams_env,
+    session_teams_env, set_session_teams_env, teammate_audit, teammate_cwd, teams_env_disclosure,
+    teams_env_refusal, teams_env_value_ok, teams_env_warned, vet_teammate, Asked, Flag, Shape,
+    Take, Teammate, ATRIUM_OWN_FLAGS, ENV_AGENT_TEAMS, ENV_CLAUDECODE, ENV_TASK_LIST, FLAGS,
+    TEAMS_ENV_VALUE_MAX,
 };
 pub use tmuxproto::{
     agent_name, expand, needs_broker, parse, parse_target, parse_teammate_command, run, sh_words,
@@ -118,6 +119,18 @@ pub fn respawn_args(id: usize, command: &str) -> Vec<String> {
         "--teammate".into(),
         command.to_string(),
     ]
+}
+
+/// The refusal for a teammate command line too long to read. The usual
+/// cause is a lead started with a very large inline `--mcp-config`, which
+/// Claude Code repeats on the line (and which atrium would drop anyway).
+pub fn oversized_line(bytes: usize) -> String {
+    format!(
+        "teammate refused: the command line is {bytes} bytes, over the {} atrium reads \
+         (a lead started with a very large inline --mcp-config sends one; put that \
+         config in a file). Nothing was started",
+        tmuxproto::MAX_COMMAND_BYTES
+    )
 }
 
 /// Claude Code's own flag for how teammates are shown. atrium passes it as
@@ -303,6 +316,11 @@ impl Broker for CtlBroker {
     /// Claude Code 2.1.325's `respawn-pane`: the server turns the caller's
     /// own placeholder into the teammate, or refuses.
     fn respawn(&mut self, id: usize, command: &str) -> Result<(), String> {
+        // Refused here, in atrium's own words, before it is a request too
+        // large for the channel to carry (the server holds the same bound).
+        if command.len() > tmuxproto::MAX_COMMAND_BYTES {
+            return Err(oversized_line(command.len()));
+        }
         let owned = respawn_args(id, command);
         let args: Vec<&str> = owned.iter().map(String::as_str).collect();
         self.call(&args).map(|_| ())
@@ -543,6 +561,32 @@ mod tests {
             .filter(|w| !w.is_empty())
             .map(str::to_string)
             .collect()
+    }
+
+    /// A line too long to read is refused by the shim itself, in atrium's
+    /// words, before it would be a request the channel cannot carry.
+    #[test]
+    fn an_oversized_teammate_line_is_refused_before_it_is_sent() {
+        let mut broker = CtlBroker {
+            address: "no-such-endpoint".to_string(),
+            caller: Some(3),
+        };
+        let big = format!(
+            "cd /d && env claude --mcp-config '{}'",
+            "x".repeat(tmuxproto::MAX_COMMAND_BYTES)
+        );
+        let e = broker.respawn(4, &big).unwrap_err();
+        assert!(
+            e.starts_with("teammate refused: the command line is"),
+            "{e}"
+        );
+        assert!(e.contains("--mcp-config") && e.contains("24576"), "{e}");
+        assert!(!e.contains("xxxx"));
+        // The bound leaves room for the line in one request: at the bound,
+        // with every byte one that JSON doubles, it is under the wire's cap.
+        let worst = "\\".repeat(tmuxproto::MAX_COMMAND_BYTES);
+        let line = crate::ctl::build_request(&respawn_args(4, &format!("c{worst}")), Some(3));
+        assert!(line.unwrap().len() < 64 * 1024);
     }
 
     #[test]

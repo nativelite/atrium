@@ -43,10 +43,12 @@ fn a_pane_with_no_recorded_command_respawns_its_title() {
 use atrium::ctl::TrustMode;
 use atrium::tmux_shim::Asked;
 
-fn slot(parent: usize) -> Slot {
+/// A live placeholder that pane `maker` made and is the parent of.
+fn slot(maker: usize) -> Slot {
     Slot {
         placeholder: true,
-        parent: Some(AgentId(parent)),
+        parent: Some(AgentId(maker)),
+        owner: Some(AgentId(maker)),
         exited: false,
     }
 }
@@ -89,6 +91,37 @@ fn only_the_callers_own_live_placeholder_may_become_a_teammate() {
     ));
 }
 
+/// A lead that was respawned between the split and the respawn-pane is a new
+/// process under a new id. Its children follow it (the parent link is moved),
+/// but a placeholder its old process made is nobody's to claim: not the new
+/// id's, and not the old one's, should anything ever present it.
+#[test]
+fn a_placeholder_does_not_follow_its_maker_through_a_respawn() {
+    let (old, new) = (AgentId(3), AgentId(7));
+    let moved = Slot {
+        parent: Some(new),
+        ..slot(3)
+    };
+    assert!(
+        !is_own_placeholder(new, Some(moved)),
+        "the new process never made it"
+    );
+    assert!(
+        !is_own_placeholder(old, Some(moved)),
+        "the old id is not its parent"
+    );
+    // A maker that is gone altogether (its pane exited): the link is stale.
+    assert!(!is_own_placeholder(new, Some(slot(3))));
+    // A placeholder with no recorded maker is nobody's.
+    assert!(!is_own_placeholder(
+        old,
+        Some(Slot {
+            owner: None,
+            ..slot(3)
+        })
+    ));
+}
+
 const MODES: [TrustMode; 5] = [
     TrustMode::Off,
     TrustMode::Plan,
@@ -97,59 +130,150 @@ const MODES: [TrustMode; 5] = [
     TrustMode::Skip,
 ];
 
-/// For every asked mode, lead mode and launch trust: the teammate is never
-/// above its lead pane's mode, never above the session's, and never above
-/// what it asked for.
+const ASKS: [Asked; 8] = [
+    Asked::Nothing,
+    Asked::Default,
+    Asked::DontAsk,
+    Asked::Mode(TrustMode::Off),
+    Asked::Mode(TrustMode::Plan),
+    Asked::Mode(TrustMode::Edits),
+    Asked::Mode(TrustMode::Auto),
+    Asked::Mode(TrustMode::Skip),
+];
+
+fn lower(a: TrustMode, b: TrustMode) -> TrustMode {
+    if a.rank() <= b.rank() {
+        a
+    } else {
+        b
+    }
+}
+
+/// The full matrix, launch trust x lead mode x what the line asked: 200
+/// cases, each held to the rules that make a teammate never less held than
+/// its lead, its session or its own request.
 #[test]
-fn a_teammates_mode_is_never_above_its_lead_the_session_or_its_request() {
+fn the_posture_matrix_holds_every_teammate_to_its_lead_its_session_and_its_request() {
+    use TrustMode::{Off, Plan};
     for policy in MODES {
         for lead in MODES {
-            let (inherit, _) = teammate_mode(Asked::LeadsOwn, lead, policy);
-            assert!(inherit.rank() <= lead.rank() && inherit.rank() <= policy.rank());
-            for asked in MODES {
-                let (mode, note) = teammate_mode(Asked::Mode(asked), lead, policy);
-                assert!(mode.rank() <= lead.rank(), "{asked:?} {lead:?} {policy:?}");
-                assert!(
-                    mode.rank() <= policy.rank(),
-                    "{asked:?} {lead:?} {policy:?}"
-                );
-                assert!(mode.rank() <= asked.rank(), "{asked:?} {lead:?} {policy:?}");
-                // Whatever was held back is said.
-                let lowered = mode != asked;
-                assert_eq!(note.is_some(), lowered, "{asked:?} {lead:?} {policy:?}");
+            let governed = lower(lead, policy);
+            for asked in ASKS {
+                let got = teammate_mode(asked, lead, policy);
+                let case = format!("launch {policy:?}, lead {lead:?}, asked {asked:?}: {got:?}");
+                // Never above the lead pane, never above the session.
+                assert!(got.mode.rank() <= lead.rank(), "{case}");
+                assert!(got.mode.rank() <= policy.rank(), "{case}");
+                // A flag atrium writes itself only where the spawn writes none.
+                if got.flag.is_some() {
+                    assert_eq!(got.mode, Off, "{case}");
+                }
+                match asked {
+                    Asked::Nothing => {
+                        assert_eq!((got.mode, got.flag), (governed, None), "{case}");
+                    }
+                    // Passed on as written, unless the lead is held to plan.
+                    Asked::Default | Asked::DontAsk => {
+                        let word = if asked == Asked::Default {
+                            "default"
+                        } else {
+                            "dontAsk"
+                        };
+                        if governed == Plan {
+                            assert_eq!((got.mode, got.flag), (Plan, None), "{case}");
+                        } else {
+                            assert_eq!((got.mode, got.flag), (Off, Some(word)), "{case}");
+                        }
+                    }
+                    // Plan asked is plan got, whatever governs.
+                    Asked::Mode(Plan) => {
+                        let plan = (got.mode, got.flag) == (Plan, None)
+                            || (got.mode, got.flag) == (Off, Some("plan"));
+                        assert!(plan, "{case}");
+                        assert_eq!(got.flag.is_some(), governed == Off, "{case}");
+                    }
+                    Asked::Mode(m) => {
+                        assert!(got.mode.rank() <= m.rank(), "{case}");
+                        assert_eq!(got.mode, lower(m, governed), "{case}");
+                        assert_eq!(got.flag, None, "{case}");
+                        // Whatever was held back is said.
+                        assert_eq!(got.note.is_some(), got.mode != m, "{case}");
+                    }
+                }
             }
         }
     }
 }
 
+/// The cases a person would name, one row each: launch trust, the lead
+/// pane's mode, what the line asked, and the mode and the flag that result.
 #[test]
 fn a_teammates_mode_in_the_cases_that_matter() {
+    use Asked::{Default, DontAsk, Mode, Nothing};
     use TrustMode::*;
-    // A skip request under an accept session: accept, and the reply says so.
-    let (mode, note) = teammate_mode(Asked::Mode(Skip), Edits, Edits);
-    assert_eq!(mode, Edits);
-    assert!(note.unwrap().contains("held to its lead pane's accept"));
-    // A lead the fleet holds to plan, in a session launched at accept: plan.
-    assert_eq!(teammate_mode(Asked::Mode(Edits), Plan, Edits).0, Plan);
-    assert_eq!(teammate_mode(Asked::Mode(Skip), Plan, Skip).0, Plan);
-    // `--plan-mode-required`, or a plan request: plan, below any lead.
-    assert_eq!(teammate_mode(Asked::Mode(Plan), Skip, Skip), (Plan, None));
-    assert_eq!(teammate_mode(Asked::Mode(Plan), Edits, Edits), (Plan, None));
-    // A request for less than the lead has is honoured.
-    assert_eq!(teammate_mode(Asked::Mode(Edits), Auto, Skip), (Edits, None));
-    // No request, or `default`: the lead pane's own mode, capped like it.
-    assert_eq!(teammate_mode(Asked::LeadsOwn, Edits, Edits), (Edits, None));
-    assert_eq!(teammate_mode(Asked::LeadsOwn, Plan, Edits), (Plan, None));
-    assert_eq!(teammate_mode(Asked::LeadsOwn, Skip, Skip), (Skip, None));
-    // A session with no `--trust` adds no permission flag for anyone.
-    for asked in [Asked::LeadsOwn, Asked::Mode(Skip), Asked::Mode(Plan)] {
-        assert_eq!(teammate_mode(asked, Off, Off).0, Off);
+    let table: &[(TrustMode, TrustMode, Asked, TrustMode, Option<&str>)] = &[
+        // A session at accept, a lead at accept.
+        (Edits, Edits, Nothing, Edits, None),
+        (Edits, Edits, Mode(Edits), Edits, None),
+        (Edits, Edits, Mode(Auto), Edits, None),
+        (Edits, Edits, Mode(Skip), Edits, None),
+        (Edits, Edits, Mode(Plan), Plan, None),
+        // The human switched the lead down to default: its teammates ask too.
+        (Edits, Edits, Default, Off, Some("default")),
+        (Edits, Edits, DontAsk, Off, Some("dontAsk")),
+        (Auto, Auto, Default, Off, Some("default")),
+        (Skip, Skip, Default, Off, Some("default")),
+        // Automode and skip sessions.
+        (Auto, Auto, Mode(Auto), Auto, None),
+        (Auto, Auto, Mode(Skip), Auto, None),
+        (Auto, Auto, Mode(Edits), Edits, None),
+        (Skip, Skip, Mode(Skip), Skip, None),
+        (Skip, Skip, Mode(Plan), Plan, None),
+        (Skip, Auto, Mode(Edits), Edits, None),
+        // A lead the fleet holds to plan, in a session launched higher.
+        (Edits, Plan, Nothing, Plan, None),
+        (Edits, Plan, Mode(Edits), Plan, None),
+        (Skip, Plan, Mode(Skip), Plan, None),
+        (Edits, Plan, Default, Plan, None),
+        (Edits, Plan, DontAsk, Plan, None),
+        // A session launched at plan.
+        (Plan, Plan, Default, Plan, None),
+        (Plan, Plan, Mode(Skip), Plan, None),
+        (Plan, Plan, Mode(Plan), Plan, None),
+        // No `--trust`: atrium governs nothing, and still a plan request is
+        // plan and a default request is default.
+        (Off, Off, Nothing, Off, None),
+        (Off, Off, Mode(Skip), Off, None),
+        (Off, Off, Mode(Edits), Off, None),
+        (Off, Off, Mode(Plan), Off, Some("plan")),
+        (Off, Off, Default, Off, Some("default")),
+        (Off, Off, DontAsk, Off, Some("dontAsk")),
+        // A lead with no posture of its own in a governed session.
+        (Edits, Off, Mode(Plan), Off, Some("plan")),
+        (Edits, Off, Mode(Skip), Off, None),
+        (Plan, Off, Mode(Plan), Off, Some("plan")),
+        // A lead recorded above the session (it cannot be) is still capped.
+        (Edits, Skip, Mode(Skip), Edits, None),
+        (Edits, Skip, Nothing, Edits, None),
+    ];
+    for (policy, lead, asked, mode, flag) in table.iter().copied() {
+        let got = teammate_mode(asked, lead, policy);
+        assert_eq!(
+            (got.mode, got.flag),
+            (mode, flag),
+            "launch {policy:?}, lead {lead:?}, asked {asked:?}"
+        );
     }
-    // A lead recorded above the session (it cannot be, by `effective_mode`
-    // at its own spawn) would still be capped here.
-    let (mode, note) = teammate_mode(Asked::Mode(Skip), Skip, Edits);
-    assert_eq!(mode, Edits);
-    assert!(note.unwrap().contains("capped to accept"));
+    // What was held back is said, and how the audit row names the result.
+    let got = teammate_mode(Mode(Skip), Edits, Edits);
+    assert!(got.note.unwrap().contains("held to its lead pane's accept"));
+    let got = teammate_mode(Mode(Skip), Skip, Edits);
+    assert!(got.note.unwrap().contains("capped to accept"));
+    assert_eq!(teammate_mode(Mode(Plan), Off, Off).label(), "plan");
+    assert_eq!(teammate_mode(Default, Auto, Auto).label(), "default");
+    assert_eq!(teammate_mode(DontAsk, Auto, Auto).label(), "dontAsk");
+    assert_eq!(teammate_mode(Nothing, Auto, Auto).label(), "automode");
+    assert_eq!(teammate_mode(Mode(Plan), Off, Off).note, None);
 }
 
 /// A teammate runs under its lead pane's own identity, and only that: the

@@ -16,9 +16,10 @@
 //!   consumed and become a *request* the server caps; the flags that load
 //!   code or settings are consumed and dropped; an unknown flag, a positional
 //!   argument or a value outside its shape refuses the launch;
-//! * of the **environment**, three assignments are applied and the rest are
-//!   counted and dropped;
-//! * the **working directory** must be the lead's own or inside the project
+//! * of the **environment**, three assignments are applied, the ones whose
+//!   names the human listed in `teams_env` are applied, and the rest are
+//!   dropped (the server names the ones that would have differed);
+//! * the **working directory** must be the lead pane's own
 //!   ([`teammate_cwd`]).
 //!
 //! Everything here is pure (the directory check reads the file system), so
@@ -26,7 +27,7 @@
 
 use crate::bind;
 use crate::ctl::TrustMode;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tmuxproto::TeammateCommand;
 
 /// The value a flag may carry: printable ASCII from a small set, bounded, and
@@ -144,7 +145,8 @@ const fn f(name: &'static str, take: Take) -> Flag {
 /// nothing else. Read from the installed binary's own code (2026-11-15).
 ///
 /// The first eight are the teammate's identity, written by the spawn
-/// function itself. The rest are the "inherited" flags, which one function
+/// function itself (`--agent-type` among them, which is dropped: see below).
+/// The rest are the "inherited" flags, which one function
 /// builds from the lead's own state: its permission mode, its command-line
 /// deny rules and tool list, its model and effort, and every settings, plugin
 /// and MCP source it was started with.
@@ -156,7 +158,12 @@ const fn f(name: &'static str, take: Take) -> Flag {
 /// commands to start; `--project-config-root` moves where project settings
 /// are read from; `--setting-sources` can leave out the settings file that
 /// holds the human's own deny rules and hooks; `--proactivity` shapes the
-/// permission mode; `--chrome` turns a browser integration on. A teammate
+/// permission mode; `--chrome` turns a browser integration on. And
+/// `--agent-type`, for now: it names an agent definition, which a pane can
+/// write under the project's `.claude/agents`, and whether that file's own
+/// `permissionMode`, hooks or MCP servers outrank the `--permission-mode`
+/// atrium passes has not been established by a live run. Dropped, the
+/// teammate runs as a general teammate. A teammate
 /// gets atrium's own `--settings`
 /// (its status hooks) and atrium's mod like every claude pane, and reads the
 /// user's and the project's settings as any claude started in that directory.
@@ -173,7 +180,7 @@ pub const FLAGS: &[Flag] = &[
     f("--parent-session-id", Take::Pass(Shape::Token)),
     f("--lead-verify-key", Take::Pass(Shape::Key)),
     f("--plan-mode-required", Take::PlanRequired),
-    f("--agent-type", Take::Pass(Shape::Name)),
+    f("--agent-type", Take::DropValue),
     // The permission posture (the inherited-flags function, first).
     f("--dangerously-skip-permissions", Take::Skip),
     f("--permission-mode", Take::Mode),
@@ -233,10 +240,18 @@ const READ_FROM: &str = "this atrium knows the teammate command of Claude Code 2
 /// The posture a teammate command asks for, before the server caps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Asked {
-    /// No permission flag, or `default` / `dontAsk`: nothing atrium's ladder
-    /// has a safe rung for, so the teammate takes its lead pane's mode.
-    LeadsOwn,
-    /// A mode by name, `--plan-mode-required`, or the skip switch.
+    /// No permission flag at all: the teammate takes its lead pane's mode.
+    Nothing,
+    /// `--permission-mode default`: ask before every edit and command. It
+    /// sits under every rung atrium governs but `plan`, so it is passed on
+    /// as written (a lead its human switched down to `default` does not get
+    /// hands-off teammates).
+    Default,
+    /// `--permission-mode dontAsk`: refuse what is not already allowed.
+    /// Passed on as written, like [`Asked::Default`].
+    DontAsk,
+    /// A mode atrium governs, by name, by `--plan-mode-required`, or by the
+    /// skip switch.
     Mode(TrustMode),
 }
 
@@ -296,7 +311,8 @@ fn asked_mode(value: &str) -> Result<Asked, ()> {
         "auto" => Ok(Asked::Mode(TrustMode::Auto)),
         "plan" => Ok(Asked::Mode(TrustMode::Plan)),
         "bypassPermissions" => Ok(Asked::Mode(TrustMode::Skip)),
-        "default" | "dontAsk" => Ok(Asked::LeadsOwn),
+        "default" => Ok(Asked::Default),
+        "dontAsk" => Ok(Asked::DontAsk),
         _ => Err(()),
     }
 }
@@ -475,7 +491,7 @@ pub fn vet_teammate(cmd: &TeammateCommand, teams_env: &[String]) -> Result<Teamm
     let asked = if plan_required {
         Asked::Mode(TrustMode::Plan)
     } else {
-        asked.unwrap_or(Asked::LeadsOwn)
+        asked.unwrap_or(Asked::Nothing)
     };
     let mut env = vec![
         (ENV_CLAUDECODE.to_string(), "1".to_string()),
@@ -486,8 +502,11 @@ pub fn vet_teammate(cmd: &TeammateCommand, teams_env: &[String]) -> Result<Teamm
     // The last assignment of a name is the one that counts, as `env` has it.
     let mut listed: Vec<(String, String)> = Vec::new();
     let mut unapplied: Vec<(String, String)> = Vec::new();
+    // (On Windows a name is the same name in any case, as the merge into the
+    // child's environment has it.)
+    let fold = cfg!(windows);
     let put = |into: &mut Vec<(String, String)>, name: &str, value: &str| {
-        into.retain(|(n, _)| n != name);
+        into.retain(|(n, _)| !env_name_eq(n, name, fold));
         into.push((name.to_string(), value.to_string()));
     };
     for (name, value) in &cmd.env {
@@ -503,7 +522,9 @@ pub fn vet_teammate(cmd: &TeammateCommand, teams_env: &[String]) -> Result<Teamm
             }
             // On the human's list (`teams_env`), and not a name that may
             // never be listed, whatever the list says.
-            n if teams_env.iter().any(|a| a.as_str() == n) && teams_env_refusal(n).is_none() => {
+            n if teams_env.iter().any(|a| env_name_eq(a, n, fold))
+                && teams_env_refusal(n).is_none() =>
+            {
                 if !teams_env_value_ok(value) {
                     return Err(refused(&format!(
                         "the value of {n}, which `teams_env` lets a lead pass on, holds a \
@@ -550,6 +571,16 @@ pub fn is_env_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Are `a` and `b` the same environment variable name? Exactly, or without
+/// regard to ASCII case when `fold` is set, which is how Windows has it.
+pub fn env_name_eq(a: &str, b: &str, fold: bool) -> bool {
+    if fold {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 /// Why `name` can never be on a `teams_env` list, or `None` when it may. Each
 /// of these, set from a lead's command line, would do more than configure a
 /// provider: skip the permission system, impersonate another pane to atrium,
@@ -566,15 +597,76 @@ pub fn teams_env_refusal(name: &str) -> Option<&'static str> {
     if n.starts_with("DYLD_") || matches!(n.as_str(), "LD_PRELOAD" | "LD_LIBRARY_PATH") {
         return Some("it loads code into the teammate's process");
     }
+    if n.starts_with("GIT_CONFIG_") {
+        return Some("it rewrites git's configuration, which can name programs to run");
+    }
     match n.as_str() {
         "TMUX" | "TMUX_PANE" => Some("it is how atrium tells a claude pane which pane it is"),
         "PATH" | "PATHEXT" => Some("it decides which program a name runs"),
-        "NODE_OPTIONS" => Some("it loads code into the teammate's process"),
+        "NODE_OPTIONS" | "BUN_OPTIONS" | "CLAUDE_CODE_PLUGIN_DIRS" => {
+            Some("it loads code into the teammate's process")
+        }
+        "BASH_ENV" | "ENV" => Some("it names a script every shell the teammate starts runs"),
+        "COMSPEC" | "SHELL" | "CLAUDE_CODE_SHELL" => {
+            Some("it decides which shell runs the teammate's commands")
+        }
+        "GIT_SSH_COMMAND" => Some("it names a program git runs"),
+        "CARGO_MAKEFLAGS" => Some("it is the session's build pool, which atrium sets"),
         "CLAUDE_CODE_TEAMMATE_COMMAND" => {
             Some("a teammate is the lead pane's own claude, never a command a variable names")
         }
         _ => None,
     }
+}
+
+/// Is `name` one a `teams_env` list may hold but that moves **where settings
+/// are read from or where traffic goes**: `CLAUDE_CONFIG_DIR`, `HOME`,
+/// `USERPROFILE`, `APPDATA`, `ANTHROPIC_BASE_URL`, any name ending `_PROXY`,
+/// `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE` and `SystemRoot`, in any case?
+/// Listable on purpose (a proxy is the common case), and disclosed with a
+/// warning wherever the list is shown ([`teams_env_disclosure`]).
+pub fn teams_env_warned(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    n.ends_with("_PROXY")
+        || matches!(
+            n.as_str(),
+            "CLAUDE_CONFIG_DIR"
+                | "HOME"
+                | "USERPROFILE"
+                | "APPDATA"
+                | "ANTHROPIC_BASE_URL"
+                | "NODE_EXTRA_CA_CERTS"
+                | "SSL_CERT_FILE"
+                | "SYSTEMROOT"
+        )
+}
+
+/// What a human is shown of a `teams_env` list before a session starts (the
+/// fleet banner, a plain launch's one stderr line, `atrium config path`):
+/// the names, and a `WARNING` naming the ones [`teams_env_warned`] flags.
+/// `None` for an empty list.
+pub fn teams_env_disclosure(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut line = format!(
+        "variables a Claude Code lead may set on its teammates (`teams_env`): {}; each \
+         is taken from a pane's request",
+        names.join(", ")
+    );
+    let warned: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| teams_env_warned(n))
+        .collect();
+    if !warned.is_empty() {
+        line.push_str(&format!(
+            ". WARNING: {} can move where a teammate reads its settings and \
+             credentials from, or where its traffic goes",
+            warned.join(", ")
+        ));
+    }
+    Some(line)
 }
 
 /// May an allowlisted variable carry `value`: at most
@@ -650,20 +742,42 @@ const NOT_PASSED_SHOWN: usize = 8;
 
 /// Of the assignments a teammate command carried and atrium did not apply,
 /// the **names** whose value differs from what the teammate will have anyway
-/// (`will_have`: atrium's own environment under what atrium gave the lead).
-/// An empty forwarded value is the same as an unset variable. A variable the
-/// teammate gets the same value for is not a loss and is not named.
+/// (`will_have`: atrium's own ambient environment and the non-secret
+/// variables it adds). An empty forwarded value is the same as an unset
+/// variable. A variable the teammate gets the same value for is not a loss
+/// and is not named.
+///
+/// `secret` is the names the lead's **identity** sets. Such a variable is
+/// never compared and never named or counted: the teammate has atrium's
+/// value for it by design, and answering "same" or "different" for a value
+/// the caller chose would let it test guesses of a credential.
+///
+/// `fold` (Windows) makes a name the same name in any case, as the merge
+/// into the child's environment has it: of several case variants the last
+/// is the one assignment, compared once, so variants cannot carry several
+/// guesses or count twice.
 ///
 /// Names only, never a value. They are the caller's text: one that is not a
 /// variable name of at most 64 characters is left out of the list and counted
 /// in the second number. Returns `(names, how many differ in all)`.
 pub fn env_not_passed(
     unapplied: &[(String, String)],
+    secret: &[String],
+    fold: bool,
     will_have: impl Fn(&str) -> Option<String>,
 ) -> (Vec<String>, usize) {
+    // One assignment per name: the last, as the environment has it.
+    let mut last: Vec<&(String, String)> = Vec::new();
+    for pair in unapplied {
+        last.retain(|(n, _)| !env_name_eq(n, &pair.0, fold));
+        last.push(pair);
+    }
     let mut names: Vec<String> = Vec::new();
     let mut total = 0;
-    for (name, value) in unapplied {
+    for (name, value) in last {
+        if secret.iter().any(|s| env_name_eq(s, name, fold)) {
+            continue;
+        }
         if *value == will_have(name).unwrap_or_default() {
             continue;
         }
@@ -743,18 +857,24 @@ pub fn teammate_audit(command: &str) -> String {
     out
 }
 
-/// The directory a teammate starts in: `asked` (the word after `cd`), when
-/// its **real path** is the lead pane's own directory or lies inside the
-/// session's project directory; the refusal otherwise. Real paths are
-/// compared (`std::fs::canonicalize`), so a link inside the project cannot
-/// name a directory outside it. The real path is returned, and is what the
-/// teammate is started in. The refusal does not repeat the path.
-pub fn teammate_cwd(asked: &str, lead: &Path, root: &Path) -> Result<PathBuf, String> {
+/// May a teammate start in `asked` (the word after `cd`)? Only when it is
+/// the **lead pane's own working directory**: the two are compared by their
+/// real paths (`std::fs::canonicalize`), so another spelling of the same
+/// directory passes and a link to another does not. `Ok` means "start it
+/// where the lead is"; the caller uses its own record of the lead's
+/// directory, never this string. The refusal does not repeat the path.
+///
+/// A directory of the caller's choosing, even one inside the project, is
+/// refused: a claude started there loads that directory's `.claude/settings`,
+/// `.mcp.json` and `CLAUDE.md`, and atrium would pre-accept its folder trust,
+/// none of which a plain `ctl spawn` lets a pane choose.
+pub fn teammate_cwd(asked: &str, lead: &Path) -> Result<(), String> {
     let refuse = |why: &str| {
         format!(
-            "teammate refused: its working directory {why}. A teammate starts in its lead \
-             pane's own directory or inside the session's project directory (their real \
-             paths are compared, so a link cannot lead outside). Nothing was started"
+            "teammate refused: its working directory {why}. A teammate starts where its \
+             lead is: the only directory atrium accepts is the lead pane's own (a \
+             directory of the request's choosing would bring its own settings, MCP servers \
+             and instructions). Nothing was started"
         )
     };
     let path = Path::new(asked);
@@ -763,38 +883,25 @@ pub fn teammate_cwd(asked: &str, lead: &Path, root: &Path) -> Result<PathBuf, St
     }
     let real =
         std::fs::canonicalize(path).map_err(|_| refuse("does not exist or cannot be read"))?;
-    if !real.is_dir() {
-        return Err(refuse("is not a directory"));
+    if !std::fs::canonicalize(lead).is_ok_and(|l| l == real) {
+        return Err(refuse("is not its lead pane's own"));
     }
-    let is_lead = std::fs::canonicalize(lead).is_ok_and(|l| l == real);
-    let in_root = std::fs::canonicalize(root).is_ok_and(|r| real.starts_with(r));
-    if !(is_lead || in_root) {
-        return Err(refuse("is neither the lead's own nor inside the project"));
-    }
-    Ok(real)
+    Ok(())
 }
 
-/// A canonical path as a process can be started in it. On Windows
-/// `canonicalize` answers in the verbatim form (`\\?\D:\work`,
-/// `\\?\UNC\host\share`), which `cmd.exe` (the host of an npm `claude.cmd`)
-/// refuses as a current directory; the same path is written plainly.
-/// Elsewhere the path is returned as it is.
-pub fn plain_path(real: &Path) -> String {
-    let text = real.to_string_lossy();
-    if cfg!(windows) {
-        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{unc}");
-        }
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            let mut chars = rest.chars();
-            let drive =
-                chars.next().is_some_and(|c| c.is_ascii_alphabetic()) && chars.next() == Some(':');
-            if drive {
-                return rest.to_string();
-            }
-        }
+/// A lead's recorded program as the teammate is started with it. A bare name
+/// is left for the `PATH` pin; an absolute path is left as it is. A
+/// **relative path** (`./bin/claude`, a fleet `cmd` written that way) is made
+/// absolute against `base`, atrium's own working directory, which is where it
+/// was resolved from when the lead was started: on unix a child resolves a
+/// relative program after it has changed into its own directory, so the same
+/// words could name another file there.
+pub fn absolute_program(own: &str, base: &Path) -> String {
+    let is_path = own.contains(['/', '\\']);
+    if is_path && !Path::new(own).is_absolute() {
+        return base.join(own).to_string_lossy().into_owned();
     }
-    text.into_owned()
+    own.to_string()
 }
 
 #[cfg(test)]

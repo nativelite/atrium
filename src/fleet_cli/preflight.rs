@@ -488,16 +488,11 @@ pub(super) fn commands_line(fleet: &atrium::fleet::Fleet) -> Option<String> {
     })
 }
 
-/// The banner line for a fleet's `teams_env` allowlist, when it lists any.
+/// The banner line for a fleet's `teams_env` allowlist, when it lists any,
+/// with a WARNING for the names that move settings or traffic.
 pub(super) fn teams_env_line(fleet: &atrium::fleet::Fleet) -> Option<String> {
     let names = fleet.teams_env.as_deref().unwrap_or(&[]);
-    (!names.is_empty()).then(|| {
-        format!(
-            "atrium fleet: variables a Claude Code lead may set on its teammates \
-             (`teams_env`): {}; each is taken from a pane's request",
-            names.join(", ")
-        )
-    })
+    atrium::tmux_shim::teams_env_disclosure(names).map(|line| format!("atrium fleet: {line}"))
 }
 
 #[cfg(test)]

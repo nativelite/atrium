@@ -447,14 +447,29 @@ fn a_teams_env_list_is_disclosed_in_the_banner_when_it_is_not_empty() {
     };
     assert_eq!(super::teams_env_line(&fleet("")), None);
     assert_eq!(super::teams_env_line(&fleet(r#""teams_env": [],"#)), None);
-    let line = super::teams_env_line(&fleet(
-        r#""teams_env": ["ANTHROPIC_BASE_URL", "HTTPS_PROXY"],"#,
-    ))
-    .expect("a line");
+    let line = super::teams_env_line(&fleet(r#""teams_env": ["AWS_PROFILE", "AWS_REGION"],"#))
+        .expect("a line");
     assert_eq!(
         line,
         "atrium fleet: variables a Claude Code lead may set on its teammates (`teams_env`): \
-         ANTHROPIC_BASE_URL, HTTPS_PROXY; each is taken from a pane's request"
+         AWS_PROFILE, AWS_REGION; each is taken from a pane's request"
+    );
+    // A name that moves where settings are read from, or where traffic
+    // goes, is listed and warned of.
+    let line = super::teams_env_line(&fleet(
+        r#""teams_env": ["AWS_PROFILE", "ANTHROPIC_BASE_URL", "HTTPS_PROXY", "CLAUDE_CONFIG_DIR"],"#,
+    ))
+    .expect("a line");
+    assert!(
+        line.starts_with(
+            "atrium fleet: variables a Claude Code lead may set on its teammates (`teams_env`): \
+             AWS_PROFILE, ANTHROPIC_BASE_URL, HTTPS_PROXY, CLAUDE_CONFIG_DIR; each is taken"
+        ),
+        "{line}"
+    );
+    assert!(
+        line.contains("WARNING: ANTHROPIC_BASE_URL, HTTPS_PROXY, CLAUDE_CONFIG_DIR can move"),
+        "{line}"
     );
     assert!(!line.contains("  "), "{line:?}");
 }

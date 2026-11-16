@@ -2,6 +2,7 @@
 //! refused.
 
 use super::*;
+use std::path::PathBuf;
 use tmuxproto::parse_teammate_command;
 
 // ---- fixtures ---------------------------------------------------------------
@@ -65,7 +66,7 @@ fn the_minimal_fixture_is_a_teammate_with_three_variables() {
             "0b9f6c1e-2a67-4c58-9d0e-6f4f8a1d2c33",
         ])
     );
-    assert_eq!(t.asked, Asked::LeadsOwn, "no permission flag asks nothing");
+    assert_eq!(t.asked, Asked::Nothing, "no permission flag asks nothing");
     assert!(t.deny.is_empty() && t.dropped.is_empty());
     assert_eq!(
         t.env,
@@ -100,8 +101,6 @@ fn the_full_fixture_is_passed_consumed_and_dropped_flag_by_flag() {
             "--lead-verify-key",
             KEY,
             "--plan-mode-required",
-            "--agent-type",
-            "code-reviewer",
             "--tools",
             "Read",
             "--tools",
@@ -120,6 +119,7 @@ fn the_full_fixture_is_passed_consumed_and_dropped_flag_by_flag() {
     assert_eq!(
         t.dropped,
         [
+            "--agent-type",
             "--proactivity",
             "--settings",
             "--setting-sources",
@@ -388,17 +388,12 @@ fn a_program_that_is_not_claude_refuses_the_launch() {
 
 #[test]
 fn a_value_outside_its_shape_refuses_and_is_never_echoed() {
-    let long = "a".repeat(300);
     for (flag, value) in [
         ("--agent-color", "'red; id'"),
         (
             "--agent-color",
             "'\u{43a}\u{440}\u{430}\u{441}\u{43d}\u{44b}\u{439}'",
         ),
-        ("--agent-type", "'../../x'"),
-        ("--agent-type", "'two  spaces'"),
-        ("--agent-type", "'trailing '"),
-        ("--agent-type", long.as_str()),
         ("--parent-session-id", "'id with space'"),
         ("--lead-verify-key", "'1.k/../x'"),
         ("--lead-verify-key", "'1.k k'"),
@@ -429,7 +424,6 @@ fn a_value_outside_its_shape_refuses_and_is_never_echoed() {
         "--agent-color=-red",
         "--model=--dangerously-skip-permissions",
         "--model --dangerously-skip-permissions",
-        "--agent-type '-x'",
         "--parent-session-id=-1",
         "--lead-verify-key=-k",
         "--effort=-high",
@@ -509,9 +503,10 @@ fn a_malformed_use_of_a_known_flag_refuses() {
 #[test]
 fn the_permission_flags_become_a_request_and_are_never_passed_on() {
     for (rest, asked) in [
-        ("", Asked::LeadsOwn),
-        ("--permission-mode default", Asked::LeadsOwn),
-        ("--permission-mode dontAsk", Asked::LeadsOwn),
+        ("", Asked::Nothing),
+        ("--permission-mode default", Asked::Default),
+        ("--permission-mode=default", Asked::Default),
+        ("--permission-mode dontAsk", Asked::DontAsk),
         ("--permission-mode plan", Asked::Mode(TrustMode::Plan)),
         (
             "--permission-mode acceptEdits",
@@ -620,7 +615,7 @@ fn the_audit_detail_names_flags_and_counts_and_holds_no_value() {
     assert!(d.contains("--lead-verify-key unknown=0"), "{d}");
 }
 
-// ---- the working directory --------------------------------------------------
+// ---- the working directory, and the program ---------------------------------
 
 struct Scratch(PathBuf);
 impl Scratch {
@@ -647,108 +642,115 @@ fn s(p: &Path) -> &str {
     p.to_str().unwrap()
 }
 
+/// A teammate starts where its lead is: the lead pane's own directory, by
+/// whatever spelling, and no other.
 #[test]
-fn a_teammate_starts_in_its_leads_directory_or_inside_the_project() {
-    let sc = Scratch::new("ok");
-    let root = sc.dir("project");
-    let sub = sc.dir("project/crates/a");
-    let lead = sc.dir("worktrees/lead");
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap();
-    // The project itself, a directory inside it, and the lead's own
-    // directory (a worktree outside the project).
-    assert_eq!(teammate_cwd(s(&root), &lead, &root).unwrap(), real(&root));
-    assert_eq!(teammate_cwd(s(&sub), &lead, &root).unwrap(), real(&sub));
-    assert_eq!(teammate_cwd(s(&lead), &lead, &root).unwrap(), real(&lead));
-    // Spelled with `..`, it is still judged by where it really is.
-    let dotted = sub.join("..").join("a");
-    assert_eq!(teammate_cwd(s(&dotted), &lead, &root).unwrap(), real(&sub));
+fn a_teammate_starts_only_in_its_lead_panes_own_directory() {
+    let sc = Scratch::new("own");
+    let lead = sc.dir("project/app");
+    assert_eq!(teammate_cwd(s(&lead), &lead), Ok(()));
+    // Another spelling of the same directory is the same directory.
+    let dotted = lead.join("..").join("app");
+    assert_eq!(teammate_cwd(s(&dotted), &lead), Ok(()));
+    // The lead's directory recorded with another spelling is too.
+    assert_eq!(teammate_cwd(s(&lead), &dotted), Ok(()));
 }
 
+/// Every other directory is refused, a subdirectory of the lead's and the
+/// project around it included: a directory of the request's choosing brings
+/// its own settings, MCP servers and instructions.
 #[test]
-fn a_directory_outside_both_is_refused_without_repeating_it() {
-    let sc = Scratch::new("out");
-    let root = sc.dir("project");
-    let lead = sc.dir("worktrees/lead");
+fn any_directory_but_the_leads_own_is_refused_without_repeating_it() {
+    let sc = Scratch::new("other");
+    let project = sc.dir("project");
+    let lead = sc.dir("project/app");
+    let below = sc.dir("project/app/secret-name");
+    let sibling = sc.dir("project/other");
     let outside = sc.dir("elsewhere/secret-name");
-    let sibling = sc.dir("worktrees/other");
-    let prefix_twin = sc.dir("project-evil");
-    let file = root.join("file.txt");
+    let twin = sc.dir("project/app-evil");
+    let file = lead.join("file.txt");
     std::fs::write(&file, b"x").unwrap();
-    let escape = root.join("..").join("elsewhere").join("secret-name");
     for (asked, why) in [
-        (s(&outside).to_string(), "neither the lead's own nor inside"),
-        (s(&sibling).to_string(), "neither"),
-        // `project-evil` shares the project's name as a prefix, not its path.
-        (s(&prefix_twin).to_string(), "neither"),
-        (s(&escape).to_string(), "neither"),
-        (s(&sc.0).to_string(), "neither"),
-        (s(&root.join("missing")).to_string(), "does not exist"),
-        (s(&file).to_string(), "not a directory"),
+        (s(&below).to_string(), "is not its lead pane's own"),
+        (s(&project).to_string(), "is not its lead pane's own"),
+        (s(&sibling).to_string(), "is not its lead pane's own"),
+        (s(&outside).to_string(), "is not its lead pane's own"),
+        (s(&twin).to_string(), "is not its lead pane's own"),
+        (s(&sc.0).to_string(), "is not its lead pane's own"),
+        (s(&file).to_string(), "is not its lead pane's own"),
+        (s(&lead.join("missing")).to_string(), "does not exist"),
         ("relative/dir".to_string(), "not an absolute path"),
         (".".to_string(), "not an absolute path"),
         ("".to_string(), "not an absolute path"),
     ] {
-        let e = teammate_cwd(&asked, &lead, &root).unwrap_err();
+        let e = teammate_cwd(&asked, &lead).unwrap_err();
         assert!(e.starts_with("teammate refused:"), "{e}");
         assert!(e.contains(why), "{asked}: {e}");
+        assert!(
+            e.contains("starts where its lead is"),
+            "the refusal says the rule: {e}"
+        );
         assert!(!e.contains("secret-name"), "the path is not repeated: {e}");
     }
 }
 
-/// A link inside the project that leads outside it: the real path decides.
+/// A link is judged by where it leads: one to the lead's directory is that
+/// directory, and one beside it that leads elsewhere is not.
 #[cfg(unix)]
 #[test]
-fn a_symlinked_directory_cannot_step_outside_the_project() {
+fn a_symlinked_directory_is_judged_by_where_it_leads() {
     let sc = Scratch::new("link");
-    let root = sc.dir("project");
-    let lead = sc.dir("project/lead");
+    let lead = sc.dir("project/app");
     let outside = sc.dir("elsewhere");
-    let inner = sc.dir("project/real");
-    let link_out = root.join("looks-inside");
+    let below = sc.dir("project/app/sub");
+    // A link inside the lead's directory that leads out of it.
+    let link_out = lead.join("looks-inside");
     std::os::unix::fs::symlink(&outside, &link_out).unwrap();
-    let e = teammate_cwd(s(&link_out), &lead, &root).unwrap_err();
-    assert!(e.contains("neither"), "{e}");
-    // Through the link, deeper.
-    std::fs::create_dir_all(outside.join("deep")).unwrap();
-    let e = teammate_cwd(s(&link_out.join("deep")), &lead, &root).unwrap_err();
-    assert!(e.contains("neither"), "{e}");
-    // A link that stays inside is where it leads.
-    let link_in = root.join("alias");
-    std::os::unix::fs::symlink(&inner, &link_in).unwrap();
-    assert_eq!(
-        teammate_cwd(s(&link_in), &lead, &root).unwrap(),
-        std::fs::canonicalize(&inner).unwrap()
-    );
-    // A project reached through a link is compared by its real path too.
-    let root_link = sc.0.join("project-link");
-    std::os::unix::fs::symlink(&root, &root_link).unwrap();
-    assert!(teammate_cwd(s(&inner), &lead, &root_link).is_ok());
+    assert!(teammate_cwd(s(&link_out), &lead)
+        .unwrap_err()
+        .contains("is not its lead pane's own"));
+    // A link elsewhere that leads to a subdirectory of the lead's.
+    let link_sub = sc.0.join("alias-sub");
+    std::os::unix::fs::symlink(&below, &link_sub).unwrap();
+    assert!(teammate_cwd(s(&link_sub), &lead).is_err());
+    // A link to the lead's directory itself is the lead's directory.
+    let link_own = sc.0.join("alias-own");
+    std::os::unix::fs::symlink(&lead, &link_own).unwrap();
+    assert_eq!(teammate_cwd(s(&link_own), &lead), Ok(()));
+    // And a lead recorded through a link is compared by its real path.
+    assert_eq!(teammate_cwd(s(&lead), &link_own), Ok(()));
 }
 
+/// A lead recorded with a relative program path is started, for its
+/// teammate, by that path made absolute against atrium's own directory: the
+/// child must not resolve the same words from its own.
 #[test]
-fn a_canonical_path_is_written_plainly_for_the_process() {
-    if cfg!(windows) {
-        assert_eq!(plain_path(Path::new(r"\\?\D:\work\app")), r"D:\work\app");
-        assert_eq!(
-            plain_path(Path::new(r"\\?\UNC\host\share\app")),
-            r"\\host\share\app"
-        );
-        // Anything else verbatim is left as it is.
-        assert_eq!(
-            plain_path(Path::new(r"\\?\Volume{1234}\x")),
-            r"\\?\Volume{1234}\x"
-        );
-        assert_eq!(plain_path(Path::new(r"C:\plain")), r"C:\plain");
+fn a_relative_recorded_program_is_made_absolute_against_atriums_directory() {
+    let base = if cfg!(windows) {
+        Path::new(r"D:\work\app")
     } else {
-        assert_eq!(plain_path(Path::new("/work/app")), "/work/app");
+        Path::new("/work/app")
+    };
+    for relative in ["./bin/claude", "bin/claude", "../tools/claude"] {
+        let got = absolute_program(relative, base);
+        assert!(Path::new(&got).is_absolute(), "{relative}: {got}");
+        assert_eq!(Path::new(&got), base.join(relative), "{relative}");
     }
-    // What `teammate_cwd` answers is a directory a process can start in.
-    let sc = Scratch::new("plain");
-    let root = sc.dir("project");
-    let real = teammate_cwd(s(&root), &root, &root).unwrap();
-    let plain = plain_path(&real);
-    assert!(!plain.starts_with(r"\\?\"), "{plain}");
-    assert!(Path::new(&plain).is_dir());
+    if cfg!(windows) {
+        assert_eq!(
+            absolute_program(r".\bin\claude.cmd", base),
+            r"D:\work\app\.\bin\claude.cmd"
+        );
+    }
+    // A bare name is left for the PATH pin; an absolute path is as written.
+    assert_eq!(absolute_program("claude", base), "claude");
+    assert_eq!(absolute_program("claude2", base), "claude2");
+    let absolute = if cfg!(windows) {
+        r"C:\tools\claude.exe"
+    } else {
+        "/opt/claude/bin/claude"
+    };
+    assert_eq!(absolute_program(absolute, base), absolute);
 }
 
 // ---- `teams_env`: what a lead may pass on, and what is said of the rest -------
@@ -930,7 +932,7 @@ fn the_not_passed_note_names_what_differs_and_holds_no_value() {
         // Emptied by the lead, set here: that differs.
         ("SAME_BUT_EMPTIED", ""),
     ]);
-    let (named, total) = env_not_passed(&unapplied, has);
+    let (named, total) = env_not_passed(&unapplied, &[], false, has);
     assert_eq!(named, ["DIFFERENT", "ONLY_IN_LEAD", "SAME_BUT_EMPTIED"]);
     assert_eq!(total, 3);
     let note = not_passed_note("researcher", &named, total).unwrap();
@@ -948,7 +950,7 @@ fn the_not_passed_note_names_what_differs_and_holds_no_value() {
         assert!(!note.contains(value), "{value} is in {note}");
     }
     // Nothing differs: nothing is said.
-    let (named, total) = env_not_passed(&pairs(&[("SAME", "one"), ("X", "")]), has);
+    let (named, total) = env_not_passed(&pairs(&[("SAME", "one"), ("X", "")]), &[], false, has);
     assert!(named.is_empty() && total == 0);
     assert_eq!(not_passed_note("researcher", &named, total), None);
 }
@@ -958,7 +960,7 @@ fn the_not_passed_note_is_bounded_and_shows_only_names_that_are_names() {
     let many: Vec<(String, String)> = (0..20)
         .map(|i| (format!("VAR_{i}"), "x".to_string()))
         .collect();
-    let (named, total) = env_not_passed(&many, |_| None);
+    let (named, total) = env_not_passed(&many, &[], false, |_| None);
     assert_eq!((named.len(), total), (20, 20));
     let note = not_passed_note("dev", &named, total).unwrap();
     assert!(note.contains("20 variable(s)"), "{note}");
@@ -973,7 +975,7 @@ fn the_not_passed_note_is_bounded_and_shows_only_names_that_are_names() {
         ("esc\u{1b}[2J", "x"),
         ("FINE", "x"),
     ]);
-    let (named, total) = env_not_passed(&odd, |_| None);
+    let (named, total) = env_not_passed(&odd, &[], false, |_| None);
     assert_eq!((named.clone(), total), (names(&["FINE"]), 4));
     let note = not_passed_note("dev", &named, total).unwrap();
     assert!(
@@ -985,4 +987,231 @@ fn the_not_passed_note_is_bounded_and_shows_only_names_that_are_names() {
     let role = format!("dev\u{1b}[2J{}", "x".repeat(100));
     let note = not_passed_note(&role, &names(&["A"]), 1).unwrap();
     assert!(!note.contains('\u{1b}') && note.len() < 200, "{note}");
+}
+
+// ---- round 2: the never-list, the warned names, the comparison ----------------
+
+/// `--agent-type` is not passed on, whatever it names: a plugin-namespaced
+/// value is dropped like any other, not refused.
+#[test]
+fn agent_type_is_dropped_whatever_its_value() {
+    for value in [
+        "code-reviewer",
+        "plugin:agent",
+        "'my agent'",
+        "'../x'",
+        "--model",
+    ] {
+        let t =
+            vet(&with(&format!("--agent-type {value}"))).unwrap_or_else(|e| panic!("{value}: {e}"));
+        assert_eq!(t.dropped, ["--agent-type"], "{value}");
+        assert!(
+            !t.args
+                .iter()
+                .any(|a| a.contains("agent-type") || a.contains("plugin")),
+            "{value}: {:?}",
+            t.args
+        );
+    }
+    let t = vet(&with("--agent-type=plugin:agent --model opus")).unwrap();
+    assert_eq!(t.dropped, ["--agent-type"]);
+    assert_eq!(&t.args[6..], v(&["--model", "opus"]));
+    // The names are still held to their shape where they are passed on.
+    for line in [
+        "cd /d && env claude --agent-id a@t --agent-name a --team-name '../../x'",
+        "cd /d && env claude --agent-id a@t --agent-name a --team-name 'two  spaces'",
+        "cd /d && env claude --agent-id a@t --agent-name 'trailing ' --team-name t",
+    ] {
+        assert!(
+            vet(line).unwrap_err().contains("the value of flag"),
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn the_never_list_covers_shells_loaders_git_and_atriums_own_variables() {
+    for (name, why) in [
+        ("CLAUDE_CODE_PLUGIN_DIRS", "loads code"),
+        ("BUN_OPTIONS", "loads code"),
+        ("CARGO_MAKEFLAGS", "build pool"),
+        ("BASH_ENV", "every shell"),
+        ("ENV", "every shell"),
+        ("env", "every shell"),
+        ("GIT_SSH_COMMAND", "program git runs"),
+        ("GIT_CONFIG_GLOBAL", "git's configuration"),
+        ("GIT_CONFIG_COUNT", "git's configuration"),
+        ("git_config_key_0", "git's configuration"),
+        ("ComSpec", "which shell"),
+        ("COMSPEC", "which shell"),
+        ("SHELL", "which shell"),
+        ("Shell", "which shell"),
+        ("CLAUDE_CODE_SHELL", "which shell"),
+    ] {
+        let got = teams_env_refusal(name).unwrap_or_else(|| panic!("{name} may be listed"));
+        assert!(got.contains(why), "{name}: {got}");
+        let text = format!(r#"["HTTPS_PROXY","{name}"]"#);
+        let e = parse_teams_env(json::parse(&text).ok().as_ref(), "config.json").unwrap_err();
+        assert!(e.contains(&format!("may not list {name}")), "{e}");
+    }
+    // Close to a forbidden name, and not one.
+    for ok in [
+        "GIT_AUTHOR_NAME",
+        "ENVIRONMENT",
+        "SHELL_LEVEL",
+        "MY_ENV",
+        "CARGO_HOME",
+    ] {
+        assert_eq!(teams_env_refusal(ok), None, "{ok}");
+    }
+}
+
+/// Names that may be listed on purpose and move where settings are read from
+/// or where traffic goes: listed, and disclosed with a warning.
+#[test]
+fn a_listed_name_that_moves_settings_or_traffic_is_disclosed_with_a_warning() {
+    for name in [
+        "CLAUDE_CONFIG_DIR",
+        "HOME",
+        "USERPROFILE",
+        "APPDATA",
+        "AppData",
+        "ANTHROPIC_BASE_URL",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "SystemRoot",
+        "SYSTEMROOT",
+    ] {
+        assert_eq!(teams_env_refusal(name), None, "{name} is listable");
+        assert!(teams_env_warned(name), "{name}");
+    }
+    for name in [
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "PROXY_MODE",
+        "ANTHROPIC_MODEL",
+        "HOMEBREW_X",
+    ] {
+        assert!(!teams_env_warned(name), "{name}");
+    }
+    assert_eq!(teams_env_disclosure(&[]), None);
+    assert_eq!(
+        teams_env_disclosure(&names(&["AWS_PROFILE", "AWS_REGION"])).unwrap(),
+        "variables a Claude Code lead may set on its teammates (`teams_env`): AWS_PROFILE, \
+         AWS_REGION; each is taken from a pane's request"
+    );
+    let line = teams_env_disclosure(&names(&[
+        "AWS_PROFILE",
+        "ANTHROPIC_BASE_URL",
+        "https_proxy",
+    ]))
+    .unwrap();
+    assert!(
+        line.ends_with(
+            ". WARNING: ANTHROPIC_BASE_URL, https_proxy can move where a teammate reads its \
+             settings and credentials from, or where its traffic goes"
+        ),
+        "{line}"
+    );
+    assert!(!line.contains("  "), "{line:?}");
+}
+
+/// On Windows a variable is the same variable in any case, so the list
+/// matches as the environment merges; elsewhere the case is part of the name.
+#[test]
+fn the_list_matches_a_name_as_the_platform_merges_it() {
+    assert!(env_name_eq("Https_Proxy", "HTTPS_PROXY", true));
+    assert!(!env_name_eq("Https_Proxy", "HTTPS_PROXY", false));
+    assert!(env_name_eq("HTTPS_PROXY", "HTTPS_PROXY", false));
+    let line = "cd /d && env https_proxy=http://one:1 HTTPS_PROXY=http://two:2 claude --agent-id a@t --agent-name a --team-name t";
+    let t = vet_teammate(
+        &parse_teammate_command(line).unwrap(),
+        &names(&["HTTPS_PROXY"]),
+    )
+    .unwrap();
+    let set: Vec<&(String, String)> = t
+        .env
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("HTTPS_PROXY"))
+        .collect();
+    if cfg!(windows) {
+        // One variable, the last assignment, whichever case wrote it.
+        assert_eq!(set.len(), 1, "{:?}", t.env);
+        assert_eq!(set[0].1, "http://two:2");
+        assert!(t.unapplied.is_empty());
+    } else {
+        assert_eq!(set.len(), 1);
+        assert_eq!(
+            set[0],
+            &("HTTPS_PROXY".to_string(), "http://two:2".to_string())
+        );
+        assert_eq!(t.unapplied, pairs(&[("https_proxy", "http://one:1")]));
+    }
+}
+
+/// A variable the lead's identity sets is a credential atrium resolved: it
+/// is never compared with what the line carries, never named and never
+/// counted, so the note cannot be used to test a guess of it.
+#[test]
+fn a_variable_the_identity_sets_is_never_compared_or_named() {
+    let secret = names(&["ANTHROPIC_API_KEY", "HF_TOKEN"]);
+    // The answer does not depend on the guess: right, wrong or empty.
+    for guess in ["sk-the-real-one", "sk-a-wrong-guess", ""] {
+        let unapplied = pairs(&[("ANTHROPIC_API_KEY", guess), ("OTHER", "x")]);
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let (named, total) = env_not_passed(&unapplied, &secret, false, |name| {
+            asked.borrow_mut().push(name.to_string());
+            (name == "ANTHROPIC_API_KEY").then(|| "sk-the-real-one".to_string())
+        });
+        assert_eq!((named, total), (names(&["OTHER"]), 1), "{guess:?}");
+        assert_eq!(
+            *asked.borrow(),
+            ["OTHER"],
+            "the secret's value is never even looked up"
+        );
+    }
+    // On Windows a case variant is the same variable, and is skipped too.
+    let unapplied = pairs(&[("anthropic_api_key", "guess"), ("Hf_Token", "guess")]);
+    assert_eq!(
+        env_not_passed(&unapplied, &secret, true, |_| None),
+        (Vec::new(), 0)
+    );
+    // Elsewhere it is another variable, which the identity did not set.
+    let (named, total) = env_not_passed(&unapplied, &secret, false, |_| None);
+    assert_eq!((named.len(), total), (2, 2));
+}
+
+/// Case variants of one name are one assignment on Windows: the last, compared
+/// once. They cannot carry several guesses, and cannot count twice.
+#[test]
+fn case_variants_are_one_comparison_where_the_platform_folds_case() {
+    let has = |name: &str| {
+        name.eq_ignore_ascii_case("SystemRoot")
+            .then(|| r"C:\Windows".to_string())
+    };
+    let variants = pairs(&[
+        ("SYSTEMROOT", "guess-one"),
+        ("systemroot", "guess-two"),
+        ("SystemRoot", r"C:\Windows"),
+    ]);
+    // Folded: the last assignment is the variable, and it equals: nothing.
+    assert_eq!(env_not_passed(&variants, &[], true, has), (Vec::new(), 0));
+    // Folded, the last one differing: one variable, counted once, named once.
+    let variants = pairs(&[
+        ("SystemRoot", r"C:\Windows"),
+        ("SYSTEMROOT", "guess-one"),
+        ("systemroot", "guess-two"),
+    ]);
+    assert_eq!(
+        env_not_passed(&variants, &[], true, has),
+        (names(&["systemroot"]), 1)
+    );
+    // Not folded (unix): three names, three variables.
+    let exact = |name: &str| (name == "SystemRoot").then(|| r"C:\Windows".to_string());
+    let (named, total) = env_not_passed(&variants, &[], false, exact);
+    assert_eq!((named, total), (names(&["SYSTEMROOT", "systemroot"]), 2));
 }

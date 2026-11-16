@@ -24,7 +24,11 @@ pub(crate) fn respawn(
     // plain respawn below, and a plain respawn never takes a placeholder.
     if let Some(line) = rr.teammate.as_deref() {
         let teams_env = atrium::tmux_shim::session_teams_env();
-        return teammate(&rr.target, line, caller, trust_mode(), &teams_env, cx);
+        let teams = Teams {
+            on: atrium::tmux_shim::session_enabled(),
+            env: &teams_env,
+        };
+        return teammate(&rr.target, line, caller, trust_mode(), teams, cx);
     }
     let (windows, pending) = (&mut *cx.windows, &mut *cx.pending);
     let (rows, cols) = (cx.rows, cx.cols);
@@ -198,12 +202,21 @@ pub(crate) fn respawn_argv(argv: &[String], title: &str) -> Vec<String> {
 pub(crate) struct Slot {
     pub(crate) placeholder: bool,
     pub(crate) parent: Option<AgentId>,
+    /// The pane that made the placeholder (`Pane::held_for`): set once, and
+    /// not moved when that pane is respawned under a new id.
+    pub(crate) owner: Option<AgentId>,
     pub(crate) exited: bool,
 }
 
 /// Is `slot` a placeholder `lead` may start a teammate in: a live pane that
-/// still carries the placeholder mark and whose parent is `lead` itself? The
-/// whole rule for which pane a `respawn-pane` may replace. Pure.
+/// still carries the placeholder mark, whose parent is `lead` and which
+/// `lead` itself made? The whole rule for which pane a `respawn-pane` may
+/// replace. Pure.
+///
+/// The maker is recorded apart from the parent because the parent link
+/// follows a pane through a `ctl respawn` (its children stay its children
+/// under its new id), and a placeholder must not: the Claude Code that asked
+/// for it is gone, and the new process under that pane never did.
 ///
 /// `false` for a pane that does not exist, for any pane that runs a command
 /// (an agent, a shell, a teammate already started: the mark is cleared when
@@ -212,41 +225,111 @@ pub(crate) struct Slot {
 /// that is being reaped. "No ctl request changes a pane's recorded command"
 /// holds for every pane this answers `false` for.
 pub(crate) fn is_own_placeholder(lead: AgentId, slot: Option<Slot>) -> bool {
-    slot.is_some_and(|s| s.placeholder && !s.exited && s.parent == Some(lead))
+    slot.is_some_and(|s| {
+        s.placeholder && !s.exited && s.parent == Some(lead) && s.owner == Some(lead)
+    })
 }
 
-/// The posture a teammate starts at: the **lower** of what its command asked
-/// for and its lead pane's own mode, then capped at the session's launch
-/// trust by [`effective_mode`] like every spawn. Returns the mode and what
-/// was held back, for the reply. Pure.
+/// The posture a teammate starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Posture {
+    /// The rung atrium governs, recorded on the pane and turned into flags by
+    /// the spawn like any pane's.
+    pub(crate) mode: ctl::TrustMode,
+    /// A `--permission-mode` value atrium writes itself, when `mode` is `Off`
+    /// (no flag from the spawn) and the line asked to be held tighter than
+    /// that: `plan`, `default` or `dontAsk`.
+    pub(crate) flag: Option<&'static str>,
+    /// What was held back, for the reply.
+    pub(crate) note: Option<String>,
+}
+
+impl Posture {
+    /// The mode the teammate runs in, as the audit row names it.
+    pub(crate) fn label(&self) -> &'static str {
+        self.flag.unwrap_or(self.mode.policy_label())
+    }
+}
+
+/// The posture a teammate starts at, from what its command line asked, its
+/// lead pane's own mode and the session's launch trust. Pure.
 ///
-/// A command that asked for nothing (no permission flag, or `default` /
-/// `dontAsk`) takes the lead pane's mode. It can never come out above the
-/// lead pane's mode or above the session's.
+/// * A mode atrium governs (`acceptEdits`, `auto`, a skip): the **lower** of
+///   it and the lead pane's mode, then capped at the launch trust by
+///   [`effective_mode`] like every spawn.
+/// * `plan` (or `--plan-mode-required`): `plan`, always. Where the governed
+///   result would be `Off` (a lead with no posture, a session with no
+///   `--trust`), the teammate is still started with `--permission-mode plan`:
+///   it is never less held than it was asked to be.
+/// * `default` and `dontAsk`: passed on as written, with no rung of atrium's
+///   on top (both sit under every rung but `plan`), unless the lead pane is
+///   held to `plan`, in which case `plan` wins.
+/// * No permission flag at all: the lead pane's mode, capped like it.
+///
+/// It never comes out above the lead pane's mode, the session's, or what was
+/// asked.
 pub(crate) fn teammate_mode(
     asked: atrium::tmux_shim::Asked,
     lead: ctl::TrustMode,
     policy: ctl::TrustMode,
-) -> (ctl::TrustMode, Option<String>) {
+) -> Posture {
     use atrium::tmux_shim::Asked;
-    let (wanted, held) = match asked {
-        Asked::LeadsOwn => (lead, None),
-        Asked::Mode(m) if m.rank() <= lead.rank() => (m, None),
-        Asked::Mode(m) => (
-            lead,
-            Some(format!(
-                "asked for {}; held to its lead pane's {}",
-                m.policy_label(),
-                lead.policy_label()
-            )),
-        ),
+    use ctl::TrustMode::{Off, Plan};
+    // What the lead pane itself is held to in this session.
+    let (inherit, _) = effective_mode(Some(lead), policy);
+    let plain = |mode, flag| Posture {
+        mode,
+        flag,
+        note: None,
     };
-    let (mode, capped) = effective_mode(Some(wanted), policy);
-    let note = match (held, capped) {
-        (Some(h), Some(c)) => Some(format!("{h}; {c}")),
-        (h, c) => h.or(c),
-    };
-    (mode, note)
+    match asked {
+        Asked::Nothing => plain(inherit, None),
+        Asked::Default | Asked::DontAsk if inherit == Plan => Posture {
+            mode: Plan,
+            flag: None,
+            note: Some("its lead pane is held to plan, which is what it starts in".to_string()),
+        },
+        Asked::Default => plain(Off, Some("default")),
+        Asked::DontAsk => plain(Off, Some("dontAsk")),
+        Asked::Mode(m) => {
+            let (wanted, held) = if m.rank() <= lead.rank() {
+                (m, None)
+            } else {
+                (
+                    lead,
+                    Some(format!(
+                        "asked for {}; held to its lead pane's {}",
+                        m.policy_label(),
+                        lead.policy_label()
+                    )),
+                )
+            };
+            let (mode, capped) = effective_mode(Some(wanted), policy);
+            if m == Plan && mode != Plan {
+                // Asked to be read-only where atrium governs nothing: plan
+                // all the same, by a flag atrium writes itself.
+                return plain(Off, Some("plan"));
+            }
+            let note = match (held, capped) {
+                (Some(h), Some(c)) => Some(format!("{h}; {c}")),
+                (h, c) => h.or(c),
+            };
+            Posture {
+                mode,
+                flag: None,
+                note,
+            }
+        }
+    }
+}
+
+/// Whether Claude Code's teammates are caught as panes in this session, and
+/// which variables a lead may pass on to them: the two session settings the
+/// teammate handler reads, passed in so a test can say them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Teams<'a> {
+    pub(crate) on: bool,
+    pub(crate) env: &'a [String],
 }
 
 /// The identity a teammate runs under: its **lead pane's own**, by name, or
@@ -291,8 +374,9 @@ fn not_own_placeholder(target: &str) -> String {
 /// table ([`atrium::tmux_shim::vet_teammate`]), and the teammate's command is
 /// built here:
 ///
-/// * **program**: the calling pane's own recorded command (pinned to `PATH`
-///   like a spawn's "caller's own kind"), not the path in the line;
+/// * **program**: the calling pane's own recorded program (`argv[0]`, pinned
+///   to `PATH` like a spawn's "caller's own kind"; a relative path made
+///   absolute), not the path in the line, and none of the lead's arguments;
 /// * **flags**: the ones the table passes on; the line's permission flags
 ///   are a request, resolved by [`teammate_mode`];
 /// * **environment**: what atrium gave the lead pane, from atrium's own
@@ -301,8 +385,8 @@ fn not_own_placeholder(target: &str) -> String {
 ///   assignments whose names are on the session's `teams_env`. Every other
 ///   assignment is dropped, and the ones whose value differs from what the
 ///   teammate has anyway are named ([`atrium::tmux_shim::env_not_passed`]);
-/// * **directory**: the line's, when it is the lead's own or inside the
-///   project ([`atrium::tmux_shim::teammate_cwd`]).
+/// * **directory**: the lead pane's own; a line that names any other is
+///   refused ([`atrium::tmux_shim::teammate_cwd`]).
 ///
 /// The pane keeps its place in the layout and its **agent id** (Claude Code
 /// goes on naming it by the `%N` its split printed), becomes an agent's pane
@@ -316,7 +400,7 @@ pub(crate) fn teammate(
     line: &str,
     caller: Option<AgentId>,
     policy: ctl::TrustMode,
-    teams_env: &[String],
+    teams: Teams<'_>,
     cx: &mut CtlSession<'_>,
 ) -> ctl::Reply {
     use atrium::tmux_shim as shim;
@@ -329,7 +413,7 @@ pub(crate) fn teammate(
     let Some(lead) = pane_by_agent(windows, lead_id).filter(|p| is_claude_pane(p)) else {
         return ctl::reply_err(TEAMMATE_NEEDS_LEAD);
     };
-    if !shim::session_enabled() {
+    if !teams.on {
         return ctl::reply_err(
             "teammate refused: this session keeps Claude Code's teammates in-process \
              (teams: off)",
@@ -362,6 +446,7 @@ pub(crate) fn teammate(
     let slot = id.and_then(|id| pane_by_agent(windows, id)).map(|p| Slot {
         placeholder: p.placeholder,
         parent: p.parent,
+        owner: p.held_for,
         exited: p.exited,
     });
     let Some(id) = id.filter(|_| is_own_placeholder(lead_id, slot)) else {
@@ -377,7 +462,7 @@ pub(crate) fn teammate(
             ))
         }
     };
-    let mate = match shim::vet_teammate(&parsed, teams_env) {
+    let mate = match shim::vet_teammate(&parsed, teams.env) {
         Ok(mate) => mate,
         Err(why) => return ctl::reply_err(&why),
     };
@@ -409,6 +494,11 @@ pub(crate) fn teammate(
     ) {
         return ctl::reply_err(&denied.message());
     }
+    // A relative recorded path is made absolute against atrium's own
+    // directory, where it was resolved from when the lead was started: the
+    // teammate's process must not resolve those words again from its own.
+    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let own = shim::absolute_program(&own, &root);
     let program = {
         let path = std::env::var_os("PATH");
         let pathext = std::env::var("PATHEXT").ok();
@@ -418,28 +508,28 @@ pub(crate) fn teammate(
             Err(why) => return ctl::reply_err(&why),
         }
     };
-    // Where: the line's directory, if it is the lead's own or in the project.
-    let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    // Where: the lead pane's own directory, and nowhere else. The line's
+    // directory only has to be that one; the teammate is started from
+    // atrium's record of the lead (its directory, its worktree instructions).
     let lead_dir = lead_place
         .0
         .as_deref()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| root.clone());
-    let real = match shim::teammate_cwd(&parsed.cwd, &lead_dir, &root) {
-        Ok(real) => real,
-        Err(why) => return ctl::reply_err(&why),
-    };
-    // In the lead's own directory the teammate is where the lead is, under
-    // the same worktree instructions; anywhere else in the project it is a
-    // plain pane there.
-    let (cwd, norms, worktree) = if std::fs::canonicalize(&lead_dir).is_ok_and(|l| l == real) {
-        lead_place
-    } else {
-        (Some(shim::plain_path(&real)), None, None)
-    };
-    let (mode, mode_note) = teammate_mode(mate.asked, lead_mode, policy);
+    if let Err(why) = shim::teammate_cwd(&parsed.cwd, &lead_dir) {
+        return ctl::reply_err(&why);
+    }
+    let (cwd, norms, worktree) = lead_place;
+    let posture = teammate_mode(mate.asked, lead_mode, policy);
+    let mode = posture.mode;
     let mut command = vec![program];
     command.extend(mate.args.iter().cloned());
+    // A mode the line asked for that sits under what atrium governs here:
+    // atrium writes the flag itself (the spawn adds none at `Off`).
+    if let Some(value) = posture.flag {
+        command.push("--permission-mode".to_string());
+        command.push(value.to_string());
+    }
     let mut deny = lead_deny;
     for rule in &mate.deny {
         if !deny.contains(rule) {
@@ -462,28 +552,31 @@ pub(crate) fn teammate(
     let mut extra_env = lead_env.clone();
     extra_env.extend(mate.env.iter().cloned());
     // Which of the line's other assignments would have changed anything:
-    // each is compared with the value the teammate will have. The
-    // identity's values are secrets; they live in this block and are
-    // only compared.
+    // each is compared with the value the teammate has anyway, from atrium's
+    // ambient environment and the non-secret variables above. A variable the
+    // lead's identity sets is never compared (its value is a credential, and
+    // the teammate has atrium's by design): only the identity's variable
+    // NAMES are taken here, and only when there is something to compare.
     let (not_passed, differing) = {
-        let given = identity.as_deref().map(identity_values).unwrap_or_default();
-        shim::env_not_passed(&mate.unapplied, |name| {
-            let same = |k: &String| {
-                if cfg!(windows) {
-                    k.eq_ignore_ascii_case(name)
-                } else {
-                    k == name
-                }
-            };
-            given
+        let secret = match identity.as_deref() {
+            Some(name) if !mate.unapplied.is_empty() => identity_names(name),
+            _ => Vec::new(),
+        };
+        let fold = cfg!(windows);
+        shim::env_not_passed(&mate.unapplied, &secret, fold, |name| {
+            extra_env
                 .iter()
                 .rev()
-                .chain(extra_env.iter().rev())
-                .find(|(k, _)| same(k))
+                .find(|(k, _)| shim::env_name_eq(k, name, fold))
                 .map(|(_, v)| v.clone())
                 .or_else(|| std::env::var(name).ok())
         })
     };
+    // Nothing queued for the placeholder's id may be delivered to the
+    // teammate that takes the id over: it was addressed to a pane that ran
+    // nothing. (Text to a placeholder is refused at every trust; this is the
+    // second lock.)
+    super::sends::drop_for(cx.pending, id);
     let mut flash = None;
     let new_pane = match spawn_pane_in_slot(
         PaneSpec {
@@ -546,6 +639,7 @@ pub(crate) fn teammate(
     // The mark goes last and for good: the pane now runs a command, and no
     // request changes that again.
     p.placeholder = false;
+    p.held_for = None;
     debug_assert_eq!(
         p.agent_id, new_pane.agent_id,
         "the teammate keeps the slot's id"
@@ -566,14 +660,17 @@ pub(crate) fn teammate(
     if !mate.dropped.is_empty() {
         notes.push(format!("not passed on: {}", mate.dropped.join(", ")));
     }
-    notes.extend(mode_note);
+    if mate.dropped.contains(&"--agent-type") {
+        notes.push("--agent-type is not honoured yet: it runs as a general teammate".to_string());
+    }
+    notes.extend(posture.note.clone());
     cx.audit.record(
         Some(lead_id),
         "teammate",
         &format!(
             "pane={id} role={} mode={} env_dropped={} flags_dropped={}",
             atrium::audit::field(&mate.role),
-            mode.policy_label(),
+            posture.label(),
             mate.env_dropped,
             if mate.dropped.is_empty() {
                 "-".to_string()

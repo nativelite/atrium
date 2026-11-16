@@ -483,7 +483,9 @@ fn wake_may_land(
     policy: ctl::TrustMode,
 ) -> bool {
     pane_by_agent(windows, id).is_some_and(|p| {
-        ctl::text_may_land(is_agent_pane(p), mods.has_cap(id.0, "inbox"), from, policy)
+        // A placeholder is woken by nothing, at any trust.
+        !p.placeholder
+            && ctl::text_may_land(is_agent_pane(p), mods.has_cap(id.0, "inbox"), from, policy)
     })
 }
 
@@ -1252,12 +1254,16 @@ fn send_under(
         return deny;
     }
     if let Some(pane) = pane_by_agent(windows, id) {
-        let lands = ctl::text_may_land(
-            is_agent_pane(pane),
-            cx.mods.has_cap(id.0, "inbox"),
-            ctl::TextFrom::Pane,
-            policy,
-        );
+        // A placeholder takes no text at any trust, `skip` included: it is
+        // neither an agent nor a shell, and whatever were queued for its id
+        // would be typed into the teammate that takes the id over.
+        let lands = !pane.placeholder
+            && ctl::text_may_land(
+                is_agent_pane(pane),
+                cx.mods.has_cap(id.0, "inbox"),
+                ctl::TextFrom::Pane,
+                policy,
+            );
         if !lands {
             return ctl::reply_err(&ctl::send_into_non_agent_refusal(id));
         }

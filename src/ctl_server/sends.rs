@@ -736,6 +736,15 @@ fn report_drop(
 /// to type, oldest first, removing them from the queue: what `ctl inbox` gives
 /// a pane's mod. A send already partly written stays on the pty path, so no
 /// text ever lands twice.
+/// Drop every delivery queued for `target`, written or not, without
+/// counting it as delivered: what a teammate launch does for the
+/// placeholder's id before a teammate takes it over. Returns how many.
+pub(crate) fn drop_for(pending: &mut Vec<PendingSend>, target: AgentId) -> usize {
+    let before = pending.len();
+    pending.retain(|ps| ps.target != target);
+    before - pending.len()
+}
+
 pub(crate) fn take_for(
     pending: &mut Vec<PendingSend>,
     target: AgentId,

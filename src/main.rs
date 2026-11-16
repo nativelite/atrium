@@ -560,6 +560,15 @@ fn launch() -> ExitCode {
         eprintln!("atrium: {msg}");
         return ExitCode::FAILURE;
     }
+    // A `teams_env` list lets a pane's request set variables on a Claude Code
+    // lead's teammates. A fleet's banner shows it; a plain launch says it
+    // here, in one line, while stderr is still a plain terminal.
+    if allow_ctl && atrium::tmux_shim::session_enabled() {
+        let names = atrium::tmux_shim::session_teams_env();
+        if let Some(line) = atrium::tmux_shim::teams_env_disclosure(&names) {
+            eprintln!("atrium: {line}");
+        }
+    }
     // The last session in this project crashed: offer to pick it back up before
     // starting a fresh one. Ahead of the skip confirmation, because a resume
     // settles its own posture (and asks its own questions).

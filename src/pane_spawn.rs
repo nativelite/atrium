@@ -389,6 +389,8 @@ pub(crate) fn spawn_hold_pane(id: usize, rows: u16, cols: u16) -> std::io::Resul
         norms: None,
         context_env: Vec::new(),
         placeholder: true,
+        // Set by the hold spawn's adoption, with the parent.
+        held_for: None,
     })
 }
 
@@ -673,6 +675,7 @@ fn spawn_pane_as(
         norms: extra_norms.map(str::to_string),
         context_env: atrium::context::restorable_env(extra_env),
         placeholder: false,
+        held_for: None,
     })
 }
 
@@ -1148,17 +1151,19 @@ fn identity_env(
     merged
 }
 
-/// The variables the identity `name` resolves to, for a **comparison only**
-/// (which of a teammate command's dropped assignments the teammate has
-/// anyway). The values are credentials: the caller compares and drops them,
-/// as [`identity_env`] does at the spawn. A name that does not resolve gives
-/// nothing; the spawn is what reports that.
-pub(crate) fn identity_values(name: &str) -> Vec<(String, String)> {
+/// The **names** of the variables the identity `name` sets, and nothing of
+/// their values: what a teammate launch must leave out of its "dropped and
+/// different" comparison. The resolved values are credentials; they are
+/// dropped here, in this function, and never compared with anything a
+/// request carried. A name that does not resolve gives nothing; the spawn is
+/// what reports that.
+pub(crate) fn identity_names(name: &str) -> Vec<String> {
     name.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter_map(|part| akey::resolve(part).ok())
         .flatten()
+        .map(|(var, _secret)| var)
         .collect()
 }
 

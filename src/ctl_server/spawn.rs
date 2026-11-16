@@ -57,6 +57,7 @@ fn adopt_worker(
     pane.worktree = sp.worktree.clone();
     // The one place the mark is set: a hold spawn's pane, owned by `caller`.
     pane.placeholder = sp.hold;
+    pane.held_for = caller.filter(|_| sp.hold);
     atrium::ctl::reply_spawned(
         pane.agent_id,
         sp.role.as_deref(),

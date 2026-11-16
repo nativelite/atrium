@@ -386,8 +386,11 @@ under its trust ceiling, with the status border and the overview row. Both
 launch sequences are served: 2.1.289's (the teammate's command on the split)
 and 2.1.325's (a placeholder split, then `respawn-pane` with a shell command
 line, which atrium parses and never runs: the teammate is the lead's own
-claude, at a mode no higher than its lead's, with the environment atrium gave
-its lead). Set Claude Code's `teammateMode` to `auto` or `tmux`; details in
+claude, in the lead's own directory, at a mode no higher than its lead's,
+with the environment atrium gave its lead). A live 2.1.325 lead has started
+a teammate this way on Windows. With atrium's mod on, the mod opens
+teammates itself and this path is not used. Set Claude Code's
+`teammateMode` to `auto` or `tmux`; details in
 [docs/control-plane.md](docs/control-plane.md#claude-codes-own-teams-as-atrium-panes).
 
 ## Reference
@@ -495,13 +498,16 @@ and win over the pointer.
   pane or an operator says can add to it, and a listed command is a grant. A
   fleet's own `commands` key replaces it.
 - **`teams_env`** — the environment variable names a Claude Code lead may set
-  on its split-pane teammates, such as `["ANTHROPIC_BASE_URL", "HTTPS_PROXY"]`.
+  on its split-pane teammates, such as `["AWS_PROFILE", "HTTPS_PROXY"]`.
   Empty by default: a teammate gets what atrium gave its lead (its identity,
   its fleet context) and nothing from the lead's own command line, and atrium
   names on the bar any variable that was dropped and would have differed. A
   fleet's own `teams_env` replaces it. `PATH`, `NODE_OPTIONS`, `ATRIUM_*`,
-  `TMUX`, the loader variables and anything with `SKIP_PERMISSIONS` can never
-  be listed. See [a teammate's
+  `TMUX`, the loader, shell and git-config variables and anything with
+  `SKIP_PERMISSIONS` can never be listed; a base URL, a proxy, a config or
+  home directory can, and is shown with a `WARNING` before the session starts
+  (the fleet banner, one stderr line on a plain launch, `atrium config
+  path`). See [a teammate's
   environment](docs/control-plane.md#a-teammates-environment).
 - **`notify`** — how a "needs you" transition rings the host terminal: `"both"`
   (default: bell + toast + Windows Terminal's tab indicator), `"bell"`, `"toast"`
