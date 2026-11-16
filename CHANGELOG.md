@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A stable, configurable ctl endpoint: `--ctl-socket <path>` and
+  `ATRIUM_CTL_SOCKET`** (#23). The endpoint was always named after the process
+  id, so a helper outside the session had to search the temp directory and
+  could not tell two sessions apart. The flag (which wins) or the variable now
+  names it: an absolute socket path on unix, a named-pipe name on Windows.
+  Panes receive the chosen address as `ATRIUM_CTL`. A path another session is
+  serving on is refused and the launch fails with a line saying so, before the
+  terminal is taken; a stale socket file left by a killed session is taken
+  over; a file that is not a socket is never removed. A path with a comma is
+  refused (the tmux shim's `TMUX` value cannot carry one). The `0600` mode and
+  the same-user peer checks are unchanged. Needs nativelite-ipc 0.2.2, where
+  the live-versus-stale decision lives.
+- **A discovery file for the running session's endpoint.** Every ctl session
+  writes `ctl/<pid>.endpoint` under the per-user state directory, removed on
+  exit and treated as stale when its endpoint no longer answers. `atrium ctl`
+  outside a pane, with no `ATRIUM_CTL`, uses it when exactly one session is
+  running (token-free reads only, since no pane token comes with it).
+
 ## [0.46.0] - 2026-11-09
 
 ### Added
