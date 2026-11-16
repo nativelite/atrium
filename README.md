@@ -134,8 +134,19 @@ Plain single-pane use (`atrium claude`) needs neither.
 
 ### Install the mod
 
-atrium carries a small Claude Code plugin, **the mod**, inside its binary. Once
-installed, every claude pane atrium spawns loads it, and the pane's status comes
+atrium carries a small Claude Code plugin, **the mod**, inside its binary. It is
+offered, never installed silently: the first start with a person at it asks
+once, before the terminal is taken, `Install the atrium mod? [Y/n]`, after
+saying what the mod is, what it gives and what it changes. Enter means yes and
+writes the mod's folder; `n` writes nothing. Either answer is kept (as `"mod":
+true` or `"mod": false` in `config.json`, or in `mod.answer` beside it when
+there is no config file) and atrium does not ask again. Nothing is asked when
+nobody is there (no terminal on stdin, `ATRIUM_YES`, a headless fleet, an
+atrium started inside an atrium pane), when
+`claude` is not on `PATH`, or when you manage the folder yourself (`ATRIUM_MOD`,
+the config's `mod.path`).
+
+Once installed, every claude pane atrium spawns loads it, and the pane's status comes
 from the engine itself instead of from a transcript inference: the yellow border
 appears the instant a permission prompt does, a turn that ends on an API error
 shows red, and the overview shows each agent's context fill and cost. The mod
@@ -144,13 +155,22 @@ pane and item it is, refuses edits outside its item's files, and runs the
 model's subagents as visible panes.
 
 ```bash
-atrium mod install     # once per machine, and again after upgrading atrium
-atrium mod status      # what is installed, and whether panes will load it
+atrium mod install     # say yes later, or after a no: writes the folder and keeps the yes
+atrium mod status      # what is installed, the answer that is kept, whether panes will load it
 ```
 
-Nothing else changes: a pane without the mod keeps the inferred status, and
-codex panes are untouched. `"mod": false` in `config.json` or in a fleet keeps
-it out of every pane. Details: [mod/README.md](mod/README.md).
+What it changes: in atrium's claude panes the mod takes over Claude Code's
+Agent tool, so a subagent the model starts is a pane you can watch (a fleet's
+`subagents` key can say `native` or `deny`). It never blocks a tool call when
+it fails, and atrium backs it out by itself if it breaks. A pane without the
+mod keeps the inferred status, and codex panes are untouched.
+
+A yes also covers upgrades: a launch keeps the folder current with the atrium
+that runs, and writes it again if it went missing, with one line saying so.
+To decline later, set `"mod": false` in `config.json` (or in one fleet): off
+and silent. Where nobody was asked and no mod is installed, a launch that hosts
+claude with the control plane on says so in one line and names `atrium mod
+install`. Details: [mod/README.md](mod/README.md).
 
 ## Quickstart
 
@@ -389,7 +409,10 @@ line, which atrium parses and never runs: the teammate is the lead's own
 claude, in the lead's own directory, at a mode no higher than its lead's,
 with the environment atrium gave its lead). A live 2.1.325 lead has started
 a teammate this way on Windows. With atrium's mod on, the mod opens
-teammates itself and this path is not used. Set Claude Code's
+teammates itself and this path is not used; a launch says which path is in
+force in one `teams:` line (the mod, the tmux shim, or neither). Claude Code's
+own teams also need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, in the
+environment or in Claude Code's settings. Set Claude Code's
 `teammateMode` to `auto` or `tmux`; details in
 [docs/control-plane.md](docs/control-plane.md#claude-codes-own-teams-as-atrium-panes).
 
@@ -429,7 +452,7 @@ teammates itself and this path is not used. Set Claude Code's
 | `atrium fleet up <name> --headless [--size <rows>x<cols>]` | the same with no terminal, reached through `atrium ctl` alone ([headless](#running-many-agents-at-once)) |
 | `atrium fleet init <template> [--agents N]` / `ls --templates` | start a project's `atrium.fleet.json` from a built-in reference fleet (`solo`, `pair`, `crew`) or one of your own from the global `fleet.json` ([templates](docs/fleets.md#templates)) |
 | `atrium ctl <cmd>` | drive the control plane from inside a pane ([reference](docs/control-plane.md)) |
-| `atrium mod install [--at <dir>]` / `status` | write the Claude Code plugin built into atrium (the mod) to its folder, so claude panes report their status for certain / what is installed |
+| `atrium mod install [--at <dir>]` / `status` | write the Claude Code plugin built into atrium (the mod) to its folder, so claude panes report their status for certain (the first start offers this once) / what is installed, and the answer that is kept |
 | `atrium config path` / `init [--at <path>]` | where the user-global config is read from / write a starter there (asks for the location on a first run; see [Config](#config)) |
 | `atrium recover [--list \| --snapshot <path>]` | restore this project's last session — also offered automatically when a launch finds one that crashed ([session recovery](docs/session-recovery.md)) |
 | `atrium reap` / `--reap-orphans` | clean up orphaned pane groups ([reaping](docs/reaping.md)) |
@@ -455,7 +478,9 @@ file should live (Enter takes the default), writes a starter there, and remember
 the answer in `config.path` beside the default — atrium's own pointer, so a config
 kept elsewhere is found on every later launch and an upgrade never asks again.
 `atrium config init [--at <path>]` does the same by hand; `atrium config path`
-shows where it resolved and why. A script or a test is never asked. For a fully
+shows where it resolved and why. A script or a test is never asked. The same
+first-run step then offers [the mod](#install-the-mod), once; that question is
+also asked on a plain launch, which asks for no config file. For a fully
 explicit layout, `ATRIUM_CONFIG` and `ATRIUM_FLEET` name each file's full path
 and win over the pointer.
 
@@ -485,9 +510,13 @@ and win over the pointer.
   `ATRIUM_CTL_ALLOW`, `ATRIUM_TRUST_ALLOW`; they merge with the variable and the
   fleet's own.
 - **`build_jobs`**, **`memory_mb`** — defaults for fleets that set neither.
-- **`mod`** — `false` keeps atrium's Claude Code plugin (the mod, `atrium mod
-  install`) out of every claude pane on this machine; `{ "path": "<dir>" }` names
-  the folder when it was installed somewhere else.
+- **`mod`** — the answer to the first-run offer of atrium's Claude Code plugin
+  (the mod). `true` is a yes: claude panes load it, and a launch writes its
+  folder again if it goes missing. `false` keeps it out of every claude pane on
+  this machine, silently. `{ "path": "<dir>" }` names a folder you manage
+  yourself: nothing is asked and nothing is created there. `null` or absent:
+  not answered yet. atrium writes this one key when you answer (or run `atrium
+  mod install`), and no other byte of the file.
 - **`teams`** — `"off"` keeps a Claude Code lead's teammates in-process instead of
   catching them as atrium panes; `"show"` (the default) catches them. A fleet's
   own `teams` key wins.

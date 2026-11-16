@@ -34,25 +34,41 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match modfiles::install_at(&dir) {
-                Ok(done) => {
-                    println!(
-                        "mod {} at {}: {} written, {} unchanged",
-                        modfiles::embedded_version(),
-                        done.dir.display(),
-                        done.written.len(),
-                        done.unchanged.len()
-                    );
-                    // A fresh install is a fresh start: whatever the breaker
-                    // remembered was about what was there before.
-                    if let Some(root) = atrium::session_store::state_root() {
-                        if !matches!(modfiles::read_record(&root), modfiles::RecordRead::None)
-                            && modfiles::clear_record(&root)
-                        {
-                            println!(
-                                "the breaker's record was cleared: the next session loads the \
-                                 mod again"
-                            );
+            // The same code the first-run offer runs on a yes: the files,
+            // the marker, and a cleared breaker record.
+            match modfiles::install_report(&dir, atrium::session_store::state_root().as_deref()) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                    // Installing into the folder panes load is a yes to the
+                    // mod, kept like the first-run offer's: it turns a
+                    // recorded no around, and lets a launch write the folder
+                    // again if it goes missing. Not for a folder the user
+                    // manages (`ATRIUM_MOD`, `mod.path`, a git checkout).
+                    let cfg = atrium::config::get();
+                    if configured.as_deref() == Some(dir.as_path())
+                        && install_is_a_yes(
+                            modfiles::env_named(),
+                            cfg.mod_path.is_some(),
+                            modfiles::developer_folder(&dir, false),
+                            modfiles::Said::of(cfg),
+                        )
+                    {
+                        match atrium::config::record_mod_answer(true) {
+                            Ok(kept) if cfg.mod_off => println!(
+                                "the mod was off on this machine and is on again: your yes is \
+                                 kept in {}",
+                                kept.describe(true)
+                            ),
+                            Ok(kept) => println!(
+                                "your yes is kept in {}: a launch writes this folder again if \
+                                 it goes missing",
+                                kept.describe(true)
+                            ),
+                            Err(why) => {
+                                eprintln!("atrium mod install: the yes could not be kept ({why})")
+                            }
                         }
                     }
                     if at.is_some() && configured.as_deref() != Some(dir.as_path()) {
@@ -77,16 +93,30 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
         }
         Some("status") => {
             let enabled = modfiles::session_enabled();
-            let (line, _) = modfiles::describe(&modfiles::status(), enabled);
+            let said = modfiles::Said::of(atrium::config::get());
+            let (line, _) =
+                modfiles::describe(&modfiles::status(), enabled, modfiles::session_yes());
             println!("{line}");
             println!(
                 "enabled: {}",
                 if enabled {
                     "yes (a fleet may still say \"mod\": false for its own session)"
                 } else {
-                    "no: \"mod\": false in config.json; nothing is loaded, checked or said"
+                    "no: \"mod\": false in config.json, or a no to the first-run offer; \
+                     nothing is loaded, checked or said"
                 }
             );
+            println!(
+                "{}",
+                offer_line(
+                    atrium::config::mod_answer_kept().map(|(yes, kept)| (yes, kept.describe(yes))),
+                    modfiles::env_named(),
+                    said == modfiles::Said::Managed,
+                )
+            );
+            // Which path a named teammate takes in a session started from
+            // here with the control plane on (a fleet's own keys may differ).
+            println!("{}", modfiles::session_teammates_line(true));
             println!(
                 "built in: mod {} ({})",
                 modfiles::embedded_version(),
@@ -185,6 +215,50 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
             eprint!("{}", atrium::help::MOD);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Does `atrium mod install` into the folder panes load count as a yes to
+/// the mod, to be kept? Not when the user manages the folder (`ATRIUM_MOD`,
+/// the config's `mod.path`, a git checkout), and not when a yes is already
+/// kept. A recorded no is turned around: installing is changing one's mind.
+pub(crate) fn install_is_a_yes(
+    env_named: bool,
+    path_named: bool,
+    checkout: bool,
+    said: atrium::modfiles::Said,
+) -> bool {
+    !env_named && !path_named && !checkout && said != atrium::modfiles::Said::Yes
+}
+
+/// The `offer:` line of `atrium mod status`: the recorded answer to the
+/// first-run offer and where it is kept, or why nobody was asked.
+pub(crate) fn offer_line(
+    kept: Option<(bool, String)>,
+    env_named: bool,
+    path_named: bool,
+) -> String {
+    match kept {
+        Some((true, at)) => format!(
+            "offer: answered yes, kept in {at}; a launch writes the folder again if it goes \
+             missing"
+        ),
+        Some((false, at)) => {
+            format!("offer: answered no, kept in {at}; `atrium mod install` turns it around")
+        }
+        None if env_named => format!(
+            "offer: not asked ({} names the folder, which is yours to manage)",
+            atrium::modfiles::ENV_MOD
+        ),
+        None if path_named => {
+            "offer: not asked (the config's mod.path names the folder, which is yours to manage)"
+                .to_string()
+        }
+        None => "offer: not asked yet; the next start with a person at it asks once, when \
+                 claude is on PATH and no marked mod is installed (the answer is kept as \
+                 \"mod\" in config.json, or in mod.answer beside it when there is no config \
+                 file)"
+            .to_string(),
     }
 }
 
@@ -308,6 +382,54 @@ mod tests {
             ),
             Some("9".to_string())
         );
+    }
+
+    /// `atrium mod install` into the folder panes load is a yes, kept like
+    /// the offer's: it turns a recorded no around. Never for a folder the
+    /// user manages, and not again once a yes is kept.
+    #[test]
+    fn installing_into_the_panes_folder_is_a_yes_unless_the_user_manages_it() {
+        use atrium::modfiles::Said;
+        assert!(install_is_a_yes(false, false, false, Said::Unset));
+        assert!(install_is_a_yes(false, false, false, Said::No));
+        assert!(!install_is_a_yes(false, false, false, Said::Yes));
+        for said in [Said::Unset, Said::No, Said::Yes, Said::Managed] {
+            assert!(!install_is_a_yes(true, false, false, said), "ATRIUM_MOD");
+            assert!(!install_is_a_yes(false, true, false, said), "mod.path");
+            assert!(!install_is_a_yes(false, false, true, said), "a checkout");
+        }
+    }
+
+    #[test]
+    fn status_shows_the_recorded_answer_and_where_it_is_kept() {
+        let yes = offer_line(
+            Some((true, "/cfg/config.json (\"mod\": true)".to_string())),
+            false,
+            false,
+        );
+        assert!(
+            yes.starts_with("offer: answered yes, kept in /cfg/config.json (\"mod\": true)"),
+            "{yes}"
+        );
+        let no = offer_line(
+            Some((false, "/cfg/mod.answer (no)".to_string())),
+            false,
+            false,
+        );
+        assert!(
+            no.starts_with("offer: answered no, kept in /cfg/mod.answer (no)")
+                && no.contains("`atrium mod install`"),
+            "{no}"
+        );
+        let unasked = offer_line(None, false, false);
+        assert!(
+            unasked.starts_with("offer: not asked yet") && unasked.contains("mod.answer"),
+            "{unasked}"
+        );
+        assert!(offer_line(None, true, false).contains("ATRIUM_MOD names the folder"));
+        assert!(offer_line(None, false, true).contains("mod.path names the folder"));
+        // A recorded answer is shown even where the folder is named outright.
+        assert!(offer_line(Some((true, "x".to_string())), true, true).contains("answered yes"));
     }
 
     #[test]

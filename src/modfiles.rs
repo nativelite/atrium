@@ -15,6 +15,11 @@
 //! named by `ATRIUM_MOD`, an install from before 0.48) is loaded as it is
 //! and never written to.
 //!
+//! The mod is offered, not installed silently: a first start with a person at
+//! it asks once ([`first_run_offer`]), and the answer is kept in the config
+//! ([`crate::config::record_mod_answer`]). A kept yes is what lets a launch
+//! write the folder again when it is missing ([`launch_with`]).
+//!
 //! Where it lives: `ATRIUM_MOD` (the folder's full path) when set, else the
 //! config's `mod.path`, else `mod/` under the platform config directory.
 //! `mod: false` in the config, or in a fleet, injects it into no pane.
@@ -229,7 +234,9 @@ pub fn pane_env(
 /// One line for the operator (`atrium mod status`, the fleet preflight): what
 /// is installed and whether panes will load it. The second value says the
 /// line is a warning: the session would inject the mod and none is installed.
-pub fn describe(s: &Status, enabled: bool) -> (String, bool) {
+/// `yes`: a yes to the mod is recorded ([`Said::Yes`]), so a folder that is
+/// missing is written when the first claude pane starts ([`launch_with`]).
+pub fn describe(s: &Status, enabled: bool, yes: bool) -> (String, bool) {
     let built = embedded_version();
     let dir = s
         .dir
@@ -249,14 +256,539 @@ pub fn describe(s: &Status, enabled: bool) -> (String, bool) {
             ),
             true,
         ),
-        (None, true) => (
+        (None, true) if yes && s.dir.is_some() => (
             format!(
-                "mod: not installed at {dir}; run `atrium mod install` so claude panes \
-                 report status for certain (by inference until then)"
+                "mod: not at {dir} now; it is written there when the first claude pane \
+                 starts (you said yes to the mod)"
             ),
-            true,
+            false,
         ),
+        (None, true) => (not_installed_line(&dir), true),
     }
+}
+
+/// The one line for a session that would load the mod and finds none: what
+/// is missing, what that costs, and the command that adds it.
+pub fn not_installed_line(dir: &str) -> String {
+    format!(
+        "mod: not installed at {dir}: claude panes report status by inference and their \
+         subagents are not panes; `atrium mod install` adds it"
+    )
+}
+
+/// Write the mod at `dir` as `atrium mod install` does, and clear what the
+/// breaker remembered under `root` (a fresh install is a fresh start:
+/// whatever it remembered was about what was there before). The lines to
+/// print, in order.
+pub fn install_report(dir: &Path, root: Option<&Path>) -> Result<Vec<String>, String> {
+    let done = install_at(dir)?;
+    let mut lines = vec![format!(
+        "mod {} at {}: {} written, {} unchanged",
+        embedded_version(),
+        done.dir.display(),
+        done.written.len(),
+        done.unchanged.len()
+    )];
+    if let Some(root) = root {
+        if !matches!(read_record(root), RecordRead::None) && clear_record(root) {
+            lines.push(
+                "the breaker's record was cleared: the next session loads the mod again"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(lines)
+}
+
+// ---- The offer at first start, and what a yes covers (PLAN 0.48.0, S3) ----
+//
+// The mod is offered, never installed silently. Once, before the terminal is
+// taken, a launch with a person at it asks whether to install the mod; Enter
+// means yes. The answer is kept ([`crate::config::record_mod_answer`]) and
+// nobody is asked twice. A yes is also the permission a later launch needs to
+// write the folder again when it is missing ([`launch_with`]); a no is
+// `"mod": false`: off and silent. Where nobody is there (no terminal on
+// stdin, `ATRIUM_YES`), nothing is asked, installed or recorded.
+
+/// What the config, with the answer file folded in, says of the mod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said {
+    /// Nothing: the offer has not been answered.
+    Unset,
+    /// `"mod": true`, or a yes in the answer file.
+    Yes,
+    /// `"mod": false`, or a no in the answer file.
+    No,
+    /// `"mod": { "path": … }`: a folder the user manages. Not asked, and
+    /// nothing is created there.
+    Managed,
+}
+
+impl Said {
+    pub fn of(cfg: &crate::config::GlobalConfig) -> Said {
+        if cfg.mod_off {
+            Said::No
+        } else if cfg.mod_path.is_some() {
+            Said::Managed
+        } else if cfg.mod_yes {
+            Said::Yes
+        } else {
+            Said::Unset
+        }
+    }
+}
+
+/// What decides whether a launch asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferFacts {
+    /// A person is there: stdin is a terminal and `ATRIUM_YES` is unset.
+    pub human: bool,
+    /// [`ENV_MOD`] names the folder.
+    pub env_named: bool,
+    pub said: Said,
+    /// What is at the folder panes would load, `None` when there is no
+    /// platform config directory to hold one.
+    pub folder: Option<Folder>,
+    /// The folder is inside a git checkout ([`developer_folder`]).
+    pub checkout: bool,
+    /// `claude`, or a command the config or the environment names as one,
+    /// is on `PATH`.
+    pub claude: bool,
+}
+
+/// What a launch does about the offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Offer {
+    /// Ask whether to install the mod.
+    Install,
+    /// Ask about a mod an older atrium left there without a marker: a yes
+    /// installs over it and marks it.
+    Adopt,
+    /// Ask nothing, and why.
+    Not(NotAsked),
+}
+
+/// Why a launch does not ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotAsked {
+    /// No terminal on stdin, or `ATRIUM_YES`.
+    NobodyThere,
+    /// [`ENV_MOD`] names the folder: the user's (or a developer's) own.
+    EnvNamed,
+    /// The config names `mod.path`.
+    Managed,
+    /// Answered before: no.
+    SaidNo,
+    /// Answered before: yes.
+    SaidYes,
+    /// No platform config directory to install into.
+    NoFolder,
+    /// Installed, with the marker.
+    Installed,
+    /// The folder is inside a git checkout.
+    Checkout,
+    /// No Claude Code on `PATH`: nothing is asked and nothing recorded, so
+    /// the question comes when claude appears.
+    NoClaude,
+}
+
+/// Decide whether this launch asks. Pure.
+pub fn offer_of(f: &OfferFacts) -> Offer {
+    use NotAsked::*;
+    let not = Offer::Not;
+    if !f.human {
+        return not(NobodyThere);
+    }
+    if f.env_named {
+        return not(EnvNamed);
+    }
+    match f.said {
+        Said::Managed => return not(Managed),
+        Said::No => return not(SaidNo),
+        Said::Yes => return not(SaidYes),
+        Said::Unset => {}
+    }
+    let Some(folder) = f.folder else {
+        return not(NoFolder);
+    };
+    if folder == Folder::Ours {
+        return not(Installed);
+    }
+    if f.checkout {
+        return not(Checkout);
+    }
+    if !f.claude {
+        return not(NoClaude);
+    }
+    match folder {
+        Folder::Unmarked => Offer::Adopt,
+        _ => Offer::Install,
+    }
+}
+
+/// The question itself.
+pub const OFFER_QUESTION: &str = "Install the atrium mod? [Y/n] ";
+
+/// What is said before the question: what the mod is, what it gives, what
+/// it changes, how to change one's mind. `adopt`: a mod without a marker is
+/// already at `dir` ([`Offer::Adopt`]).
+pub fn offer_text(dir: &Path, adopt: bool) -> String {
+    let mut text = format!(
+        "atrium: the atrium mod is a Claude Code plugin that atrium loads into the claude \
+         panes it hosts, written to {}.\n\
+         \x20 With it: atrium knows each agent's status for certain, a message to an agent is \
+         delivered without typing into its prompt and keeps its line breaks, and an agent's \
+         subagents become visible panes.\n\
+         \x20 What it changes: in atrium's panes it takes over Claude Code's Agent tool. It \
+         never blocks a tool call when it fails, and atrium switches it off by itself if it \
+         breaks.\n\
+         \x20 To change your mind: `atrium mod install` adds it, \"mod\": false in config.json \
+         turns it off.\n",
+        dir.display()
+    );
+    if adopt {
+        text.push_str(
+            "\x20 A mod from an older atrium is in that folder now: yes lets atrium keep it \
+             current, no turns the mod off in atrium's panes.\n",
+        );
+    }
+    text
+}
+
+/// What one line of input means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reply {
+    Yes,
+    No,
+    Unclear,
+}
+
+/// Enter, `y` or `yes` is yes; `n` or `no` is no; case and blanks aside.
+pub fn reply_of(line: &str) -> Reply {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Reply::Yes,
+        "n" | "no" => Reply::No,
+        _ => Reply::Unclear,
+    }
+}
+
+/// What came of asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    Yes,
+    No,
+    /// End of input, or two lines that were neither: nothing is recorded,
+    /// and the next start asks again.
+    NoAnswer,
+}
+
+/// Say `text`, ask [`OFFER_QUESTION`] on `out` and read the answer from
+/// `input`. A line that is neither yes nor no is asked about once more.
+pub fn ask(input: &mut dyn std::io::BufRead, out: &mut dyn std::io::Write, text: &str) -> Asked {
+    let _ = out.write_all(text.as_bytes());
+    for attempt in 0..2 {
+        let _ = out.write_all(OFFER_QUESTION.as_bytes());
+        let _ = out.flush();
+        let mut line = String::new();
+        if !matches!(input.read_line(&mut line), Ok(n) if n > 0) {
+            let _ = out.write_all(b"\n");
+            return Asked::NoAnswer;
+        }
+        match reply_of(&line) {
+            Reply::Yes => return Asked::Yes,
+            Reply::No => return Asked::No,
+            Reply::Unclear if attempt == 0 => {
+                let _ = out.write_all(b"Please answer y or n (Enter is yes).\n");
+            }
+            Reply::Unclear => {}
+        }
+    }
+    Asked::NoAnswer
+}
+
+/// Ask, and act on the answer: a yes installs at `dir` exactly as `atrium
+/// mod install` does ([`install_report`]) and says what it wrote; yes and no
+/// are handed to `record`, which answers where it was kept. An install that
+/// fails records nothing, so the next start asks again. Everything said goes
+/// to `out`.
+pub fn run_offer(
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+    dir: &Path,
+    adopt: bool,
+    root: Option<&Path>,
+    record: &mut dyn FnMut(bool) -> Result<String, String>,
+) -> Asked {
+    let asked = ask(input, out, &offer_text(dir, adopt));
+    let mut say = |line: String| {
+        let _ = writeln!(out, "atrium: {line}");
+    };
+    let mut keep = |yes: bool, say: &mut dyn FnMut(String)| match record(yes) {
+        Ok(kept) => say(format!(
+            "the answer is kept in {kept}; atrium does not ask again"
+        )),
+        Err(why) => say(format!(
+            "the answer could not be kept ({why}); the next start asks again"
+        )),
+    };
+    match asked {
+        Asked::Yes => match install_report(dir, root) {
+            Ok(lines) => {
+                for line in lines {
+                    say(line);
+                }
+                keep(true, &mut say);
+            }
+            Err(why) => say(format!(
+                "the mod was not installed ({why}); the next start asks again"
+            )),
+        },
+        Asked::No => {
+            say(if adopt {
+                "the mod is off in atrium's panes and its folder is left as it is; \
+                 `atrium mod install` turns it on again"
+                    .to_string()
+            } else {
+                "the mod is not installed; `atrium mod install` adds it later".to_string()
+            });
+            keep(false, &mut say);
+        }
+        Asked::NoAnswer => {
+            say("no answer taken and nothing installed; the next start asks again".to_string())
+        }
+    }
+    asked
+}
+
+/// Is one of `names` a command on `dirs` (tried with each of `exts`, as
+/// [`crate::resolve::resolve`] does), or a path to a file? Pure over its
+/// inputs.
+pub fn claude_on_path(names: &[String], dirs: &[PathBuf], exts: &[String]) -> bool {
+    names
+        .iter()
+        .any(|name| crate::resolve::resolve(name, dirs, exts).is_some_and(|found| found.is_file()))
+}
+
+/// [`claude_on_path`] for this process: `claude` and every alias in `cfg` or
+/// in the environment, over `PATH` (and `PATHEXT` on Windows).
+fn claude_here(cfg: &crate::config::GlobalConfig) -> bool {
+    let mut names = vec!["claude".to_string()];
+    names.extend(cfg.alias_names());
+    names.extend(crate::ctl::parse_allow_list(
+        crate::bind::ENV_CLAUDE_ALIASES,
+    ));
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    #[cfg(not(windows))]
+    let exts: Vec<String> = vec![String::new()];
+    claude_on_path(&names, &dirs, &exts)
+}
+
+/// Is [`ENV_MOD`] naming the folder?
+pub fn env_named() -> bool {
+    std::env::var_os(ENV_MOD).is_some_and(|v| !v.is_empty())
+}
+
+/// Is a person there to be asked? Stdin is a terminal, `ATRIUM_YES` is
+/// unset, and this atrium is not itself running inside an atrium pane
+/// (`pane`: what `ATRIUM_PANE` holds): a pane's stdin is a terminal too, and
+/// what types into it may be an agent. The first start belongs to the
+/// outermost atrium. Pure.
+pub fn person_there(yes_set: bool, stdin_is_terminal: bool, pane: Option<&str>) -> bool {
+    !yes_set && stdin_is_terminal && !pane.is_some_and(|p| !p.trim().is_empty())
+}
+
+/// The offer, at first start: called once per launch that hosts a session,
+/// before the config is installed and before the terminal is taken. Asks on
+/// stderr and reads stdin, only when [`offer_of`] says so. A config that
+/// does not load is the launch's to report: nothing is asked over it.
+pub fn first_run_offer() {
+    use std::io::IsTerminal;
+    // Nobody there: decided before anything is read from disk.
+    if !person_there(
+        std::env::var_os("ATRIUM_YES").is_some(),
+        std::io::stdin().is_terminal(),
+        std::env::var(crate::ctl::ENV_PANE).ok().as_deref(),
+    ) {
+        return;
+    }
+    let Ok(cfg) = crate::config::load_effective() else {
+        return;
+    };
+    let dir = cfg.mod_path.clone().or_else(default_dir);
+    let mut facts = OfferFacts {
+        human: true,
+        env_named: env_named(),
+        said: Said::of(&cfg),
+        folder: dir.as_deref().map(folder_at),
+        checkout: dir.as_deref().is_some_and(|d| developer_folder(d, false)),
+        claude: true,
+    };
+    // The PATH is searched only when everything else says "ask".
+    if !matches!(offer_of(&facts), Offer::Not(_)) {
+        facts.claude = claude_here(&cfg);
+    }
+    let (Some(dir), offer) = (dir, offer_of(&facts)) else {
+        return;
+    };
+    if matches!(offer, Offer::Not(_)) {
+        return;
+    }
+    let stdin = std::io::stdin();
+    run_offer(
+        &mut stdin.lock(),
+        &mut std::io::stderr(),
+        &dir,
+        offer == Offer::Adopt,
+        crate::session_store::state_root().as_deref(),
+        &mut |yes| crate::config::record_mod_answer(yes).map(|kept| kept.describe(yes)),
+    );
+}
+
+/// The line for a launch that hosts a claude pane and finds no mod and no
+/// answer: said once, before the terminal is taken, where nobody was asked.
+/// Nothing when the session does not use the mod (a recorded no is that),
+/// when a yes is recorded (the launch writes the folder), or when a mod is
+/// there.
+pub fn absent_note(enabled: bool, said: Said, folder: Option<Folder>, dir: &str) -> Option<String> {
+    (enabled && matches!(said, Said::Unset | Said::Managed) && folder == Some(Folder::Absent))
+        .then(|| not_installed_line(dir))
+}
+
+/// [`absent_note`] for this session, after the config is installed.
+pub fn session_absent_note() -> Option<String> {
+    let dir = configured_dir()?;
+    // A yes that will not have the launch write this folder (it is the
+    // user's to manage) leaves the folder as absent as it is.
+    let said = match Said::of(crate::config::get()) {
+        Said::Yes if !session_yes() => Said::Managed,
+        said => said,
+    };
+    absent_note(
+        session_enabled(),
+        said,
+        Some(folder_at(&dir)),
+        &dir.display().to_string(),
+    )
+}
+
+/// Is a yes to the mod recorded, and is the configured folder one a launch
+/// may write on the strength of it (not named by [`ENV_MOD`], not inside a
+/// git checkout)? After the config is installed.
+pub fn session_yes() -> bool {
+    Said::of(crate::config::get()) == Said::Yes
+        && configured_dir().is_some_and(|d| !developer_folder(&d, env_named()))
+}
+
+/// What Claude Code's own teams need switched on.
+pub const ENV_AGENT_TEAMS: &str = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS";
+
+/// What decides which path a named teammate takes in a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TeammateFacts {
+    /// The control plane is on: without it neither the mod nor the shim
+    /// reaches atrium.
+    pub ctl: bool,
+    /// The session's claude panes are expected to run the mod
+    /// ([`expected_on`]).
+    pub mod_on: bool,
+    /// The session's `subagents` policy.
+    pub subagents: crate::modstate::Subagents,
+    /// The tmux shim is put into claude panes
+    /// ([`crate::tmux_shim::session_enabled`]).
+    pub shim_on: bool,
+    /// [`ENV_AGENT_TEAMS`] is switched on in atrium's own environment, which
+    /// every pane inherits.
+    pub teams_var: bool,
+}
+
+/// One line for the fleet banner, a plain launch and `atrium mod status`:
+/// which path handles a subagent the model names in a claude pane of this
+/// session. Pure.
+pub fn teammates_line(f: &TeammateFacts) -> String {
+    use crate::modstate::Subagents;
+    let shim = || {
+        let mut line =
+            "Claude Code's own teammates land as panes through the tmux shim".to_string();
+        if !f.teams_var {
+            line.push_str(&format!(
+                "; teams also need {ENV_AGENT_TEAMS}=1 in the environment or in Claude \
+                 Code's settings (atrium cannot see it in its environment)"
+            ));
+        }
+        line
+    };
+    let inside = "subagents and teammates run inside their agent and are not visible to atrium";
+    match (f.subagents, f.ctl && f.mod_on, f.ctl && f.shim_on) {
+        // Held by the launch flags too, so it stands with or without the mod.
+        (Subagents::Deny, _, _) => {
+            "teams: claude panes are launched without the Agent tool (subagents: deny), so \
+             none starts a subagent or a teammate"
+                .to_string()
+        }
+        (Subagents::Panes, true, _) => {
+            "teams: named subagents and teammates become atrium panes through the mod \
+             (subagents: panes)"
+                .to_string()
+        }
+        (Subagents::Native, true, true) => format!(
+            "teams: the mod leaves the Agent tool to Claude Code (subagents: native); {}",
+            shim()
+        ),
+        (Subagents::Native, true, false) => format!(
+            "teams: the mod leaves the Agent tool to Claude Code (subagents: native) and the \
+             tmux shim is off: {inside}"
+        ),
+        (_, false, true) => format!("teams: the mod is off; {}", shim()),
+        (_, false, false) if !f.ctl => format!("teams: no control plane: {inside}"),
+        (_, false, false) => {
+            format!("teams: the mod is off and the tmux shim is off: {inside}")
+        }
+    }
+}
+
+/// Is [`ENV_AGENT_TEAMS`] switched on in `value` (what the variable holds)?
+pub fn teams_var_on(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|v| {
+        !v.is_empty() && !["0", "false", "no", "off"].contains(&v.to_ascii_lowercase().as_str())
+    })
+}
+
+/// Are this machine's claude panes expected to run the mod in a session
+/// where it is `enabled`, as far as can be told before one starts? A mod is
+/// installed, or a recorded yes will have the launch write it (`yes`:
+/// [`session_yes`]); and the breaker holds no record against this binary's
+/// mod.
+pub fn expected_on(enabled: bool, yes: bool) -> bool {
+    if !enabled {
+        return false;
+    }
+    if installed_dir().is_none() && !yes {
+        return false;
+    }
+    !crate::session_store::state_root()
+        .is_some_and(|root| matches!(read_record(&root), RecordRead::Tripped(r) if r.mod_matches()))
+}
+
+/// [`teammates_line`] for a session that is not a fleet's (a plain launch,
+/// `atrium mod status`): the config's and the environment's say.
+pub fn session_teammates_line(ctl: bool) -> String {
+    teammates_line(&TeammateFacts {
+        ctl,
+        mod_on: expected_on(session_enabled(), session_yes()),
+        subagents: crate::modstate::Subagents::parse(&crate::modstate::session_subagents().0)
+            .unwrap_or(crate::modstate::Subagents::Panes),
+        shim_on: crate::tmux_shim::session_enabled(),
+        teams_var: teams_var_on(std::env::var(ENV_AGENT_TEAMS).ok().as_deref()),
+    })
 }
 
 // ---- The breaker's memory, and the files healing (PLAN 0.48.0, S2) ----
@@ -898,11 +1430,12 @@ pub fn launch_once(claude: impl FnOnce() -> Option<String>) -> Vec<String> {
     if !first || !session_enabled() {
         return Vec::new();
     }
-    let (lines, state) = launch_at(
+    let (lines, state) = launch_with(
         configured_dir().as_deref(),
         crate::session_store::state_root().as_deref(),
         claude,
         crate::session_store::now_ms(),
+        Said::of(crate::config::get()) == Said::Yes,
     );
     if !state.loadable {
         UNLOADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -928,22 +1461,90 @@ pub struct Launched {
     pub current: bool,
 }
 
-/// [`launch_once`] over a given mod folder and state root: the heal, then
-/// the record. Touches nothing else.
+/// [`launch_with`] with no yes recorded: the heal, then the record. Nothing
+/// is created.
 pub fn launch_at(
     dir: Option<&Path>,
     root: Option<&Path>,
     claude: impl FnOnce() -> Option<String>,
     now_ms: u64,
 ) -> (Vec<String>, Launched) {
+    launch_with(dir, root, claude, now_ms, false)
+}
+
+/// What a recorded yes lets a launch do at `dir` before the heal: write the
+/// mod where it is missing, and take over a folder an older atrium left
+/// without a marker. `Some(line)` when it did (or tried), and whether files
+/// of the mod changed. Never in a developer's folder ([`developer_folder`]),
+/// never over a mod whose manifest names a later version than this
+/// binary's, and never in a folder that already has the marker (the heal's).
+pub fn refresh_after_yes(dir: &Path, developer: bool) -> Option<(String, bool)> {
+    if developer {
+        return None;
+    }
+    let reason = match folder_at(dir) {
+        Folder::Ours => return None,
+        Folder::Absent => "it was missing",
+        Folder::Unmarked => {
+            let there = status_at(dir).installed.unwrap_or_default();
+            if later_version(&there, &embedded_version()) {
+                return None;
+            }
+            "the one there was from an older atrium"
+        }
+    };
+    Some(match install_at(dir) {
+        Ok(done) => (
+            format!(
+                "mod: written to {} from this atrium ({}): {reason}, and you said yes to the mod",
+                dir.display(),
+                embedded_version()
+            ),
+            !done.written.is_empty(),
+        ),
+        Err(why) => (
+            format!(
+                "mod: could not be written to {} ({why}); `atrium mod install` tries again",
+                dir.display()
+            ),
+            false,
+        ),
+    })
+}
+
+/// [`launch_once`] over a given mod folder and state root: with a recorded
+/// yes (`yes`), the folder is written where it is missing or unmarked
+/// ([`refresh_after_yes`]); then the heal, then the record. Touches nothing
+/// else. Without a yes nothing is created.
+pub fn launch_with(
+    dir: Option<&Path>,
+    root: Option<&Path>,
+    claude: impl FnOnce() -> Option<String>,
+    now_ms: u64,
+    yes: bool,
+) -> (Vec<String>, Launched) {
+    launch_in(dir, root, claude, now_ms, yes, env_named())
+}
+
+/// [`launch_with`], told whether [`ENV_MOD`] names the folder.
+pub fn launch_in(
+    dir: Option<&Path>,
+    root: Option<&Path>,
+    claude: impl FnOnce() -> Option<String>,
+    now_ms: u64,
+    yes: bool,
+    env_named: bool,
+) -> (Vec<String>, Launched) {
     let mut lines = Vec::new();
+    let developer = dir.is_some_and(|d| developer_folder(d, env_named));
+    let written = dir
+        .filter(|_| yes)
+        .and_then(|d| refresh_after_yes(d, developer));
+    let wrote_files = written.as_ref().is_some_and(|(_, changed)| *changed);
+    lines.extend(written.map(|(line, _)| line));
     let heal = dir.map_or(Heal::NotInstalled, heal_at);
     let said = match dir {
-        Some(d) => heal_line(
-            &heal,
-            d,
-            developer_folder(d, std::env::var_os(ENV_MOD).is_some_and(|v| !v.is_empty())),
-        ),
+        Some(d) => heal_line(&heal, d, developer),
         None => HealSaid {
             line: None,
             loadable: true,
@@ -967,7 +1568,7 @@ pub fn launch_at(
         RecordRead::Tripped(_) => claude(),
         RecordRead::None | RecordRead::Unreadable => None,
     };
-    let healed = matches!(heal, Heal::Rewrote(_));
+    let healed = wrote_files || matches!(heal, Heal::Rewrote(_));
     let launch = launch_of(true, record, version.as_deref(), healed);
     lines.extend(launch_line(&launch, now_ms));
     (
@@ -1116,6 +1717,9 @@ pub fn breaker_lines(record: &RecordRead, claude: Option<&str>, now_ms: u64) -> 
 }
 
 #[cfg(test)]
+mod offer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1212,13 +1816,13 @@ mod tests {
             installed: None,
             current: false,
         };
-        let (line, warn) = describe(&none, true);
+        let (line, warn) = describe(&none, true, false);
         assert!(
             line.contains("not installed") && line.contains("/d"),
             "{line}"
         );
         assert!(warn);
-        let (line, warn) = describe(&none, false);
+        let (line, warn) = describe(&none, false, false);
         assert!(line.contains("off"), "{line}");
         assert!(!warn);
         let ok = Status {
@@ -1226,7 +1830,7 @@ mod tests {
             installed: Some(v.clone()),
             current: true,
         };
-        let (line, warn) = describe(&ok, true);
+        let (line, warn) = describe(&ok, true, false);
         assert_eq!(line, format!("mod: installed {v} at /d"));
         assert!(!warn);
         let stale = Status {
@@ -1234,7 +1838,7 @@ mod tests {
             current: false,
             ..ok
         };
-        let (line, warn) = describe(&stale, true);
+        let (line, warn) = describe(&stale, true, false);
         assert!(line.contains("0.0.1") && line.contains("differs"), "{line}");
         assert!(warn);
         let nowhere = Status {
@@ -1242,7 +1846,7 @@ mod tests {
             installed: None,
             current: false,
         };
-        assert!(describe(&nowhere, true)
+        assert!(describe(&nowhere, true, false)
             .0
             .contains("no platform config directory"));
     }

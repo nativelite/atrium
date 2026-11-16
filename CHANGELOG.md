@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **The mod is offered at first start.** It is offered, not installed
+  silently: the first launch with a person at it (a terminal on stdin,
+  `ATRIUM_YES` unset) asks once, before the terminal is taken and after the
+  config-location question where that is asked, `Install the atrium mod?
+  [Y/n]`, having said what the mod is and where it is written, what it gives,
+  what it changes (in atrium's panes it takes over Claude Code's Agent tool)
+  and how to change your mind. Enter means yes and installs it as `atrium mod
+  install` does; `n` writes nothing; no answer records nothing and the next
+  start asks again. A plain launch asks too.
+  - **The answer is kept in the config**, as `"mod": true` or `"mod": false`,
+    by changing that one key and no other byte of the file (a config that
+    does not parse, names `mod.path`, or is a symbolic link is never written
+    to). With no config file to hold it, it is kept in `mod.answer` beside
+    the config pointer; the config's key, when present, wins. A no is `"mod":
+    false`: off and silent. `"mod": true` is new as a value; `true`, `false`
+    and `{ "path": … }` already in a config count as answered.
+  - **A yes covers upgrades.** With a yes kept, a launch whose mod folder is
+    missing writes it again, and one that finds a mod an older atrium left
+    without a marker installs over it and marks it, with one line. Never in a
+    folder `ATRIUM_MOD` names or inside a git checkout, never over a newer
+    mod. `atrium mod install` into the folder panes load is a yes and is kept
+    the same way, which turns a recorded no around.
+  - **Nobody there, nobody asked.** No terminal on stdin, `ATRIUM_YES`, a
+    headless fleet, an atrium started inside an atrium pane, `atrium ctl`:
+    nothing is asked, installed or recorded.
+    Nor when `claude` (or a configured alias) is not on `PATH`, when a marked
+    mod is installed, or when `ATRIUM_MOD` or `mod.path` names the folder. A
+    launch that hosts claude with the control plane on and finds no mod and
+    no answer says so in one line with `atrium mod install` (a fleet in its
+    preflight block), once, and never after a no.
+  - `atrium mod status` shows the answer and where it is kept (`offer:`).
+
 - **A broken mod is backed out by atrium, not left to break panes** (the mod
   0.3.0). The mod is on its way to being the default for claude panes.
   - **Its hooks are written to fail open.** Every hook catches what its own
@@ -75,6 +107,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool itself, under both its names; before, only the mod refused it. `panes` remains the mod's
   takeover: without the mod the engine's own Agent tool works and its
   subagents are not atrium panes.
+
+### Changed
+- **The launch says which path handles a named teammate, and no longer
+  announces teams it cannot deliver.** The fleet banner's `teams: Claude
+  Code's teammates land as panes (teammateMode auto or tmux)` was printed
+  whenever the tmux shim was on. With the mod on that is not what happens (the
+  mod takes over the Agent tool and opens the pane itself), and Claude Code's
+  own teams need `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`. The line now says
+  one of: `named subagents and teammates become atrium panes through the mod
+  (subagents: panes)`; `the mod is off; Claude Code's own teammates land as
+  panes through the tmux shim`, with `teams also need
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the environment or in Claude
+  Code's settings (atrium cannot see it in its environment)` when the variable
+  is not in atrium's environment; or that subagents and teammates run inside
+  their agent and are not visible to atrium. It names the `subagents` policy
+  in force, and is also printed by a plain `--allow-ctl` launch of claude and
+  by `atrium mod status`.
+- The preflight's line for a mod that is not installed now reads `mod: not
+  installed at <dir>: claude panes report status by inference and their
+  subagents are not panes; `atrium mod install` adds it`; with a yes kept it
+  says the folder is written when the first claude pane starts, and is not a
+  warning.
 
 ### Fixed
 - **The mod's `/atrium` pane and its `atrium_list`, `atrium_status`,

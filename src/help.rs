@@ -47,6 +47,7 @@ families:  atrium fleet --help     saved rosters: up, init, ls, clean
 The trust policy is a ceiling for every caller: `ctl spawn --mode` may match it or
 de-escalate, never elevate. Extend the accept allowlist with ATRIUM_TRUST_ALLOW=a,b.
 Mouse capture is off so text selection works; Ctrl+A m turns it on.
+The first start with a person at it asks once whether to install the mod (Enter is yes).
 ",
         v = env!("CARGO_PKG_VERSION")
     )
@@ -211,14 +212,17 @@ usage: atrium mod <command>    the plugin of function hooks a claude pane loads
   install [--at <dir>]  write the mod built into this atrium to its folder (the config's
                         mod.path, else mod/ under the platform config directory, else <dir>);
                         an upgrade of atrium is an upgrade of the mod, a hand edit is restored
-  status                what is installed there, whether claude panes will load it, whether
-                        the breaker backed the mod out (against which versions, and when),
-                        and the failures a running session's mods reported
+  status                what is installed there, whether claude panes will load it, the
+                        answer to the first-run offer and where it is kept, which path a
+                        named teammate takes, whether the breaker backed the mod out (against
+                        which versions, and when), and what a running session's mods reported
   retry                 forget that the breaker tripped: the next session loads the mod again
 
 Once installed, every claude pane atrium spawns gets CLAUDE_CODE_PLUGIN_DIRS naming the
 folder and reports its status to atrium for certain instead of by inference. ATRIUM_MOD
 names the folder outright; \"mod\": false in config.json or a fleet turns injection off.
+The first start with a person at it offers the mod once (Enter is yes) and keeps the answer
+as \"mod\": true or false; a yes also lets a launch write the folder again if it goes missing.
 
 `install` marks the folder it writes and clears the breaker's record; a launch keeps a
 marked folder current with the atrium that runs (one line when it rewrote a file) and

@@ -265,8 +265,9 @@ send.
 - `ATRIUM_MOD=<this folder>` loads this checkout into every claude pane as
   it is. atrium never writes into a folder without its marker
   (`.atrium-mod`, which only `atrium mod install` leaves), so edits here are
-  safe from the launch refresh; one line at launch says the folder is loaded
-  as it is.
+  safe from the launch refresh, whatever answer is kept; one line at launch
+  says the folder is loaded as it is. With `ATRIUM_MOD` set the first-run
+  offer is not made.
 - Under `cargo test` and `cargo run` in this repository, `.cargo/config.toml`
   sets `ATRIUM_MOD` to `target/test-mod`, so that a test session with a
   claude pane cannot read, or refresh, the mod you installed for real. It
@@ -283,8 +284,15 @@ claude --plugin-dir /path/to/atrium/mod
 ```
 
 or for every session a host starts, with `CLAUDE_CODE_PLUGIN_DIRS` naming the
-folder. atrium carries these files inside its binary: `atrium mod install`
-writes them to `mod/` under the platform config directory (or `--at <dir>`),
+folder. atrium carries these files inside its binary and offers to install
+them at first start: a launch with a person at it asks once, `Install the
+atrium mod? [Y/n]`, Enter meaning yes, and keeps the answer (`"mod": true` or
+`"mod": false` in `config.json`, or `mod.answer` beside it when there is no
+config file). Nothing is asked where nobody is there (no terminal,
+`ATRIUM_YES`, inside an atrium pane), when `claude` is not on `PATH`, or when
+`ATRIUM_MOD` or the config's `mod.path` names the folder.
+`atrium mod install` does the same by hand, and is how a no is turned around:
+it writes them to `mod/` under the platform config directory (or `--at <dir>`),
 and every claude pane atrium then spawns gets `CLAUDE_CODE_PLUGIN_DIRS` naming
 that folder and `ATRIUM_BIN` naming the atrium that hosts it. `atrium mod
 status` says what is installed; `"mod": false` in `config.json` or in a fleet
@@ -293,7 +301,10 @@ turns the injection off. `atrium mod install` leaves a marker in the folder
 folder that has the marker current with the atrium that runs, and says so in
 one line when it rewrote a file. A folder a newer atrium wrote is not
 downgraded, and a folder without the marker is loaded as it is and never
-written to.
+written to unless a yes is kept: then a launch installs over a mod an older
+atrium left there and marks it, and writes the folder again if it went
+missing, with one line. Never in a folder `ATRIUM_MOD` names or inside a git
+checkout.
 
 Check it: `claude plugin validate mod` and `claude plugin test mod`
 (`python dev.py check` runs both when `claude` is on PATH).

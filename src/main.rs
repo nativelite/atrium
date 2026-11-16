@@ -293,6 +293,54 @@ fn cap_trust_to_ancestor(mut trust: atrium::ctl::TrustMode) -> atrium::ctl::Trus
     trust
 }
 
+/// Is this argv a launch that hosts a session, where the first-run offer of
+/// the mod belongs? `recover` and `fleet up` (not `--headless`, which has no
+/// one to ask, and not their help), and a plain launch or `up` (not
+/// `--version`, `--help` or `--stdin-probe`, which answer and leave). Never
+/// `ctl`, `mod` or another `fleet` command; `config`, `reap`, the shim and
+/// the watchdog have returned before this is asked. Whether a person is
+/// there is not decided here ([`atrium::modfiles::offer_of`]).
+fn offers_mod(args: &[String]) -> bool {
+    let wants_help = |rest: &[String]| rest.iter().any(|a| atrium::help::wants(a));
+    match args.first().map(String::as_str) {
+        Some("ctl" | "mod" | "config" | "reap") => false,
+        Some("recover") => !wants_help(&args[1..]) && !args.iter().any(|a| a == "--list"),
+        Some("fleet") => {
+            args.get(1).map(String::as_str) == Some("up")
+                && !wants_help(&args[2..])
+                && !args.iter().any(|a| a == "--headless")
+        }
+        _ => {
+            // atrium's own meta-flags are read after `--identity` and
+            // `--reap-orphans`, as `launch` reads them.
+            let (_, rest) = atrium::identity::parse(args);
+            let (_, rest) = atrium::orphan::parse_flag(&rest);
+            !matches!(
+                rest.first().map(String::as_str),
+                Some("--version" | "-V" | "--help" | "-h" | "--stdin-probe")
+            )
+        }
+    }
+}
+
+/// What a plain launch says before the terminal is taken when the command
+/// it hosts is claude and the control plane is on: the path a named teammate
+/// takes ([`atrium::modfiles::session_teammates_line`]); and the one line
+/// for a mod that is not installed and an offer nobody answered
+/// ([`atrium::modfiles::session_absent_note`]). Nothing for any other
+/// command.
+fn claude_launch_notes(command: &[String], allow_ctl: bool) -> Vec<String> {
+    let is_claude = command
+        .first()
+        .is_some_and(|c| atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)));
+    if !is_claude || !allow_ctl {
+        return Vec::new();
+    }
+    let mut lines = vec![atrium::modfiles::session_teammates_line(true)];
+    lines.extend(atrium::modfiles::session_absent_note());
+    lines
+}
+
 fn main() -> ExitCode {
     let code = launch();
     // The discovery file names a running session; this one is over.
@@ -412,6 +460,16 @@ fn launch() -> ExitCode {
         || (first == Some("fleet") && args.get(1).map(String::as_str) == Some("up"))
     {
         atrium::config::first_run_setup();
+    }
+    // The second question of the first run, asked once and kept: whether to
+    // install the mod. On every launch that hosts a session and can have a
+    // person at it (`offers_mod`), a plain one included, since the mod is
+    // loaded into a claude pane wherever it runs. After the config question,
+    // so a new user answers both in one go and the answer has a file to go
+    // into; before the config is installed, so this launch already runs on
+    // the answer. It asks nothing where nobody is there.
+    if offers_mod(&args) {
+        atrium::modfiles::first_run_offer();
     }
     // The user-global config (`config.json`): aliases, session-wide lists and
     // fleet defaults, in force for every launch path below. Not for the ctl
@@ -568,6 +626,13 @@ fn launch() -> ExitCode {
         if let Some(line) = atrium::tmux_shim::teams_env_disclosure(&names) {
             eprintln!("atrium: {line}");
         }
+    }
+    // A launch that hosts claude says, here too, what a fleet's banner says:
+    // which path handles a subagent the model names (the mod, the tmux shim,
+    // neither), and, once, that no mod is installed when none is and nobody
+    // has answered the offer (a recorded no is silent).
+    for line in claude_launch_notes(&command, allow_ctl) {
+        eprintln!("atrium: {line}");
     }
     // The last session in this project crashed: offer to pick it back up before
     // starting a fresh one. Ahead of the skip confirmation, because a resume
@@ -741,5 +806,81 @@ fn default_shell() -> String {
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".into())
     } else {
         std::env::var("SHELL").unwrap_or_else(|_| "sh".into())
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split(' ')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The offer belongs to the launches that host a session, never to a
+    /// command that answers and leaves or that runs with nobody there.
+    #[test]
+    fn the_mod_is_offered_only_on_launches_that_host_a_session() {
+        for hosts in [
+            "",
+            "claude",
+            "--allow-ctl claude",
+            "--identity work --allow-ctl claude --help",
+            "-n 4 claude",
+            "--reap-orphans claude",
+            "--trust up team",
+            "up team",
+            "fleet up team",
+            "fleet up team --allow-ctl",
+            "recover",
+            "recover --trust accept",
+        ] {
+            assert!(offers_mod(&argv(hosts)), "{hosts:?}");
+        }
+        for not in [
+            "ctl list",
+            "ctl spawn claude",
+            "mod install",
+            "mod status",
+            "config path",
+            "reap",
+            "--version",
+            "-V --json",
+            "--help",
+            "-h",
+            "--identity work --help",
+            "--reap-orphans --version",
+            "--stdin-probe",
+            "fleet",
+            "fleet ls",
+            "fleet init",
+            "fleet clean team",
+            "fleet --help",
+            "fleet up --help",
+            "fleet up team --headless",
+            "fleet up team --headless --size 40x120",
+            "recover --help",
+            "recover --list",
+        ] {
+            assert!(!offers_mod(&argv(not)), "{not:?}");
+        }
+    }
+
+    /// A plain launch speaks of teammates and the mod only when it hosts
+    /// claude with the control plane on.
+    #[test]
+    fn only_a_ctl_launch_of_claude_gets_the_notes() {
+        let cmd = |s: &str| argv(s);
+        assert!(claude_launch_notes(&cmd("cmd"), true).is_empty());
+        assert!(claude_launch_notes(&cmd("codex"), true).is_empty());
+        assert!(claude_launch_notes(&cmd("claude"), false).is_empty());
+        let notes = claude_launch_notes(&cmd("claude --model x"), true);
+        assert!(!notes.is_empty() && notes.len() <= 2, "{notes:?}");
+        assert!(notes[0].starts_with("teams: "), "{notes:?}");
+        // The full path of a claude counts, as it does everywhere else.
+        assert!(!claude_launch_notes(&cmd("/usr/local/bin/claude"), true).is_empty());
     }
 }
