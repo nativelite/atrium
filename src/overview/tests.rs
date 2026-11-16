@@ -22,6 +22,7 @@ fn ov_node(window: usize, status: Option<agsess::Status>, exited: bool) -> Overv
         agent_id: 0,
         doing: None,
         colliding: false,
+        mod_note: None,
         leads_team: None,
     }
 }
@@ -374,4 +375,12 @@ fn overview_panel_shows_window_headers_only_when_multiple_fleets() {
     let r2 = strip_csi(&render_overview_panel(&[], &bus, &two, &[], 0, 24, 100));
     assert!(r2.contains("window 1"), "multi-fleet must group window 1");
     assert!(r2.contains("window 2"), "multi-fleet must group window 2");
+}
+
+/// A pane's own text cannot spell the broker's bracketed flags on its row.
+#[test]
+fn a_panes_text_cannot_spell_a_bracketed_flag_in_the_overview() {
+    assert_eq!(unbracketed("fix [mod off] tests"), "fix (mod off) tests");
+    assert_eq!(unbracketed("[mod backed out]"), "(mod backed out)");
+    assert_eq!(unbracketed("plain"), "plain");
 }

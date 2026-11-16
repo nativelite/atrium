@@ -841,6 +841,11 @@ pub struct AgentState {
     /// Files two or more live panes edited, as the overlay computed them
     /// ([`crate::modstate::ModState::collisions`]); keyed by agent id.
     collisions: Vec<crate::modstate::Collision>,
+    /// What the chrome says of a pane's mod when it is not simply working:
+    /// set aside, or still loaded after the breaker backed the mod out
+    /// ([`crate::modstate::ModState::overlay`]); keyed by the pane's agent
+    /// id, so a pane with no session bound is flagged too.
+    mod_notes: std::collections::HashMap<usize, &'static str>,
 }
 
 /// What a pane's mod reported beyond the four inferred statuses: the chrome
@@ -872,6 +877,7 @@ impl AgentState {
             overrides: Default::default(),
             mod_facts: Default::default(),
             collisions: Vec::new(),
+            mod_notes: Default::default(),
         }
     }
 
@@ -904,6 +910,17 @@ impl AgentState {
         self.overrides.clear();
         self.mod_facts.clear();
         self.collisions.clear();
+        self.mod_notes.clear();
+    }
+
+    /// Flag a pane's mod for the bar and the overview.
+    pub fn set_mod_note(&mut self, pane: usize, note: &'static str) {
+        self.mod_notes.insert(pane, note);
+    }
+
+    /// The flag on a pane's mod, when it has one.
+    pub fn mod_note_for(&self, pane: usize) -> Option<&'static str> {
+        self.mod_notes.get(&pane).copied()
     }
 
     /// Record the live collisions the overlay computed.

@@ -1030,6 +1030,7 @@ fn golden_status_reply_for_one_pane() {
         status: Some("waiting-approval".to_string()),
         idle_ms: 7000,
         doing: None,
+        mod_health: None,
     };
     assert_eq!(
         reply.to_json(),
@@ -1040,6 +1041,7 @@ fn golden_status_reply_for_one_pane() {
         status: None,
         idle_ms: 0,
         doing: None,
+        mod_health: None,
     };
     assert_eq!(
         unbound.to_json(),
@@ -1093,6 +1095,9 @@ fn golden_metrics_reply_carries_every_state_and_counter() {
         bus_depth: 40,
         bus_last_seq: 57,
         open_decisions: 1,
+        mod_failures: 9,
+        mod_tripped: true,
+        mod_late_hellos: 2,
         ..Metrics::default()
     };
     for status in [
@@ -1110,9 +1115,144 @@ fn golden_metrics_reply_carries_every_state_and_counter() {
     assert_eq!(
         reply_metrics(m).to_json(),
         format!(
-            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500,"panes":{{"working":2,"waiting-approval":1,"waiting-prompt":0,"idle":1,"errored":1,"ended":0,"unbound":2}},"wakes_delivered":12,"held_inboxes":2,"bus_depth":40,"bus_last_seq":57,"open_decisions":1}}"#,
+            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500,"panes":{{"working":2,"waiting-approval":1,"waiting-prompt":0,"idle":1,"errored":1,"ended":0,"unbound":2}},"wakes_delivered":12,"held_inboxes":2,"bus_depth":40,"bus_last_seq":57,"open_decisions":1,"mod_failures":9,"mod_tripped":1,"mod_late_hellos":2}}"#,
             env!("CARGO_PKG_VERSION")
         )
+    );
+}
+
+/// The mod's failure counts ride a `report` as three fields, the way the mod
+/// writes them (`mod/hooks/health.ts`): the counts parse strictly, the class
+/// is one of five words, and the audit label carries how many and which
+/// class, never the message.
+#[test]
+fn report_carries_the_mods_own_failure_counts() {
+    use crate::modstate::{FailClass, FailureReport};
+    let line = build_request(
+        &v(&[
+            "report",
+            "status=working",
+            "fail=tool.call:2,feature.inbox:1",
+            "fail_class=api",
+            "fail_at=feature.inbox",
+            "fail_thrown=2",
+            "fail_msg=HooksError: no implementation for prompt.submit",
+        ]),
+        Some(2),
+    )
+    .unwrap();
+    let req = parse_request(&line).unwrap();
+    let (action, detail) = req.cmd.audit_label();
+    assert_eq!(action, "report");
+    assert_eq!(
+        detail,
+        "status=working context=- answer_len=0 fails=3 class=api"
+    );
+    assert!(
+        !detail.contains("HooksError"),
+        "the message is a pane's text"
+    );
+    match req.cmd {
+        Cmd::Report(r) => assert_eq!(
+            r.failures,
+            Some(FailureReport {
+                counts: vec![
+                    ("tool.call".to_string(), 2),
+                    ("feature.inbox".to_string(), 1)
+                ],
+                class: Some(FailClass::Api),
+                message: Some("HooksError: no implementation for prompt.submit".to_string()),
+                at: Some("feature.inbox".to_string()),
+                thrown: Some(2),
+            })
+        ),
+        other => panic!("expected report, got {other:?}"),
+    }
+    // The counts alone are a report.
+    let line = build_request(&v(&["report", "fail=whoami:1"]), Some(2)).unwrap();
+    assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Report(r) if r.failures.is_some()));
+    // A class or a message without counts, a class that is not one, counts
+    // that do not parse: refused whole.
+    for bad in [
+        r#"{"cmd":"report","fail_class":"api"}"#,
+        r#"{"cmd":"report","fail_msg":"x"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_class":"everything"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_class":7}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_msg":["x"]}"#,
+        r#"{"cmd":"report","fail":"a"}"#,
+        r#"{"cmd":"report","fail":"a:b"}"#,
+        r#"{"cmd":"report","fail":"a:1;rm -rf:2"}"#,
+        r#"{"cmd":"report","fail":{"a":1}}"#,
+        r#"{"cmd":"report","fail":""}"#,
+        r#"{"cmd":"report","fail_at":"hello"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_at":"not a site"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_at":7}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_thrown":-1}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_thrown":"many"}"#,
+        r#"{"cmd":"report","fail_thrown":3}"#,
+    ] {
+        assert!(parse_request(bad).is_err(), "{bad}");
+    }
+    // A report without them is as it always was.
+    let line = build_request(&v(&["report", "status=idle"]), Some(2)).unwrap();
+    assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Report(r) if r.failures.is_none()));
+}
+
+/// A refusal the broker will not change carries `final`, which is what the mod
+/// reads; every other refusal is one it may ask again after.
+#[test]
+fn a_final_refusal_is_marked_and_an_ordinary_one_is_not() {
+    assert_eq!(
+        reply_final("mod set aside: no hello within its window").to_json(),
+        r#"{"ok":false,"err":"mod set aside: no hello within its window","final":true}"#
+    );
+    assert_eq!(
+        reply_err("server busy; ask again").to_json(),
+        r#"{"ok":false,"err":"server busy; ask again"}"#
+    );
+}
+
+/// A pane's mod rides `status <target>` and `answer` under `"mod"`, and the
+/// key is absent for a pane without one, so the wire is unchanged there.
+#[test]
+fn a_panes_mod_is_shown_beside_its_status_and_its_answer() {
+    let health = ModHealth {
+        state: "set-aside".to_string(),
+        why: Some("it reported repeated failures".to_string()),
+        version: Some("0.3.0".to_string()),
+        failures: 5,
+        lost: vec!["inbox".to_string()],
+        hooks: vec![("tool.call".to_string(), 4), ("whoami".to_string(), 1)],
+        class: Some("hook".to_string()),
+        error: Some("Error: boom".to_string()),
+    };
+    let status = with_mod_health(
+        reply_status_one(AgentId(2), Some("working"), 0, None),
+        Some(health.clone()),
+    );
+    assert_eq!(
+        status.to_json(),
+        r#"{"ok":true,"pane":2,"status":"working","idle_ms":0,"mod":{"state":"set-aside","why":"it reported repeated failures","version":"0.3.0","failures":5,"lost":["inbox"],"hooks":{"tool.call":4,"whoami":1},"class":"hook","error":"Error: boom"}}"#
+    );
+    let answer = with_mod_health(reply_answer(AgentId(2), None, None), Some(health));
+    assert!(answer.to_json().contains(r#""mod":{"state":"set-aside""#));
+    // None leaves both as they were, and any other reply untouched.
+    assert_eq!(
+        with_mod_health(reply_status_one(AgentId(2), None, 0, None), None).to_json(),
+        r#"{"ok":true,"pane":2,"status":null,"idle_ms":0}"#
+    );
+    assert_eq!(
+        with_mod_health(reply_err("no"), Some(ModHealth::default())).to_json(),
+        reply_err("no").to_json()
+    );
+    // A pending pane: no version yet, nothing counted.
+    let pending = ModHealth {
+        state: "pending".to_string(),
+        ..ModHealth::default()
+    };
+    assert_eq!(
+        with_mod_health(reply_status_one(AgentId(1), None, 0, None), Some(pending)).to_json(),
+        r#"{"ok":true,"pane":1,"status":null,"idle_ms":0,"mod":{"state":"pending","version":null,"failures":0,"hooks":{},"class":null,"error":null}}"#
     );
 }
 

@@ -436,6 +436,18 @@ pub(super) fn render_metrics(reply: &str) -> Option<String> {
             "gauge",
             "decision_needed events nobody has resolved.",
         ),
+        (
+            "mod_failures",
+            "atrium_mod_failures_total",
+            "counter",
+            "Failures the mods in this session's panes reported of themselves.",
+        ),
+        (
+            "mod_tripped",
+            "atrium_mod_breaker_tripped",
+            "gauge",
+            "1 once the mod's circuit breaker tripped (new claude panes launch without it), else 0.",
+        ),
     ] {
         if let Some(n) = count(&v, key) {
             family(&mut out, name, kind, help);

@@ -455,3 +455,29 @@ fn the_network_proxy_probe_wants_the_features_row() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A `deny` subagent policy reaches the pane as tool rules Claude Code
+/// enforces itself, under both names the subagent tool is known by; `panes`
+/// and `native` add none. This is the function `agent_args` builds the deny
+/// list with.
+#[test]
+fn a_deny_subagent_policy_puts_the_subagent_tool_on_the_deny_list() {
+    let session = vec!["git push".to_string()];
+    let agent = vec!["WebFetch".to_string()];
+    let denied = claude_deny_args(&session, "deny", &agent);
+    assert_eq!(denied[0], "--disallowedTools");
+    for tool in ["Agent", "Task", "Bash(git push*)", "WebFetch"] {
+        assert!(denied.iter().any(|r| r == tool), "{tool} in {denied:?}");
+    }
+    for policy in ["panes", "native", "nonsense"] {
+        let rules = claude_deny_args(&session, policy, &agent);
+        assert!(
+            !rules.iter().any(|r| r == "Agent" || r == "Task"),
+            "{policy}: {rules:?}"
+        );
+        assert!(rules.iter().any(|r| r == "WebFetch"));
+    }
+    // Named twice (the fleet also listed it): once on the list.
+    let twice = claude_deny_args(&["Agent".to_string()], "deny", &[]);
+    assert_eq!(twice.iter().filter(|r| *r == "Agent").count(), 1);
+}

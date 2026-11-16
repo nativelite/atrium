@@ -360,6 +360,248 @@ pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::Ag
     }
 }
 
+/// Is the agent in a pane up, as far as atrium can tell, so that its mod
+/// could have said hello by now? One of three things, each of which this
+/// very process caused:
+///
+/// - its vendor's prompt hint is on its screen (what a queued send waits for);
+/// - something reported a status for it through `ctl report` (its status
+///   hooks or its mod: either means the engine is running this pane's hooks);
+/// - its session's transcript holds an event newer than the pane's launch.
+///
+/// A status that merely *exists* is not enough: a resumed or recovered
+/// session has a transcript, and a status inferred from it, before its
+/// claude has drawn a thing. Nor is a startup dialog (folder trust, a login),
+/// however long it sits there. Pure.
+pub(crate) fn started_by(
+    hint_on_screen: bool,
+    reported: bool,
+    transcript_ms: Option<u64>,
+    launch_ms: u64,
+) -> bool {
+    hint_on_screen || reported || transcript_ms.is_some_and(|t| t > launch_ms)
+}
+
+/// [`started_by`] for a live pane.
+pub(crate) fn pane_started(
+    pane: &Pane,
+    world: &atrium::vendors::AgentState,
+    mods: &atrium::modstate::ModState,
+) -> bool {
+    let hint = atrium::vendors::vendor_for_stem(&pane.title)
+        .and_then(atrium::vendors::prompt_marker)
+        .is_some_and(|hint| crate::ctl_server::screen_has(pane.term.screen(), hint));
+    let reported = mods
+        .report_for(pane.agent_id.0)
+        .is_some_and(|r| r.status.is_some());
+    let transcript_ms = pane.session_id.as_deref().and_then(|id| {
+        world
+            .sessions()
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.last_ts_ms)
+    });
+    started_by(hint, reported, transcript_ms, pane.launch_ms)
+}
+
+/// Which claude to ask its version when a trip is to be written down: the
+/// recorded program of a pane atrium launched with the mod, one that missed
+/// its window before any other, and only if it is a claude (`is_claude`:
+/// `atrium::bind::is_claude_stem` of its stem). `None`: no such pane, so no
+/// version, so no record. Never "the first pane in window order", which may
+/// be a shell or another agent. Pure.
+pub(crate) fn trip_program(
+    panes: &[(bool, bool, Option<String>)],
+    is_claude: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    // (launched with the mod, missed its window, its program)
+    let pick = |want_missed: bool| {
+        panes
+            .iter()
+            .filter(|(launched, missed, _)| *launched && *missed == want_missed)
+            .filter_map(|(_, _, program)| program.clone())
+            .find(|p| is_claude(p))
+    };
+    pick(true).or_else(|| pick(false))
+}
+
+/// The pane at the top of `pane`'s spawn tree (itself when nothing spawned
+/// it), from the broker's own record of parents.
+pub(crate) fn root_of(parents: &[(AgentId, Option<AgentId>)], pane: AgentId) -> AgentId {
+    let mut at = pane;
+    for _ in 0..64 {
+        match parents
+            .iter()
+            .find(|(id, _)| *id == at)
+            .and_then(|(_, p)| *p)
+        {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    at
+}
+
+/// Does this session have a mod whose health is atrium's to watch: it uses
+/// the mod (`"mod": false` in the config or the fleet says no), it has a
+/// control plane for a hello to arrive on, and it has launched at least one
+/// pane with the mod? Otherwise the health phase does nothing: no window, no
+/// bar line, no decision, no record, whatever any pane reports. Pure.
+pub(crate) fn health_runs(enabled: bool, ctl_on: bool, ever_injected: bool) -> bool {
+    enabled && ctl_on && ever_injected
+}
+
+/// The bar's one flash slot: a line and when it was raised.
+pub(crate) type Flash = Option<(String, Instant)>;
+
+/// What the health phase writes to, lent for one pass.
+pub(crate) struct HealthOut<'a> {
+    pub(crate) flash: &'a mut Option<(String, Instant)>,
+    pub(crate) audit: &'a mut atrium::audit::Audit,
+    pub(crate) bus: &'a mut atrium::bus::Bus,
+}
+
+/// Act on what a health tick found (`atrium::modstate::HealthEvent`): say
+/// each on the bar (`said` is called before each new line, so a headless
+/// session prints every one), record it, and for a trip post the one
+/// decision that offers a respawn of the panes still running the mod.
+/// Nothing here restarts, kills or types into a pane. `label` names a pane
+/// for a person; `recovered` and `trip` are `atrium::modfiles`' two calls,
+/// passed in so this is testable without the session's globals.
+pub(crate) fn apply_health_events(
+    events: Vec<atrium::modstate::HealthEvent>,
+    now_ms: u64,
+    out: &mut HealthOut<'_>,
+    label: &dyn Fn(usize) -> Option<String>,
+    said: &mut dyn FnMut(&mut Flash),
+    recovered: &mut dyn FnMut() -> Option<String>,
+    trip: &mut dyn FnMut(&str, bool) -> atrium::modfiles::Kept,
+) {
+    use atrium::modstate::HealthEvent;
+    for event in events {
+        said(out.flash);
+        match event {
+            HealthEvent::Healthy { .. } => {
+                if let Some(line) = recovered() {
+                    out.audit.record(None, "mod-back", "", true, "");
+                    *out.flash = Some((line, Instant::now()));
+                }
+            }
+            HealthEvent::SetAside { pane, why } => {
+                out.audit.record(
+                    None,
+                    "mod-set-aside",
+                    &format!("pane={pane}"),
+                    true,
+                    why.label(),
+                );
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: mod set aside ({}); it runs as a pane without one \
+                         (sends are typed)",
+                        why.label()
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::InboxLost { pane } => {
+                out.audit
+                    .record(None, "mod-inbox-lost", &format!("pane={pane}"), true, "");
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: its mod stopped collecting deliveries; sends are typed \
+                         into it now"
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::FeatureLost { pane, feature } => {
+                out.audit.record(
+                    None,
+                    "mod-feature-lost",
+                    &format!("pane={pane} feature={feature}"),
+                    true,
+                    "",
+                );
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: its mod lost `{feature}` (this Claude Code lacks what it \
+                         calls); the rest of the mod goes on"
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::Tripped {
+                reason,
+                running,
+                remember,
+            } => {
+                let kept = trip(&reason, remember);
+                let labels: Vec<String> = running.iter().filter_map(|id| label(*id)).collect();
+                out.audit.record(
+                    None,
+                    "mod-breaker",
+                    &format!("running={} kept={kept:?}", labels.len()),
+                    true,
+                    &reason,
+                );
+                if !labels.is_empty() {
+                    if let Err(e) = out.bus.publish(
+                        "atrium",
+                        atrium::bus::Kind::DecisionNeeded,
+                        None,
+                        &[("msg".to_string(), trip_decision(&reason, &labels))],
+                        now_ms,
+                    ) {
+                        out.audit
+                            .record(None, "mod-breaker", "decision not posted", false, &e);
+                    }
+                }
+                *out.flash = Some((trip_line(&reason, kept, labels.len()), Instant::now()));
+            }
+        }
+    }
+}
+
+/// The one line the bar says when the breaker trips.
+pub(crate) fn trip_line(reason: &str, kept: atrium::modfiles::Kept, running: usize) -> String {
+    use atrium::modfiles::Kept;
+    let mut line = format!(
+        "mod backed out: {reason}. New claude panes launch without it{}",
+        match kept {
+            Kept::Recorded => ", in later sessions too until Claude Code or the mod changes",
+            Kept::Session => " for this session",
+            Kept::SessionNotCurrent =>
+                " for this session (the installed mod is not this atrium's own copy: run \
+                 `atrium mod install`)",
+        }
+    );
+    if running > 0 {
+        line.push_str(&format!(
+            "; the {running} pane{} that {} it {} left as {} (see the bus)",
+            if running == 1 { "" } else { "s" },
+            if running == 1 { "has" } else { "have" },
+            if running == 1 { "is" } else { "are" },
+            if running == 1 { "it is" } else { "they are" }
+        ));
+    }
+    line.push_str(". `atrium mod status` says more");
+    line
+}
+
+/// The decision posted when the breaker trips with panes still running the
+/// mod: atrium does not restart a working agent, it offers.
+pub(crate) fn trip_decision(reason: &str, running: &[String]) -> String {
+    format!(
+        "the mod was backed out ({reason}). {} still run{} with it loaded and {} left alone: \
+         respawn one with `atrium ctl respawn <pane>` to drop the mod from it, or resolve this \
+         to leave them",
+        running.join(", "),
+        if running.len() == 1 { "s" } else { "" },
+        if running.len() == 1 { "is" } else { "are" }
+    )
+}
+
 /// Phase 7 of the loop: one bar entry per window — its focused pane's title,
 /// identity and role, whether it is active, and what it flags.
 pub(crate) fn bar_infos(
@@ -377,6 +619,9 @@ pub(crate) fn bar_infos(
             badge: w
                 .bar_pane()
                 .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
+            // The flag on its mod, from the broker's state, in a segment of
+            // its own: a pane's title cannot spell it.
+            mod_note: w.bar_pane().and_then(|p| world.mod_note_for(p.agent_id.0)),
             active: i == active,
             // A window is "waiting" when a bound agent pane in it is blocked
             // on the human (§4.2 rung 3). Status only.
@@ -666,5 +911,305 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The breaker's one bar line says why, what happens to new panes, for
+    /// how long, and that nothing running was touched.
+    #[test]
+    fn the_trip_line_says_why_how_long_and_that_running_panes_are_left() {
+        use super::trip_line;
+        use atrium::modfiles::Kept;
+        let line = trip_line(
+            "2 claude panes loaded it and never said hello",
+            Kept::Recorded,
+            2,
+        );
+        assert!(line.starts_with("mod backed out: 2 claude panes loaded it and never said hello."));
+        assert!(
+            line.contains("until Claude Code or the mod changes"),
+            "{line}"
+        );
+        assert!(
+            line.contains("the 2 panes that have it are left as they are"),
+            "{line}"
+        );
+        assert!(!line.contains("relaunch"), "{line}");
+        assert!(line.ends_with("`atrium mod status` says more"), "{line}");
+        let session_only = trip_line("why", Kept::Session, 0);
+        assert!(session_only.contains("for this session"), "{session_only}");
+        assert!(!session_only.contains("left as"));
+        // What ran was not this atrium's own copy: nothing is remembered, and
+        // the line names the fix.
+        let stale = trip_line("why", Kept::SessionNotCurrent, 0);
+        assert!(
+            stale.contains("for this session") && stale.contains("atrium mod install"),
+            "{stale}"
+        );
+        assert!(!stale.contains("later sessions"), "{stale}");
+        let one = trip_line("why", Kept::Recorded, 1);
+        assert!(
+            one.contains("the 1 pane that has it is left as it is"),
+            "{one}"
+        );
+    }
+
+    /// A working pane is offered a respawn on the bus, by name, never given one.
+    #[test]
+    fn the_trip_decision_names_the_panes_and_offers_a_respawn() {
+        use super::trip_decision;
+        let one = trip_decision("why", &["2 (builder)".to_string()]);
+        assert!(
+            one.contains("2 (builder) still runs with it loaded and is left alone"),
+            "{one}"
+        );
+        assert!(one.contains("atrium ctl respawn <pane>"), "{one}");
+        let two = trip_decision("why", &["1".to_string(), "2".to_string()]);
+        assert!(
+            two.contains("1, 2 still run with it loaded and are left alone"),
+            "{two}"
+        );
+    }
+
+    /// The hello window opens on something this process's pane did: a status
+    /// that was already there for a resumed or recovered session is not it.
+    #[test]
+    fn a_pane_is_started_by_its_own_doing_not_by_a_transcript_that_was_already_there() {
+        use super::started_by;
+        let launch: u64 = 10_000_000;
+        // A recovered session: its transcript, and the status inferred from
+        // it, are an hour old when the pane is launched. Not started.
+        assert!(!started_by(false, false, Some(launch - 3_600_000), launch));
+        assert!(!started_by(false, false, Some(launch), launch));
+        // It writes to the transcript: started.
+        assert!(started_by(false, false, Some(launch + 1), launch));
+        // No transcript at all (a fresh session at a trust dialog): not started.
+        assert!(!started_by(false, false, None, launch));
+        // The prompt hint, or a status reported through ctl: started.
+        assert!(started_by(true, false, None, launch));
+        assert!(started_by(false, true, Some(launch - 3_600_000), launch));
+    }
+
+    /// A session with no mod to watch runs no health phase.
+    #[test]
+    fn the_health_phase_runs_only_where_there_is_a_mod_to_watch() {
+        use super::health_runs;
+        assert!(health_runs(true, true, true));
+        assert!(!health_runs(false, true, true), "\"mod\": false");
+        assert!(!health_runs(true, false, true), "no control plane");
+        assert!(!health_runs(true, true, false), "no pane was given the mod");
+    }
+
+    /// What the health phase does with each thing a tick finds, with the
+    /// session's two globals stood in for.
+    #[test]
+    fn health_events_become_bar_lines_audit_rows_and_one_decision() {
+        use super::{apply_health_events, HealthOut};
+        use atrium::modstate::{Aside, HealthEvent};
+        let mut flash = None;
+        let mut audit = atrium::audit::Audit::in_memory();
+        let mut bus = atrium::bus::Bus::new();
+        let mut said: Vec<String> = Vec::new();
+        let mut trips: Vec<(String, bool)> = Vec::new();
+        let mut recoveries = 0;
+        let events = vec![
+            HealthEvent::Healthy { pane: 3 },
+            HealthEvent::SetAside {
+                pane: 1,
+                why: Aside::NoHello,
+            },
+            HealthEvent::InboxLost { pane: 4 },
+            HealthEvent::FeatureLost {
+                pane: 3,
+                feature: "inbox",
+            },
+            HealthEvent::Tripped {
+                reason: "2 claude panes loaded it and never said hello".to_string(),
+                running: vec![1, 2, 99],
+                remember: true,
+            },
+        ];
+        apply_health_events(
+            events,
+            5,
+            &mut HealthOut {
+                flash: &mut flash,
+                audit: &mut audit,
+                bus: &mut bus,
+            },
+            // Pane 99 left between the tick and here: it is simply not named.
+            &|id| (id != 99).then(|| format!("{id} (builder)")),
+            &mut |flash| {
+                if let Some((line, _)) = flash.take() {
+                    said.push(line);
+                }
+            },
+            &mut || {
+                recoveries += 1;
+                Some("mod: back on".to_string())
+            },
+            &mut |reason, remember| {
+                trips.push((reason.to_string(), remember));
+                atrium::modfiles::Kept::Recorded
+            },
+        );
+        // Every line was said, in order; the last one is still on the bar.
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert_eq!(said[0], "mod: back on");
+        assert!(said[1].starts_with("pane 1: mod set aside (no hello within its window)"));
+        assert!(said[2].starts_with("pane 4: its mod stopped collecting"));
+        assert!(said[3].starts_with("pane 3: its mod lost `inbox`"));
+        let last = flash.expect("the trip line").0;
+        assert!(
+            last.starts_with("mod backed out:") && last.contains("the 2 panes"),
+            "{last}"
+        );
+        assert_eq!(recoveries, 1);
+        // The trip went to modfiles once, with what the tick decided.
+        assert_eq!(
+            trips,
+            vec![(
+                "2 claude panes loaded it and never said hello".to_string(),
+                true
+            )]
+        );
+        // One decision, naming the panes, offering a respawn.
+        let open = bus.pending_decisions();
+        assert_eq!(open.len(), 1);
+        let msg = open[0].fields.get("msg").cloned().unwrap_or_default();
+        assert!(
+            msg.contains("1 (builder), 2 (builder) still run")
+                && msg.contains("atrium ctl respawn"),
+            "{msg}"
+        );
+        // And nothing here could have restarted a pane: it holds no pane.
+
+        // A trip with nobody running posts no decision; one not to remember
+        // is passed on as such.
+        let mut flash = None;
+        let mut bus = atrium::bus::Bus::new();
+        let mut asked = None;
+        apply_health_events(
+            vec![HealthEvent::Tripped {
+                reason: "why".to_string(),
+                running: vec![],
+                remember: false,
+            }],
+            5,
+            &mut HealthOut {
+                flash: &mut flash,
+                audit: &mut audit,
+                bus: &mut bus,
+            },
+            &|_| None,
+            &mut |_| {},
+            &mut || None,
+            &mut |_, remember| {
+                asked = Some(remember);
+                atrium::modfiles::Kept::Session
+            },
+        );
+        assert_eq!(asked, Some(false));
+        assert!(bus.pending_decisions().is_empty());
+        assert!(flash.expect("a line").0.contains("for this session"));
+    }
+
+    /// The claude asked its version at a trip is one atrium launched with the
+    /// mod, a pane that missed its window first: never whatever pane happens
+    /// to come first in window order.
+    #[test]
+    fn the_version_at_a_trip_is_asked_of_a_claude_that_ran_the_mod() {
+        use super::trip_program;
+        let claude = |p: &str| p == "claude" || p == "claude2";
+        let some = |s: &str| Some(s.to_string());
+        // (launched with the mod, missed its window, program)
+        // A shell first in window order, then an alias that missed.
+        assert_eq!(
+            trip_program(
+                &[
+                    (false, false, some("cmd")),
+                    (true, false, some("claude")),
+                    (true, true, some("claude2")),
+                ],
+                &claude
+            ),
+            some("claude2")
+        );
+        // Nobody missed (a trip made of reports): a pane launched with it.
+        assert_eq!(
+            trip_program(
+                &[(false, false, some("sh")), (true, false, some("claude"))],
+                &claude
+            ),
+            some("claude")
+        );
+        // A claude atrium launched without the mod is not asked.
+        assert_eq!(
+            trip_program(&[(false, false, some("claude"))], &claude),
+            None
+        );
+        // A pane launched with the mod whose program is no claude (it cannot
+        // be, but the record must not rest on it): no version, no record.
+        assert_eq!(trip_program(&[(true, true, some("cmd"))], &claude), None);
+        assert_eq!(trip_program(&[(true, true, None)], &claude), None);
+        assert_eq!(trip_program(&[], &claude), None);
+    }
+
+    /// The root of a pane's spawn tree, which is what two seats must differ
+    /// in for a trip to be written down.
+    #[test]
+    fn the_root_of_a_pane_is_the_top_of_its_spawn_tree() {
+        use super::root_of;
+        let parents = vec![
+            (AgentId(1), None),
+            (AgentId(2), Some(AgentId(1))),
+            (AgentId(3), Some(AgentId(2))),
+            (AgentId(4), None),
+            // A cycle cannot hang the walk.
+            (AgentId(8), Some(AgentId(9))),
+            (AgentId(9), Some(AgentId(8))),
+        ];
+        assert_eq!(root_of(&parents, AgentId(3)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(2)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(1)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(4)), AgentId(4));
+        assert_eq!(
+            root_of(&parents, AgentId(77)),
+            AgentId(77),
+            "unknown: itself"
+        );
+        let _ = root_of(&parents, AgentId(8));
+    }
+
+    /// `pane_started` on a real pane: nothing yet, then the prompt hint on
+    /// its screen, or a status reported for it.
+    #[test]
+    fn a_live_pane_is_started_by_its_prompt_hint_or_a_reported_status() {
+        use super::pane_started;
+        let world = atrium::vendors::AgentState::default();
+        let mut mods = atrium::modstate::ModState::default();
+        let mut pane = idle_pane();
+        pane.title = "claude".to_string();
+        assert!(!pane_started(&pane, &world, &mods), "a blank screen");
+        // A startup dialog is not the prompt.
+        pane.term
+            .feed(b"Do you trust the files in this folder?\r\n");
+        assert!(!pane_started(&pane, &world, &mods));
+        // A status reported through ctl (its status hooks spoke).
+        mods.report(
+            pane.agent_id.0,
+            &atrium::modstate::Report {
+                status: Some(atrium::modstate::ModStatus::Working),
+                ..atrium::modstate::Report::default()
+            },
+            1,
+        );
+        assert!(pane_started(&pane, &world, &mods));
+        // Or the prompt hint on its screen.
+        let mods = atrium::modstate::ModState::default();
+        pane.term.feed(b"\r\n? for shortcuts\r\n");
+        assert!(pane_started(&pane, &world, &mods));
+        // The same hint in a pane that is no agent's says nothing.
+        pane.title = "cmd".to_string();
+        assert!(!pane_started(&pane, &world, &mods));
     }
 }

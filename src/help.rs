@@ -211,12 +211,23 @@ usage: atrium mod <command>    the plugin of function hooks a claude pane loads
   install [--at <dir>]  write the mod built into this atrium to its folder (the config's
                         mod.path, else mod/ under the platform config directory, else <dir>);
                         an upgrade of atrium is an upgrade of the mod, a hand edit is restored
-  status                what is installed there, and whether claude panes will load it
+  status                what is installed there, whether claude panes will load it, whether
+                        the breaker backed the mod out (against which versions, and when),
+                        and the failures a running session's mods reported
+  retry                 forget that the breaker tripped: the next session loads the mod again
 
 Once installed, every claude pane atrium spawns gets CLAUDE_CODE_PLUGIN_DIRS naming the
 folder and reports its status to atrium for certain instead of by inference. ATRIUM_MOD
 names the folder outright; \"mod\": false in config.json or a fleet turns injection off.
-See PLAN-mod.md and mod/README.md.
+
+`install` marks the folder it writes and clears the breaker's record; a launch keeps a
+marked folder current with the atrium that runs (one line when it rewrote a file) and
+never writes to any other. A pane whose mod says no hello within 30 s of starting, or
+reports that its hooks keep failing, runs as a pane without one. When two panes do, new
+claude panes launch without the mod for the session and nothing running is restarted.
+Later sessions too, until Claude Code or the mod changes or `atrium mod retry`, only when
+atrium itself saw two separately launched panes miss the window and none say hello.
+See mod/README.md and docs/control-plane.md.
 ";
 
 /// `atrium recover --help`.

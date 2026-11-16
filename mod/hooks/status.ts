@@ -3,7 +3,7 @@
 // so every rule is tested by `claude plugin test` with nothing mocked.
 
 /** This mod's version, sent in `hello`. */
-export const MOD_VERSION = '0.2.0'
+export const MOD_VERSION = '0.3.0'
 
 /**
  * The capabilities this version implements, offered in `hello`. The broker

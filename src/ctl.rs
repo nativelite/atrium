@@ -72,7 +72,9 @@ pub use reply::{
     reply_spawned, reply_status_one, reply_who, reply_whoami, zero_sub_warning, InboxItem,
     ListNode, Reply, TreeNode, WhoEntry, IDLE_RENDER_MIN_MS,
 };
-pub use reply::{reply_metrics, reply_pong, Metrics, PANE_STATES};
+pub use reply::{
+    reply_final, reply_metrics, reply_pong, with_mod_health, Metrics, ModHealth, PANE_STATES,
+};
 pub use request::{
     parse_request, parse_spawn_size, AgentId, AnswerReq, AskReq, AskedReq, AuditReq, BoardOp,
     BusOp, Cmd, CommandReq, HelloReq, InboxReq, KillReq, ReportReq, Request, RespawnReq, SendReq,

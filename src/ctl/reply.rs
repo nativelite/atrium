@@ -98,6 +98,9 @@ pub enum Reply {
         /// The caption the pane's mod reported, when fresh; the key is left
         /// out otherwise, so the wire is unchanged for a pane without one.
         doing: Option<String>,
+        /// The pane's mod, when it has one or was launched with one; the
+        /// key is left out otherwise.
+        mod_health: Option<Box<ModHealth>>,
     },
     Tree(Vec<ListNode>),
     /// `{"ok":true,"pane":N,"accepted":[...]}` — the caps a `hello` was granted.
@@ -120,6 +123,8 @@ pub enum Reply {
         status: Option<String>,
         seq: Option<u64>,
         answer: Option<String>,
+        /// As on [`Reply::StatusOne`].
+        mod_health: Option<Box<ModHealth>>,
     },
     /// `{"ok":true,"items":[{"kind":"send"|"wake"|"ask","text":...[,"id":N]},...]}`
     /// — the caller's deliveries and queued questions, taken.
@@ -137,6 +142,13 @@ pub enum Reply {
         path: String,
         panes: Vec<WhoEntry>,
     },
+    /// `{"ok":false,"err":"<msg>","final":true}` — a refusal that is the
+    /// broker's own decision about the caller's mod and will not change: its
+    /// mod was set aside, or its hello is not one this session takes. The mod
+    /// reads `final` and stops for the session; every other refusal (a busy
+    /// listener, a request too large, a verb it does not know) is one it may
+    /// ask again after.
+    Final(String),
     /// `{"ok":true,"atrium":V,"uptime_ms":N}` — the run loop answered a `ping`.
     Pong {
         uptime_ms: u64,
@@ -180,6 +192,15 @@ pub struct Metrics {
     pub bus_last_seq: u64,
     /// `decision_needed` events nobody has resolved.
     pub open_decisions: usize,
+    /// Failures the mods in this session's panes reported of themselves, as
+    /// a counter: a pane that leaves does not lower it.
+    pub mod_failures: u64,
+    /// `1` once the mod's circuit breaker tripped in this session (new claude
+    /// panes launch without the mod), else `0`.
+    pub mod_tripped: bool,
+    /// Panes atrium launched with the mod that said hello after the breaker
+    /// tripped: a sign the mod may be fine after all.
+    pub mod_late_hellos: u32,
 }
 
 impl Metrics {
@@ -190,6 +211,51 @@ impl Metrics {
             .and_then(|s| PANE_STATES.iter().position(|known| *known == s))
             .unwrap_or(PANE_STATES.len() - 1);
         self.panes[at] += 1;
+    }
+}
+
+/// A pane's mod, as `status <target>` and `answer` show it under `"mod"`:
+/// `{"state":S,"version":V|null,"failures":N,"hooks":{<hook>:N,…},
+/// "class":C|null,"error":M|null}`. `state` is `ok` (it said hello and holds
+/// its caps), `pending` (launched with the mod, no hello yet), `no-inbox` (it
+/// stopped collecting its deliveries; they are typed), or `set-aside` with
+/// `why`. `error` is the last failure's message as the mod sent it, scrubbed
+/// and cut by the broker: a pane's text, for a reader, never an instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ModHealth {
+    pub state: String,
+    /// Why it was set aside, when it was.
+    pub why: Option<String>,
+    pub version: Option<String>,
+    pub failures: u64,
+    /// The features its mod lost to a missing engine method.
+    pub lost: Vec<String>,
+    pub hooks: Vec<(String, u64)>,
+    pub class: Option<String>,
+    pub error: Option<String>,
+}
+
+impl ModHealth {
+    fn to_value(&self) -> Value {
+        let mut pairs = vec![("state", s(&self.state))];
+        if let Some(why) = &self.why {
+            pairs.push(("why", s(why)));
+        }
+        pairs.push(("version", opt_s(&self.version)));
+        pairs.push(("failures", u(self.failures)));
+        if !self.lost.is_empty() {
+            pairs.push((
+                "lost",
+                Value::Array(self.lost.iter().map(|f| s(f)).collect()),
+            ));
+        }
+        pairs.push((
+            "hooks",
+            Value::Object(self.hooks.iter().map(|(h, n)| (h.clone(), u(*n))).collect()),
+        ));
+        pairs.push(("class", opt_s(&self.class)));
+        pairs.push(("error", opt_s(&self.error)));
+        obj(pairs)
     }
 }
 
@@ -248,6 +314,11 @@ impl Reply {
         let ok = ("ok", Value::Bool(true));
         match self {
             Reply::Err(msg) => obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]),
+            Reply::Final(msg) => obj(vec![
+                ("ok", Value::Bool(false)),
+                ("err", s(msg)),
+                ("final", Value::Bool(true)),
+            ]),
             Reply::BoardEntry { key, entry } => obj(vec![
                 ok,
                 ("key", s(key)),
@@ -359,6 +430,7 @@ impl Reply {
                 status,
                 idle_ms,
                 doing,
+                mod_health,
             } => {
                 let mut pairs = vec![
                     ok,
@@ -368,6 +440,9 @@ impl Reply {
                 ];
                 if let Some(d) = doing {
                     pairs.push(("doing", s(d)));
+                }
+                if let Some(m) = mod_health {
+                    pairs.push(("mod", m.to_value()));
                 }
                 obj(pairs)
             }
@@ -443,13 +518,20 @@ impl Reply {
                 status,
                 seq,
                 answer,
-            } => obj(vec![
-                ok,
-                ("pane", i(pane.0)),
-                ("status", opt_s(status)),
-                ("seq", seq.map(u).unwrap_or(Value::Null)),
-                ("answer", opt_s(answer)),
-            ]),
+                mod_health,
+            } => {
+                let mut pairs = vec![
+                    ok,
+                    ("pane", i(pane.0)),
+                    ("status", opt_s(status)),
+                    ("seq", seq.map(u).unwrap_or(Value::Null)),
+                    ("answer", opt_s(answer)),
+                ];
+                if let Some(m) = mod_health {
+                    pairs.push(("mod", m.to_value()));
+                }
+                obj(pairs)
+            }
             Reply::Pong { uptime_ms } => obj(vec![
                 ok,
                 ("atrium", s(env!("CARGO_PKG_VERSION"))),
@@ -472,6 +554,9 @@ impl Reply {
                 ("bus_depth", i(m.bus_depth)),
                 ("bus_last_seq", u(m.bus_last_seq)),
                 ("open_decisions", i(m.open_decisions)),
+                ("mod_failures", u(m.mod_failures)),
+                ("mod_tripped", u(u64::from(m.mod_tripped))),
+                ("mod_late_hellos", u(u64::from(m.mod_late_hellos))),
             ]),
             Reply::Tree(nodes) => obj(vec![
                 ok,
@@ -518,6 +603,11 @@ impl std::fmt::Display for Reply {
 /// `{"ok":false,"err":"<msg>"}`
 pub fn reply_err(msg: &str) -> Reply {
     Reply::Err(msg.to_string())
+}
+
+/// `{"ok":false,"err":"<msg>","final":true}`: see [`Reply::Final`].
+pub fn reply_final(msg: &str) -> Reply {
+    Reply::Final(msg.to_string())
 }
 
 /// `{"ok":true,"pane":N,"accepted":[...]}` — a `hello` taken.
@@ -578,6 +668,7 @@ pub fn reply_answer(pane: AgentId, status: Option<&str>, answer: Option<(&str, u
         status: status.map(str::to_string),
         seq: answer.map(|(_, s)| s),
         answer: answer.map(|(t, _)| t.to_string()),
+        mod_health: None,
     }
 }
 
@@ -814,6 +905,43 @@ pub fn reply_status_one(
         status: status.map(str::to_string),
         idle_ms,
         doing: doing.map(str::to_string),
+        mod_health: None,
+    }
+}
+
+/// `reply` with the pane's mod beside it (`"mod":{…}`), for the two replies
+/// that show one: a single target's `status` and `answer`. Any other reply
+/// comes back as it was.
+pub fn with_mod_health(reply: Reply, health: Option<ModHealth>) -> Reply {
+    let health = health.map(Box::new);
+    match reply {
+        Reply::StatusOne {
+            pane,
+            status,
+            idle_ms,
+            doing,
+            ..
+        } => Reply::StatusOne {
+            pane,
+            status,
+            idle_ms,
+            doing,
+            mod_health: health,
+        },
+        Reply::Answer {
+            pane,
+            status,
+            seq,
+            answer,
+            ..
+        } => Reply::Answer {
+            pane,
+            status,
+            seq,
+            answer,
+            mod_health: health,
+        },
+        other => other,
     }
 }
 

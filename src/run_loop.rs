@@ -257,6 +257,8 @@ impl RunState<'_> {
 
         self.refresh_agents();
 
+        self.mod_health();
+
         self.resync_screen();
 
         // 5c. the host terminal's title and the needs-you ring (`attention`):
@@ -436,26 +438,121 @@ impl RunState<'_> {
                 keep.push((ticket, pane));
                 continue;
             }
-            let reply = atrium::ctl::reply_inbox(items);
+            let reply = atrium::ctl::reply_inbox(items.clone());
             match listener.respond_parked(ticket, &reply.to_json()) {
                 Ok(()) => {
                     self.ctl_audit.record(Some(pane), "inbox", "wait", true, "");
                 }
-                // The client left before its delivery: the items are lost to
-                // it, as they would be to a poll whose reply never arrived.
-                // Say so where the operator can see it.
+                // The client left before its delivery. What it was to take is
+                // put back in the queue rather than lost: its next poll
+                // collects it, or it is typed once the mod has lost the cap.
                 Err(e) => {
-                    self.ctl_audit.record(
-                        Some(pane),
-                        "inbox",
-                        "wait",
-                        false,
-                        &format!("held reply not delivered: {e}"),
+                    crate::ctl_server::held_reply_lost(
+                        &mut self.pending_sends,
+                        &mut self.ctl_audit,
+                        pane,
+                        &items,
+                        &e.to_string(),
                     );
                 }
             }
         }
         self.held_inboxes = keep;
+    }
+
+    /// The mod's health and its circuit breaker ([`atrium::modstate`]): expect
+    /// a hello from each pane the spawn path gave the mod, and act on what the
+    /// tick finds ([`apply_health_events`]). A pane whose mod is set aside, or
+    /// stopped collecting, runs as one without a mod from here on (its queued
+    /// sends are typed by the very next [`flush_sends`]). When the breaker
+    /// trips, new claude panes launch without the mod
+    /// ([`atrium::modfiles::trip`]); every pane that is running is left as it
+    /// is, flagged, and one decision on the bus offers a respawn. Nothing is
+    /// restarted here.
+    ///
+    /// A session with no mod to watch does none of it ([`health_runs`]).
+    fn mod_health(&mut self) {
+        let injected = atrium::modstate::take_injected();
+        if !health_runs(
+            atrium::modfiles::session_enabled(),
+            self.ctl_listener.is_some(),
+            atrium::modstate::ever_injected(),
+        ) {
+            return;
+        }
+        for pane in injected {
+            self.mods.expect_mod(pane);
+        }
+        let now = atrium::session_store::now_ms();
+        if !self.mods.health_due(now) {
+            return;
+        }
+        let parents = crate::ctl_server::ctl_parents(&self.windows);
+        let live: Vec<atrium::modstate::PaneSeen> = self
+            .windows
+            .iter()
+            .flat_map(|w| w.panes.iter())
+            .filter(|p| !p.exited)
+            .map(|p| atrium::modstate::PaneSeen {
+                pane: p.agent_id.0,
+                root: root_of(&parents, p.agent_id).0,
+                // Asked only of a pane still owed its first sight, and only
+                // until it is seen.
+                started: self.mods.awaiting_start(p.agent_id.0)
+                    && pane_started(p, &self.world, &self.mods),
+            })
+            .collect();
+        let events = self.mods.health_tick(now, &live);
+        if events.is_empty() {
+            return;
+        }
+        // The trip is kept against the Claude Code that ran the mod: a pane
+        // atrium launched with it, one that missed its window first, is asked
+        // its version (cached; two seconds at most), and only when the trip is
+        // one to remember ([`trip_program`]).
+        let candidates: Vec<(bool, bool, Option<String>)> = self
+            .windows
+            .iter()
+            .flat_map(|w| w.panes.iter())
+            .map(|p| {
+                (
+                    self.mods.expects(p.agent_id.0),
+                    self.mods.aside(p.agent_id.0) == Some(atrium::modstate::Aside::NoHello),
+                    p.argv.first().cloned(),
+                )
+            })
+            .collect();
+        let program = trip_program(&candidates, &|p| {
+            atrium::bind::is_claude_stem(&atrium::bind::command_stem(p))
+        });
+        let (windows, host) = (&self.windows, &self.host);
+        apply_health_events(
+            events,
+            now,
+            &mut HealthOut {
+                flash: &mut self.flash,
+                audit: &mut self.ctl_audit,
+                bus: &mut self.bus,
+            },
+            &|id| {
+                windows
+                    .iter()
+                    .flat_map(|w| w.panes.iter())
+                    .find(|p| p.agent_id.0 == id)
+                    .map(|p| crate::ctl_server::pane_label(p.agent_id, p.role.as_deref()))
+            },
+            &mut |flash| host.report_flash(flash),
+            &mut atrium::modfiles::recovered,
+            &mut |reason, remember| {
+                let version = match (&program, remember) {
+                    (Some(p), true) => claude_version(p),
+                    _ => None,
+                };
+                atrium::modfiles::trip(reason, version.as_deref(), remember)
+            },
+        );
+        self.lay_mod_reports();
+        self.force_repaint = true;
     }
 
     /// Lay every fresh mod-reported status over the inferred snapshot
