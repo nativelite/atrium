@@ -49,6 +49,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   state names, never a pane's role or title. Neither verb repaints, and
   neither is written to the audit log, which a probe every few seconds would
   otherwise fill. Both reply shapes are pinned by `golden_*` tests.
+- **Headless sessions: `atrium fleet up <name> --headless [--size
+  <rows>x<cols>]`.** A fleet runs with no terminal on stdin or stdout, for a
+  service manager, a container or a job runner. No raw mode is entered,
+  nothing is read from stdin, stdout is never written to (frames are dropped
+  where they are made, so a full or closed pipe cannot stall the loop and a
+  log file gets no escape sequences), and nothing asks a terminal for its
+  size: the panes are laid out at `--size` (default `50x200`; rows 3 to 500,
+  columns 10 to 1000). The panes and their emulators run as they do attached,
+  so the ctl reads, sends from the session's own panes, the board, the bus
+  and the session snapshot all work (from outside a pane, a write needs an
+  operator token). What the status bar would have flashed goes to stderr, one line
+  each. `--headless` is refused, with the reason, without the control channel
+  (`--allow-ctl` or the fleet's `allow_ctl`: nothing else could reach the
+  session), without `ATRIUM_YES=1` (nobody is there for the banner's Enter),
+  at the `skip` posture whatever is set (full bypass is confirmed by a person
+  at a terminal, and `ATRIUM_YES` never stands in for that), and when the
+  endpoint cannot be bound. The resume offer is not made. The session ends when its last pane
+  exits or on a termination signal (`SIGTERM`, `SIGINT`, `SIGHUP`; on Windows
+  Ctrl+C, Ctrl+Break or the console closing, taken by a handler installed for
+  headless sessions only), through the teardown an attached session runs.
+  Flags go after the fleet's name (`atrium fleet up <name> --headless`); the
+  `atrium <flags> up <name>` alias does not take them. `atrium attach` is not
+  part of this: a headless session is reached through `ctl` only. The run loop
+  now runs on a host (`run_loop::Host`: the attached terminal, or nobody),
+  the seam an attach can plug into; an attached session asks its terminal
+  exactly what it did before.
 
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real

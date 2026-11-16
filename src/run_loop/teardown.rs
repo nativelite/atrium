@@ -7,7 +7,7 @@ use crate::*;
 impl RunState<'_> {
     pub(super) fn teardown(self) -> ExitCode {
         let RunState {
-            term: _,
+            host: _,
             mods: _,
             teams: _,
             attention: _,

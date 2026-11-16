@@ -13,7 +13,8 @@ impl RunState<'_> {
                 keys.take().ok()
             }
             // No key thread could be started: wait on the keyboard as before.
-            None => self.term.read_bytes(Duration::from_millis(15)).ok(),
+            // Or there is no keyboard (a headless host): wait on the doorbell.
+            None => self.host.wait_without_key_thread(&self.wake),
         }
     }
 
@@ -250,7 +251,7 @@ impl RunState<'_> {
         // Keep the terminal's capture and the scanner's parsing in
         // lockstep — set both, and don't leave one on if the other
         // fails.
-        if self.term.set_mouse(self.mouse_on).is_ok() {
+        if self.host.set_mouse(self.mouse_on).is_ok() {
             self.scanner.set_mouse(self.mouse_on);
             self.flash = Some((
                 if self.mouse_on {

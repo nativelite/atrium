@@ -159,6 +159,13 @@ usage: atrium fleet <command> [args]    saved rosters of agents (atrium.fleet.js
 
   up <name> [--allow-ctl] [--trust [<policy>]] [--skip-permissions] [--max-depth <N>]
                                     bring the fleet up; the flags are the session flags
+  up <name> --headless [--size <rows>x<cols>] [session flags]
+                                    the same with no terminal: nothing is read from stdin or
+                                    drawn on stdout, the panes run at --size (default 50x200),
+                                    and the session is reached through `atrium ctl` alone. Needs
+                                    the control channel (--allow-ctl or the fleet's allow_ctl)
+                                    and ATRIUM_YES=1, since there is nobody to ask. Ends when
+                                    its last pane exits or on a termination signal
   init <template> [--agents <N>]    write ./atrium.fleet.json from a built-in (solo, pair, crew)
                                     or one of your own fleets in the user-global fleet.json;
                                     --agents scales the builders; never overwrites
@@ -330,6 +337,8 @@ mod tests {
                     "--trust",
                     "--skip-permissions",
                     "--max-depth",
+                    "--headless",
+                    "--size",
                     "init",
                     "--agents",
                     "ls",

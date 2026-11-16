@@ -61,6 +61,26 @@ impl Screen {
         Screen::new(io::stdout(), DEFAULT_LIMIT)
     }
 
+    /// A screen nobody reads: a headless session's. Every flush is dropped
+    /// where it stands, on the caller's thread, so there is no writer thread,
+    /// no queue to fall behind (and so never a resync), and no handle on this
+    /// process's stdout at all: a stdout that is a full pipe, a closed pipe or
+    /// a log file is neither waited on nor written to.
+    pub fn discard() -> Screen {
+        // The sender is dropped here: `finish` never waits on a screen that
+        // has no writer thread (`tx` is `None`).
+        let (_, done) = mpsc::channel();
+        Screen {
+            buf: Vec::new(),
+            tx: None,
+            fallback: Some(Box::new(io::sink())),
+            pending: Arc::new(AtomicUsize::new(0)),
+            dropping: false,
+            limit: usize::MAX,
+            done,
+        }
+    }
+
     /// A screen over any sink, discarding once `limit` bytes are queued.
     pub fn new<W: Write + Send + 'static>(sink: W, limit: usize) -> Screen {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -239,6 +259,16 @@ impl SizeWatch {
                 }
             });
         SizeWatch { latest, stop }
+    }
+
+    /// A size that never changes and is never asked for: a headless session's.
+    /// No thread is started and no terminal is queried, so this is safe in a
+    /// process with no terminal at all.
+    pub fn fixed(size: (u16, u16)) -> SizeWatch {
+        SizeWatch {
+            latest: Arc::new(std::sync::atomic::AtomicU32::new(pack(size))),
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
     }
 
     /// The most recent size as `(rows, cols)`, or `None` if none is known.
@@ -486,6 +516,36 @@ mod tests {
             SizeWatch::start((24, 80)).latest().map(|s| s.1 > 0),
             Some(true)
         );
+    }
+
+    /// A headless session's screen: frames of any size are dropped without a
+    /// resync ever being asked for, and `finish` has nothing to wait on.
+    #[test]
+    fn a_discarding_screen_takes_everything_and_never_resyncs() {
+        let mut s = Screen::discard();
+        let frame = vec![b'x'; DEFAULT_LIMIT * 2];
+        let started = std::time::Instant::now();
+        for _ in 0..8 {
+            s.write_all(&frame).unwrap();
+            s.flush().unwrap();
+            assert_eq!(s.backlog(), 0);
+            assert!(!s.is_dropping(), "nothing is behind: there is no reader");
+            assert!(!s.take_resync());
+        }
+        s.write_all(b"restore").unwrap();
+        s.finish(Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a screen nobody reads must not wait for anyone"
+        );
+    }
+
+    #[test]
+    fn a_fixed_size_is_the_size_it_was_given() {
+        let w = SizeWatch::fixed((50, 200));
+        assert_eq!(w.latest(), Some((50, 200)));
+        std::thread::sleep(SizeWatch::EVERY * 2);
+        assert_eq!(w.latest(), Some((50, 200)), "nothing asks a terminal");
     }
 
     #[test]

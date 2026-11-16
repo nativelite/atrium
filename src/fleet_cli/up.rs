@@ -3,7 +3,7 @@
 
 use super::clean::report_worktree_teardown;
 use super::fsan;
-use super::launch::{spawn_fleet_window, FleetSpawn};
+use super::launch::{headless_gate, spawn_fleet_window, FleetSpawn};
 use super::preflight::{banner_lines, preflight_context_mode, BannerFacts};
 use crate::*;
 
@@ -90,10 +90,28 @@ pub(crate) fn fleet_up(
     max_depth: usize,
     trust: atrium::ctl::TrustMode,
 ) -> ExitCode {
+    fleet_up_on(name, allow_ctl, max_depth, trust, None)
+}
+
+/// [`fleet_up`], attached (`headless` is `None`) or with no terminal at the
+/// given `(rows, cols)` (`--headless`). Headless reads no stdin and asks
+/// nobody anything: the resume offer is not made, and the launch must already
+/// carry its approval and its control channel ([`headless_gate`]).
+pub(super) fn fleet_up_on(
+    name: &str,
+    allow_ctl: bool,
+    max_depth: usize,
+    trust: atrium::ctl::TrustMode,
+    headless: Option<(u16, u16)>,
+) -> ExitCode {
     // A crashed fleet in this project is offered back before a fresh one is
-    // started over it — the same one prompt a plain launch gives.
-    if let Some(code) = crate::offer_resume(allow_ctl, max_depth, trust) {
-        return code;
+    // started over it — the same one prompt a plain launch gives. Not headless:
+    // the offer is a question, and a terminal on stdin there is not ours to
+    // read (`atrium recover` still has the session).
+    if headless.is_none() {
+        if let Some(code) = crate::offer_resume(allow_ctl, max_depth, trust) {
+            return code;
+        }
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let (located, fleet) = match load_fleet(name, &cwd) {
@@ -121,6 +139,12 @@ pub(crate) fn fleet_up(
     // coordinating fleet without ctl fails silently — panes come up and publish
     // into nothing — and that has already cost a run.
     let allow_ctl = allow_ctl || fleet.allow_ctl.unwrap_or(false);
+    if headless.is_some() {
+        let yes = std::env::var_os("ATRIUM_YES").is_some();
+        if let Err(line) = headless_gate(allow_ctl, yes) {
+            return fail(&line);
+        }
+    }
     let trust = match resolve_trust(name, trust, &fleet) {
         Ok(t) => t,
         Err(line) => return fail(&line),
@@ -133,9 +157,22 @@ pub(crate) fn fleet_up(
     // the roster, a human reviews and runs it. The review is the approval, so the
     // posture must be impossible to slip past it.
     let trust = cap_trust_to_ancestor(trust);
-    if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
-        eprintln!("atrium fleet: aborted.");
-        return ExitCode::SUCCESS;
+    if trust == atrium::ctl::TrustMode::Skip {
+        if headless.is_some() {
+            // Full bypass is confirmed by a person typing `y`, and `ATRIUM_YES`
+            // never stands in for that, attached or not. Headless has no one to
+            // type it, and where the ancestry walk gives no ceiling (Windows
+            // today) a pane could otherwise start a nested headless fleet at
+            // `skip` with one environment variable. So: refused, with the way on.
+            return fail(
+                "atrium fleet: --headless cannot run at the skip posture: full bypass is \
+                 confirmed by a person at a terminal, and ATRIUM_YES does not stand in for \
+                 that. Use --trust automode (or lower), or run the fleet attached.",
+            );
+        } else if !confirm_skip_permissions() {
+            eprintln!("atrium fleet: aborted.");
+            return ExitCode::SUCCESS;
+        }
     }
 
     let launch = match plan_launch(name, cwd, &located, fleet, allow_ctl, trust) {
@@ -160,7 +197,9 @@ pub(crate) fn fleet_up(
     // keypress is proportionate to starting N agents with filesystem access.
     //
     // Skipped when stdin is not a terminal (a script, CI) or `ATRIUM_YES=1`, since
-    // there is nobody to ask; the banner still prints for the log.
+    // there is nobody to ask; the banner still prints for the log. A headless
+    // launch got here only with `ATRIUM_YES` set (`headless_gate`), which
+    // `fleet_ack` answers before it would touch stdin.
     if !fleet_ack() {
         eprintln!("atrium fleet: aborted.");
         return ExitCode::SUCCESS;
@@ -170,7 +209,7 @@ pub(crate) fn fleet_up(
         Ok(teardown) => teardown,
         Err(line) => return fail(&line),
     };
-    run_fleet(launch, max_depth, teardown)
+    run_fleet(launch, max_depth, teardown, headless)
 }
 
 /// Print `line` and fail the launch.
@@ -476,9 +515,14 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
 /// early exits (no terminal to take, the roster failing to spawn) came after
 /// the worktrees were made and returned straight past the teardown, leaving
 /// them on disk for good.
-fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) -> ExitCode {
+fn run_fleet(
+    launch: FleetLaunch,
+    max_depth: usize,
+    teardown: Option<Teardown>,
+    headless: Option<(u16, u16)>,
+) -> ExitCode {
     let cwd = launch.cwd.clone();
-    let exit = run_session(launch, max_depth);
+    let exit = run_session(launch, max_depth, headless);
     // After the run loop has restored the normal screen (or never left it).
     // Each worktree is removed ONLY if clean and fully merged; anything with
     // uncommitted or unmerged work is kept and its path + branch reported, so
@@ -491,9 +535,10 @@ fn run_fleet(launch: FleetLaunch, max_depth: usize, teardown: Option<Teardown>) 
     exit
 }
 
-/// Enter the terminal, spawn the approved roster into one tiled window and run
-/// the session.
-fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
+/// Enter the terminal (or take none: `headless` is the `(rows, cols)` a
+/// session with no terminal runs at), spawn the approved roster into one
+/// tiled window and run the session.
+fn run_session(launch: FleetLaunch, max_depth: usize, headless: Option<(u16, u16)>) -> ExitCode {
     let FleetLaunch {
         name,
         cwd,
@@ -519,11 +564,26 @@ fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
         Ok(None) => None,
         Err(msg) => return fail(&format!("atrium: {msg}")),
     };
-    let mut term = match rawterm::Terminal::raw() {
-        Ok(t) => t,
-        Err(e) => return fail(&format!("atrium: stdin/stdout must be a terminal: {e}")),
+    // Headless, a session whose endpoint did not bind is unreachable: stop
+    // here, before any pane exists, with the bind's own reason.
+    if headless.is_some() && ctl_listener.is_none() {
+        let why = flash.map_or_else(|| "ctl channel disabled".to_string(), |(note, _)| note);
+        return fail(&format!("atrium fleet: --headless cannot start: {why}"));
+    }
+    // Headless: no terminal is opened, put in raw mode or measured.
+    let mut term = match headless {
+        Some(_) => None,
+        None => match rawterm::Terminal::raw() {
+            Ok(t) => Some(t),
+            Err(e) => return fail(&format!("atrium: stdin/stdout must be a terminal: {e}")),
+        },
     };
-    let (rows, cols) = term.size().unwrap_or((24, 80));
+    let (rows, cols) = match (&term, headless) {
+        (_, Some(size)) => size,
+        (Some(term), None) => term.size().unwrap_or((24, 80)),
+        // Not reachable: without `headless` the terminal was taken above.
+        (None, None) => (24, 80),
+    };
 
     // When worktrees are active, hand the plans to the spawn so each member
     // pane's cwd is its worktree dir; an empty slice (inactive, or not a repo)
@@ -551,13 +611,24 @@ fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
         }
     };
 
+    // What the spawn flashed (an identity that did not resolve) has no bar to
+    // show on when headless: say it on stderr. Attached, unchanged.
+    if headless.is_some() {
+        if let Some((note, _)) = flash.take() {
+            crate::run_loop::stderr_line(&note);
+        }
+    }
     // New panes / splits opened later host a shell under the fleet's default
     // identity — a scratch pane in-role, not another copy of an agent.
     let scratch = vec![default_shell()];
+    let host = match term.as_mut() {
+        Some(term) => crate::run_loop::Host::Attached(term),
+        None => crate::run_loop::Host::Headless { rows, cols },
+    };
     // ctl is opt-in for a fleet too (`atrium fleet up <name> --allow-ctl`), so the
     // roster can coordinate over the board/bus; without the flag it runs as before.
-    run(
-        &mut term,
+    crate::run_loop::run_on(
+        host,
         RunArgs {
             command: &scratch,
             identity: fleet.identity.as_deref(),
