@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`atrium --version --json`.** One object on one line for a script or a bug
+  report: `{"version":"…","commit":…,"target":"…"}`. `commit` is the
+  `ATRIUM_BUILD_COMMIT` the build was given, and `null` when it was given
+  none (atrium has no build script, so an ordinary `cargo install` has none).
+  `target` is put together from the compiler's `cfg` values and is the rustc
+  triple on the targets atrium ships for. Plain `--version` is unchanged.
+
+### Fixed
+- **An outer tmux no longer reaches a pane (#22).** Started inside a real
+  tmux, atrium inherited `TMUX` and `TMUX_PANE`, and every pane without
+  atrium's own shim (ctl off, not claude, `teams: "off"`) inherited them in
+  turn, so Claude Code's agent teams there split the outer tmux window. The
+  hosting process now drops both at startup, before any pane exists; the only
+  `TMUX` a pane can carry is the one atrium's shim sets. The shim itself and
+  `atrium ctl` run inside a pane and are left alone.
+
 ## [0.46.0] - 2026-11-09
 
 ### Added
