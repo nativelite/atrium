@@ -20,7 +20,7 @@
 </div></header>
 
 <main class="wrap doc">
-<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html">dev fleet</a><a href="reaping.html">reaping</a><a href="session-recovery.html" class="active">session recovery</a></div>
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html">dev fleet</a><a href="reaping.html">reaping</a><a href="session-recovery.html" class="active">session recovery</a><a href="containers.html">containers</a></div>
 <h1>Session save-state and recovery</h1>
 <p>atrium periodically writes a snapshot of the running session to disk. If the host crashes or atrium exits uncleanly, <code>atrium recover</code> reads that snapshot and reopens the session: same window-and-pane layout, same working directories, same identities, same agent commands, the same <b>session policy</b> (deny rules, trust postures, spawn capabilities, compile pool, memory ceiling) — and, for agents that support <code>--resume</code>, the same transcript.</p>
 <h2>Picking up where you left off</h2>

@@ -317,7 +317,9 @@ in a session of its own (`setsid`, a service unit, a container's init) if it
 should outlive the shell that started it (`nohup` alone is not enough: atrium
 takes `SIGHUP` itself, to tear its panes down). There is no `atrium attach` yet: a
 headless session cannot be looked at or typed into from a terminal, only
-reached through `ctl`.
+reached through `ctl`. Running atrium in a container (the fixed control
+socket, probes, operator tokens, memory limits, what to persist) is in
+[docs/containers.md](docs/containers.md).
 
 ## Coordinating agents: the control plane
 

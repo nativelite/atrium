@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Running atrium in a container, documented** (`docs/containers.md`): one
+  session per container, the fixed control socket, `ctl ping` as a liveness
+  probe and `ctl metrics` behind a sidecar, operator tokens from a mounted
+  secret (and why it must be copied to an owner-only file first), the
+  container's memory limit as the hard limit where atrium owns no cgroup, and
+  what to persist. `docs/trust-and-security.md` gains the operator item.
 - **Operator tokens: a control-plane credential for a caller that is not a
   pane** (#24). `--operator-token-file <path>` (the first argument; anywhere
   among `fleet up`'s and `recover`'s flags) or `ATRIUM_OPERATOR_TOKEN_FILE`

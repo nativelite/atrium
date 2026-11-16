@@ -27,6 +27,7 @@ PAGES = [
     ("dev-fleet", "dev fleet"),
     ("reaping", "reaping"),
     ("session-recovery", "session recovery"),
+    ("containers", "containers"),
 ]
 SLUGS = {slug for slug, _ in PAGES}
 

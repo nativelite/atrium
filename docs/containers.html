@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Running atrium in a container — atrium docs</title>
+<meta name="description" content="atrium documentation: Running atrium in a container. tmux for coding agents, zero third-party dependencies.">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<header><div class="wrap bar">
+  <span class="dots"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span></span>
+  <span class="title"><a href="index.html"><b>atrium</b></a> — docs</span>
+  <nav>
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io</a>
+    <a href="https://github.com/nativelite/atrium">github</a>
+  </nav>
+</div></header>
+
+<main class="wrap doc">
+<div class="docnav"><a href="index.html">home</a><a href="architecture.html">architecture</a><a href="agent-status.html">agent status</a><a href="identity.html">identity</a><a href="fleets.html">fleets</a><a href="control-plane.html">control plane</a><a href="trust-and-security.html">trust &amp; security</a><a href="worktrees.html">worktrees</a><a href="dev-fleet.html">dev fleet</a><a href="reaping.html">reaping</a><a href="session-recovery.html">session recovery</a><a href="containers.html" class="active">containers</a></div>
+<h1>Running atrium in a container</h1>
+<p>atrium makes no network calls of its own and keeps its control channel on a same-user local socket, so one container holding one atrium session is a natural unit: the agents inside reach whatever the container's network policy allows, and everything that operates the session from outside does it through that one socket. This page is the checklist for that deployment. Each item points at the page that documents the mechanism.</p>
+<h2>The shape</h2>
+<ul><li><b>One container, one session.</b> Run atrium as a non-root user with a persistent home, so the agents' own credentials and transcripts survive a restart.</li><li><b>A fixed control socket</b>, on a volume a sidecar can share: <code>ATRIUM_CTL_SOCKET=/run/atrium/ctl.sock</code> (or <code>--ctl-socket</code>). The socket is <code>0600</code> and every peer's uid is checked, so a sidecar must run as the same uid. See <a href="control-plane.html#a-stable-endpoint---ctl-socket">A stable endpoint</a>. The variable names the endpoint; it does not switch the control plane on. That is still <code>--allow-ctl</code>, or <code>"allow_ctl": true</code> in the fleet.</li><li><b>Headless or attached.</b> A fleet that nobody watches starts with <code>ATRIUM_YES=1 atrium fleet up &lt;name&gt; --headless</code>; see the README's headless section. A person who wants to see the panes still attaches through a terminal the container provides (<code>kubectl exec -it … -- atrium …</code>, with or without an outer tmux). There is no <code>atrium attach</code> to a headless session yet.</li></ul>
+<h2>Starting it</h2>
+<pre><code># headless: an init process, a Job, a systemd unit
+export ATRIUM_CTL_SOCKET=/run/atrium/ctl.sock
+export ATRIUM_BOARD=/home/agent/.atrium/board.json
+export ATRIUM_BUS=/home/agent/.atrium/bus.jsonl
+ATRIUM_YES=1 atrium fleet up review-crew --headless --size 50x200</code></pre>
+<ul><li>Headless needs the control channel and <code>ATRIUM_YES=1</code>, and is refused at the <code>skip</code> posture: full bypass is confirmed by a person at a terminal. An unattended fleet tops out at <code>automode</code>.</li><li>The session ends when its last pane exits or on <code>SIGTERM</code>, <code>SIGINT</code> or <code>SIGHUP</code>, through the same teardown as an attached session, and exits 0 either way.</li><li>Make atrium the container's main process, or start it under <code>setsid</code>. <code>nohup</code> alone does not protect it: atrium takes <code>SIGHUP</code> itself, to tear its panes down.</li></ul>
+<h2>Inside an outer tmux</h2>
+<p>Started inside a real tmux, atrium drops the inherited <code>TMUX</code> and <code>TMUX_PANE</code> before any pane exists, so Claude Code's agent teams split an atrium pane and never the outer tmux window. No <code>env -u TMUX</code> wrapper is needed.</p>
+<h2>Probes and metrics</h2>
+<p>Both are token-free reads on the control socket. Outside a pane, with no <code>ATRIUM_CTL</code> set, <code>atrium ctl</code> finds the session through its discovery file when exactly one is running; in a sidecar, set <code>ATRIUM_CTL</code> to the socket path.</p>
+<pre><code>livenessProbe:
+  exec:
+    command: ["atrium", "ctl", "ping", "--timeout", "2000"]
+  periodSeconds: 10</code></pre>
+<ul><li><code>atrium ctl ping</code> exits 0 only when the session's run loop answered, and 1 with one line (<code>no endpoint</code>, <code>connection refused</code>, <code>timeout</code>) otherwise. It never waits past its timeout.</li><li><code>atrium ctl metrics</code> prints Prometheus text (<code>atrium_panes{state=…}</code>, <code>atrium_wakes_delivered_total</code>, <code>atrium_bus_depth</code>, <code>atrium_open_decisions</code>, …). atrium opens no port: a sidecar runs the command and serves the text.</li><li><code>atrium --version --json</code> gives the version and target for an image label.</li></ul>
+<p>Neither probe is written to the audit log.</p>
+<h2>Operating it from outside: operator tokens</h2>
+<p>Without a credential, a caller outside a pane gets the reads only. A control service that must <code>send</code>, <code>kill</code>, <code>spawn</code>, publish or resolve a decision presents an operator token; see <a href="control-plane.html#operator-tokens-a-caller-that-is-not-a-pane">Operator tokens</a>.</p>
+<pre><code>atrium --allow-ctl --operator-token-file /run/atrium/operators.json claude
+atrium ctl --operator-token-file /run/atrium/op-token kill dev_2</code></pre>
+<ul><li><b>The file must be owned by atrium's user and closed to group and others</b> (<code>chmod 600</code>), or atrium refuses to start. A Kubernetes Secret volume is usually root-owned and group-readable, so it is refused as mounted. Copy it in the entrypoint or an init step, as the user atrium runs as: <code>install -m 600 /secrets/operators.json /run/atrium/operators.json</code>.</li><li><b>Keep the file away from the panes if you can.</b> Panes run as the same user as atrium and can read any file that user can. atrium removes <code>ATRIUM_OPERATOR_TOKEN_FILE</code> from the environment panes inherit, which hides the path, not the file. The control service's own copy belongs in the sidecar's filesystem, not the agents'.</li><li><b>Grant the fewest verbs.</b> Nothing is granted by default. An operator's spawn is bounded by the session's launch trust and takes a bare command name only; its text is typed only into agent panes, never into a shell.</li><li>Every operator request is recorded as <code>operator:&lt;name&gt;</code> in <code>atrium ctl audit</code>. Set <code>ATRIUM_CTL_AUDIT=&lt;file&gt;</code> to keep the log past the in-memory ring.</li></ul>
+<h2>Memory</h2>
+<p>On Linux the hard memory cap for panes needs a cgroup atrium owns: its own cgroup delegated to it and holding no other process (what <code>systemd-run --user --scope -p Delegate=yes</code> gives). A container normally does not provide that, so inside one:</p>
+<ul><li>atrium's hard cap is not taken; the soft guard still watches and stops the largest build near the ceiling (<code>ATRIUM_MEMORY_MB</code>, or <code>memory_mb</code> in the fleet).</li><li><b>The container's own memory limit is the hard limit.</b> Set it. When it is hit the kernel's OOM killer chooses the victim inside the container, and that can be atrium itself. Leave headroom above <code>ATRIUM_MEMORY_MB</code>.</li></ul>
+<h2>What to persist</h2>
+<table><thead><tr><th>what</th><th>where</th><th>why</th></tr></thead><tbody><tr><td>the board</td><td><code>ATRIUM_BOARD=&lt;file&gt;</code></td><td>survives a restart; in memory otherwise</td></tr><tr><td>the bus</td><td><code>ATRIUM_BUS=&lt;file&gt;</code></td><td>the same, and a sidecar can tail it</td></tr><tr><td>the audit log</td><td><code>ATRIUM_CTL_AUDIT=&lt;file&gt;</code></td><td>the in-memory ring holds 1024 entries</td></tr><tr><td>session snapshots</td><td>the per-user state directory (<code>ATRIUM_STATE_DIR</code> overrides it)</td><td><code>atrium recover</code> after a crash; see <a href="session-recovery.html">session recovery</a></td></tr><tr><td>the agents' homes</td><td><code>$HOME</code></td><td>their credentials and transcripts</td></tr></tbody></table>
+<h2>What a session does not do</h2>
+<ul><li>It does not talk to another session. The board and the bus live in one process; bridging the bus between sessions is planned as <code>atrium bridge</code>, speaking a line protocol to an adapter that owns the transport and TLS.</li><li>It opens no network listener. Everything above is a local socket and files.</li></ul>
+</main>
+
+<footer><div class="wrap">
+  <div class="row">
+    <a href="index.html">home</a>
+    <a href="https://crates.io/crates/atrium">crates.io/atrium</a>
+    <a href="https://github.com/nativelite/atrium">github.com/nativelite/atrium</a>
+    <a href="https://github.com/nativelite/marketplace">marketplace</a>
+    <a href="https://github.com/nativelite">nativelite</a>
+  </div>
+  <div>Built on the nativelite stack. Zero third-party dependencies. MIT licensed.</div>
+</div></footer>
+
+</body>
+</html>

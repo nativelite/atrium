@@ -323,6 +323,16 @@ limits, each one unit-tested as a pure function:
 7. **Visibility is the safety story.** Nothing a `ctl`-spawned agent does is
    hidden: it's a pane with a status border, in the org chart, killable. That is
    the whole reason to do this in atrium instead of as opaque subagents.
+8. **A caller that is not a pane has its own credential.** An
+   [operator token](control-plane.md#operator-tokens-a-caller-that-is-not-a-pane)
+   comes from a file the hosting atrium was given, names the verbs its holder
+   may use, and never reaches a pane's environment. An operator reaches the
+   whole session for those verbs, but its spawn is bounded by the launch trust
+   and takes a bare command name, and its text is typed only into agent panes.
+   Every operator request is audited as `operator:<name>`. A pane and an
+   operator are separate namespaces: neither token is ever taken for the
+   other. File permissions keep other users out, not a same-user pane; the
+   deployment keeps the file where panes cannot read it.
 
 ## What the mod adds
 
