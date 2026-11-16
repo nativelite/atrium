@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-11-15
+
 ### Added
 - **`atrium ctl command <target> /<name>`: run one slash command in a
   teammate's pane.** The name is typed as its own prompt line, with no

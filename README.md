@@ -463,6 +463,7 @@ and win over the pointer.
   "mod": null,
   "teams": null,
   "notify": null,
+  "commands": [],
   "fleet_defaults": { "trust": "automode", "identity": "work", "allow_ctl": true }
 }
 ```
@@ -484,6 +485,10 @@ and win over the pointer.
   own `teams` key wins.
 - **`fleet_defaults`** — `trust`, `identity`, `allow_ctl`, `grid` for fleets that
   leave them out.
+- **`commands`** — the slash commands `atrium ctl command` may deliver to an
+  agent's pane, such as `["/compact", "/clear"]`. Empty by default: nothing a
+  pane or an operator says can add to it, and a listed command is a grant. A
+  fleet's own `commands` key replaces it.
 - **`notify`** — how a "needs you" transition rings the host terminal: `"both"`
   (default: bell + toast + Windows Terminal's tab indicator), `"bell"`, `"toast"`
   or `"off"`. The title always follows the state; see [agent-aware
