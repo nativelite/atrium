@@ -2,30 +2,43 @@
 // reply. The call itself (`$.process.run`) lives in register.ts, because the
 // engine's validator follows `$` only inside the file that received it.
 
-/** A reply as `atrium ctl` prints it: `ok` and either the verb's fields or `err`. */
-export type Reply = { ok: boolean; err?: string } & Record<string, unknown>
+/**
+ * A reply as `atrium ctl` prints it: `ok` and either the verb's fields or
+ * `err`. `fault` is the mod's own mark, never atrium's: the question could not
+ * be asked (`ctl`: no binary, no endpoint, no reply line; `timeout`: no reply
+ * in time) or the answer was not a reply (`shape`). A refusal atrium gave has
+ * no `fault`, and only such a refusal is atrium saying no.
+ */
+export type Reply = { ok: boolean; err?: string; fault?: 'ctl' | 'timeout' | 'shape' } & Record<string, unknown>
 
 /** What `$.process.run` answers, the part a reply is read from. */
 export type Ran = { exitCode: number; stdout: string; stderr: string }
 
 /**
- * The reply on the last line of stdout, or `{ ok: false, err }` when there is
- * none: a channel that is gone, a binary that is missing, a usage error. Never
- * throws; the caller decides what a refusal means.
+ * The reply on the last line of stdout, or `{ ok: false, err, fault }` when
+ * there is none: a channel that is gone, a binary that is missing, a usage
+ * error (`ctl`), or a line that is not a reply (`shape`). Never throws; the
+ * caller decides what a refusal means.
  */
 export function parseReply(ran: Ran): Reply {
+  if (ran === null || typeof ran !== 'object' || typeof ran.stdout !== 'string') {
+    return { ok: false, err: 'the engine ran the command and answered no output', fault: 'shape' }
+  }
   const line = ran.stdout.trim().split('\n').pop() ?? ''
   let parsed: unknown
   try {
     parsed = JSON.parse(line)
   } catch {
-    const err = (ran.stderr || ran.stdout).trim().slice(0, 200)
-    return { ok: false, err: err || `exit ${ran.exitCode} with no reply` }
+    const said = typeof ran.stderr === 'string' && ran.stderr !== '' ? ran.stderr : ran.stdout
+    const err = said.trim().slice(0, 200)
+    return { ok: false, err: err || `exit ${ran.exitCode} with no reply`, fault: 'ctl' }
   }
-  if (parsed !== null && typeof parsed === 'object' && 'ok' in parsed) {
-    return parsed as Reply
+  if (parsed !== null && typeof parsed === 'object' && typeof (parsed as { ok?: unknown }).ok === 'boolean') {
+    // `fault` is the mod's word: one a reply happens to carry is not believed.
+    const { fault: _fault, ...reply } = parsed as Record<string, unknown>
+    return reply as Reply
   }
-  return { ok: false, err: `not a ctl reply: ${line.slice(0, 120)}` }
+  return { ok: false, err: `not a ctl reply: ${line.slice(0, 120)}`, fault: 'shape' }
 }
 
 /**

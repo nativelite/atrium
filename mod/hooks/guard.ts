@@ -30,6 +30,30 @@ export function join(base: string, rel: string): string {
   return `${base.replace(/[\\/]+$/, '')}${sep}${rel.replace(/^[\\/]+/, '')}`
 }
 
+/**
+ * `path` with its `.` and `..` segments folded, by its text alone: what a
+ * path is compared as when the filesystem could not be asked for its real
+ * one (the folder is not there yet, or the engine's `stat` failed). A `..`
+ * never climbs past the root.
+ */
+export function lexical(path: string): string {
+  const sep = path.includes('\\') && !path.includes('/') ? '\\' : '/'
+  const drive = /^[A-Za-z]:/.exec(path)?.[0] ?? ''
+  const rest = path.slice(drive.length)
+  const rooted = /^[\\/]/.test(rest)
+  const out: string[] = []
+  for (const part of rest.split(SEP)) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      if (out.length > 0 && out[out.length - 1] !== '..') out.pop()
+      else if (!rooted) out.push('..')
+      continue
+    }
+    out.push(part)
+  }
+  return `${drive}${rooted ? sep : ''}${out.join(sep)}`
+}
+
 /** Two real paths are the same file when equal after normalising separators. */
 function same(a: string, b: string): boolean {
   return a.split(SEP).join('/') === b.split(SEP).join('/')
