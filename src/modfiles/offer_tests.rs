@@ -153,12 +153,23 @@ fn the_decision_table_of_who_is_asked() {
 /// into.
 #[test]
 fn nobody_is_there_without_a_terminal_under_atrium_yes_or_inside_a_pane() {
-    assert!(person_there(false, true, None));
-    assert!(person_there(false, true, Some("")), "empty counts as unset");
-    assert!(!person_there(true, true, None), "ATRIUM_YES");
-    assert!(!person_there(false, false, None), "no terminal on stdin");
-    assert!(!person_there(false, true, Some("3")), "inside a pane");
-    assert!(!person_there(true, false, Some("3")));
+    assert!(person_there(false, true, true, None));
+    assert!(
+        person_there(false, true, true, Some("")),
+        "empty counts as unset"
+    );
+    assert!(!person_there(true, true, true, None), "ATRIUM_YES");
+    assert!(
+        !person_there(false, false, true, None),
+        "no terminal on stdin"
+    );
+    // The question is written to stderr: redirected, nobody would see it.
+    assert!(
+        !person_there(false, true, false, None),
+        "stderr is not a terminal"
+    );
+    assert!(!person_there(false, true, true, Some("3")), "inside a pane");
+    assert!(!person_there(true, false, false, Some("3")));
 }
 
 #[test]
@@ -190,7 +201,12 @@ fn enter_is_yes_and_only_the_plain_words_are_an_answer() {
 
 fn asking(input: &str) -> (Asked, String) {
     let mut out = Vec::new();
-    let asked = ask(&mut std::io::Cursor::new(input.as_bytes()), &mut out, "T\n");
+    let asked = ask(
+        &mut std::io::Cursor::new(input.as_bytes()),
+        &mut out,
+        "T\n",
+        &mut || {},
+    );
     (asked, String::from_utf8(out).unwrap())
 }
 
@@ -216,11 +232,86 @@ fn an_unclear_line_is_asked_about_once_more_and_end_of_input_is_no_answer() {
     assert_eq!(asking("what\n").0, Asked::NoAnswer);
 }
 
+/// A terminal for the tests: what was typed and not yet read, which a flush
+/// throws away as the real one does.
+#[derive(Clone, Default)]
+struct Typed(std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<u8>>>);
+
+impl Typed {
+    fn key(&self, text: &str) {
+        self.0.borrow_mut().extend(text.bytes());
+    }
+}
+
+impl std::io::Read for Typed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut queue = self.0.borrow_mut();
+        let n = buf.len().min(queue.len());
+        for slot in buf.iter_mut().take(n) {
+            *slot = queue.pop_front().unwrap_or_default();
+        }
+        Ok(n)
+    }
+}
+
+/// Keys pressed before the question was on screen are not its answer: the
+/// pending input is thrown away immediately before each question is printed,
+/// so an Enter typed ahead cannot install the mod.
+#[test]
+fn what_was_typed_before_the_question_is_not_its_answer() {
+    // An Enter is waiting. Without the flush it would be a yes.
+    let typed = Typed::default();
+    typed.key("\n");
+    let (pending, mut flushes) = (typed.clone(), 0);
+    let mut out = Vec::new();
+    let asked = ask(
+        &mut std::io::BufReader::new(typed),
+        &mut out,
+        "T\n",
+        &mut || {
+            flushes += 1;
+            pending.0.borrow_mut().clear();
+        },
+    );
+    assert_eq!(
+        asked,
+        Asked::NoAnswer,
+        "the typed-ahead Enter was thrown away"
+    );
+    assert_eq!(flushes, 1);
+
+    // The flush comes before every question, the second one too: what is
+    // typed after the first question and before the second is dropped, and
+    // what is typed after the question was printed is the answer.
+    let typed = Typed::default();
+    typed.key("y\n");
+    let (pending, later, mut flushes) = (typed.clone(), typed.clone(), 0);
+    let mut out = Vec::new();
+    let asked = ask(
+        &mut std::io::BufReader::with_capacity(1, typed),
+        &mut out,
+        "T\n",
+        &mut || {
+            flushes += 1;
+            pending.0.borrow_mut().clear();
+            // What the person types once the question is on screen.
+            later.key(if flushes == 1 { "what\ny\n" } else { "n\n" });
+        },
+    );
+    assert_eq!(flushes, 2);
+    assert_eq!(
+        asked,
+        Asked::No,
+        "the y typed ahead of the second question is gone"
+    );
+}
+
 /// The wording, in the order the plan gives: what it is, what you get, what
-/// it changes, how to change your mind.
+/// it changes, how to change your mind, and where the answer is kept, all
+/// before the question.
 #[test]
 fn the_offer_says_what_it_is_what_it_gives_what_it_changes_and_how_to_undo_it() {
-    let text = offer_text(Path::new("/cfg/atrium/mod"), false);
+    let text = offer_text(Path::new("/cfg/atrium/mod"), false, "WHERE-KEPT");
     let order = [
         "a Claude Code plugin that atrium loads into the claude panes it hosts",
         "/cfg/atrium/mod",
@@ -228,10 +319,13 @@ fn the_offer_says_what_it_is_what_it_gives_what_it_changes_and_how_to_undo_it() 
         "without typing into its prompt and keeps its line breaks",
         "subagents become visible panes",
         "takes over Claude Code's Agent tool",
-        "never blocks a tool call when it fails",
-        "switches it off by itself if it breaks",
-        "`atrium mod install`",
-        "\"mod\": false",
+        "If it fails it lets Claude Code carry on",
+        "a refusal that atrium itself returned still stands",
+        "switches it off by itself if it stops answering or keeps failing",
+        "`atrium mod install` says yes",
+        "`atrium mod off` says no",
+        "Nothing of the mod is written without a yes",
+        "Your answer, yes or no, is kept in WHERE-KEPT",
     ];
     let mut at = 0;
     for piece in order {
@@ -240,13 +334,20 @@ fn the_offer_says_what_it_is_what_it_gives_what_it_changes_and_how_to_undo_it() 
             .unwrap_or_else(|| panic!("{piece:?} is missing or out of order in:\n{text}"));
         at += found + piece.len();
     }
-    assert_eq!(text.lines().count(), 4, "{text}");
+    assert_eq!(text.lines().count(), 5, "{text}");
+    // Nothing that was found untrue.
+    for gone in ["never blocks", "if it breaks", "writes nothing"] {
+        assert!(!text.contains(gone), "{gone:?} in: {text}");
+    }
     assert!(!text.contains("older atrium"));
-    // An unmarked mod is already there: a no turns it off, and that is said.
-    let adopt = offer_text(Path::new("/cfg/atrium/mod"), true);
+    // An unmarked mod is already there: a yes replaces its files, a no
+    // turns the mod off, and both are said.
+    let adopt = offer_text(Path::new("/cfg/atrium/mod"), true, "WHERE-KEPT");
     assert!(adopt.starts_with(&text));
     assert!(
-        adopt.contains("older atrium") && adopt.contains("no turns the mod off"),
+        adopt.contains("older atrium")
+            && adopt.contains("a yes replaces its files with this atrium's copy")
+            && adopt.contains("a no leaves the files and turns the mod off"),
         "{adopt}"
     );
 }
@@ -258,12 +359,16 @@ fn offered(input: &str, dir: &Path, adopt: bool) -> (Asked, String, Vec<bool>) {
     let asked = run_offer(
         &mut std::io::Cursor::new(input.as_bytes()),
         &mut out,
-        dir,
-        adopt,
-        None,
-        &mut |yes| {
-            recorded.push(yes);
-            Ok("THE-PLACE".to_string())
+        OfferRun {
+            dir,
+            adopt,
+            root: None,
+            kept: "THE-PLACE-TO-BE",
+            flush: &mut || {},
+            record: &mut |yes| {
+                recorded.push(yes);
+                Ok("THE-PLACE".to_string())
+            },
         },
     );
     (asked, String::from_utf8(out).unwrap(), recorded)
@@ -287,6 +392,11 @@ fn a_yes_installs_as_mod_install_does_and_is_recorded() {
         "what it wrote is printed: {said}"
     );
     assert!(said.contains("kept in THE-PLACE"), "{said}");
+    // Where the answer goes was said before the question was asked.
+    assert!(
+        said.find("is kept in THE-PLACE-TO-BE").unwrap() < said.find(OFFER_QUESTION).unwrap(),
+        "{said}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -297,7 +407,7 @@ fn a_no_writes_nothing_and_is_recorded() {
     assert_eq!(asked, Asked::No);
     assert!(!dir.exists(), "nothing is written without a yes");
     assert_eq!(recorded, [false]);
-    assert!(said.contains("the mod is not installed"), "{said}");
+    assert!(said.contains("no mod is written"), "{said}");
     assert!(said.contains("kept in THE-PLACE"), "{said}");
 }
 
@@ -353,23 +463,50 @@ fn a_yes_over_an_unmarked_mod_marks_it_and_a_no_leaves_it_as_it_is() {
 
 #[test]
 fn a_failed_record_is_said_and_the_install_stands() {
+    let run = |input: &'static str, dir: &Path| {
+        let mut out = Vec::new();
+        run_offer(
+            &mut std::io::Cursor::new(input.as_bytes()),
+            &mut out,
+            OfferRun {
+                dir,
+                adopt: false,
+                root: None,
+                kept: "X",
+                flush: &mut || {},
+                record: &mut |_| Err("read-only".to_string()),
+            },
+        );
+        String::from_utf8(out).unwrap()
+    };
+    // A yes: the folder is installed and marked, so the offer is not made
+    // again while it is there. The line says that, not "asks again".
     let dir = temp("unkept");
-    let mut out = Vec::new();
-    run_offer(
-        &mut std::io::Cursor::new(b"y\n".as_slice()),
-        &mut out,
-        &dir,
-        false,
-        None,
-        &mut |_| Err("read-only".to_string()),
-    );
-    let said = String::from_utf8(out).unwrap();
+    let said = run("y\n", &dir);
     assert!(
-        said.contains("could not be kept (read-only)") && said.contains("asks again"),
+        said.contains("the mod is installed; the answer could not be kept (read-only)")
+            && said.contains("does not ask again while it is there"),
         "{said}"
     );
+    assert!(!said.contains("the next start asks again"), "{said}");
     assert_eq!(folder_at(&dir), Folder::Ours);
+    assert_eq!(
+        offer_of(&OfferFacts {
+            folder: Some(folder_at(&dir)),
+            ..ASKED
+        }),
+        Offer::Not(NotAsked::Installed),
+        "and that is what the next start does"
+    );
     let _ = std::fs::remove_dir_all(&dir);
+    // A no that could not be kept: nothing is there, so the next start asks.
+    let dir = temp("unkept-no");
+    let said = run("n\n", &dir);
+    assert!(
+        said.contains("could not be kept (read-only); the next start asks again"),
+        "{said}"
+    );
+    assert!(!dir.exists());
 }
 
 #[test]
@@ -429,7 +566,8 @@ fn after_a_yes_a_missing_folder_is_written_again_with_one_line() {
     assert!(
         lines[0].contains("written to")
             && lines[0].contains("it was missing")
-            && lines[0].contains("you said yes"),
+            && lines[0].contains("you said yes")
+            && lines[0].ends_with("`atrium mod off` stops this"),
         "{lines:?}"
     );
     assert_eq!(folder_at(&dir), Folder::Ours);
@@ -532,24 +670,43 @@ fn a_folder_named_by_the_environment_or_inside_a_checkout_is_never_touched() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// Writing the folder again is a change of what is on disk: a breaker record
-/// is then about something else, and the mod is tried again.
+/// A breaker record for this same Claude Code and this same mod, and a user
+/// who deleted the folder: the kept yes writes it back, and it is the very
+/// mod the record names. Nothing changed, so the mod stays off and the line
+/// says why. Only a folder that held another mod (unmarked, or older) is a
+/// change.
 #[test]
-fn a_folder_written_after_a_yes_has_the_mod_tried_again() {
-    let (dir, root) = (temp("retry"), temp("retry-root"));
+fn a_folder_written_back_after_a_yes_is_no_change_for_the_breaker() {
+    let (dir, root) = (temp("same"), temp("same-root"));
     write_record(&root, &TripRecord::now("2.1.325", "why", 1)).unwrap();
-    let (lines, state) = launch_in(
-        Some(&dir),
-        Some(&root),
-        || Some("2.1.325".to_string()),
-        60_000,
-        true,
-        false,
-    );
-    assert!(matches!(state.launch, Launch::Retrying(_)), "{state:?}");
+    let claude = || Some("2.1.325".to_string());
+    let (lines, state) = launch_in(Some(&dir), Some(&root), claude, 60_000, true, false);
+    assert_eq!(folder_at(&dir), Folder::Ours, "the folder is rewritten");
+    assert!(matches!(state.launch, Launch::Tripped(_)), "{state:?}");
     assert_eq!(lines.len(), 2, "{lines:?}");
-    let _ = std::fs::remove_dir_all(&dir);
-    let _ = std::fs::remove_dir_all(&root);
+    assert!(lines[0].contains("it was missing"), "{lines:?}");
+    assert!(
+        lines[1].contains("are unchanged, so it stays off") && lines[1].contains("(why)"),
+        "{lines:?}"
+    );
+    assert!(!lines.join(" ").contains("tried again"), "{lines:?}");
+    assert!(!refresh_after_yes(&temp("same-flag"), false).unwrap().1);
+    let _ = std::fs::remove_dir_all(temp("same-flag"));
+
+    // An unmarked mod from an older atrium was what ran: replacing it is a
+    // change, and the mod is tried again.
+    let old = temp("same-old");
+    old_install(&old, "0.2.0");
+    let (lines, state) = launch_in(Some(&old), Some(&root), claude, 60_000, true, false);
+    assert!(matches!(state.launch, Launch::Retrying(_)), "{state:?}");
+    assert!(lines[1].contains("tried again"), "{lines:?}");
+    // And so is a marked folder the heal had to rewrite.
+    std::fs::write(old.join("hooks/status.ts"), "// edited").unwrap();
+    let (_, state) = launch_in(Some(&old), Some(&root), claude, 60_000, true, false);
+    assert!(matches!(state.launch, Launch::Retrying(_)), "{state:?}");
+    for d in [dir, root, old] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 // ---- nobody there ----
@@ -606,7 +763,7 @@ fn describe_says_a_missing_folder_is_written_at_launch_after_a_yes() {
 
 const FACTS: TeammateFacts = TeammateFacts {
     ctl: true,
-    mod_on: true,
+    mod_expect: Expect::On,
     subagents: Subagents::Panes,
     shim_on: true,
     teams_var: false,
@@ -635,7 +792,7 @@ fn with_the_mod_on_a_named_teammate_is_a_pane_through_the_mod() {
 #[test]
 fn with_the_mod_off_and_the_shim_on_teammates_land_through_the_shim() {
     let off = TeammateFacts {
-        mod_on: false,
+        mod_expect: Expect::Off,
         ..FACTS
     };
     assert_eq!(
@@ -659,7 +816,7 @@ fn with_the_mod_off_and_the_shim_on_teammates_land_through_the_shim() {
 #[test]
 fn with_neither_subagents_run_inside_their_agent() {
     let neither = TeammateFacts {
-        mod_on: false,
+        mod_expect: Expect::Off,
         shim_on: false,
         ..FACTS
     };
@@ -699,10 +856,10 @@ fn the_subagents_policy_in_force_is_part_of_the_line() {
         "{line}"
     );
     // `deny` holds with or without the mod: the launch flags carry it.
-    for mod_on in [true, false] {
+    for mod_expect in [Expect::On, Expect::Likely, Expect::Off] {
         let line = teammates_line(&TeammateFacts {
             subagents: Subagents::Deny,
-            mod_on,
+            mod_expect,
             ..FACTS
         });
         assert!(line.contains("(subagents: deny)"), "{line}");
@@ -721,4 +878,155 @@ fn the_teams_variable_counts_only_when_it_is_switched_on() {
         assert!(!teams_var_on(Some(off)), "{off:?}");
     }
     assert!(!teams_var_on(None));
+}
+
+/// Not settled before a pane starts: the line says "expected".
+#[test]
+fn a_mod_that_is_only_likely_is_said_to_be_expected() {
+    let line = teammates_line(&TeammateFacts {
+        mod_expect: Expect::Likely,
+        ..FACTS
+    });
+    assert_eq!(
+        line,
+        "teams: named subagents and teammates are expected to become atrium panes through the \
+         mod (subagents: panes); the first claude pane settles whether the mod loads"
+    );
+}
+
+const INSTALLED: ExpectFacts = ExpectFacts {
+    enabled: true,
+    installed: true,
+    will_write: false,
+    mixed: false,
+    differs: false,
+};
+
+/// The teams line and the session agree, because both decide with
+/// `launch_of`: a record for this Claude Code and mod keeps the mod off; a
+/// Claude Code that was upgraded since means it is tried again.
+#[test]
+fn the_mod_is_expected_as_the_launch_will_decide_it() {
+    let record = || RecordRead::Tripped(TripRecord::now("2.1.325", "why", 1));
+    let claude = |v: &'static str| move || Some(v.to_string());
+    assert_eq!(expect_of(&INSTALLED, RecordRead::None, || None), Expect::On);
+    assert_eq!(
+        expect_of(&INSTALLED, RecordRead::Unreadable, || None),
+        Expect::On
+    );
+    assert_eq!(
+        expect_of(&INSTALLED, record(), claude("2.1.325")),
+        Expect::Off,
+        "the same claude and the same mod: it stays off"
+    );
+    assert_eq!(
+        expect_of(&INSTALLED, record(), claude("2.2.0")),
+        Expect::Likely,
+        "claude was upgraded: the launch tries the mod again"
+    );
+    assert_eq!(
+        expect_of(&INSTALLED, record(), || None),
+        Expect::Off,
+        "an unknown version is not a changed one"
+    );
+    // Files the launch is about to replace: the mod on disk will not be the
+    // one that tripped.
+    let differs = ExpectFacts {
+        differs: true,
+        ..INSTALLED
+    };
+    assert_eq!(
+        expect_of(&differs, record(), claude("2.1.325")),
+        Expect::Likely
+    );
+    assert_eq!(
+        expect_of(&differs, RecordRead::None, || None),
+        Expect::Likely
+    );
+    // A folder the kept yes will write back is this binary's mod again: no
+    // change for the breaker, and only likely until it is written.
+    let will_write = ExpectFacts {
+        installed: false,
+        will_write: true,
+        ..INSTALLED
+    };
+    assert_eq!(
+        expect_of(&will_write, RecordRead::None, || None),
+        Expect::Likely
+    );
+    assert_eq!(
+        expect_of(&will_write, record(), claude("2.1.325")),
+        Expect::Off
+    );
+    // A folder left a mix of versions may not load.
+    let mixed = ExpectFacts {
+        mixed: true,
+        ..INSTALLED
+    };
+    assert_eq!(expect_of(&mixed, RecordRead::None, || None), Expect::Likely);
+    // Not used, or nothing there and nothing to come: off, and claude is
+    // never asked.
+    let never = || -> Option<String> { panic!("claude is not asked") };
+    for off in [
+        ExpectFacts {
+            enabled: false,
+            ..INSTALLED
+        },
+        ExpectFacts {
+            installed: false,
+            ..INSTALLED
+        },
+    ] {
+        assert_eq!(expect_of(&off, record(), never), Expect::Off);
+    }
+    assert_eq!(expect_of(&INSTALLED, RecordRead::None, never), Expect::On);
+}
+
+/// A platform config directory inside a larger repository (dotfiles over
+/// `~/.config` or `~`) does not make the mod folder a checkout of the mod.
+#[test]
+fn a_config_directory_inside_a_dotfiles_repo_is_not_a_checkout_of_the_mod() {
+    let home = temp("dotfiles");
+    let platform = home.join(".config").join("atrium");
+    let folder = platform.join("mod");
+    std::fs::create_dir_all(&folder).unwrap();
+    for git in [home.join(".git"), home.join(".config").join(".git")] {
+        std::fs::create_dir_all(&git).unwrap();
+        assert!(
+            !developer_folder_in(&folder, false, Some(&platform)),
+            "{} is above the platform directory",
+            git.display()
+        );
+    }
+    // The platform directory itself under git is the same case.
+    std::fs::create_dir_all(platform.join(".git")).unwrap();
+    assert!(!developer_folder_in(&folder, false, Some(&platform)));
+    // The mod folder itself as a checkout is one.
+    std::fs::create_dir_all(folder.join(".git")).unwrap();
+    assert!(developer_folder_in(&folder, false, Some(&platform)));
+    std::fs::remove_dir_all(folder.join(".git")).unwrap();
+    // A folder outside the platform directory is looked at all the way up.
+    let elsewhere = home.join("src").join("mine");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    assert!(developer_folder_in(&elsewhere, false, Some(&platform)));
+    assert!(developer_folder_in(&elsewhere, false, None));
+    // Named by ATRIUM_MOD: always.
+    assert!(developer_folder_in(&folder, true, Some(&platform)));
+    // atrium's own source `mod/`, with no `.git` in sight: known by its shape.
+    let tree = temp("source-tree");
+    let source = tree.join("mod");
+    for d in ["hooks", "types", "tests"] {
+        std::fs::create_dir_all(source.join(d)).unwrap();
+    }
+    assert!(
+        !developer_folder_in(&source, false, None),
+        "no Cargo.toml beside it"
+    );
+    std::fs::write(tree.join("Cargo.toml"), "").unwrap();
+    assert!(developer_folder_in(&source, false, None));
+    // An installed folder never has that shape, and a marker rules it out.
+    std::fs::write(source.join(MARKER), "{}").unwrap();
+    assert!(!developer_folder_in(&source, false, None));
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&tree);
 }

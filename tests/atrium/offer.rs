@@ -6,6 +6,13 @@
 //! and `PATH`, and clears `ATRIUM_MOD` (which `.cargo/config.toml` sets for
 //! cargo runs and which would end the offer before it began), so nothing here
 //! reads or writes the developer's own config or mod folder.
+//!
+//! A pty child's environment is this process's plus overrides, and a
+//! variable cannot be taken out of it that way. `ATRIUM_YES` and
+//! `ATRIUM_PANE` in the environment the suite runs in (a gate run from
+//! inside an atrium pane has both) would each mean "nobody is there". So
+//! every launch here goes through a small script that unsets both and then
+//! runs atrium: the tests always run, whatever the gate's own environment.
 
 use crate::support::*;
 use std::path::{Path, PathBuf};
@@ -20,6 +27,17 @@ struct Lab {
     root: PathBuf,
 }
 
+/// How a launch differs from "a person at a terminal".
+#[derive(Default)]
+struct How<'a> {
+    /// `ATRIUM_YES=1`.
+    yes: bool,
+    /// `ATRIUM_PANE=3`: this atrium runs inside an atrium pane.
+    pane: bool,
+    /// stderr goes to this file instead of the terminal.
+    stderr: Option<&'a Path>,
+}
+
 impl Lab {
     fn new(name: &str, claude: bool) -> Lab {
         let root =
@@ -32,20 +50,13 @@ impl Lab {
             } else {
                 "claude"
             });
-            std::fs::write(
-                &fake,
-                if cfg!(windows) {
-                    "@echo fake\r\n"
-                } else {
-                    "#!/bin/sh\necho fake\n"
-                },
-            )
-            .unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
+            let text = if cfg!(windows) {
+                "@echo fake\r\n"
+            } else {
+                "#!/bin/sh\necho fake\n"
+            };
+            std::fs::write(&fake, text).unwrap();
+            make_executable(&fake);
         }
         Lab { root }
     }
@@ -93,30 +104,81 @@ impl Lab {
             ("ATRIUM_MOD".to_string(), String::new()),
             ("ATRIUM_CONFIG".to_string(), String::new()),
             ("ATRIUM_CLAUDE_ALIASES".to_string(), String::new()),
-            // The suite may itself run inside an atrium pane, where nobody
-            // is asked; a launch here is its own outermost atrium.
-            ("ATRIUM_PANE".to_string(), String::new()),
             ("ATRIUM_RESUME_OFFER".to_string(), "0".to_string()),
         ]
     }
 
-    /// A launch a person is at: `atrium <args>` in a pty.
-    fn pty(&self, args: &[&str]) -> pty::Pty {
-        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), args, 30, 120, &self.env()).unwrap()
+    /// The script a pty launch runs: it takes `ATRIUM_YES` and `ATRIUM_PANE`
+    /// out of the environment (or sets them, when `how` says so), then runs
+    /// atrium with its own arguments.
+    fn launcher(&self, how: &How) -> PathBuf {
+        let exe = env!("CARGO_BIN_EXE_atrium");
+        let name = format!(
+            "run-{}{}{}",
+            u8::from(how.yes),
+            u8::from(how.pane),
+            u8::from(how.stderr.is_some())
+        );
+        let (path, text) = if cfg!(windows) {
+            let mut text = "@echo off\r\nset ATRIUM_YES=\r\nset ATRIUM_PANE=\r\n".to_string();
+            if how.yes {
+                text.push_str("set ATRIUM_YES=1\r\n");
+            }
+            if how.pane {
+                text.push_str("set ATRIUM_PANE=3\r\n");
+            }
+            text.push_str(&format!("\"{exe}\" %*"));
+            if let Some(file) = how.stderr {
+                text.push_str(&format!(" 2> \"{}\"", file.display()));
+            }
+            text.push_str("\r\n");
+            (self.root.join(format!("{name}.cmd")), text)
+        } else {
+            let mut text = "#!/bin/sh\nunset ATRIUM_YES ATRIUM_PANE\n".to_string();
+            if how.yes {
+                text.push_str("export ATRIUM_YES=1\n");
+            }
+            if how.pane {
+                text.push_str("export ATRIUM_PANE=3\n");
+            }
+            text.push_str(&format!("exec \"{exe}\" \"$@\""));
+            if let Some(file) = how.stderr {
+                text.push_str(&format!(" 2> \"{}\"", file.display()));
+            }
+            text.push('\n');
+            (self.root.join(format!("{name}.sh")), text)
+        };
+        std::fs::write(&path, text).unwrap();
+        make_executable(&path);
+        path
     }
 
-    /// A launch nobody is at: no terminal on stdin. Its stderr.
-    fn piped(&self, args: &[&str], extra: &[(&str, &str)]) -> String {
+    /// A launch a person is at: `atrium <args>` in a pty.
+    fn pty(&self, args: &[&str]) -> pty::Pty {
+        self.pty_how(args, &How::default())
+    }
+
+    fn pty_how(&self, args: &[&str], how: &How) -> pty::Pty {
+        let script = self.launcher(how).display().to_string();
+        pty::Pty::spawn_with_env(&script, args, 30, 120, &self.env()).unwrap()
+    }
+
+    /// A launch nobody is at: no terminal on stdin. Its stdout and stderr.
+    fn piped(&self, args: &[&str], extra: &[(&str, &str)]) -> (String, String) {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_atrium"));
         cmd.args(args)
             .envs(self.env())
             .env_remove("ATRIUM_YES")
+            .env_remove("ATRIUM_PANE")
             .stdin(std::process::Stdio::null());
         for (k, v) in extra {
             cmd.env(k, v);
         }
         let out = cmd.output().unwrap();
-        String::from_utf8_lossy(&out.stderr).into_owned()
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 
     /// Every file under the platform config directory, relative to it.
@@ -149,17 +211,14 @@ impl Drop for Lab {
     }
 }
 
-/// `ATRIUM_YES` in the developer's own shell means "nobody is there" to
-/// every child, and a pty child cannot have a variable removed: say so and
-/// skip, rather than fail on the machine's setup.
-fn person_possible() -> bool {
-    if std::env::var_os("ATRIUM_YES").is_some() {
-        eprintln!(
-            "skipped: ATRIUM_YES is set in this environment, so no launch here has a person at it"
-        );
-        return false;
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    true
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn shown(bytes: &[u8]) -> String {
@@ -182,9 +241,6 @@ const LAUNCH: &[&str] = &["fleet", "up", "no-such-fleet-for-the-offer"];
 /// marker, and keeps the yes in the config just written.
 #[test]
 fn a_first_launch_answers_both_questions_with_enter_and_the_mod_is_installed() {
-    if !person_possible() {
-        return;
-    }
     let lab = Lab::new("enter", true);
     let mut p = lab.pty(LAUNCH);
     let mut seen = read_until(&mut p, CONFIG_QUESTION, Duration::from_secs(15));
@@ -197,13 +253,17 @@ fn a_first_launch_answers_both_questions_with_enter_and_the_mod_is_installed() {
     seen.extend(read_until(&mut p, QUESTION, Duration::from_secs(15)));
     let text = shown(&seen);
     assert!(contains(&seen, QUESTION), "{text}");
-    // The wording, in its order, before the question.
+    // The wording, before the question: what it is, what it changes, and
+    // where the answer will be kept (the config the first question wrote).
     for piece in [
         "a Claude Code plugin",
         "status for certain",
         "takes over Claude Code's Agent tool",
-        "never blocks a tool call",
-        "atrium mod install",
+        "lets Claude Code carry on",
+        "atrium mod off",
+        "Nothing of the mod is written without a yes",
+        "Your answer, yes or no, is kept in",
+        "config.json (its \"mod\" key",
     ] {
         assert!(
             contains_shown(&seen, piece.as_bytes()),
@@ -250,9 +310,6 @@ fn a_first_launch_answers_both_questions_with_enter_and_the_mod_is_installed() {
 /// no is `"mod": false`: off and silent.
 #[test]
 fn a_no_is_recorded_and_the_second_launch_asks_nothing() {
-    if !person_possible() {
-        return;
-    }
     let lab = Lab::new("no", true);
     let mut p = lab.pty(LAUNCH);
     let mut seen = read_until(&mut p, CONFIG_QUESTION, Duration::from_secs(15));
@@ -263,7 +320,7 @@ fn a_no_is_recorded_and_the_second_launch_asks_nothing() {
     let text = to_exit(&mut p, seen);
     assert!(
         !lab.mod_dir().exists(),
-        "nothing is written without a yes: {text}"
+        "nothing of the mod is written without a yes: {text}"
     );
     let config = std::fs::read_to_string(lab.config()).unwrap();
     assert!(config.contains("\"mod\": false"), "{config}");
@@ -273,7 +330,7 @@ fn a_no_is_recorded_and_the_second_launch_asks_nothing() {
     assert!(!text.contains("Install the atrium mod"), "{text}");
     assert!(!lab.mod_dir().exists());
     // And where nobody is there, a claude launch says nothing of the mod.
-    let err = lab.piped(&["--allow-ctl", "claude"], &[]);
+    let (_, err) = lab.piped(&["--allow-ctl", "claude"], &[]);
     assert!(
         !err.contains("mod: not installed"),
         "silent after a no: {err}"
@@ -286,14 +343,14 @@ fn a_no_is_recorded_and_the_second_launch_asks_nothing() {
 #[test]
 fn with_nobody_there_nothing_is_asked_and_nothing_is_written() {
     let lab = Lab::new("nobody", true);
-    let err = lab.piped(LAUNCH, &[]);
+    let (_, err) = lab.piped(LAUNCH, &[]);
     assert!(!err.contains("Install the atrium mod"), "{err}");
     assert!(!err.contains("Global config file location"), "{err}");
     assert_eq!(lab.written(), Vec::<String>::new(), "{err}");
 
     // A plain launch of claude: the terminal is never taken (there is none),
     // and the lines before it are there. Once, not per pane.
-    let err = lab.piped(&["--allow-ctl", "claude"], &[]);
+    let (_, err) = lab.piped(&["--allow-ctl", "claude"], &[]);
     assert!(!err.contains("Install the atrium mod"), "{err}");
     assert_eq!(err.matches("mod: not installed at").count(), 1, "{err}");
     assert!(err.contains("`atrium mod install` adds it"), "{err}");
@@ -305,7 +362,7 @@ fn with_nobody_there_nothing_is_asked_and_nothing_is_written() {
             && err.contains("atrium cannot see it in its environment"),
         "{err}"
     );
-    let err = lab.piped(
+    let (_, err) = lab.piped(
         &["--allow-ctl", "claude"],
         &[("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")],
     );
@@ -313,7 +370,7 @@ fn with_nobody_there_nothing_is_asked_and_nothing_is_written() {
     // Not for a command that is not claude, and not without the control plane.
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     for args in [&["--allow-ctl", shell][..], &["claude"][..]] {
-        let err = lab.piped(args, &[]);
+        let (_, err) = lab.piped(args, &[]);
         assert!(
             !err.contains("mod:") && !err.contains("teams:"),
             "{args:?}: {err}"
@@ -322,13 +379,116 @@ fn with_nobody_there_nothing_is_asked_and_nothing_is_written() {
     assert_eq!(lab.written(), Vec::<String>::new());
 
     // A terminal, and `ATRIUM_YES`: the same nothing.
-    let mut env = lab.env();
-    env.push(("ATRIUM_YES".to_string(), "1".to_string()));
-    let mut p =
-        pty::Pty::spawn_with_env(env!("CARGO_BIN_EXE_atrium"), LAUNCH, 30, 120, &env).unwrap();
+    let mut p = lab.pty_how(
+        LAUNCH,
+        &How {
+            yes: true,
+            ..How::default()
+        },
+    );
     let text = to_exit(&mut p, Vec::new());
+    assert!(text.contains("no fleet named"), "{text}");
     assert!(!text.contains("Install the atrium mod"), "{text}");
     assert_eq!(lab.written(), Vec::<String>::new(), "{text}");
+}
+
+/// The question is written to stderr. With stderr redirected nobody would
+/// see it, atrium would wait on a blank screen, and the Enter pressed at an
+/// apparent hang would install the mod: so with stdin a terminal and stderr
+/// a file nothing is asked and nothing is written.
+#[test]
+fn with_stderr_redirected_nothing_is_asked_and_nothing_is_written() {
+    let lab = Lab::new("stderr", true);
+    let log = lab.root.join("err.log");
+    let how = How {
+        stderr: Some(&log),
+        ..How::default()
+    };
+    // No config: neither question may wait for a line nobody was shown.
+    let mut p = lab.pty_how(LAUNCH, &how);
+    let text = to_exit(&mut p, Vec::new());
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        err.contains("no fleet named"),
+        "the launch ran to its end: {err}"
+    );
+    for (what, said) in [("the terminal", &text), ("the file", &err)] {
+        assert!(!said.contains("Install the atrium mod"), "{what}: {said}");
+        assert!(!said.contains("Global config file"), "{what}: {said}");
+    }
+    assert_eq!(lab.written(), Vec::<String>::new());
+    // With a config there (so only the mod question is in play): the same.
+    std::fs::create_dir_all(lab.atrium()).unwrap();
+    std::fs::write(lab.config(), "{}").unwrap();
+    let mut p = lab.pty_how(LAUNCH, &how);
+    let text = to_exit(&mut p, Vec::new());
+    let err = std::fs::read_to_string(&log).unwrap();
+    assert!(err.contains("no fleet named"), "{err}");
+    assert!(!err.contains("Install the atrium mod"), "{err}");
+    assert!(!text.contains("Install the atrium mod"), "{text}");
+    assert_eq!(lab.written(), ["atrium/config.json"]);
+    assert_eq!(std::fs::read_to_string(lab.config()).unwrap(), "{}");
+}
+
+/// Keys pressed before the question is on screen are not its answer. A path
+/// pasted at the config question with extra Enters behind it answers the
+/// config question only: the mod question still waits, and a real `n` is
+/// then taken.
+#[test]
+fn what_is_typed_ahead_does_not_answer_the_question() {
+    let lab = Lab::new("ahead", true);
+    let mut p = lab.pty(LAUNCH);
+    let mut seen = read_until(&mut p, CONFIG_QUESTION, Duration::from_secs(15));
+    assert!(contains(&seen, CONFIG_QUESTION), "{}", shown(&seen));
+    // One Enter for the config question, and two more typed ahead.
+    p.write(b"\r\r\r").unwrap();
+    seen.extend(read_until(&mut p, QUESTION, Duration::from_secs(15)));
+    assert!(contains(&seen, QUESTION), "{}", shown(&seen));
+    // The question is still waiting: nothing was taken as its answer.
+    let after = read_until(&mut p, b"does not ask again", Duration::from_secs(3));
+    let text = shown(&after);
+    assert!(
+        !text.contains("written,") && !text.contains("does not ask again"),
+        "an Enter typed ahead answered the question: {text}"
+    );
+    assert!(p.try_wait().unwrap().is_none(), "atrium is still asking");
+    assert!(!lab.mod_dir().exists(), "{text}");
+    assert!(lab.config().is_file(), "the config question was answered");
+    // A real answer is taken.
+    p.write(b"n\r").unwrap();
+    seen.extend(after);
+    let text = to_exit(&mut p, seen);
+    let config = std::fs::read_to_string(lab.config()).unwrap();
+    assert!(config.contains("\"mod\": false"), "{config}\n{text}");
+    assert!(!lab.mod_dir().exists());
+}
+
+/// An atrium started inside an atrium pane is not the first start, and what
+/// types into a pane may be an agent: nothing is asked there, though both
+/// its streams are terminals.
+#[test]
+fn an_atrium_inside_a_pane_is_not_asked() {
+    let lab = Lab::new("pane", true);
+    std::fs::create_dir_all(lab.atrium()).unwrap();
+    std::fs::write(lab.config(), "{}").unwrap();
+    let mut p = lab.pty_how(
+        LAUNCH,
+        &How {
+            pane: true,
+            ..How::default()
+        },
+    );
+    let text = to_exit(&mut p, Vec::new());
+    assert!(text.contains("no fleet named"), "{text}");
+    assert!(!text.contains("Install the atrium mod"), "{text}");
+    assert_eq!(lab.written(), ["atrium/config.json"]);
+    assert_eq!(std::fs::read_to_string(lab.config()).unwrap(), "{}");
+    // The same launch outside a pane is asked: the pane is what decided.
+    let mut p = lab.pty(LAUNCH);
+    let seen = read_until(&mut p, QUESTION, Duration::from_secs(15));
+    assert!(contains(&seen, QUESTION), "{}", shown(&seen));
+    p.write(b"n\r").unwrap();
+    let _ = to_exit(&mut p, seen);
 }
 
 /// An existing user: a config they formatted by hand, no answer in it. The
@@ -336,9 +496,6 @@ fn with_nobody_there_nothing_is_asked_and_nothing_is_written() {
 /// into their file as one key and every other byte stays.
 #[test]
 fn an_existing_config_with_no_answer_is_asked_once_and_edited_by_one_key() {
-    if !person_possible() {
-        return;
-    }
     let lab = Lab::new("existing", true);
     let hand = "{\n\t\"deny\" : [ \"Bash(rm -rf *)\" ],\n\n    \"notify\":\"bell\"\n}\n";
     std::fs::create_dir_all(lab.atrium()).unwrap();
@@ -371,14 +528,12 @@ fn an_existing_config_with_no_answer_is_asked_once_and_edited_by_one_key() {
 /// appears.
 #[test]
 fn without_claude_on_path_nothing_is_asked_or_recorded() {
-    if !person_possible() {
-        return;
-    }
     let lab = Lab::new("noclaude", false);
     std::fs::create_dir_all(lab.atrium()).unwrap();
     std::fs::write(lab.config(), "{}").unwrap();
     let mut p = lab.pty(LAUNCH);
     let text = to_exit(&mut p, Vec::new());
+    assert!(text.contains("no fleet named"), "{text}");
     assert!(!text.contains("Install the atrium mod"), "{text}");
     assert_eq!(lab.written(), ["atrium/config.json"]);
     assert_eq!(std::fs::read_to_string(lab.config()).unwrap(), "{}");
@@ -389,9 +544,6 @@ fn without_claude_on_path_nothing_is_asked_or_recorded() {
 /// starts as usual.
 #[test]
 fn a_plain_launch_asks_before_the_terminal_is_taken_and_keeps_the_answer_beside_the_config() {
-    if !person_possible() {
-        return;
-    }
     let lab = Lab::new("plain", true);
     let (shell, bar): (&[&str], &[u8]) = if cfg!(windows) {
         (&["cmd", "/Q"], b"1:cmd")
@@ -405,6 +557,11 @@ fn a_plain_launch_asks_before_the_terminal_is_taken_and_keeps_the_answer_beside_
     assert!(
         !contains(&seen, CONFIG_QUESTION),
         "a plain launch asks for no config"
+    );
+    assert!(
+        contains_shown(&seen, b"mod.answer (one word)"),
+        "where the answer goes is said first: {}",
+        shown(&seen)
     );
     p.write(b"n\r").unwrap();
     let after = read_until(&mut p, bar, Duration::from_secs(15));
@@ -432,4 +589,59 @@ fn a_plain_launch_asks_before_the_terminal_is_taken_and_keeps_the_answer_beside_
     assert!(!contains(&seen, QUESTION), "{}", shown(&seen));
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
+}
+
+/// `atrium mod off` is a no without hand-editing: kept exactly as answering
+/// `n` keeps it, shown by `atrium mod status`, and turned around by `atrium
+/// mod install`.
+#[test]
+fn mod_off_records_a_no_and_mod_install_turns_it_around() {
+    let lab = Lab::new("off", true);
+    // No config file: the answer file.
+    let (out, err) = lab.piped(&["mod", "off"], &[]);
+    assert!(
+        out.contains("the no is kept in") && out.contains("mod.answer (no)"),
+        "{out}{err}"
+    );
+    assert_eq!(lab.written(), ["atrium/mod.answer"]);
+    let (status, _) = lab.piped(&["mod", "status"], &[]);
+    assert!(status.contains("offer: answered no, kept in"), "{status}");
+    assert!(status.contains("enabled: no"), "{status}");
+    // A person at the next start is not asked: the answer is there.
+    let mut p = lab.pty(LAUNCH);
+    let seen = read_until(&mut p, CONFIG_QUESTION, Duration::from_secs(15));
+    p.write(b"\r").unwrap();
+    let text = to_exit(&mut p, seen);
+    assert!(!text.contains("Install the atrium mod"), "{text}");
+    assert!(!lab.mod_dir().exists());
+
+    // `mod install` says yes again, and the yes is kept where the config
+    // the launch above wrote can hold it: its one key.
+    let (out, err) = lab.piped(&["mod", "install"], &[]);
+    assert!(
+        out.contains("the mod was off on this machine and is on again"),
+        "{out}{err}"
+    );
+    assert!(lab.mod_dir().join(".atrium-mod").is_file());
+    let (status, _) = lab.piped(&["mod", "status"], &[]);
+    assert!(
+        status.contains("offer: answered yes, kept in") && status.contains("`atrium mod off`"),
+        "{status}"
+    );
+    assert!(status.contains("enabled: yes"), "{status}");
+
+    // And off again, with a config there: its one key.
+    let before = std::fs::read_to_string(lab.config()).unwrap();
+    let (out, err) = lab.piped(&["mod", "off"], &[]);
+    assert!(out.contains("config.json (\"mod\": false)"), "{out}{err}");
+    assert_eq!(
+        std::fs::read_to_string(lab.config()).unwrap(),
+        before.replace("\"mod\": true", "\"mod\": false")
+    );
+    assert!(
+        lab.mod_dir().join(".atrium-mod").is_file(),
+        "the folder is left as it is"
+    );
+    let (_, err) = lab.piped(&["mod", "off", "now"], &[]);
+    assert!(err.contains("unexpected argument"), "{err}");
 }

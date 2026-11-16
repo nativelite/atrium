@@ -9,36 +9,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **The mod is offered at first start.** It is offered, not installed
-  silently: the first launch with a person at it (a terminal on stdin,
-  `ATRIUM_YES` unset) asks once, before the terminal is taken and after the
-  config-location question where that is asked, `Install the atrium mod?
-  [Y/n]`, having said what the mod is and where it is written, what it gives,
-  what it changes (in atrium's panes it takes over Claude Code's Agent tool)
-  and how to change your mind. Enter means yes and installs it as `atrium mod
-  install` does; `n` writes nothing; no answer records nothing and the next
+  silently: the first launch with a person at it asks once, before the
+  terminal is taken and after the config-location question where that is
+  asked, `Install the atrium mod? [Y/n]`, having said what the mod is and
+  where it is written, what it gives, what it changes (in atrium's panes it
+  takes over Claude Code's Agent tool; if it fails it lets Claude Code carry
+  on, and a refusal atrium itself returned still stands), how to change your
+  mind, and where your answer will be kept. Enter means yes and installs it as
+  `atrium mod install` does. Nothing of the mod is written without a yes; the
+  answer itself, yes or no, is kept. No answer records nothing and the next
   start asks again. A plain launch asks too.
   - **The answer is kept in the config**, as `"mod": true` or `"mod": false`,
-    by changing that one key and no other byte of the file (a config that
-    does not parse, names `mod.path`, or is a symbolic link is never written
-    to). With no config file to hold it, it is kept in `mod.answer` beside
-    the config pointer; the config's key, when present, wins. A no is `"mod":
-    false`: off and silent. `"mod": true` is new as a value; `true`, `false`
-    and `{ "path": … }` already in a config count as answered.
+    by changing that one key and no other byte of the file; the file keeps its
+    permissions. A config is never written when it does not parse, when its
+    `"mod"` is an object (`{ "path": … }`, `{}`, a mistyped key: yours,
+    whatever is in it), or when it is read-only, a symbolic link, hard-linked
+    or another user's. Then, and with no config file to hold it, the answer is
+    kept in `mod.answer` beside the config pointer; the config's key, when
+    present, wins. A no is `"mod": false`: off and silent.
+  - **`"mod": true` is new as a value, and it is a yes.** If your config
+    already says `"mod": true`, that counts as the yes: you are not asked, and
+    if the mod's folder is missing it is written when the first claude pane
+    starts, with one line. For such a config this is the first time atrium
+    writes the mod without `atrium mod install`. `atrium mod off`, or `"mod":
+    false`, stops it.
   - **A yes covers upgrades.** With a yes kept, a launch whose mod folder is
     missing writes it again, and one that finds a mod an older atrium left
-    without a marker installs over it and marks it, with one line. Never in a
-    folder `ATRIUM_MOD` names or inside a git checkout, never over a newer
-    mod. `atrium mod install` into the folder panes load is a yes and is kept
-    the same way, which turns a recorded no around.
-  - **Nobody there, nobody asked.** No terminal on stdin, `ATRIUM_YES`, a
-    headless fleet, an atrium started inside an atrium pane, `atrium ctl`:
-    nothing is asked, installed or recorded.
-    Nor when `claude` (or a configured alias) is not on `PATH`, when a marked
-    mod is installed, or when `ATRIUM_MOD` or `mod.path` names the folder. A
-    launch that hosts claude with the control plane on and finds no mod and
-    no answer says so in one line with `atrium mod install` (a fleet in its
-    preflight block), once, and never after a no.
-  - `atrium mod status` shows the answer and where it is kept (`offer:`).
+    without a marker replaces its files and marks it, with one line that names
+    `atrium mod off`. Never in a folder `ATRIUM_MOD` names or in a git
+    checkout of the mod, never over a newer mod. A missing folder written back
+    does not bring a mod the breaker backed out back on: nothing changed.
+  - **`atrium mod off`** says no without hand-editing, kept as answering `n`
+    keeps it; `atrium mod install` into the folder panes load says yes and is
+    kept the same way, which turns a recorded no around.
+  - **Nobody there, nobody asked.** Stdin or stderr not a terminal (the
+    question would go unseen), `ATRIUM_YES`, a headless fleet, an atrium
+    started inside an atrium pane, `atrium ctl`: nothing is asked, installed
+    or recorded. Keys typed before the question is on screen are thrown away
+    and never answer it. Nor is anyone asked when `claude` (or a configured
+    alias) is not on `PATH`, when a marked mod is installed, or when the
+    folder is the user's to manage (`ATRIUM_MOD`, an object under `"mod"`, a
+    git checkout of the mod; a config directory inside a dotfiles repository
+    is asked normally). A launch that hosts claude with the control plane on
+    and finds no mod and no answer says so in one line with `atrium mod
+    install` (a fleet in its preflight block), once, and never after a no.
+  - `atrium mod status` shows the answer and where it is kept (`offer:`), or
+    why the offer is not made on this machine.
+  - The config-location question of `fleet up` and `recover` is likewise no
+    longer asked when stderr is not a terminal.
 
 - **A broken mod is backed out by atrium, not left to break panes** (the mod
   0.3.0). The mod is on its way to being the default for claude panes.
@@ -123,7 +141,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is not in atrium's environment; or that subagents and teammates run inside
   their agent and are not visible to atrium. It names the `subagents` policy
   in force, and is also printed by a plain `--allow-ctl` launch of claude and
-  by `atrium mod status`.
+  by `atrium mod status`. Whether the mod will be on is decided as the launch
+  decides it (the breaker's record against this Claude Code and this mod
+  included); where the first claude pane has yet to settle it, the line says
+  teammates "are expected to become" panes.
 - The preflight's line for a mod that is not installed now reads `mod: not
   installed at <dir>: claude panes report status by inference and their
   subagents are not panes; `atrium mod install` adds it`; with a yes kept it

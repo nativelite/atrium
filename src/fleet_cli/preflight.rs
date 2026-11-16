@@ -210,8 +210,8 @@ pub(super) struct BannerFacts {
     /// `teams` key).
     pub(super) teams_on: bool,
     /// Whether this fleet's claude panes are expected to run the mod
-    /// ([`atrium::modfiles::expected_on`]).
-    pub(super) mod_on: bool,
+    /// ([`atrium::modfiles::expected`]).
+    pub(super) mod_expect: atrium::modfiles::Expect,
     /// Whether Claude Code's teams are switched on in atrium's environment
     /// ([`atrium::modfiles::ENV_AGENT_TEAMS`]).
     pub(super) teams_var: bool,
@@ -252,7 +252,16 @@ impl BannerFacts {
             mod_line,
             mod_missing,
             teams_on: fleet.teams.unwrap_or(true),
-            mod_on: atrium::modfiles::expected_on(enabled, yes),
+            // Decided as the launch will decide it; claude is asked its
+            // version only when the breaker left a record to hold it against.
+            mod_expect: atrium::modfiles::expected(enabled, yes, || {
+                fleet
+                    .agents
+                    .iter()
+                    .filter_map(|a| a.cmd.first())
+                    .find(|c| atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)))
+                    .and_then(|c| crate::pane_spawn::claude_version(c))
+            }),
             teams_var: atrium::modfiles::teams_var_on(
                 std::env::var(atrium::modfiles::ENV_AGENT_TEAMS)
                     .ok()
@@ -331,7 +340,7 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
                 "atrium fleet: {}",
                 atrium::modfiles::teammates_line(&atrium::modfiles::TeammateFacts {
                     ctl: launch.allow_ctl,
-                    mod_on: facts.mod_on,
+                    mod_expect: facts.mod_expect,
                     subagents: fleet
                         .subagents
                         .as_deref()

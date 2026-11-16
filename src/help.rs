@@ -216,13 +216,16 @@ usage: atrium mod <command>    the plugin of function hooks a claude pane loads
                         answer to the first-run offer and where it is kept, which path a
                         named teammate takes, whether the breaker backed the mod out (against
                         which versions, and when), and what a running session's mods reported
+  off                   say no to the mod: kept as \"mod\": false in config.json (that one
+                        key), or in mod.answer beside it; `install` says yes again
   retry                 forget that the breaker tripped: the next session loads the mod again
 
 Once installed, every claude pane atrium spawns gets CLAUDE_CODE_PLUGIN_DIRS naming the
 folder and reports its status to atrium for certain instead of by inference. ATRIUM_MOD
 names the folder outright; \"mod\": false in config.json or a fleet turns injection off.
-The first start with a person at it offers the mod once (Enter is yes) and keeps the answer
-as \"mod\": true or false; a yes also lets a launch write the folder again if it goes missing.
+The first start with a person at it offers the mod once (Enter is yes). Nothing of the mod
+is written without a yes; the answer, yes or no, is kept as \"mod\": true or false in
+config.json, or beside it. A yes also lets a launch write the folder again if it goes missing.
 
 `install` marks the folder it writes and clears the breaker's record; a launch keeps a
 marked folder current with the atrium that runs (one line when it rewrote a file) and

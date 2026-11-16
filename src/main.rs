@@ -336,7 +336,9 @@ fn claude_launch_notes(command: &[String], allow_ctl: bool) -> Vec<String> {
     if !is_claude || !allow_ctl {
         return Vec::new();
     }
-    let mut lines = vec![atrium::modfiles::session_teammates_line(true)];
+    let mut lines = vec![atrium::modfiles::session_teammates_line(true, || {
+        claude_version(&command[0])
+    })];
     lines.extend(atrium::modfiles::session_absent_note());
     lines
 }

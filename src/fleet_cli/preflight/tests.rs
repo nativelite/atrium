@@ -51,7 +51,7 @@ fn facts() -> BannerFacts {
         mod_line: "mod: installed 0.1.0 at /cfg/mod".to_string(),
         mod_missing: false,
         teams_on: true,
-        mod_on: true,
+        mod_expect: atrium::modfiles::Expect::On,
         teams_var: false,
         codex_hooks_unreviewed: Vec::new(),
         codex_hooks_reviewed: Vec::new(),
@@ -407,10 +407,20 @@ fn the_banner_says_which_path_handles_a_named_teammate() {
         "atrium fleet: teams: named subagents and teammates become atrium panes through the \
          mod (subagents: panes)"
     );
+    // Not settled before a pane starts (the launch has yet to write the
+    // folder, or is trying the mod again): "expected", not a flat statement.
+    let mut likely = facts();
+    likely.mod_expect = atrium::modfiles::Expect::Likely;
+    assert_eq!(
+        teams(TWO_AGENTS, true, &likely),
+        "atrium fleet: teams: named subagents and teammates are expected to become atrium \
+         panes through the mod (subagents: panes); the first claude pane settles whether the \
+         mod loads"
+    );
     // (b) The mod is off and the shim is on: Claude Code's own teams, which
     // need a variable atrium cannot see unless it is in its environment.
     let mut shim = facts();
-    shim.mod_on = false;
+    shim.mod_expect = atrium::modfiles::Expect::Off;
     assert_eq!(
         teams(TWO_AGENTS, true, &shim),
         "atrium fleet: teams: the mod is off; Claude Code's own teammates land as panes \
@@ -425,7 +435,7 @@ fn the_banner_says_which_path_handles_a_named_teammate() {
     );
     // (c) Neither.
     let mut neither = facts();
-    neither.mod_on = false;
+    neither.mod_expect = atrium::modfiles::Expect::Off;
     neither.teams_on = false;
     assert_eq!(
         teams(TWO_AGENTS, true, &neither),
