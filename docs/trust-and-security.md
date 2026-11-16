@@ -44,6 +44,20 @@ To run agents at a higher posture, set it at launch with `--trust`, where it is
 one visible, deliberate choice rather than something a pane can ask for
 mid-session.
 
+### What the ceiling covers on the control plane
+
+A mode caps what an agent does through its own tools. The control plane is another way to act, so the ceiling is held there too, for every pane, below `skip`:
+
+- **A spawn starts an agent CLI found on `PATH`.** The command of a `ctl spawn` is a bare name; a path of any kind (`\\host\share\claude.exe`, `./x/claude.sh`, `C:\tmp\claude.exe`, `/tmp/claude`) is refused, because it would pass the allowlist on its file name and start a program that ignores the flags above. A fleet file's `cmd` may be a path: a person wrote it.
+- **Text is typed only into an agent's pane.** A `ctl send` or a bus wake into a shell is a command line, run with no gate. A pane whose command is not an agent CLI takes neither, unless its own mod collects its deliveries (`inbox`: nothing is typed).
+- **No line of a `send`, and no argument of a spawned command, starts with `!`.** Claude Code runs such a prompt as a shell command with no permission prompt. A pane may send a `/` command into its own subtree.
+
+At `skip` these three are lifted for a pane's request: every command already runs with no gate, so there is nothing to step over. That includes a wake typed into a shell pane that subscribed or is addressed, which the shell runs as a line (`… & calc` on `cmd.exe`). With no `--trust` at all they hold: the agents run under their own permission settings, and a command typed into a shell would sidestep those just the same. An [operator](control-plane.md#operator-tokens-a-caller-that-is-not-a-pane) is held to all three at any trust. What you type at the keyboard is not a ctl request.
+
+What this does not cover: a bare name is looked up on the `PATH` atrium was launched with, and on Windows a name found nowhere on `PATH` falls to the system's own search, which includes atrium's working directory; whoever can write there, or change `PATH` before launch, chooses the program. And a pane's token is in the environment of that pane's processes, readable by other processes of the same user: the rules bound what any pane's token can do, not which process presents it.
+
+See [what a pane's request is held to](control-plane.md#what-a-panes-request-is-held-to) for the exact tests and the refusals.
+
 ### Why the root pane is no longer carved out
 
 This policy used to carve out the root pane, on the reading that the root pane is
@@ -290,7 +304,10 @@ limits, each one unit-tested as a pure function:
    `ctl spawn -- rm -rf`. Extend it per-session, set by the human who launches
    atrium, with **`ATRIUM_CTL_ALLOW`** (comma-separated stems, for example for
    another agent CLI) or `ctl_allow` in the user-global `config.json`. It never
-   weakens a session that didn't set it.
+   weakens a session that didn't set it. The command is a **bare name** looked
+   up on `PATH`, for every caller: the allowlist reads the file stem, so a
+   path that ends in `claude` is refused rather than run as given. Its
+   arguments may not start a line with `!` below `skip`.
 3. **No count cap; a depth guard.** A fleet designed for 32 runs 32; width is
    unlimited. Only *recursion* is bounded, by **`--max-depth`** (default 6, `0`
    removes it): a spawn past the ceiling is refused, so a self-spawning agent
@@ -300,6 +317,10 @@ limits, each one unit-tested as a pure function:
    / `audit` only panes **in its own subtree**; a lead steers its own team, never
    a sibling's. **You control everything**: a root pane (the one atrium opened, or
    any `ctl` run from outside a pane) is the operator and reaches every pane.
+   Reaching a pane is not typing into it: below `skip`, `send` text and a wake
+   are typed only into an **agent's** pane (a shell would run them), and no
+   line of a `send` starts with `!` (an agent CLI would run it as a shell
+   line); see [what the ceiling covers](#what-the-ceiling-covers-on-the-control-plane).
    One deliberate exception: a **bus wake** — the framed line an event becomes
    in the pane of a subscriber or an addressee (`bus pub --to`) — may also go
    *up* the tree, to the panes that spawned the publisher, and to any pane that
@@ -317,7 +338,10 @@ limits, each one unit-tested as a pure function:
 6. **Audit.** Every request is recorded: caller, action, a **secret-free** detail
    (`send` logs the text *length*, never the body; identities by name only), and
    outcome, to an in-memory ring, readable live via `ctl audit` (subtree-scoped
-   like any read). Opt in to a persistent JSONL mirror with
+   like any read). A request is recorded with or without a credential, so
+   nothing it carried is kept raw: each field is scrubbed of control,
+   direction and zero-width characters and cut to 128 characters, and every
+   entry's detail and note to 512. Opt in to a persistent JSONL mirror with
    **`ATRIUM_CTL_AUDIT=<file>`**; a file it can't open is flashed once, and the log
    keeps running in memory.
 7. **Visibility is the safety story.** Nothing a `ctl`-spawned agent does is

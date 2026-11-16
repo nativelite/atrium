@@ -129,6 +129,14 @@ fn dialog_up(vendor: agsess::Vendor, screen: &ansi::Screen) -> Option<&'static s
         .find(|m| screen_has(screen, m))
 }
 
+/// May a queued delivery be typed into a pane's pty? Into an agent's pane,
+/// yes; into any other only in a `skip` session ([`atrium::ctl::text_may_land`]
+/// for a pane's text, with no inbox left to take it). An operator's text is
+/// never queued for a pane that is not an agent's, at any trust.
+pub(crate) fn may_type_into(agent_pane: bool, policy: atrium::ctl::TrustMode) -> bool {
+    atrium::ctl::text_may_land(agent_pane, false, atrium::ctl::TextFrom::Pane, policy)
+}
+
 pub(crate) fn typed_bytes(text: &str, paste_wanted: bool) -> Vec<u8> {
     if cfg!(unix) && paste_wanted {
         let mut v = Vec::with_capacity(text.len() + 12);
@@ -272,6 +280,25 @@ pub(crate) fn flush_sends(
                 let ready = match pane_by_agent(windows, ps.target) {
                     None => return false, // target gone — drop the send
                     Some(p) => {
+                        // The last guard before anything is typed. A queued
+                        // delivery was accepted for a pane text may land in
+                        // (`ctl::text_may_land`), and one way that can stop
+                        // being true: the target's mod was to collect it over
+                        // `inbox`, and the mod is gone (the pane was
+                        // respawned). What is left is a shell, and typing
+                        // into a shell is running a command. Dropped, and
+                        // said on the bar.
+                        if !may_type_into(super::dispatch::is_agent_pane(p), trust_mode()) {
+                            *flash = Some((
+                                format!(
+                                    "a delivery for pane {} was dropped: it is not an agent's \
+                                     pane, and nothing is typed into a shell below --trust skip",
+                                    p.id
+                                ),
+                                now,
+                            ));
+                            return false;
+                        }
                         let sid = p.session_id.as_deref();
                         // The target's own startup screen holds the send for as
                         // long as it is up; the bar says so, once per screen.

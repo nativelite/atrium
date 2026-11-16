@@ -489,3 +489,145 @@ fn a_recorded_codex_command_keeps_atriums_own_args() {
     let sh = v(&["sh", "-c", "sandbox_mode=1"]);
     assert_eq!(sanitize_spawn_argv(&sh).0, sh);
 }
+
+// -- the trust ceiling on the pane path ---------------------------------------
+
+/// The form every `ctl spawn` command takes: a name, never a path.
+#[test]
+fn a_bare_command_is_a_name_and_never_a_path() {
+    for ok in [
+        "claude",
+        "codex",
+        "cursor-agent",
+        "claude2.cmd",
+        "claude.exe",
+        "_x",
+        "a.b-c_d",
+    ] {
+        assert!(is_bare_command(ok), "{ok}");
+    }
+    for bad in [
+        "",
+        r"\\host\share\claude.exe",
+        "./x/claude.sh",
+        r".\claude.cmd",
+        r"C:\tools\claude.exe",
+        "C:claude",
+        "/tmp/claude",
+        "x/claude",
+        r"x\claude",
+        "claude:stream",
+        "~/claude",
+        ".claude",
+        "-claude",
+        "claude code",
+        "claude\n",
+        "cl\u{e4}ude",
+        &"a".repeat(65),
+    ] {
+        assert!(!is_bare_command(bad), "{bad:?}");
+    }
+}
+
+/// A fleet file's command is a person's, shown in the launch banner, and is
+/// not a ctl request: it may be a path of any kind, as before.
+#[test]
+fn a_fleet_files_command_may_still_be_a_path() {
+    for program in [
+        r"C:\tools\claude.cmd",
+        "/opt/tools/claude",
+        "./bin/claude",
+        r"\\host\share\claude.exe",
+        "/usr/local/bin/codex",
+    ] {
+        match vet_fleet_argv(&v(&[program, "--model", "opus"])) {
+            ArgvVerdict::Ok { argv, .. } => assert_eq!(argv[0], program),
+            ArgvVerdict::Refused(why) => panic!("{program}: {why}"),
+        }
+    }
+    // And the pure spawn guard still reads a path by its stem: the bare-name
+    // rule is the ctl handler's, on what a request carries.
+    assert!(evaluate_spawn(&v(&["/opt/tools/claude"]), 0, 3, &[]).is_ok());
+}
+
+/// Where text from a ctl request may land.
+#[test]
+fn text_lands_in_an_agents_pane_and_in_a_shell_only_at_skip_for_a_pane() {
+    use crate::ctl::TrustMode::{Auto, Edits, Off, Plan, Skip};
+    for policy in [Off, Plan, Edits, Auto, Skip] {
+        for inbox in [false, true] {
+            for from in [TextFrom::Pane, TextFrom::Operator] {
+                assert!(text_may_land(true, inbox, from, policy), "an agent's pane");
+            }
+            assert!(
+                !text_may_land(false, inbox, TextFrom::Operator, policy),
+                "an operator's text never reaches another pane, {policy:?}"
+            );
+        }
+        assert_eq!(
+            text_may_land(false, false, TextFrom::Pane, policy),
+            policy == Skip,
+            "{policy:?}"
+        );
+        assert!(
+            text_may_land(false, true, TextFrom::Pane, policy),
+            "handed to the pane's own mod, never typed"
+        );
+    }
+}
+
+/// What an agent CLI would run as a shell line.
+#[test]
+fn a_shell_line_is_a_bang_at_the_start_of_any_line() {
+    for text in [
+        "!rm -rf x",
+        "  !rm",
+        "\t!rm",
+        "hello\n!rm",
+        "hello\r\n   !rm",
+        "hello\r!rm",
+        "hello\u{2028}!rm",
+        "hello\u{85}!rm",
+        "x\u{15}!rm",
+        "x\u{8}!rm",
+        "rm -rf x\u{1b}[H!",
+        "rm -rf x\u{1}!",
+        "\u{200b}!rm",
+        "\u{feff} !rm",
+        "\u{a0}!rm",
+    ] {
+        assert!(has_shell_line(text), "{text:?}");
+    }
+    for text in [
+        "",
+        "wow!",
+        "a != b",
+        "run it!\nthen report",
+        "/clear",
+        "is 3! six?",
+        "x !y",
+        "\u{1b}[H no bang here",
+    ] {
+        assert!(!has_shell_line(text), "{text:?}");
+    }
+}
+
+#[test]
+fn a_shell_line_is_refused_for_a_pane_below_skip_and_for_an_operator_always() {
+    use crate::ctl::TrustMode::{Auto, Edits, Off, Plan, Skip};
+    for policy in [Off, Plan, Edits, Auto] {
+        assert_eq!(
+            vet_prompt_text("a\n!b", TextFrom::Pane, policy),
+            Err(SHELL_LINE_REFUSED)
+        );
+        assert_eq!(vet_prompt_text("/clear", TextFrom::Pane, policy), Ok(()));
+    }
+    assert_eq!(vet_prompt_text("!b", TextFrom::Pane, Skip), Ok(()));
+    assert_eq!(
+        vet_prompt_text("!b", TextFrom::Operator, Skip),
+        Err(SHELL_LINE_REFUSED)
+    );
+    assert!(
+        SHELL_LINE_REFUSED.contains("trust ceiling") && SHELL_LINE_REFUSED.contains("in words")
+    );
+}

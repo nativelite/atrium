@@ -214,18 +214,22 @@ impl Cmd {
     /// **secret-free** description (identity *names* only; `send` logs the text
     /// *length*, never the body).
     pub fn audit_label(&self) -> (&'static str, String) {
+        // Every field is the caller's, and a request is recorded whether or
+        // not it carried a credential: each is scrubbed and bounded on its way
+        // in (`audit::field`), so the label never holds raw request text.
+        use crate::audit::field as f;
         match self {
             Cmd::List => ("list", String::new()),
             Cmd::Status(sr) => (
                 "status",
                 match &sr.target {
-                    Some(t) => format!("target={t}"),
+                    Some(t) => format!("target={}", f(t)),
                     None => "scope=subtree".to_string(),
                 },
             ),
             Cmd::Send(sr) => (
                 "send",
-                format!("target={} len={}", sr.target, sr.text.chars().count()),
+                format!("target={} len={}", f(&sr.target), sr.text.chars().count()),
             ),
             Cmd::Spawn(sp) => {
                 let stem = sp
@@ -237,25 +241,25 @@ impl Cmd {
                     "spawn",
                     format!(
                         "role={} argv={} identity={}",
-                        sp.role.as_deref().unwrap_or("-"),
-                        stem,
-                        sp.identity.as_deref().unwrap_or("-")
+                        f(sp.role.as_deref().unwrap_or("-")),
+                        f(&stem),
+                        f(sp.identity.as_deref().unwrap_or("-"))
                     ),
                 )
             }
-            Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
+            Cmd::Kill(kr) => ("kill", format!("target={}", f(&kr.target))),
             Cmd::Audit(_) => ("audit", String::new()),
             Cmd::Board(op) => (
                 "board",
                 match op {
                     BoardOp::Set { key, fields } => {
-                        format!("set {key} fields={}", fields.len())
+                        format!("set {} fields={}", f(key), fields.len())
                     }
-                    BoardOp::Get { key } => format!("get {key}"),
+                    BoardOp::Get { key } => format!("get {}", f(key)),
                     BoardOp::List => "list".to_string(),
-                    BoardOp::Del { key } => format!("del {key}"),
-                    BoardOp::Claim { key, .. } => format!("claim {key}"),
-                    BoardOp::Release { key } => format!("release {key}"),
+                    BoardOp::Del { key } => format!("del {}", f(key)),
+                    BoardOp::Claim { key, .. } => format!("claim {}", f(key)),
+                    BoardOp::Release { key } => format!("release {}", f(key)),
                 },
             ),
             Cmd::Bus(op) => (
@@ -268,10 +272,15 @@ impl Cmd {
                         create,
                     } => {
                         let new = if *create { " --new" } else { "" };
-                        format!("pub {topic}{new} {} fields={}", kind.as_str(), fields.len())
+                        format!(
+                            "pub {}{new} {} fields={}",
+                            f(topic),
+                            kind.as_str(),
+                            fields.len()
+                        )
                     }
-                    BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
-                    BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
+                    BusOp::Sub { topics } => format!("sub {}", joined(topics)),
+                    BusOp::Unsub { topics } => format!("unsub {}", joined(topics)),
                     BusOp::Feed { since } => format!("feed since={since}"),
                     BusOp::Resolve { seq } => format!("resolve {seq}"),
                     BusOp::Topics => "topics".to_string(),
@@ -281,13 +290,13 @@ impl Cmd {
                 "respawn",
                 format!(
                     "target={} worktree={}",
-                    rr.target,
-                    rr.worktree.as_deref().unwrap_or("-")
+                    f(&rr.target),
+                    f(rr.worktree.as_deref().unwrap_or("-"))
                 ),
             ),
             Cmd::Hello(h) => (
                 "hello",
-                format!("mod={} caps={}", h.version, h.caps.join(",")),
+                format!("mod={} caps={}", f(&h.version), joined(&h.caps)),
             ),
             // The answer's length, never its text: it is the model's output.
             Cmd::Report(r) => (
@@ -302,7 +311,7 @@ impl Cmd {
                 ),
             ),
             Cmd::Whoami => ("whoami", String::new()),
-            Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
+            Cmd::Answer(a) => ("answer", format!("target={}", f(&a.target))),
             Cmd::Inbox(i) => (
                 "inbox",
                 if i.wait {
@@ -314,14 +323,29 @@ impl Cmd {
             // The question's length, never its text.
             Cmd::Ask(a) => (
                 "ask",
-                format!("target={} len={}", a.target, a.text.chars().count()),
+                format!("target={} len={}", f(&a.target), a.text.chars().count()),
             ),
-            Cmd::Asked(a) => ("asked", format!("target={} id={}", a.target, a.id)),
-            Cmd::Who(w) => ("who", format!("path={}", w.path)),
+            Cmd::Asked(a) => ("asked", format!("target={} id={}", f(&a.target), a.id)),
+            Cmd::Who(w) => ("who", format!("path={}", f(&w.path))),
             Cmd::Ping => ("ping", String::new()),
             Cmd::Metrics => ("metrics", String::new()),
         }
     }
+}
+
+/// A list field (topics, caps) for an audit detail: each item scrubbed and
+/// bounded, at most eight shown and the rest counted.
+fn joined(items: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut out: Vec<String> = items
+        .iter()
+        .take(SHOWN)
+        .map(|i| crate::audit::scrub(i, 32))
+        .collect();
+    if items.len() > SHOWN {
+        out.push(format!("(+{} more)", items.len() - SHOWN));
+    }
+    out.join(",")
 }
 
 /// A `hello` request's payload: what a pane's mod says about itself.

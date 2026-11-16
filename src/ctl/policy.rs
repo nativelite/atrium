@@ -67,6 +67,161 @@ pub fn evaluate_spawn(
     Ok(attempted)
 }
 
+/// Is `program` a **bare command name**: 1 to 64 of `A-Z a-z 0-9 . _ -`, not
+/// starting with `.` or `-`? No `/`, no `\`, no `:` — so no path of any kind
+/// (absolute, relative, UNC, a drive, a drive-relative `C:claude`, an NTFS
+/// stream `claude:x`) and nothing a shell or a terminal would read specially.
+///
+/// This is the form every `ctl spawn` command must take, whoever asks.
+/// [`evaluate_spawn`] checks a command by its file stem alone, and a command
+/// with a separator in it is run as given ([`crate::resolve::resolve`]), so
+/// `\\host\share\claude.exe` or `./x/claude.sh` would pass as `claude` and
+/// start a program of the caller's choosing, one that honours none of the
+/// posture flags atrium appends: a way out of the session's trust ceiling for
+/// any pane that can reach ctl. A bare name is looked up on `PATH`, which the
+/// human who launched atrium set.
+///
+/// A fleet file's `cmd` is not a ctl request and is not held to this: a person
+/// wrote it and the launch banner shows it ([`vet_fleet_argv`]).
+///
+/// The same predicate vets an operator's role and worktree names
+/// ([`crate::operator`]), which become a path component and a git ref.
+pub fn is_bare_command(program: &str) -> bool {
+    !program.is_empty()
+        && program.len() <= 64
+        && program
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && !program.starts_with(['.', '-'])
+}
+
+/// The reply to a `ctl spawn` whose command is not a bare name
+/// ([`is_bare_command`]): why, and what to do. The command itself is not
+/// echoed; it is whatever the caller sent.
+pub const SPAWN_NEEDS_BARE_COMMAND: &str =
+    "spawn refused: the command must be a bare name found on PATH (`claude`, `codex`), \
+     not a path. ctl checks a command by its file name and a path is run as given, so a \
+     path could start any program, outside the session's trust ceiling. Use the bare \
+     name, with its directory on PATH where atrium was launched; a command that needs a \
+     path belongs in a fleet file, which a person writes and approves";
+
+/// Who is asking for text to be put into a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextFrom {
+    /// A pane's own request, or a wake for an event a pane caused: `ctl send`,
+    /// a `bus pub`, the collision and respawn decisions atrium posts from what
+    /// panes reported.
+    Pane,
+    /// An operator token's request ([`crate::operator`]).
+    Operator,
+}
+
+/// May text from a ctl request be delivered to this pane? The one rule behind
+/// `send`, `ask` (for an operator) and every bus wake. Pure.
+///
+/// Text delivered to a pane is typed into it and submitted. To an agent that
+/// is a prompt, and what the agent does with it is bounded by its trust mode.
+/// To a shell, or any other program, it is a command line run with no gate:
+/// `send 0 "curl … | sh"` is command execution whatever the session's trust,
+/// and so is a wake, whose body (`& calc`, `$(…)`) the shell would run. So:
+///
+/// * an **agent's pane** (`agent_pane`: the command it was spawned with is an
+///   agent CLI) takes text from anyone;
+/// * any other pane takes none from an **operator**, at any trust;
+/// * any other pane takes text from a **pane** only when nothing is typed
+///   (`takes_inbox`: its own mod declared `inbox` and collects its deliveries
+///   itself), or when the session's launch trust is `skip`, where no command
+///   is gated anyway and there is no ceiling to step over.
+///
+/// `Off` (no `--trust`) is below `skip` like every other mode: there the
+/// agents run under their own permission settings, which a command typed into
+/// a shell would sidestep just the same.
+pub fn text_may_land(
+    agent_pane: bool,
+    takes_inbox: bool,
+    from: TextFrom,
+    policy: super::TrustMode,
+) -> bool {
+    agent_pane
+        || match from {
+            TextFrom::Operator => false,
+            TextFrom::Pane => takes_inbox || policy == super::TrustMode::Skip,
+        }
+}
+
+/// The refusal for a pane's `ctl send` that [`text_may_land`] turned away:
+/// the reason, and the ways on.
+pub fn send_into_non_agent_refusal(target: AgentId) -> String {
+    format!(
+        "pane {target} is not an agent's pane: whatever is typed into a shell or another \
+         program is run by it as a command, with no permission gate, which would step over \
+         the session's trust ceiling. Send to an agent's pane (a claude wrapper is named in \
+         `claude_aliases` / ATRIUM_CLAUDE_ALIASES); have the human type it in that pane; or \
+         launch the session at `--trust skip`, where nothing is gated"
+    )
+}
+
+/// Would an agent CLI take part of `text` as a **shell line**? Claude Code
+/// runs a prompt that starts with `!` as a shell command, directly: no model
+/// decision, no permission prompt. So text a ctl caller chose, put at the start
+/// of an agent's prompt, is command execution under any trust mode, exactly as
+/// typing into a shell pane is. True when:
+///
+/// * the first character of **any line** that is not whitespace (or an
+///   invisible format character) is `!`. Every line, not only the first: typed
+///   without bracketed paste (always on Windows) a newline can submit, and the
+///   next line then opens a fresh prompt. A control character ends a line here
+///   as a newline does: `x` then Ctrl+U or a backspace empties the input, and
+///   what follows starts it again;
+/// * or the text holds a `!` anywhere **and** a control character other than
+///   a newline, a carriage return or a tab. An escape sequence can move the
+///   cursor (`cmd`, Home, `!`), so where the `!` sits in the text says nothing
+///   about where it lands in the input line.
+///
+/// A `!` inside a line of plain text (`wow!`, `a != b`) is not one. Pure.
+pub fn has_shell_line(text: &str) -> bool {
+    if !text.contains('!') {
+        return false;
+    }
+    let breaks = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}');
+    if text
+        .chars()
+        .any(|c| breaks(c) && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return true;
+    }
+    let skipped = |c: char| {
+        c.is_whitespace() || crate::modstate::text_safe(c.encode_utf8(&mut [0; 4])) == " "
+    };
+    text.split(breaks)
+        .any(|line| line.chars().find(|c| !skipped(*c)) == Some('!'))
+}
+
+/// May `text`, chosen by a ctl caller, be put at an agent's prompt: a `send`,
+/// or an argument of a `ctl spawn` command (a positional one is the new
+/// agent's first prompt)? `Err` is the refusal, with the reason and the way
+/// on. An operator's text is refused at any trust; a pane's unless the
+/// session's launch trust is `skip`, where nothing is gated anyway. Pure.
+pub fn vet_prompt_text(
+    text: &str,
+    from: TextFrom,
+    policy: super::TrustMode,
+) -> Result<(), &'static str> {
+    let exempt = from == TextFrom::Pane && policy == super::TrustMode::Skip;
+    if !exempt && has_shell_line(text) {
+        return Err(SHELL_LINE_REFUSED);
+    }
+    Ok(())
+}
+
+/// The refusal for text [`vet_prompt_text`] turned away.
+pub const SHELL_LINE_REFUSED: &str =
+    "refused: a line of this text starts with `!` (or the text mixes `!` with control \
+     characters). An agent CLI runs a line that starts with `!` as a shell command, with \
+     no permission gate, which would step over the session's trust ceiling. Say what you \
+     want done in words, or have the human type it in that pane (a pane's own request is \
+     taken as written in a session launched at `--trust skip`)";
+
 /// Permission-posture flags that **atrium** owns, not the spawning agent. A hosted
 /// agent running `atrium ctl spawn -- claude …` must not be able to hand its
 /// teammates a stronger posture than the human chose at launch — e.g. appending

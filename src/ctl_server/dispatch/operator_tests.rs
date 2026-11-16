@@ -6,7 +6,7 @@ use super::*;
 use atrium::operator::Operators;
 use json::Value;
 
-const BRIDGE: &str = "b1d9e07c35a24f68b1d9e07c35a24f68";
+pub(super) const BRIDGE: &str = "b1d9e07c35a24f68b1d9e07c35a24f68";
 const READER: &str = "7e2a90c4d1f3b5867e2a90c4d1f3b586";
 /// The refusal a request with no valid pane token has always had.
 const NO_PANE_TOKEN: &str =
@@ -17,7 +17,7 @@ fn shell() -> String {
 }
 
 /// `bridge` may use `verbs`; `reader` may read model output and the audit log.
-fn operators(verbs: &[&str]) -> Operators {
+pub(super) fn operators(verbs: &[&str]) -> Operators {
     let list: Vec<String> = verbs.iter().map(|v| format!("{v:?}")).collect();
     Operators::parse(&format!(
         r#"{{"operators":[
@@ -30,22 +30,22 @@ fn operators(verbs: &[&str]) -> Operators {
 }
 
 /// A session to apply requests against: no panes until a test adds one.
-struct Fx {
-    windows: Vec<Window>,
-    pending: Vec<PendingSend>,
-    world: atrium::vendors::AgentState,
-    audit: atrium::audit::Audit,
-    board: atrium::board::Board,
-    bus: atrium::bus::Bus,
-    mods: atrium::modstate::ModState,
-    extra_allow: Vec<String>,
-    max_depth: usize,
+pub(super) struct Fx {
+    pub(super) windows: Vec<Window>,
+    pub(super) pending: Vec<PendingSend>,
+    pub(super) world: atrium::vendors::AgentState,
+    pub(super) audit: atrium::audit::Audit,
+    pub(super) board: atrium::board::Board,
+    pub(super) bus: atrium::bus::Bus,
+    pub(super) mods: atrium::modstate::ModState,
+    pub(super) extra_allow: Vec<String>,
+    pub(super) max_depth: usize,
     /// Every reply served, as JSON text: no token may ever be in one.
     replies: Vec<String>,
 }
 
 impl Fx {
-    fn new() -> Fx {
+    pub(super) fn new() -> Fx {
         Fx {
             windows: Vec::new(),
             pending: Vec::new(),
@@ -62,7 +62,7 @@ impl Fx {
 
     /// Add a pane (a real, idle shell in its own window) with this place in
     /// the spawn tree; returns its agent id and its minted capability token.
-    fn pane(&mut self, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
+    pub(super) fn pane(&mut self, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
         let command = [shell()];
         let mut flash = None;
         let mut w = spawn_window(
@@ -100,7 +100,7 @@ impl Fx {
 
     /// [`Fx::pane`], recorded as spawned with `claude`: an agent's pane as far
     /// as the control plane can tell (the process is still an idle shell).
-    fn agent_pane(&mut self, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
+    pub(super) fn agent_pane(&mut self, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
         let out = self.pane(role, parent);
         let p = pane_by_agent_mut(&mut self.windows, out.0).expect("the pane just added");
         p.argv = vec!["claude".to_string()];
@@ -108,11 +108,11 @@ impl Fx {
     }
 
     /// How many deliveries are queued for `id` (taking them).
-    fn queued_for(&mut self, id: AgentId) -> usize {
+    pub(super) fn queued_for(&mut self, id: AgentId) -> usize {
         take_for(&mut self.pending, id).len()
     }
 
-    fn apply(&mut self, ops: &Operators, line: &str) -> Value {
+    pub(super) fn apply(&mut self, ops: &Operators, line: &str) -> Value {
         let mut hold = None;
         let (reply, _) = apply_ctl_as(
             line,
@@ -141,11 +141,11 @@ impl Fx {
     }
 
     /// The whole audit log, oldest first.
-    fn log(&self) -> Vec<Value> {
+    pub(super) fn log(&self) -> Vec<Value> {
         self.audit.view(None, |_| true)
     }
 
-    fn last(&self) -> Value {
+    pub(super) fn last(&self) -> Value {
         self.log().pop().expect("an audit entry")
     }
 
@@ -173,20 +173,20 @@ impl Drop for Fx {
     }
 }
 
-fn ok(v: &Value) -> bool {
+pub(super) fn ok(v: &Value) -> bool {
     v.get("ok").and_then(Value::as_bool) == Some(true)
 }
 
-fn err(v: &Value) -> &str {
+pub(super) fn err(v: &Value) -> &str {
     assert!(!ok(v), "expected a refusal, got {v}");
     v.get("err").and_then(Value::as_str).expect("an err text")
 }
 
-fn s<'a>(v: &'a Value, key: &str) -> &'a str {
+pub(super) fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-fn op(token: &str, body: &str) -> String {
+pub(super) fn op(token: &str, body: &str) -> String {
     format!(r#"{{"operator_token":"{token}",{body}}}"#)
 }
 

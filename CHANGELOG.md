@@ -127,6 +127,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unknown command "…"`). The reply to the caller is unchanged.
 - `ctl::Request`'s `Debug` output shows `<redacted>` for a pane token.
 
+### Security
+Ways a pane could step over the session's trust ceiling through the
+control plane, in every release that has one (`--allow-ctl`, up to and
+including 0.46.0). Each needed a pane token, which every pane of a ctl session
+holds; none needed anything else. They are behaviour changes: each refusal
+says why and what to do instead.
+
+- **`ctl spawn` takes a bare command name, from every caller.** The agent
+  allowlist reads a command by its file stem, and a command with a path
+  separator is run as given. So an agent held to `plan` or `accept` could run
+  `atrium ctl spawn -- \\host\share\claude.exe` (or `./x/claude.sh`,
+  `C:\tmp\claude.exe`, `/tmp/claude`): it passed as `claude`, and what started
+  was a program of the agent's choosing that ignores the posture flags atrium
+  appends. Now the command a spawn request names must be 1 to 64 of
+  `A-Z a-z 0-9 . _ -`, not starting with `.` or `-` (no `/`, `\` or `:`), and
+  is found on `PATH`; anything else is refused before the allowlist is asked.
+  Not changed: a fleet file's `cmd` may still be a path (a person writes the
+  file and the banner shows it); `respawn` replays a pane's recorded command,
+  path or not, and no request can alter that record; a spawn with no command
+  still starts the caller's own kind. To keep a path: put the command in a
+  fleet file, or its directory on `PATH` where atrium is launched.
+- **A pane's `send` is not typed into a pane that is not an agent's, below
+  `--trust skip`.** `send` types its text into the target and submits it. A
+  root pane reaches every pane, a fleet may declare shell panes, and a plain
+  `atrium --allow-ctl` hosts your shell as pane 0: an agent in a root pane
+  could `ctl send 0 "curl … | sh"` and have the shell run it, at any trust. A
+  `send` whose target was not spawned as an agent CLI (`claude`, a claude
+  alias, `codex`, …) is now refused unless the session was launched at `skip`
+  (no `--trust` counts as below `skip`). One case is still taken: a pane
+  whose own mod declared `inbox` collects its deliveries itself and is never
+  typed into; if that mod goes before it collected, the delivery is dropped
+  and the bar says so. The same rule, without the `skip` exception, already
+  held for operators. To keep the old behaviour: launch at `--trust skip`, or
+  type into the shell yourself (the keyboard is not a ctl caller and is
+  unaffected). A command that runs an agent under another name is named in
+  `claude_aliases` / `ATRIUM_CLAUDE_ALIASES`.
+- **A bus wake is not typed into a pane that is not an agent's, below
+  `skip`.** A wake is one framed line, typed and submitted, and only control
+  characters are taken out of its body: a shell handed
+  `[atrium bus #7 …] done & calc` runs `calc` (cmd.exe), and `$(…)` or a
+  backquote does the same in `sh`. That held for a pane's `bus pub` and for
+  the collision and respawn decisions atrium posts from what panes report,
+  which in a plain `atrium --allow-ctl` were addressed to the root shell. Such
+  a wake is now skipped (the event is still on the bus, for `bus feed` and the
+  decisions panel). At `skip` a wake is typed into a shell as before, `&`
+  included: nothing is gated there.
+- **No line of a pane's `send` may start with `!`, below `skip`.** Claude
+  Code runs a prompt that starts with `!` as a shell command, with no model
+  decision and no permission prompt, so a lead at `plan` could
+  `ctl send <worker> "!rm -rf x"`. Refused when the first character of any
+  line that is not whitespace is `!` (a control character counts as a line
+  break; text that mixes `!` with a control character other than a newline or
+  a tab is refused outright, because an escape sequence can move the cursor),
+  and the same for every argument of a `ctl spawn` command, since a
+  positional one is the new agent's first prompt. `wow!` and `a != b` are
+  fine, and a pane may still send a `/` command into its own subtree. For an
+  operator the `!` test now covers every line and spawn arguments too, at any
+  trust; its `/` rule is unchanged. To keep the old behaviour: launch at
+  `--trust skip`. Otherwise say it in words, or type it in that pane.
+- **The audit log keeps no raw request text.** A request is recorded whether
+  or not it carried a credential, and its detail was built from its fields as
+  sent: `hello mod=<an escape sequence>` with no token put the sequence in the
+  log and in the terminal of whoever read it, and a 60 KiB `target` filled it.
+  Every field is now scrubbed of control, direction and zero-width characters
+  and cut to 128 characters (a list shows eight items), and every entry's
+  `detail` and `note` are scrubbed and cut to 512 where the entry is made,
+  for all callers. Ordinary entries read exactly as before.
+
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real
   tmux, atrium inherited `TMUX` and `TMUX_PANE`, and every pane without

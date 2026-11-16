@@ -262,3 +262,15 @@ fn a_codex_startup_screen_holds_a_send_past_the_prompt_wait() {
     assert!(dialog_up(agsess::Vendor::Codex, prompt.screen()).is_none());
     assert!(prompt_up("codex", prompt.screen(), Duration::ZERO));
 }
+
+/// The last guard before the pty: nothing is typed into a pane that is not
+/// an agent's below `skip`.
+#[test]
+fn nothing_is_typed_into_a_non_agent_pane_below_skip() {
+    use atrium::ctl::TrustMode::{Auto, Edits, Off, Plan, Skip};
+    for policy in [Off, Plan, Edits, Auto] {
+        assert!(!may_type_into(false, policy), "{policy:?}");
+        assert!(may_type_into(true, policy), "{policy:?}");
+    }
+    assert!(may_type_into(false, Skip));
+}

@@ -29,6 +29,92 @@ fn spawn_atrium_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
     (p, shell, flag)
 }
 
+/// [`spawn_atrium_ctl_shell`] in a session launched at `--trust skip`, the
+/// one posture where a ctl request may still type into a shell pane: below it
+/// a `send` into a pane that is not an agent's is refused and a wake for one
+/// is not typed (a shell runs what is typed into it, which would step over
+/// the session's trust ceiling). The tests that prove the pty delivery itself
+/// with shells as stand-in workers launch here. Full bypass is confirmed by
+/// typing `y` at the launch prompt, as a person would.
+fn spawn_atrium_ctl_shell_at_skip() -> (pty::Pty, &'static str, &'static str) {
+    let (shell, flag): (&str, &str) = if cfg!(windows) {
+        ("cmd", "/Q")
+    } else {
+        ("sh", "-i")
+    };
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &["--trust", "skip", "--allow-ctl", shell, flag],
+        24,
+        100,
+        &[("ATRIUM_CTL_ALLOW".to_string(), shell.to_string())],
+        None,
+    )
+    .unwrap();
+    let out = read_until(&mut p, b"[y/N]", Duration::from_secs(15));
+    assert!(
+        contains(&out, b"[y/N]"),
+        "no full-bypass confirmation: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"y\r\n").unwrap();
+    let bar: &[u8] = if cfg!(windows) { b"1:cmd" } else { b"1:sh" };
+    read_until(&mut p, bar, Duration::from_secs(15));
+    (p, shell, flag)
+}
+
+/// Below `--trust skip`, a `ctl send` into a pane that is not an agent's is
+/// refused with the reason, and nothing is typed there: the worker window
+/// never shows the marker. (Before 0.47.0 the text was typed into the shell
+/// and run.)
+#[test]
+fn ctl_send_into_a_shell_pane_is_refused_below_skip() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl send dev_1 echo SHELLMARK9\r\n").as_bytes())
+        .unwrap();
+    // A space-free needle from the refusal (the pane repaints word by word).
+    let out = read_until(&mut p, b"ceiling", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"ceiling"),
+        "the send was not refused with its reason: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The worker's window: past the unbound grace, nothing was typed into it.
+    p.write(b"\x012").unwrap();
+    let out = read_until(&mut p, b"SHELLMARK9", Duration::from_secs(4));
+    assert!(
+        !contains(&out, b"SHELLMARK9"),
+        "the text reached the shell: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// A `ctl spawn` whose command is a path is refused with the reason, for a
+/// pane as for an operator: the allowlist reads a command by its file name,
+/// and a path would start any program.
+#[test]
+fn ctl_spawn_by_path_is_refused() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl spawn -- ./{shell}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"PATH", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"bare"),
+        "a path was not refused: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl list`, run inside a live `--allow-ctl` atrium pane, connects over the
 /// real channel and returns the org chart as JSON — proving the whole loop:
 /// bind → inject env → client connect → non-blocking server drain → reply.
@@ -489,10 +575,13 @@ fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
 /// spawn the worker in a *new* window, task it from the caller window, then
 /// switch to the worker window to observe: the marker appears there only if the
 /// send actually reached the worker's pty (the caller's command echo lives in a
-/// different window, so it can't produce a false positive).
+/// different window, so it can't produce a false positive). The worker is a
+/// shell standing in for an agent, so the session is launched at `skip`:
+/// below it this send is refused
+/// (`ctl_send_into_a_shell_pane_is_refused_below_skip`).
 #[test]
 fn ctl_send_delivers_a_task_to_a_worker() {
-    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell_at_skip();
     let atrium = env!("CARGO_BIN_EXE_atrium");
     let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
     p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
@@ -864,10 +953,12 @@ fn ctl_audit_records_requests() {
 /// run `bus feed`. The lead is a shell (unbound), so the wake lands after the
 /// unbound grace and is echoed by the shell, where the marker is read. The
 /// marker is spelled with the worker shell's quoting so the typed command's
-/// echo never contains it; only the delivered wake does.
+/// echo never contains it; only the delivered wake does. The session is at
+/// `skip`: below it a wake is not typed into a shell, only into an agent's
+/// pane (`ctl_server::dispatch::ceiling_tests`).
 #[test]
 fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_subtree() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell_at_skip();
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl bus --json sub work\r\n").as_bytes())
         .unwrap();
@@ -913,10 +1004,11 @@ fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_s
 
 /// A worker's `--to` hand-off up to the pane that spawned it wakes that pane.
 /// The subtree rule used to drop it silently: the lead is not in the worker's
-/// subtree, so the most common hand-off of all never landed.
+/// subtree, so the most common hand-off of all never landed. At `skip`, as
+/// above: the lead here is a shell.
 #[test]
 fn a_workers_to_wakes_the_pane_that_spawned_it() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let (mut p, shell, flag) = spawn_atrium_ctl_shell_at_skip();
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl spawn --here --role w -- {shell} {flag}\r\n").as_bytes())
         .unwrap();

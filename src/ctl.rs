@@ -55,9 +55,11 @@ pub use launch::{
     agent_ctl_directive, parse_flags, TrustMode, AGENT_CTL_DIRECTIVE, SKIP_PERMISSIONS_FLAG,
 };
 pub use policy::{
-    delegation_allowed, evaluate_spawn, extra_allow_from_env, in_subtree, parse_allow_list,
-    resolve_target, sanitize_spawn_argv, vet_fleet_argv, vet_spawn_argv, ArgvVerdict, SpawnDenied,
-    ENV_ALLOW, ENV_AUDIT,
+    delegation_allowed, evaluate_spawn, extra_allow_from_env, has_shell_line, in_subtree,
+    is_bare_command, parse_allow_list, resolve_target, sanitize_spawn_argv,
+    send_into_non_agent_refusal, text_may_land, vet_fleet_argv, vet_prompt_text, vet_spawn_argv,
+    ArgvVerdict, SpawnDenied, TextFrom, ENV_ALLOW, ENV_AUDIT, SHELL_LINE_REFUSED,
+    SPAWN_NEEDS_BARE_COMMAND,
 };
 pub use render::{hyperlink, is_url, status_glyph, status_sgr};
 pub use reply::{

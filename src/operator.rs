@@ -671,19 +671,31 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             }
             for a in &sp.argv {
                 plain("argv", a, 4096)?;
+                // A positional argument is the new agent's first prompt.
+                if crate::ctl::has_shell_line(a) {
+                    return Err(
+                        "an argument may not start with !: an agent CLI runs a prompt that \
+                         starts with ! as a shell line"
+                            .to_string(),
+                    );
+                }
             }
             // The command is a bare name, found on PATH. The spawn allowlist
             // looks at the file stem alone and a command with a separator is
             // run as given, so `\\host\share\claude.exe` or `./x/claude` would
             // pass as `claude` and run a binary of the caller's choosing,
             // which honours no posture flag. An empty argv is the server's
-            // default (claude).
+            // default (claude). The predicate is the one every caller's spawn
+            // is held to (`ctl::is_bare_command`); checked here as well so an
+            // operator's refused path never reaches the audit detail.
             if let Some(program) = sp.argv.first() {
-                word("argv[0]", program).map_err(|_| {
-                    "argv[0] must be a bare command name (no path, no drive): 1 to 64 of \
-                     A-Z a-z 0-9 . _ -"
-                        .to_string()
-                })?;
+                if !crate::ctl::is_bare_command(program) {
+                    return Err(
+                        "argv[0] must be a bare command name (no path, no drive): 1 to 64 of \
+                         A-Z a-z 0-9 . _ -"
+                            .to_string(),
+                    );
+                }
             }
             Ok(())
         }
@@ -693,10 +705,12 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             // What is typed is meant as a prompt. An agent CLI gives a leading
             // `!` or `/` a meaning of its own (a shell line, a command of the
             // CLI), which is not the agent acting under its trust mode.
-            if sr.text.trim_start().starts_with(['!', '/']) {
+            // The `!` test is the one every caller's text is held to, on every
+            // line (`ctl::has_shell_line`); the `/` test is the operator's own.
+            if crate::ctl::has_shell_line(&sr.text) || sr.text.trim_start().starts_with('/') {
                 return Err(
-                    "text may not start with ! or /: an agent CLI reads those as a shell line \
-                     or a command of its own, not as a prompt"
+                    "text may not start with ! or / (nor any later line with !): an agent CLI \
+                     reads those as a shell line or a command of its own, not as a prompt"
                         .to_string(),
                 );
             }
@@ -818,12 +832,8 @@ fn lines(what: &str, s: &str) -> Result<(), String> {
 /// system prompt (a role, a worktree): `[A-Za-z0-9._-]{1,64}`, starting with
 /// a letter, a digit or `_`.
 fn word(what: &str, s: &str) -> Result<(), String> {
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !s.starts_with(['.', '-']);
-    if !ok {
+    // One definition, shared with every caller's spawn command.
+    if !crate::ctl::is_bare_command(s) {
         return Err(format!(
             "{what} must be 1 to 64 of A-Z a-z 0-9 . _ - and not start with . or -"
         ));

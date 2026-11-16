@@ -313,6 +313,34 @@ pub(crate) fn spawn(
     // No command: the caller's own kind. A codex lead gets codex teammates
     // and a claude lead claude ones unless the spawn names the other after
     // `--`; from a pane that is no agent (a shell, the operator), claude.
+    //
+    // The command a request names is a bare name, for every caller. The
+    // allowlist below looks at the file stem alone and a command with a
+    // separator is run as given, so `\\host\share\claude.exe` or
+    // `./x/claude.sh` would pass as `claude` and start a program of the
+    // caller's choosing, which honours none of the posture flags atrium
+    // appends: a way past the session's trust ceiling for any pane holding a
+    // token. Checked on what the request carries, before the caller's own kind
+    // is filled in below: that one is the command atrium itself recorded for
+    // the calling pane (a fleet file's, the launch's, or an earlier spawn that
+    // passed this check), never a request's.
+    if sp
+        .argv
+        .first()
+        .is_some_and(|program| !ctl::is_bare_command(program))
+    {
+        return ctl::reply_err(ctl::SPAWN_NEEDS_BARE_COMMAND);
+    }
+    // A positional argument of an agent's command is its first prompt, and an
+    // agent CLI runs a prompt that starts with `!` as a shell line: the same
+    // rule as for a `send` ([`ctl::vet_prompt_text`]), on every argument.
+    // (An operator's argv was refused for this at any trust, by its vetting.)
+    let policy = trust_mode();
+    for arg in sp.argv.iter().skip(1) {
+        if let Err(why) = ctl::vet_prompt_text(arg, ctl::TextFrom::Pane, policy) {
+            return ctl::reply_err(why);
+        }
+    }
     let mut notes: Vec<String> = Vec::new();
     if sp.argv.is_empty() {
         let own = caller

@@ -14,6 +14,33 @@ use json::{Number, Value};
 /// recent history without unbounded growth. Oldest entries evict first.
 pub const DEFAULT_CAP: usize = 1024;
 
+/// Longest a request's field (a target, a role, a key, a topic, a path) is
+/// kept in an entry's detail.
+pub const FIELD_MAX: usize = 128;
+
+/// Longest an entry's `detail` or `note` is kept, whatever built it.
+pub const TEXT_MAX: usize = 512;
+
+/// `s` as the log keeps it: every control character, line separator and
+/// direction or zero-width character replaced by a space
+/// ([`crate::modstate::text_safe`]), and cut to `max` characters with a `…`
+/// when it was longer. A request's fields are whatever the caller sent, and a
+/// request needs no credential to be recorded: an escape sequence in a
+/// `target` would otherwise be replayed into the terminal of whoever reads
+/// the log, and a 64 KiB field would fill it.
+pub fn scrub(s: &str, max: usize) -> String {
+    let mut out: String = crate::modstate::text_safe(s).chars().take(max).collect();
+    if s.chars().nth(max).is_some() {
+        out.push('…');
+    }
+    out
+}
+
+/// One request field for a detail: [`scrub`] at [`FIELD_MAX`].
+pub fn field(s: &str) -> String {
+    scrub(s, FIELD_MAX)
+}
+
 /// One recorded ctl request and its outcome.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
@@ -147,10 +174,13 @@ impl Audit {
             seq: self.seq,
             caller,
             by: by.map(str::to_string),
-            action: action.to_string(),
-            detail: detail.to_string(),
+            // Scrubbed and bounded here, for every caller and every path: the
+            // one place an entry is made, so nothing a request carried reaches
+            // the ring or the file raw, whichever handler built the text.
+            action: scrub(action, FIELD_MAX),
+            detail: scrub(detail, TEXT_MAX),
             ok,
-            note: note.to_string(),
+            note: scrub(note, TEXT_MAX),
         };
         if let Some(f) = self.file.as_mut() {
             // Best-effort: a write failure is flagged once, never fatal.
@@ -357,5 +387,32 @@ mod tests {
             "seq 1 and 2 were evicted and the log must admit it"
         );
         assert_eq!(a.latest_seq(), 6, "latest counts everything ever assigned");
+    }
+
+    /// Whatever built an entry's text, the log keeps it scrubbed and bounded:
+    /// the one place an entry is made is the backstop for every handler.
+    #[test]
+    fn an_entry_is_scrubbed_and_bounded_whatever_built_it() {
+        let mut a = Audit::in_memory();
+        let hostile = format!("\u{1b}]0;pwned\u{7}\u{202e}\n{}", "A".repeat(5000));
+        a.record(None, "hello", &hostile, false, &hostile);
+        let e = a.entries().next().expect("the entry");
+        for text in [&e.detail, &e.note] {
+            assert_eq!(text.chars().count(), TEXT_MAX + 1, "cut, with the mark");
+            assert!(text.ends_with('…'));
+            assert!(!text.chars().any(|c| c.is_control() || c == '\u{202e}'));
+        }
+        // Ordinary text is kept exactly.
+        a.record(None, "send", "target=dev len=7", true, "pane=1");
+        let e = a.entries().last().expect("the entry");
+        assert_eq!(
+            (e.detail.as_str(), e.note.as_str()),
+            ("target=dev len=7", "pane=1")
+        );
+        assert_eq!(field(&"x".repeat(FIELD_MAX)), "x".repeat(FIELD_MAX));
+        assert_eq!(
+            field(&"x".repeat(FIELD_MAX + 1)).chars().count(),
+            FIELD_MAX + 1
+        );
     }
 }
