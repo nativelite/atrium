@@ -80,6 +80,11 @@ pub struct GlobalConfig {
     /// own `commands` replaces it. Each entry is a grant to every pane that
     /// may reach another: see [`crate::ctl::vet_command`].
     pub commands: Vec<String>,
+    /// `"teams_env"`: the environment variable **names** a Claude Code lead's
+    /// teammate command may set on its teammate (`["ANTHROPIC_BASE_URL"]`).
+    /// Empty by default; a fleet's own `teams_env` replaces it. See
+    /// [`crate::tmux_shim::parse_teams_env`] for what may be listed.
+    pub teams_env: Vec<String>,
     pub fleet_defaults: FleetDefaults,
 }
 
@@ -128,6 +133,7 @@ impl GlobalConfig {
         fleet.notify = fleet.notify.or(self.notify);
         // A fleet's own list replaces the config's, an empty one included.
         fleet.commands = fleet.commands.or_else(|| Some(self.commands.clone()));
+        fleet.teams_env = fleet.teams_env.or_else(|| Some(self.teams_env.clone()));
         fleet
     }
 }
@@ -231,6 +237,7 @@ pub const STARTER: &str = r#"{
   "teams": null,
   "notify": null,
   "commands": [],
+  "teams_env": [],
   "fleet_defaults": {
     "trust": null,
     "identity": null,
@@ -355,6 +362,8 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         teams_off: false,
         notify: None,
         commands: crate::ctl::parse_commands(get("commands"), "config.json")?.unwrap_or_default(),
+        teams_env: crate::tmux_shim::parse_teams_env(get("teams_env"), "config.json")?
+            .unwrap_or_default(),
         fleet_defaults: FleetDefaults::default(),
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
@@ -886,6 +895,68 @@ mod tests {
         let err = fleet(r#""commands": ["/ok", "rm -rf"],"#).unwrap_err();
         assert!(
             err.contains("fleet \"a\"") && err.contains("commands"),
+            "{err}"
+        );
+    }
+
+    /// `teams_env` is empty unless set, holds variable names only, refuses at
+    /// load the names that may never be listed, and a fleet's own list
+    /// replaces it (an empty one too).
+    #[test]
+    fn the_teams_env_key_is_validated_and_a_fleets_list_replaces_it() {
+        assert!(parse_with_home("{}", home()).unwrap().teams_env.is_empty());
+        let cfg = parse_with_home(
+            r#"{"teams_env": ["ANTHROPIC_BASE_URL", "HTTPS_PROXY", "HTTPS_PROXY"]}"#,
+            home(),
+        )
+        .unwrap();
+        assert_eq!(cfg.teams_env, ["ANTHROPIC_BASE_URL", "HTTPS_PROXY"]);
+        for bad in [
+            r#"{"teams_env": "HTTPS_PROXY"}"#,
+            r#"{"teams_env": ["HTTPS PROXY"]}"#,
+            r#"{"teams_env": ["A=b"]}"#,
+            r#"{"teams_env": ["1A"]}"#,
+            r#"{"teams_env": [""]}"#,
+            r#"{"teams_env": [7]}"#,
+            r#"{"teams_env": ["PATH"]}"#,
+            r#"{"teams_env": ["Path"]}"#,
+            r#"{"teams_env": ["PATHEXT"]}"#,
+            r#"{"teams_env": ["ATRIUM_TOKEN"]}"#,
+            r#"{"teams_env": ["atrium_ctl"]}"#,
+            r#"{"teams_env": ["TMUX"]}"#,
+            r#"{"teams_env": ["TMUX_PANE"]}"#,
+            r#"{"teams_env": ["NODE_OPTIONS"]}"#,
+            r#"{"teams_env": ["LD_PRELOAD"]}"#,
+            r#"{"teams_env": ["LD_LIBRARY_PATH"]}"#,
+            r#"{"teams_env": ["DYLD_INSERT_LIBRARIES"]}"#,
+            r#"{"teams_env": ["CLAUDE_CODE_TEAMMATE_COMMAND"]}"#,
+            r#"{"teams_env": ["CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS"]}"#,
+            r#"{"teams_env": ["MY_SKIP_PERMISSIONS_FLAG"]}"#,
+        ] {
+            let err = parse_with_home(bad, home()).unwrap_err();
+            assert!(err.contains("teams_env"), "{bad}: {err}");
+        }
+        // A forbidden name is refused with its reason.
+        let err = parse_with_home(r#"{"teams_env": ["ATRIUM_TOKEN"]}"#, home()).unwrap_err();
+        assert!(
+            err.contains("may not list ATRIUM_TOKEN") && err.contains("atrium's own"),
+            "{err}"
+        );
+        let fleet = |body: &str| {
+            let roster = format!(
+                r#"{{"fleets":{{"a":{{{body}"agents":[{{"name":"x","cmd":["claude"]}}]}}}}}}"#
+            );
+            crate::fleet::parse(&roster).map(|f| f.get("a").unwrap().clone())
+        };
+        let filled = cfg.apply_to_fleet(fleet("").unwrap());
+        assert_eq!(filled.teams_env.as_deref(), Some(&cfg.teams_env[..]));
+        let own = cfg.apply_to_fleet(fleet(r#""teams_env": ["AWS_PROFILE"],"#).unwrap());
+        assert_eq!(own.teams_env, Some(vec!["AWS_PROFILE".to_string()]));
+        let none = cfg.apply_to_fleet(fleet(r#""teams_env": [],"#).unwrap());
+        assert_eq!(none.teams_env, Some(Vec::new()), "an empty list is a list");
+        let err = fleet(r#""teams_env": ["AWS_PROFILE", "PATH"],"#).unwrap_err();
+        assert!(
+            err.contains("fleet \"a\"") && err.contains("may not list PATH"),
             "{err}"
         );
     }

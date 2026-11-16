@@ -66,6 +66,7 @@ fn with_cx<R>(fx: &mut Fx, f: impl FnOnce(&mut CtlSession<'_>) -> R) -> R {
         mods: &mut fx.mods,
         hold: &mut hold,
         held_inboxes: 0,
+        flash: &mut fx.flash,
     })
 }
 

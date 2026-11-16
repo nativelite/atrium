@@ -74,6 +74,12 @@ pub struct Fleet {
     /// config's fills it. The launch banner shows the list: each entry is a
     /// grant to every pane that can reach another.
     pub commands: Option<Vec<String>>,
+    /// `teams_env`: the environment variable names a Claude Code lead's
+    /// teammate command may set on its teammate in this fleet
+    /// (`["ANTHROPIC_BASE_URL"]`). `Some` replaces the config's
+    /// `"teams_env"`, an empty list included; absent, the config's fills
+    /// it. The launch banner shows a list that is not empty.
+    pub teams_env: Option<Vec<String>>,
     /// How the model's subagents run in this fleet's claude panes:
     /// `panes` (visible panes, the default), `native` or `deny`
     /// ([`crate::modstate::Subagents`]).
@@ -375,6 +381,8 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         }
     };
     let commands = crate::ctl::parse_commands(get("commands"), &format!("fleet {name:?}"))?;
+    let teams_env =
+        crate::tmux_shim::parse_teams_env(get("teams_env"), &format!("fleet {name:?}"))?;
     let subagents = match get("subagents") {
         Some(v) => {
             let word = v.as_str().ok_or_else(|| {
@@ -550,6 +558,7 @@ fn parse_fleet(name: &str, val: &json::Value) -> Result<Fleet, String> {
         title,
         notify,
         commands,
+        teams_env,
         subagents,
         subagents_keep,
         captions,

@@ -320,6 +320,11 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
     if let Some(line) = commands_line(fleet) {
         out.push(line);
     }
+    // The variables a Claude Code lead may set on its teammates: each one
+    // is taken from a pane's request, so the person approving sees the list.
+    if let Some(line) = teams_env_line(fleet) {
+        out.push(line);
+    }
     // Deny rules only reach claude (codex has no equivalent flag). Say so when a
     // rule is aimed at an agent it can't bind, rather than let it read as enforced.
     let unbound = deny_unbound(fleet);
@@ -481,6 +486,13 @@ pub(super) fn commands_line(fleet: &atrium::fleet::Fleet) -> Option<String> {
             commands.join(", ")
         )
     })
+}
+
+/// The banner line for a fleet's `teams_env` allowlist, when it lists any,
+/// with a WARNING for the names that move settings or traffic.
+pub(super) fn teams_env_line(fleet: &atrium::fleet::Fleet) -> Option<String> {
+    let names = fleet.teams_env.as_deref().unwrap_or(&[]);
+    atrium::tmux_shim::teams_env_disclosure(names).map(|line| format!("atrium fleet: {line}"))
 }
 
 #[cfg(test)]

@@ -254,3 +254,64 @@ fn a_claude_pane_is_told_where_the_mod_is_and_which_atrium_to_call() {
     let _ = wait_exit(&mut p, 15);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A config's `teams_env` is disclosed where a person will see it before a
+/// session starts: one stderr line on a plain `--allow-ctl` launch (before
+/// the terminal is taken, so it shows even when there is no terminal to
+/// take), and in `atrium config path`; each with the warning for the names
+/// that move settings or traffic. Without `--allow-ctl` no teammate can be
+/// caught, and nothing is said.
+#[test]
+fn a_configs_teams_env_is_disclosed_on_a_plain_launch_and_by_config_path() {
+    let base = std::env::temp_dir().join(format!("atrium-teamsenv-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).unwrap();
+    let config = base.join("config.json");
+    std::fs::write(
+        &config,
+        r#"{"teams_env": ["AWS_PROFILE", "ANTHROPIC_BASE_URL", "https_proxy"]}"#,
+    )
+    .unwrap();
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let run = |args: &[&str], config: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_atrium"))
+            .args(args)
+            .env("ATRIUM_CONFIG", config)
+            .env("ATRIUM_STATE_DIR", base.join("state").join("sessions"))
+            .env("ATRIUM_YES", "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let want = "variables a Claude Code lead may set on its teammates (`teams_env`): AWS_PROFILE, \
+                ANTHROPIC_BASE_URL, https_proxy; each is taken from a pane's request. WARNING: \
+                ANTHROPIC_BASE_URL, https_proxy can move";
+    // No terminal: the launch ends at "must be a terminal", after the line.
+    let out = run(&["--allow-ctl", shell], &config);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains(&format!("atrium: {want}")), "{err}");
+    let out = run(&[shell], &config);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("teams_env"),
+        "no control plane, no teammates: {err}"
+    );
+    let out = run(&["config", "path"], &config);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(want), "{text}");
+    // A file that lists a name that may never be listed says so there too.
+    let bad = base.join("bad.json");
+    std::fs::write(&bad, r#"{"teams_env": ["NODE_OPTIONS"]}"#).unwrap();
+    let out = run(&["config", "path"], &bad);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("does not load") && text.contains("may not list NODE_OPTIONS"),
+        "{text}"
+    );
+    // An empty list: nothing is said.
+    let empty = base.join("empty.json");
+    std::fs::write(&empty, "{}").unwrap();
+    let out = run(&["--allow-ctl", shell], &empty);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("teams_env"));
+    let _ = std::fs::remove_dir_all(&base);
+}

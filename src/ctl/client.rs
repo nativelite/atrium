@@ -954,6 +954,8 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     let mut size: Option<String> = None;
     let mut mode: Option<TrustMode> = None;
     let mut worktree: Option<String> = None;
+    let mut hold = false;
+    let mut saw_command = false;
     let mut argv: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -1015,12 +1017,39 @@ fn spawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
                 new_window = true;
                 i += 1;
             }
+            // The tmux shim's placeholder for Claude Code 2.1.325's
+            // `split-window … -- cat`; see `SpawnReq::hold`.
+            "--hold" => {
+                hold = true;
+                i += 1;
+            }
             "--" => {
                 argv = args[i + 1..].to_vec();
+                saw_command = true;
                 break;
             }
             other => return Err(format!("unexpected argument {other:?} (use `-- <cmd>`)")),
         }
+    }
+    if hold {
+        // A placeholder is atrium's own waiting program, beside the caller:
+        // it names no command and nothing a worker would carry.
+        if new_window {
+            return Err("--hold goes with --here (a placeholder sits beside its lead)".to_string());
+        }
+        if saw_command
+            || role.is_some()
+            || identity.is_some()
+            || mode.is_some()
+            || worktree.is_some()
+        {
+            return Err(
+                "--hold is a placeholder: it takes no command, --role, --identity, --mode or \
+                 --worktree"
+                    .to_string(),
+            );
+        }
+        pairs.push(("hold", Value::Bool(true)));
     }
     // No `-- <cmd>`: the server spawns the caller's own kind (codex from a
     // codex pane, claude from a claude pane; claude from anything else).
@@ -1427,11 +1456,25 @@ fn bus_feed(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     Ok(())
 }
 
-/// `respawn <target> [--worktree W]`
+/// `respawn <target> [--worktree W]`, or `respawn <target> --teammate <line>`
+/// (the tmux shim's request for Claude Code 2.1.325's `respawn-pane`; see
+/// `RespawnReq::teammate`).
 fn respawn_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
     pairs.push(("cmd", s("respawn")));
     let target = value_at(args, 1, "respawn needs a target (pane id or role)")?;
     pairs.push(("target", Value::String(target.clone())));
+    // Read by position, not searched for: the command line is the caller's
+    // text and may spell any flag.
+    if args.get(2).map(String::as_str) == Some("--teammate") {
+        let line = value_at(args, 3, "--teammate needs the teammate's command line")?;
+        if args.len() > 4 {
+            return Err(
+                "--teammate takes one command line (quote it) and nothing after it".to_string(),
+            );
+        }
+        pairs.push(("teammate", Value::String(line.clone())));
+        return Ok(());
+    }
     if let Some(pos) = args.iter().position(|a| a == "--worktree") {
         let name = value_at(args, pos + 1, "--worktree needs a name")?;
         pairs.push(("worktree", Value::String(name.clone())));

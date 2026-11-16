@@ -7,6 +7,133 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Claude Code's split-pane teams work again with Claude Code 2.1.325.**
+  That release starts a teammate differently: it splits with the placeholder
+  command `cat`, styles the pane, then sends `respawn-pane -k -t %N --
+  '<one shell command line>'`. Under atrium the split was refused (`cat` is
+  not an agent) and `respawn-pane` was not served, so no teammate pane opened.
+  Both are served now, and 2.1.289's way (the teammate's command on the split)
+  still is. The sequence and the command line were read from the code inside
+  the installed 2.1.325 binary; the tests carry its command lines as fixtures
+  and drive the sequence through the real shim with a stand-in lead.
+  - **Seen running, once:** a live Claude Code 2.1.325 lead on Windows (the
+    mod off, `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, a headless fleet at
+    `automode`) started one named teammate with its Agent tool. The audit log
+    showed the placeholder, the request and the decision; the teammate
+    started, bound and ran, and Claude Code's team file recorded it as pane
+    `%1` on the tmux backend. **Not seen:** the teammate's message arriving
+    back at its lead, anything on Linux or macOS, a second teammate,
+    `--agent-type`.
+  - `split-window … -- cat` opens a **placeholder**: a pane running atrium's
+    own binary in a mode that only waits (`atrium --tmux-hold`), placed like
+    any teammate split, a child of the lead, with no token and no ctl
+    environment. The request is `ctl spawn --here --hold`, which names no
+    command and is granted only to a claude agent's pane that may create
+    teammates, under the depth and pane caps. `cat` is still not spawnable.
+  - `respawn-pane` is `ctl respawn <pane> --teammate <line>`: the placeholder
+    becomes the teammate and keeps its pane id, so Claude Code's later
+    `kill-pane -t %N` reaches it.
+  - With atrium's mod installed and on, the mod takes over the Agent tool and
+    this path is not used; it is the path for the mod off and `teams` not
+    `off`.
+  - Needs nativelite-tmuxproto 0.4.0 (`respawn-pane`, the placeholder, and a
+    parser for the command line).
+
+### Security
+- **A teammate's command line is parsed, vetted and rebuilt by atrium; it is
+  never run.** On a real tmux the line is handed to a shell, so whoever holds
+  the lead's pane chooses the teammate's program, environment, directory and
+  permission flags. Under atrium, where a pane's request is held to the
+  session's trust:
+  - the line must fit one grammar (`cd <dir> && env <NAME=value>… <program>
+    <flags>`, with Claude Code's Linux cgroup prefix recognised and dropped);
+    any shell construct outside a quote refuses the launch, on every platform.
+    A line over 24 KiB is refused by the shim before it is sent (a lead with a
+    very large inline `--mcp-config` sends one);
+  - only a **live placeholder the calling pane's own process made** can become
+    a teammate, once. No request re-points a pane that already runs a
+    command, a plain `ctl respawn` refuses a placeholder, and a placeholder
+    whose lead was respawned or has exited can no longer be claimed;
+  - a placeholder takes **no text at any trust**, `skip` included: a `send` to
+    it is refused, a wake skips it, and anything queued for its pane id is
+    dropped when its teammate starts;
+  - the **program** is the lead pane's own recorded program (its `argv[0]`,
+    none of its arguments), pinned as a spawn of the caller's own kind is, a
+    relative path made absolute against atrium's own directory.
+    `CLAUDE_CODE_TEAMMATE_COMMAND` and a launcher setting are not honoured: a
+    line whose program is not a claude is refused;
+  - the **flags** come from a closed table read from 2.1.325. The teammate's
+    identity flags pass with each value held to a shape; `--disallowed-tools`
+    rules join atrium's own deny list (one it cannot carry intact refuses the
+    launch); `--settings`, `--managed-settings`, `--setting-sources`,
+    `--plugin-dir`, `--plugin-dir-no-mcp`, `--plugin-url`, `--mcp-config`,
+    `--project-config-root`, `--proactivity`, `--chrome` and, for now,
+    `--agent-type` are dropped and named in the reply; an unknown flag, a
+    positional argument or a value outside its shape refuses the launch with a
+    message that names the flag and says the installed Claude Code is
+    probably newer than this atrium;
+  - the **permission mode** is a request. `acceptEdits`, `auto` or a skip
+    gives the lower of it and the lead pane's own mode, capped at the launch
+    trust. `plan` (or `--plan-mode-required`) is always `plan`: where atrium
+    governs nothing it still starts the teammate with `--permission-mode
+    plan`. `default` and `dontAsk` are passed on as written, unless the lead
+    pane is held to `plan`. A teammate is never less held than its lead, its
+    session or its own request;
+  - the **directory** is the lead pane's own and no other, compared by real
+    path: a teammate starts where its lead is. A directory of the request's
+    choosing, a subdirectory of the project included, is refused;
+  - two audit rows per launch, with flag names and counts. They carry one
+    value from the line, the role (`--agent-name` after its shape check), and
+    nothing else: not the verify key, not a path, not a variable's value.
+- **A teammate's environment is what atrium gave its lead, not what the line
+  says.** In order: the lead pane's identity (by name, resolved again), its
+  fleet context variables and its program, all from atrium's own record of
+  the lead; `CLAUDECODE=1`, `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and the
+  task-list id; then the variables on the new `teams_env` list; every other
+  assignment on the line is dropped. A request cannot name an identity.
+- **Open, and said in the docs with the live test for each:** whether an agent
+  definition named by `--agent-type` can outrank the permission mode atrium
+  passes (so the flag is dropped), and whether a process holding the lead
+  pane's token could approve a teammate's permission prompts through the team
+  mailbox, since the verify key arrives on the line. atrium's ceiling on a
+  teammate is the permission mode it passes; Claude Code's in-team approval
+  flow is outside what atrium can bind.
+
+### Added
+- **`teams_env`: the variables a Claude Code lead may set on its teammates.**
+  An array of environment variable names in the user config and in a fleet
+  (`"teams_env": ["AWS_PROFILE", "HTTPS_PROXY"]`), empty by default. A
+  fleet's list replaces the config's, an empty one included; `atrium recover`
+  uses the config's. A listed name's value is taken from the lead's teammate
+  command line (plain text, at most 4096 bytes); on Windows a name matches in
+  any case. It is opt-in because the request can come from any process that
+  holds the pane's token: a base URL or proxy accepted from it could route a
+  teammate's prompts and credentials elsewhere.
+  - Never listable, in any case, and refused when the file loads: a name
+    containing `SKIP_PERMISSIONS`, an `ATRIUM_` name, `TMUX`, `TMUX_PANE`,
+    `PATH`, `PATHEXT`, `NODE_OPTIONS`, `BUN_OPTIONS`,
+    `CLAUDE_CODE_PLUGIN_DIRS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, a `DYLD_`
+    name, `BASH_ENV`, `ENV`, `ComSpec`, `SHELL`, `CLAUDE_CODE_SHELL`,
+    `GIT_SSH_COMMAND`, a `GIT_CONFIG_` name, `CARGO_MAKEFLAGS` and
+    `CLAUDE_CODE_TEAMMATE_COMMAND`.
+  - A non-empty list is shown before the session starts: in the fleet banner,
+    as one stderr line on a plain `--allow-ctl` launch, and by `atrium config
+    path` (which now also says why a config file does not load). Names that
+    move where settings are read from or where traffic goes
+    (`CLAUDE_CONFIG_DIR`, `HOME`, `USERPROFILE`, `APPDATA`,
+    `ANTHROPIC_BASE_URL`, anything ending `_PROXY`, `NODE_EXTRA_CA_CERTS`,
+    `SSL_CERT_FILE`, `SystemRoot`) are listable and follow a `WARNING:`.
+- **A dropped variable that mattered is named.** Each assignment on the line
+  that is neither applied nor listed is compared with the value the teammate
+  has anyway; the ones that differ are named in one line on the bar, in the
+  reply and in the audit log (`teammate researcher: 2 variable(s) from the
+  lead were not passed on: ANTHROPIC_BASE_URL, HTTPS_PROXY; add them to
+  teams_env to pass them`). Names only, at most eight and a count. A variable
+  the lead's identity sets is never compared or named (the answer would test
+  a guess of a credential), and on Windows the case variants of a name are
+  one comparison.
+
 ## [0.47.0] - 2026-11-15
 
 ### Added

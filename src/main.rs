@@ -316,6 +316,12 @@ fn launch() -> ExitCode {
     if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
         return atrium::tmux_shim::main(&args[1..]);
     }
+    // A teammate placeholder (`--tmux-hold`): the pane Claude Code 2.1.325
+    // reserves before it starts a teammate. It says what it is and waits to
+    // be killed; it never reaches the session code below.
+    if args.first().map(String::as_str) == Some(atrium::tmux_shim::HOLD_FLAG) {
+        atrium::tmux_shim::hold_main();
+    }
     // Operator tokens (`--operator-token-file <path>` first, or
     // ATRIUM_OPERATOR_TOKEN_FILE): the file is read and checked once, here,
     // before any dispatch, so every path that hosts a session (a plain launch,
@@ -553,6 +559,15 @@ fn launch() -> ExitCode {
     if let Err(msg) = atrium::operator::require_ctl(allow_ctl) {
         eprintln!("atrium: {msg}");
         return ExitCode::FAILURE;
+    }
+    // A `teams_env` list lets a pane's request set variables on a Claude Code
+    // lead's teammates. A fleet's banner shows it; a plain launch says it
+    // here, in one line, while stderr is still a plain terminal.
+    if allow_ctl && atrium::tmux_shim::session_enabled() {
+        let names = atrium::tmux_shim::session_teams_env();
+        if let Some(line) = atrium::tmux_shim::teams_env_disclosure(&names) {
+            eprintln!("atrium: {line}");
+        }
     }
     // The last session in this project crashed: offer to pick it back up before
     // starting a fresh one. Ahead of the skip confirmation, because a resume
