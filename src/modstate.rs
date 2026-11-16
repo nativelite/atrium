@@ -178,9 +178,10 @@ pub fn feature_caps(feature: &str) -> &'static [&'static str] {
 /// reporting. Everywhere else a missing engine method costs one feature.
 pub const CORE_SITES: &[&str] = &["session.start", "hello", "report"];
 
-/// Reported failures of its own hooks ([`PaneFailures::thrown`]) past which
-/// a pane's mod is set aside. Five, the count at which the mod switches
-/// itself off (`INERT_AFTER` in `mod/hooks/health.ts`).
+/// Errors of its own hooks within [`FAIL_WINDOW_MS`]
+/// ([`PaneFailures::thrown_recently`]) at which a pane's mod is set aside.
+/// Five, the count at which the mod switches itself off (`INERT_AFTER` in
+/// `mod/hooks/health.ts`), over the same window, of the same classes.
 pub const FAIL_SET_ASIDE: u64 = 5;
 
 /// The most of a failure message the broker keeps.
@@ -254,6 +255,11 @@ pub struct FailureReport {
     pub message: Option<String>,
     /// Where the last failure happened: the key its count is under.
     pub at: Option<String>,
+    /// How many of the failures were thrown by the mod's own hooks (class
+    /// `hook` or `api`), cumulative: the only ones that count toward setting
+    /// the mod aside. A timeout, an exchange that failed and a reply of the
+    /// wrong shape are in the counts and not in this number.
+    pub thrown: Option<u64>,
 }
 
 /// A failure's site as a `report` names it (`fail_at`): a hook's name, in the
@@ -316,6 +322,11 @@ pub struct PaneFailures {
     /// The last message: scrubbed, capped, for display only.
     pub message: Option<String>,
     pub at_ms: u64,
+    /// The highest `thrown` the mod reported: errors of its own hooks.
+    pub thrown: u64,
+    /// When that number grew, on the loop's clock, and by how much: what
+    /// the sliding window is counted over.
+    recent: VecDeque<(u64, u64)>,
 }
 
 impl PaneFailures {
@@ -324,24 +335,41 @@ impl PaneFailures {
         self.counts.values().fold(0u64, |a, n| a.saturating_add(*n))
     }
 
-    /// The failures of the mod's own hooks: every count but the
-    /// `feature.<name>` ones (a feature lost to a missing engine method,
-    /// which costs that feature) and the `ctl.<site>` ones, which are
-    /// exchanges with atrium that failed (a timeout, no endpoint, a reply of
-    /// the wrong shape). Those are shown and counted in
-    /// `metrics`, and never set a mod aside: a broker that was slow for a
-    /// moment, five times in a long session, is not a broken mod.
-    pub fn thrown(&self) -> u64 {
-        self.counts
+    /// The errors its own hooks threw within [`FAIL_WINDOW_MS`] of `clock`.
+    /// Five accidents spread over a long session are not a broken mod; five
+    /// in ten minutes are.
+    pub fn thrown_recently(&self, clock: u64) -> u64 {
+        self.recent
             .iter()
-            .filter(|(hook, _)| !hook.starts_with(CTL_SITE) && !hook.starts_with(FEATURE_SITE))
+            .filter(|(at, _)| clock.saturating_sub(*at) <= FAIL_WINDOW_MS)
             .fold(0u64, |a, (_, n)| a.saturating_add(*n))
     }
 }
 
+/// The window the errors of a mod's own hooks are counted over, on the
+/// loop's clock: ten minutes (`FAIL_WINDOW_MS` in `mod/hooks/health.ts`).
+pub const FAIL_WINDOW_MS: u64 = 600_000;
+
 /// What the count of a failed exchange with atrium is keyed with
 /// (`ctl.hello`, `ctl.report`), as against a hook's own name.
 pub const CTL_SITE: &str = "ctl.";
+
+/// Is a trip worth writing down for later sessions? Only on what atrium saw
+/// itself, and only when nothing in the session speaks against it:
+///
+/// - `observed_roots`: the root of the spawn tree of each seat that missed
+///   the hello window. Two seats under one root are one lead's children, and
+///   a lead must not be able to keep the mod off the machine: it takes misses
+///   under [`TRIP_PANES`] different roots.
+/// - `healthy`: some pane atrium launched with the mod said hello before the
+///   trip. Then the mod works on this machine, whatever went wrong for the
+///   others, and the trip is this session's alone.
+///
+/// Reports never count here: they are a pane's word.
+pub fn worth_remembering(observed_roots: &[usize], healthy: bool) -> bool {
+    let roots: HashSet<usize> = observed_roots.iter().copied().collect();
+    !healthy && roots.len() >= TRIP_PANES
+}
 
 /// The chrome's flag on a pane whose mod was set aside.
 pub const NOTE_SET_ASIDE: &str = "mod off";
@@ -405,9 +433,11 @@ impl Aside {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneSeen {
     pub pane: usize,
-    /// Its agent is up: the prompt hint is on its screen, or a status is
-    /// known for its session.
+    /// Its agent is up, by something the pane itself did since its launch.
     pub started: bool,
+    /// The pane at the top of its spawn tree (itself, for a pane atrium or
+    /// the human opened): two seats under one root are one lead's doing.
+    pub root: usize,
 }
 
 /// What a health tick found.
@@ -697,9 +727,14 @@ pub struct ModState {
     /// The voice of a respawned pane: the id of the first pane in its seat.
     /// A pane that was never respawned is its own voice and has no entry.
     voice_of: HashMap<usize, usize>,
-    /// The voices atrium itself saw miss the hello window (kept after the
-    /// pane is gone: the breaker counts what was seen this session).
-    observed: HashSet<usize>,
+    /// The voices atrium itself saw miss the hello window, each with the
+    /// voice of its tree's root (kept after the pane is gone: the breaker
+    /// counts what was seen this session).
+    observed: HashMap<usize, usize>,
+    /// How many panes atrium launched with the mod said hello and were
+    /// granted something, and how many of those after the breaker tripped.
+    hellos: u32,
+    late_hellos: u32,
     /// The voices set aside by their own reports, each with the voices above
     /// it in the spawn tree when it was.
     reporters: HashMap<usize, Vec<usize>>,
@@ -726,8 +761,17 @@ impl ModState {
         caps: &[String],
         now_ms: u64,
     ) -> Vec<String> {
-        // A pane whose mod was set aside is a pane without a mod from then on:
-        // its hello is recorded and granted nothing.
+        // A pane that missed its window and says hello after all has shown
+        // the mod works there: it gets its mod back, and its seat is no
+        // longer one atrium saw fail.
+        if self.aside.get(&pane) == Some(&Aside::NoHello) && self.expect.contains_key(&pane) {
+            self.aside.remove(&pane);
+            let voice = self.voice(pane);
+            self.observed.remove(&voice);
+        }
+        // A pane whose mod was set aside for its own failures is a pane
+        // without a mod from then on: its hello is recorded and granted
+        // nothing.
         let set_aside = self.aside.contains_key(&pane);
         let accepted: Vec<String> = CAPS
             .iter()
@@ -762,6 +806,10 @@ impl ModState {
         // Only a pane atrium launched with the mod says anything about the
         // mod atrium installs: any pane can run `atrium ctl hello`.
         if expected && !accepted.is_empty() {
+            self.hellos = self.hellos.saturating_add(1);
+            if self.tripped.is_some() {
+                self.late_hellos = self.late_hellos.saturating_add(1);
+            }
             self.raise(HealthEvent::Healthy { pane });
         }
         accepted
@@ -945,6 +993,12 @@ impl ModState {
         self.tripped.as_deref()
     }
 
+    /// How many panes atrium launched with the mod said hello after the
+    /// breaker tripped: a sign the trip may not be the mod's fault.
+    pub fn hellos_since_trip(&self) -> u32 {
+        self.late_hellos
+    }
+
     /// The pane's mod asked for its deliveries.
     pub fn note_inbox(&mut self, pane: usize) {
         let at = self.loop_ms;
@@ -1005,9 +1059,9 @@ impl ModState {
     ///   stood behind ([`feature_caps`]): the mod lost one feature to a
     ///   missing engine method, and keeps the rest;
     /// - an `api` failure at a place the mod cannot work without
-    ///   ([`CORE_SITES`]), or failures of its own hooks adding up to
-    ///   [`FAIL_SET_ASIDE`], set the whole mod aside. Returns why, the first
-    ///   time.
+    ///   ([`CORE_SITES`]), or [`FAIL_SET_ASIDE`] errors of its own hooks
+    ///   within [`FAIL_WINDOW_MS`] (`thrown`: class `hook` and `api` only),
+    ///   set the whole mod aside. Returns why, the first time.
     pub fn failures_reported(
         &mut self,
         pane: usize,
@@ -1052,7 +1106,20 @@ impl ModState {
             slot.message = Some(fail_text(m)).filter(|m| !m.is_empty());
         }
         slot.at_ms = at_ms;
-        let thrown = slot.thrown();
+        if let Some(t) = r.thrown.map(|t| t.min(FAIL_COUNT_CAP)) {
+            if t > slot.thrown {
+                slot.recent.push_back((at_ms, t - slot.thrown));
+                slot.thrown = t;
+            }
+        }
+        while slot
+            .recent
+            .front()
+            .is_some_and(|(at, _)| at_ms.saturating_sub(*at) > FAIL_WINDOW_MS)
+        {
+            slot.recent.pop_front();
+        }
+        let thrown = slot.thrown_recently(at_ms);
         for feature in features {
             if self.lost_features.entry(pane).or_default().insert(feature) {
                 self.raise(HealthEvent::FeatureLost { pane, feature });
@@ -1071,9 +1138,13 @@ impl ModState {
             return None;
         };
         self.set_aside(pane, why);
-        let voice = self.voice(pane);
-        let above: Vec<usize> = ancestors.iter().map(|a| self.voice(*a)).collect();
-        self.reporters.insert(voice, above);
+        // A voice is a pane atrium launched with the mod. One that loaded a
+        // mod by hand loses it like any other, and is nobody's voice.
+        if self.expect.contains_key(&pane) {
+            let voice = self.voice(pane);
+            let above: Vec<usize> = ancestors.iter().map(|a| self.voice(*a)).collect();
+            self.reporters.insert(voice, above);
+        }
         self.raise(HealthEvent::SetAside { pane, why });
         Some(why)
     }
@@ -1129,7 +1200,12 @@ impl ModState {
         for pane in overdue {
             self.set_aside(pane, Aside::NoHello);
             let voice = self.voice(pane);
-            self.observed.insert(voice);
+            let root = live
+                .iter()
+                .find(|s| s.pane == pane)
+                .map_or(pane, |s| s.root);
+            let root = self.voice(root);
+            self.observed.insert(voice, root);
             events.push(HealthEvent::SetAside {
                 pane,
                 why: Aside::NoHello,
@@ -1159,9 +1235,10 @@ impl ModState {
                 events.push(HealthEvent::Tripped {
                     reason,
                     running,
-                    // Only what atrium saw itself is worth remembering past
-                    // this session: reports are a pane's word.
-                    remember: self.observed.len() >= TRIP_PANES,
+                    remember: worth_remembering(
+                        &self.observed.values().copied().collect::<Vec<_>>(),
+                        self.hellos > 0,
+                    ),
                 });
             }
         }
@@ -1186,7 +1263,7 @@ impl ModState {
             .reporters
             .iter()
             .filter(|(voice, ancestors)| {
-                !self.observed.contains(voice)
+                !self.observed.contains_key(voice)
                     && !ancestors.iter().any(|a| self.reporters.contains_key(a))
             })
             .count();
@@ -1562,14 +1639,19 @@ pub fn set_session_subagents(mode: Subagents, keep: bool) {
     let _ = SESSION_SUBAGENTS.set((mode, keep));
 }
 
-/// The tool rule a claude pane is launched with under a subagent policy:
-/// `deny` is enforced by Claude Code itself (`--disallowedTools Agent`), so
-/// it holds whether or not the pane's mod loaded. `Agent` is the tool's name
-/// in Claude Code 2.1.325 (its built-in tool table, as the engine writes it
-/// for plugin authors, lists `Agent`). `panes` and `native` add no rule:
-/// `panes` is the mod's takeover, a courtesy that needs the mod.
-pub fn subagent_deny(policy: &str) -> Option<&'static str> {
-    (policy == Subagents::Deny.label()).then_some("Agent")
+/// The tool rules a claude pane is launched with under a subagent policy:
+/// `deny` is enforced by Claude Code itself (`--disallowedTools`), so it
+/// holds whether or not the pane's mod loaded. Both names this tree knows the
+/// subagent tool by are denied: `Agent` (Claude Code 2.1.325's built-in tool
+/// table lists it) and `Task` (its older name, which `mod/hooks/caption.ts`
+/// still reads). `panes` and `native` add no rule: `panes` is the mod's
+/// takeover, a courtesy that needs the mod.
+pub fn subagent_deny(policy: &str) -> &'static [&'static str] {
+    if policy == Subagents::Deny.label() {
+        &["Agent", "Task"]
+    } else {
+        &[]
+    }
 }
 
 /// The session's subagent policy as `whoami` reports it: `(mode, keep)`,
@@ -1687,9 +1769,9 @@ mod tests {
         assert_eq!(Subagents::parse("tasks"), None);
         // `deny` is also a tool rule the pane is launched with, so it holds
         // without the mod; `panes` and `native` add none.
-        assert_eq!(subagent_deny("deny"), Some("Agent"));
-        assert_eq!(subagent_deny("panes"), None);
-        assert_eq!(subagent_deny("native"), None);
+        assert_eq!(subagent_deny("deny"), &["Agent", "Task"]);
+        assert!(subagent_deny("panes").is_empty());
+        assert!(subagent_deny("native").is_empty());
         assert_eq!(
             crate::trust::deny_args(&["Agent".to_string()], &[])
                 .last()
@@ -2290,16 +2372,30 @@ mod tests {
             .map(|(pane, started)| PaneSeen {
                 pane: *pane,
                 started: *started,
+                root: *pane,
             })
             .collect()
     }
 
     fn fails(counts: &[(&str, u64)], class: Option<FailClass>, at: Option<&str>) -> FailureReport {
+        // As the mod counts it: `thrown` is what its own hooks threw, which
+        // here is every count not keyed `ctl.` or `feature.`, unless the
+        // report's class says they were timeouts.
+        let own: u64 = counts
+            .iter()
+            .filter(|(h, _)| !h.starts_with("ctl.") && !h.starts_with("feature."))
+            .map(|(_, n)| *n)
+            .sum();
+        let thrown = !matches!(
+            class,
+            Some(FailClass::Timeout | FailClass::Ctl | FailClass::Shape)
+        );
         FailureReport {
             counts: counts.iter().map(|(h, n)| (h.to_string(), *n)).collect(),
             class,
             message: None,
             at: at.map(str::to_string),
+            thrown: thrown.then_some(own.min(FAIL_COUNT_CAP)),
         }
     }
 
@@ -2390,7 +2486,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_set_aside_is_a_pane_without_a_mod_whatever_it_says_later() {
+    fn a_pane_set_aside_keeps_its_hooks_status_and_a_late_hello_brings_its_mod_back() {
         let mut m = ModState::default();
         m.expect_mod(1);
         // Its status hooks reported before the window ran out.
@@ -2430,7 +2526,8 @@ mod tests {
         assert_eq!(m.aside(2), Some(Aside::Failures));
         assert_eq!(m.status_for(2, HELLO_WINDOW_MS), None);
         assert_eq!(m.report_for(2).and_then(|r| r.doing.clone()), None);
-        // A late hello is granted nothing.
+        // Until it says hello after all: then the mod plainly works there. It
+        // gets its mod back, and its seat is no longer one atrium saw fail.
         let accepted = m.hello(
             1,
             None,
@@ -2439,9 +2536,21 @@ mod tests {
             &caps(&["status", "inbox", "answer"]),
             HELLO_WINDOW_MS + 5_000,
         );
-        assert!(accepted.is_empty());
-        assert!(!m.has_cap(1, "inbox"));
-        assert!(!m.has_cap(1, "status"));
+        assert_eq!(accepted, caps(&["status", "inbox", "answer"]));
+        assert_eq!(m.aside(1), None);
+        assert!(m.has_cap(1, "inbox"));
+        // Pane 2, set aside for its own failures, is not restored by a hello.
+        assert!(m
+            .hello(
+                2,
+                None,
+                "0.3.0",
+                None,
+                &caps(&["status"]),
+                HELLO_WINDOW_MS + 5_000
+            )
+            .is_empty());
+        assert!(!m.has_cap(2, "status"));
         // A bare status still counts from here on: atrium's status hooks
         // report one with no mod at all, and a pane without a mod keeps them.
         m.report(
@@ -2548,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn two_panes_that_miss_the_window_trip_the_breaker_once_and_it_is_remembered() {
+    fn two_panes_that_miss_the_window_trip_the_breaker_once() {
         let mut m = ModState::default();
         for p in [1, 2, 3, 4] {
             m.expect_mod(p);
@@ -2571,8 +2680,27 @@ mod tests {
                 // Every pane with the mod is left as it is, the one that has
                 // not started included; pane 9 never had one.
                 running: vec![1, 2, 3, 4],
-                remember: true,
+                // Pane 3 said hello: the mod works on this machine, so this
+                // is the session's trouble and is not written down.
+                remember: false,
             }
+        );
+        // The same without any hello, the two seats being roots: remembered.
+        let mut cold = ModState::default();
+        cold.expect_mod(1);
+        cold.expect_mod(2);
+        let events = run(
+            &mut cold,
+            0,
+            HELLO_WINDOW_MS + 1_000,
+            &[(1, true), (2, true)],
+        );
+        assert!(
+            matches!(
+                tripped(&events),
+                Some(HealthEvent::Tripped { remember: true, .. })
+            ),
+            "{events:?}"
         );
         assert_eq!(
             m.tripped(),
@@ -2685,7 +2813,7 @@ mod tests {
         assert_eq!(m.aside(1), None);
         assert!(m.has_cap(1, "inbox"));
         let f = m.failures_for(1).expect("kept");
-        assert_eq!((f.total(), f.thrown()), (100, 0));
+        assert_eq!((f.total(), f.thrown), (100, 0));
         assert_eq!(m.failures_total(), 100);
         // Four of its own hooks' on top: still under the line. The fifth is not.
         m.failures_reported(
@@ -2695,8 +2823,213 @@ mod tests {
         );
         assert_eq!(m.aside(1), None);
         assert_eq!(
-            m.failures_reported(1, &[], &fails(&[("guard", 1)], Some(FailClass::Hook), None)),
+            m.failures_reported(
+                1,
+                &[],
+                &fails(
+                    &[("tool.call", 4), ("guard", 1)],
+                    Some(FailClass::Hook),
+                    None
+                )
+            ),
             Some(Aside::Failures)
+        );
+    }
+
+    #[test]
+    fn only_what_its_hooks_threw_counts_and_only_within_ten_minutes() {
+        // Timeouts of its own hooks (a guard on a slow disk): counted, shown,
+        // and never toward setting the mod aside, however many.
+        let mut m = ModState::default();
+        modded(&mut m, 1, &["status", "inbox"]);
+        m.health_tick(0, &seen(&[(1, true)]));
+        for n in 1..=50u64 {
+            assert_eq!(
+                m.failures_reported(
+                    1,
+                    &[],
+                    &fails(&[("guard", n)], Some(FailClass::Timeout), None)
+                ),
+                None
+            );
+        }
+        assert_eq!(m.aside(1), None);
+        assert_eq!(
+            m.failures_for(1).map(|f| (f.total(), f.thrown)),
+            Some((50, 0))
+        );
+
+        // Five accidents spread over ten hours do nothing: each has left the
+        // window before the next arrives.
+        let mut m = ModState::default();
+        modded(&mut m, 1, &["status", "inbox"]);
+        let mut t = 0;
+        m.health_tick(t, &seen(&[(1, true)]));
+        for n in 1..=5u64 {
+            // Two hours of a turning loop, the mod asking for its inbox.
+            for _ in 0..7_200 {
+                t += 1_000;
+                m.note_inbox(1);
+                m.health_tick(t, &seen(&[(1, true)]));
+            }
+            assert_eq!(
+                m.failures_reported(
+                    1,
+                    &[],
+                    &fails(&[("tool.call", n)], Some(FailClass::Hook), None)
+                ),
+                None,
+                "accident {n}"
+            );
+        }
+        assert_eq!(m.aside(1), None);
+        assert_eq!(m.failures_for(1).map(|f| f.thrown), Some(5));
+        assert_eq!(
+            m.failures_for(1).map(|f| f.thrown_recently(m.loop_ms)),
+            Some(1)
+        );
+        // Four more within the next minutes: five in ten minutes. Set aside.
+        for n in 6..=8u64 {
+            t += 60_000 / 30;
+            m.health_tick(t, &seen(&[(1, true)]));
+            assert_eq!(
+                m.failures_reported(
+                    1,
+                    &[],
+                    &fails(&[("tool.call", n)], Some(FailClass::Hook), None)
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            m.failures_reported(
+                1,
+                &[],
+                &fails(&[("tool.call", 9)], Some(FailClass::Hook), None)
+            ),
+            Some(Aside::Failures)
+        );
+        // A report that names no `thrown` (an older mod) sets nothing aside.
+        let mut m = ModState::default();
+        modded(&mut m, 1, &["status"]);
+        let mut old = fails(&[("tool.call", 500)], Some(FailClass::Hook), None);
+        old.thrown = None;
+        assert_eq!(m.failures_reported(1, &[], &old), None);
+    }
+
+    #[test]
+    fn a_mod_loaded_by_hand_loses_its_own_mod_and_is_nobodys_voice() {
+        let mut m = ModState::default();
+        // Two claude panes in a session that injects no mod said hello by
+        // hand (`--plugin-dir`): never expected, so never voices.
+        for p in [1, 2] {
+            m.hello(p, None, "0.3.0", None, &caps(&["status"]), 0);
+            assert_eq!(
+                m.failures_reported(p, &[], &fails(&[("x", 9)], Some(FailClass::Hook), None)),
+                Some(Aside::Failures)
+            );
+        }
+        let events = run(&mut m, 0, 5_000, &[(1, true), (2, true)]);
+        assert!(tripped(&events).is_none(), "{events:?}");
+        assert_eq!(m.tripped(), None);
+    }
+
+    #[test]
+    fn a_late_hello_withdraws_the_seat_from_what_atrium_saw_fail() {
+        let mut m = ModState::default();
+        m.expect_mod(1);
+        m.expect_mod(2);
+        // Pane 1 misses its window, then says hello after all.
+        run(&mut m, 0, HELLO_WINDOW_MS, &[(1, true), (2, false)]);
+        assert_eq!(m.aside(1), Some(Aside::NoHello));
+        let accepted = m.hello(1, None, "0.3.0", None, &caps(&["status", "inbox"]), 0);
+        assert_eq!(accepted, caps(&["status", "inbox"]));
+        assert_eq!(m.aside(1), None);
+        // Pane 2 then misses its own: one seat, not two. No trip.
+        let events = run(
+            &mut m,
+            HELLO_WINDOW_MS + 1_000,
+            HELLO_WINDOW_MS * 2 + 3_000,
+            &[(1, true), (2, true)],
+        );
+        assert_eq!(m.aside(2), Some(Aside::NoHello));
+        assert!(tripped(&events).is_none(), "{events:?}");
+        // After a trip a hello from a pane launched before it is counted,
+        // so the session can say the mod may be fine; it does not un-trip.
+        m.expect_mod(3);
+        let from = HELLO_WINDOW_MS * 2 + 4_000;
+        let events = run(
+            &mut m,
+            from,
+            from + HELLO_WINDOW_MS + 2_000,
+            &[(1, true), (2, true), (3, true)],
+        );
+        assert!(tripped(&events).is_some(), "{events:?}");
+        assert_eq!(m.hellos_since_trip(), 0);
+        m.hello(3, None, "0.3.0", None, &caps(&["status"]), 0);
+        assert_eq!(m.hellos_since_trip(), 1);
+        assert!(m.tripped().is_some());
+    }
+
+    #[test]
+    fn a_trip_is_worth_remembering_only_on_misses_under_two_roots_with_no_hello_at_all() {
+        for (roots, healthy, want, why) in [
+            (
+                &[1usize, 2][..],
+                false,
+                true,
+                "two roots missed, nobody said hello",
+            ),
+            (
+                &[1, 2],
+                true,
+                false,
+                "the mod works for someone on this machine",
+            ),
+            (&[1, 1], false, false, "one lead's two children"),
+            (&[1, 1, 1, 1], false, false, "one lead's four children"),
+            (&[1, 1, 2], false, true, "a second root as well"),
+            (&[1], false, false, "one seat"),
+            (&[], false, false, "reports alone"),
+            (&[], true, false, "nothing seen"),
+        ] {
+            assert_eq!(worth_remembering(roots, healthy), want, "{why}");
+        }
+        // Through the tick: a lead's two children miss the window.
+        let mut m = ModState::default();
+        m.expect_mod(11);
+        m.expect_mod(12);
+        let live = vec![
+            PaneSeen {
+                pane: 10,
+                started: true,
+                root: 10,
+            },
+            PaneSeen {
+                pane: 11,
+                started: true,
+                root: 10,
+            },
+            PaneSeen {
+                pane: 12,
+                started: true,
+                root: 10,
+            },
+        ];
+        let mut events = Vec::new();
+        let mut t = 0;
+        while t <= HELLO_WINDOW_MS + 1_000 {
+            events.extend(m.health_tick(t, &live));
+            t += 1_000;
+        }
+        // The session trips (atrium saw both), and nothing is written down.
+        assert_eq!(
+            tripped(&events),
+            Some(&HealthEvent::Tripped {
+                reason: "2 claude panes loaded it and never said hello".to_string(),
+                running: vec![11, 12],
+                remember: false,
+            })
         );
     }
 
@@ -2975,6 +3308,7 @@ mod tests {
                     "x".repeat(500)
                 )),
                 at: None,
+                thrown: None,
             },
         );
         let f = m.failures_for(1).expect("kept");

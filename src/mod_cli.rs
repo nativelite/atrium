@@ -43,6 +43,18 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
                         done.written.len(),
                         done.unchanged.len()
                     );
+                    // A fresh install is a fresh start: whatever the breaker
+                    // remembered was about what was there before.
+                    if let Some(root) = atrium::session_store::state_root() {
+                        if !matches!(modfiles::read_record(&root), modfiles::RecordRead::None)
+                            && modfiles::clear_record(&root)
+                        {
+                            println!(
+                                "the breaker's record was cleared: the next session loads the \
+                                 mod again"
+                            );
+                        }
+                    }
                     if at.is_some() && configured.as_deref() != Some(dir.as_path()) {
                         println!(
                             "panes look in {}; to use this folder set \"mod\": {{ \"path\": {:?} }} \
@@ -233,16 +245,26 @@ pub(crate) fn session_line_of(reply: &str) -> String {
             .and_then(json::Value::as_i64)
     };
     match (num("mod_failures"), num("mod_tripped")) {
-        (Some(failures), Some(tripped)) => format!(
-            "session: {failures} failure{} reported by its mods; breaker {} \
-             (`atrium ctl status <pane>` shows one pane's mod)",
-            if failures == 1 { "" } else { "s" },
-            if tripped != 0 {
-                "tripped: new claude panes launch without the mod"
-            } else {
-                "closed"
-            }
-        ),
+        (Some(failures), Some(tripped)) => {
+            let late = num("mod_late_hellos").unwrap_or(0);
+            let breaker = match (tripped != 0, late) {
+                (false, _) => "closed".to_string(),
+                (true, 0) => "tripped: new claude panes launch without the mod".to_string(),
+                // Not un-tripped by itself; said, so it is not silently off.
+                (true, n) => format!(
+                    "tripped: new claude panes launch without the mod, though {n} pane{} \
+                     launched with it {} said hello since (the mod may be fine: a new \
+                     session loads it again)",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "has" } else { "have" }
+                ),
+            };
+            format!(
+                "session: {failures} failure{} reported by its mods; breaker {breaker} \
+                 (`atrium ctl status <pane>` shows one pane's mod)",
+                if failures == 1 { "" } else { "s" },
+            )
+        }
         _ => "session: reachable, and its atrium does not report mod health (older than 0.48)"
             .to_string(),
     }

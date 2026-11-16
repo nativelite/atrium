@@ -311,7 +311,7 @@ test('a guard that hangs on the engine lets the edit through after two seconds',
 test('atrium sets the mod aside: it stops asking, and tool calls run', async ($, on) => {
   const clock = mock.clock(on)
   const { calls, ran } = atrium(on, verb =>
-    verb === 'hello' ? HELLO : verb === 'whoami' ? WHO : { ok: false, err: 'mod set aside: no hello within its window; the pane runs without it' },
+    verb === 'hello' ? HELLO : verb === 'whoami' ? WHO : { ok: false, err: 'mod set aside: no hello within its window; the pane runs without it', final: true },
   )
   on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
   await $.session.start(START)
@@ -349,7 +349,7 @@ test('a delivery that lands as the mod is set aside is still submitted, not drop
     if (verb === 'hello') return HELLO_ALL
     if (verb === 'whoami') return WHO
     if (verb === 'inbox' && args.includes('--wait')) return held
-    if (verb === 'report') return { ok: false, err: 'mod set aside: it reported repeated failures; atrium treats pane 1 as one without a mod' }
+    if (verb === 'report') return { ok: false, err: 'mod set aside: it reported repeated failures; atrium treats pane 1 as one without a mod', final: true }
     return OK
   })
   const { submitted } = interactive(on)
@@ -387,7 +387,7 @@ test('a subagent whose pane has no mod is closed at once, with the Agent tool na
   await clock.settle()
   // No thirty-minute wait, no task sent, and the pane it opened is closed.
   expect(JSON.stringify(out)).toContain('has no atrium mod')
-  expect(JSON.stringify(out)).toContain('Use the Agent tool')
+  expect(JSON.stringify(out)).toContain('Subagents run with the Agent tool in this pane from now on')
   expect(calls.some(c => c[0] === 'kill' && c[1] === '7')).toBe(true)
   expect(calls.some(c => c[0] === 'send')).toBe(false)
   expect(calls.some(c => c[0] === 'wait')).toBe(false)
@@ -442,6 +442,189 @@ test('the Agent tool is taken over only while a pane could answer for it', async
   await $.turn.start({ prompt: 'x' } as never).catch(() => undefined)
   await clock.settle()
   // Now a pane would have no mod to answer with: the engine's own tool runs.
+  expect(JSON.stringify(await spawn())).toContain('the engine ran it')
+  expect(native).toBe(1)
+})
+
+test('a busy listener at hello is not a refusal: the hello is said again', async ($, on) => {
+  const clock = mock.clock(on)
+  // What the unix listener answers while atrium's loop is not taking
+  // connections (a fleet launch): a reply, ok false, and not final.
+  let busy = true
+  const { calls, ran } = atrium(on, (verb, a, n) => (busy ? { ok: false, err: 'server busy; ask again' } : healthy(verb, a, n)))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  await $.session.start(START)
+  expect(calls.map(c => c[0])).toEqual(['hello'])
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls' })).toEqual({ result: { ran: true } })
+  await clock.advance(3_100)
+  expect(calls.filter(c => c[0] === 'hello').length).toBe(2)
+  busy = false
+  await clock.advance(6_100)
+  await clock.settle()
+  // Taken on the third try: the mod is live and reports.
+  expect(calls.filter(c => c[0] === 'hello').length).toBe(3)
+  expect(calls.some(c => c[0] === 'whoami')).toBe(true)
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls' })).toEqual({ result: { ran: true } })
+  await clock.settle()
+  expect(calls.some(c => c[0] === 'report' && c.some(t => t.startsWith('status=')))).toBe(true)
+  expect(ran).toEqual(['Bash', 'Bash'])
+})
+
+test('a hello atrium refuses for good, and one it grants nothing, end the mod; nothing else does', async ($, on) => {
+  const clock = mock.clock(on)
+  const { calls } = atrium(on, verb =>
+    verb === 'hello' ? { ok: false, err: 'pane 1 was not launched with the mod by this atrium, so its hello is not taken', final: true } : OK,
+  )
+  await $.session.start(START)
+  await clock.advance(600_000)
+  // Said once, never again.
+  expect(calls.map(c => c[0])).toEqual(['hello'])
+})
+
+test('a busy listener mid-session ends nothing: the mod goes on reporting', async ($, on) => {
+  const clock = mock.clock(on)
+  let busy = false
+  const { calls, ran } = atrium(on, (verb, a, n) => (busy ? { ok: false, err: 'server busy; ask again' } : healthy(verb, a, n)))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  await $.session.start(START)
+  await clock.settle()
+  busy = true
+  for (let i = 0; i < 12; i += 1) {
+    expect(await $.tool.call({ tool: 'Bash', command: `echo ${i}` })).toEqual({ result: { ran: true } })
+    await $.turn.start({ prompt: 'x' } as never).catch(() => undefined)
+    await clock.advance(1_000)
+  }
+  busy = false
+  const before = calls.filter(c => c[0] === 'report').length
+  expect(await $.tool.call({ tool: 'Bash', command: 'ls' })).toEqual({ result: { ran: true } })
+  await $.turn.start({ prompt: 'x' } as never).catch(() => undefined)
+  await clock.settle()
+  // Still live: no hello was needed, and the next report went out.
+  expect(calls.filter(c => c[0] === 'hello').length).toBe(1)
+  expect(calls.filter(c => c[0] === 'report').length).toBeGreaterThan(before)
+  expect(ran.length).toBe(13)
+})
+
+test('a failure counted while a report is in flight is carried by the next one', async ($, on) => {
+  const clock = mock.clock(on)
+  // The first report is held; the test lets it go.
+  let release: () => void = () => undefined
+  const held = new Promise<unknown>(resolve => {
+    release = () => resolve(OK)
+  })
+  const { calls } = atrium(on, (verb, _a, n) => (verb === 'hello' ? HELLO : verb === 'whoami' ? WHO : verb === 'report' && n === 1 ? held : OK))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  await $.session.start(START)
+  await clock.settle()
+  expect(calls.filter(c => c[0] === 'report').length).toBe(1)
+  // While it is in flight, a hook of the mod throws.
+  await $.session.measure({ context: { percent: 10 } } as never).catch(() => undefined)
+  await clock.settle()
+  expect(reported(calls)).toEqual({})
+  release()
+  await clock.settle()
+  // The report that was in flight carried nothing of it; the next one does.
+  const said = reported(calls)
+  expect(said.fail).toBe('session.measure:1')
+  expect(said.fail_thrown).toBe('1')
+})
+
+test('the fifth failure is told even when it lands during a report: the farewell goes out', async ($, on) => {
+  const clock = mock.clock(on)
+  let release: () => void = () => undefined
+  let hold = false
+  const { calls } = atrium(on, verb => {
+    if (verb === 'hello') return HELLO
+    if (verb === 'whoami') return WHO
+    if (verb === 'report' && hold) {
+      hold = false
+      return new Promise<unknown>(resolve => {
+        release = () => resolve(OK)
+      })
+    }
+    return OK
+  })
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  await $.session.start(START)
+  await clock.settle()
+  const broken = (): Promise<unknown> => $.session.measure({ context: { percent: 10 } } as never).catch(() => undefined)
+  // Four failures, each told as it happens.
+  for (let i = 0; i < 4; i += 1) {
+    if (i === 3) hold = true
+    await broken()
+    await clock.settle()
+  }
+  // The report of the fourth is in flight. The fifth lands now, and the mod
+  // switches itself off.
+  await broken()
+  await clock.settle()
+  expect(reported(calls).fail).toBe('session.measure:4')
+  release()
+  await clock.settle()
+  // atrium is told of all five, by the one report the mod sends on its way out.
+  const said = reported(calls)
+  expect(said.fail).toBe('session.measure:5')
+  expect(said.fail_thrown).toBe('5')
+  // And then it is off: nothing more is asked.
+  const after = calls.length
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await clock.advance(600_000)
+  expect(calls.length).toBe(after)
+})
+
+test('at the end of the session a paused mod stops its hello, and its tools answer plainly meanwhile', async ($, on) => {
+  const clock = mock.clock(on)
+  let up = true
+  const { calls } = atrium(on, (verb, a, n) => (up ? healthy(verb, a, n) : never()))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  on('session.end', () => ({ sessionId: 's1' }) as never)
+  await $.session.start(START)
+  await clock.settle()
+  up = false
+  for (let i = 0; i < 6; i += 1) {
+    await $.tool.call({ tool: 'Bash', command: `echo ${i}` })
+    await clock.advance(6_100)
+  }
+  // Paused. One of its own tools, called now, says so instead of hanging on
+  // a broker that is not there or falling through to nothing.
+  const reports = calls.filter(c => c[0] === 'report').length
+  const out = await $.tool.call({ tool: 'mcp__atrium__list' } as never)
+  expect(JSON.stringify(out)).toContain("atrium's mod is paused")
+  expect(calls.filter(c => c[0] === 'list').length).toBe(0)
+  expect(calls.filter(c => c[0] === 'report').length).toBe(reports)
+  // The session ends: the scheduled hello must not fire into it.
+  const hellos = calls.filter(c => c[0] === 'hello').length
+  await $.session.end({ reason: 'exit' } as never)
+  await clock.advance(900_000)
+  expect(calls.filter(c => c[0] === 'hello').length).toBe(hellos)
+})
+
+test('after a child with no mod, the Agent tool is the engine\'s again: the message and the tool agree', async ($, on) => {
+  const clock = mock.clock(on)
+  // The policy is `panes` and atrium does not (yet) say the mod is backed out.
+  const who = { ...WHO, subagents: 'panes', mod_tripped: false }
+  atrium(on, verb => {
+    if (verb === 'hello') return HELLO
+    if (verb === 'whoami') return who
+    if (verb === 'spawn') return { ok: true, pane: 7, role: 'x' }
+    if (verb === 'answer') return { ok: true, pane: 7, status: null, seq: null, answer: null }
+    return OK
+  })
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__atrium__${e.name}` } }))
+  on('ui.notice', () => ({ value: undefined }))
+  let native = 0
+  on('agent.spawn', () => {
+    native += 1
+    return { deny: 'the engine ran it (the test stands for the engine)' }
+  })
+  await $.session.start(START)
+  const spawn = (): Promise<unknown> => $.agent.spawn({ tool_use_id: 't1', prompt: 'p', description: 'd' } as never)
+  // Before: the mod takes the Agent tool over.
+  expect(JSON.stringify(await spawn())).toContain('atrium_subagent')
+  const out = await $.tool.call({ tool: 'mcp__atrium__subagent', description: 'x', prompt: 'y' } as never)
+  expect(JSON.stringify(out)).toContain('Subagents run with the Agent tool in this pane from now on')
+  await clock.settle()
+  // After: what the message said to call is not refused.
   expect(JSON.stringify(await spawn())).toContain('the engine ran it')
   expect(native).toBe(1)
 })

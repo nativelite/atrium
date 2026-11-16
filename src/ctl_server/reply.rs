@@ -26,7 +26,7 @@ pub(crate) fn truncate(s: &str, n: usize) -> String {
 pub(crate) fn audit_outcome(reply: &atrium::ctl::Reply) -> (bool, String) {
     use atrium::ctl::Reply;
     let note = match reply {
-        Reply::Err(msg) => return (false, msg.clone()),
+        Reply::Err(msg) | Reply::Final(msg) => return (false, msg.clone()),
         Reply::Spawned { pane, .. } | Reply::StatusOne { pane, .. } => format!("pane={pane}"),
         Reply::Killed(ids) => format!(
             "killed={}",

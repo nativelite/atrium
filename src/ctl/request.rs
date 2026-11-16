@@ -977,11 +977,22 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                                 .ok_or_else(|| "fail_at must be a hook's name".to_string())?,
                         )?),
                     };
+                    // How many of them its own hooks threw: a whole number.
+                    let thrown = match v.get("fail_thrown") {
+                        None => None,
+                        Some(n) => Some(
+                            n.as_i64()
+                                .filter(|n| *n >= 0)
+                                .map(|n| n as u64)
+                                .ok_or_else(|| "fail_thrown must be a whole number".to_string())?,
+                        ),
+                    };
                     Some(crate::modstate::FailureReport {
                         counts: crate::modstate::parse_fail_counts(counts)?,
                         class,
                         message,
                         at,
+                        thrown,
                     })
                 }
                 _ => {
@@ -992,7 +1003,8 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                     )
                 }
             };
-            if failures.is_none() && v.get("fail_at").is_some() {
+            if failures.is_none() && (v.get("fail_at").is_some() || v.get("fail_thrown").is_some())
+            {
                 return Err(
                     "a failure report names its counts: report fail=<hook>:<n>[,...] \
                      [fail_class=<class>] [fail_at=<hook>] [fail_msg=<text>]"

@@ -605,6 +605,7 @@ fn metrics(cx: &CtlSession<'_>) -> ctl::Reply {
         bus_last_seq: cx.bus.tail(1).last().map_or(0, |e| e.seq),
         open_decisions: cx.bus.pending_decisions().len(),
         mod_failures: cx.mods.failures_total(),
+        mod_late_hellos: cx.mods.hellos_since_trip(),
         mod_tripped: cx.mods.tripped().is_some() || atrium::modfiles::session_tripped().is_some(),
         ..ctl::Metrics::default()
     };
@@ -895,12 +896,33 @@ pub(crate) fn requeue_inbox(
     queued
 }
 
+/// A held `inbox --wait` was answered and the answer could not be written
+/// (the client was gone): put its deliveries back ([`requeue_inbox`]) and
+/// record it under the pane, with how many went back.
+pub(crate) fn held_reply_lost(
+    pending: &mut Vec<PendingSend>,
+    audit: &mut atrium::audit::Audit,
+    pane: AgentId,
+    items: &[ctl::InboxItem],
+    why: &str,
+) -> usize {
+    let back = requeue_inbox(pending, pane, items);
+    audit.record(
+        Some(pane),
+        "inbox",
+        "wait",
+        false,
+        &format!("held reply not delivered ({back} queued again): {why}"),
+    );
+    back
+}
+
 /// The refusal a pane gets once its mod was set aside
 /// ([`atrium::modstate::ModState::aside`]): it starts with
 /// [`atrium::modstate::MOD_SET_ASIDE`], which the mod reads and stops asking.
 fn set_aside_refusal(mods: &atrium::modstate::ModState, pane: AgentId) -> Option<ctl::Reply> {
     mods.aside(pane.0).map(|why| {
-        ctl::reply_err(&format!(
+        ctl::reply_final(&format!(
             "{}: {}; atrium treats pane {pane} as one without a mod (sends are typed, \
              status comes from the status hooks or by inference)",
             atrium::modstate::MOD_SET_ASIDE,
@@ -950,6 +972,20 @@ fn hello(h: ctl::HelloReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> 
     let Some(me) = caller else {
         return ctl::reply_err("hello needs an authenticated pane (ATRIUM_TOKEN)");
     };
+    // Whose hello this is. Any pane with a token can run `atrium ctl hello`;
+    // only two kinds are taken ([`hello_from`]).
+    let from = hello_from(
+        cx.mods.expects(me.0),
+        atrium::modfiles::session_enabled() && atrium::modstate::ever_injected(),
+        pane_by_agent(cx.windows, me).is_some_and(super::panes::is_claude_pane),
+    );
+    if from == HelloFrom::Nobody {
+        return ctl::reply_final(&format!(
+            "pane {me} was not launched with the mod by this atrium, so its hello is not \
+             taken (a shell or another agent has no mod; a claude loads one by hand only in \
+             a session that injects none)"
+        ));
+    }
     let parent = pane_by_agent(cx.windows, me)
         .and_then(|p| p.parent)
         .map(|p| p.0);
@@ -964,6 +1000,39 @@ fn hello(h: ctl::HelloReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> 
     ctl::reply_hello(me, accepted)
 }
 
+/// Whose `hello` a request is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelloFrom {
+    /// A pane atrium launched with the mod this session: the mod it speaks
+    /// for is the one atrium installed, and its hello counts for everything
+    /// (capabilities, the health window, the breaker's evidence).
+    Launched,
+    /// A claude pane in a session where atrium injects no mod: the documented
+    /// `--plugin-dir` case. It gets its capabilities, and is never a voice,
+    /// never evidence, never clears a record (`ModState` holds all of that
+    /// to panes it was told to expect).
+    HandLoaded,
+    /// Anything else: a shell, another agent, a placeholder, or a claude
+    /// atrium launched without the mod in a session that does inject it.
+    Nobody,
+}
+
+/// Decide whose hello this is. `expects`: atrium launched the pane with the
+/// mod. `session_injects`: this session gives claude panes the mod (it uses
+/// the mod, and has launched a pane with it). `claude`: the pane runs a
+/// claude. A hello typed by hand in a pane atrium did launch with the mod
+/// cannot be told from the mod's own, by design: it fails toward "the mod is
+/// on" for that pane and no other. Pure.
+pub(crate) fn hello_from(expects: bool, session_injects: bool, claude: bool) -> HelloFrom {
+    if expects {
+        HelloFrom::Launched
+    } else if claude && !session_injects {
+        HelloFrom::HandLoaded
+    } else {
+        HelloFrom::Nobody
+    }
+}
+
 /// `ctl report`: the caller's mod reports its own status, usage or answer.
 fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -> ctl::Reply {
     let Some(me) = caller else {
@@ -975,23 +1044,23 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     // pane's mod and no other's. The panes above it are the broker's own
     // record of the spawn tree, which the breaker needs to tell one voice
     // from two (`modstate::ModState::failures_reported`).
-    if let Some(f) = &r.failures {
+    // In a session that does not use the mod (`"mod": false`) there is no mod
+    // for a failure to be about: the failure fields are dropped, and the rest
+    // of the report is taken as it always was, so a mod loaded by hand there
+    // keeps reporting its status after it counted a failure.
+    let failures = r
+        .failures
+        .as_ref()
+        .filter(|_| atrium::modfiles::session_enabled());
+    if let Some(f) = failures {
         // Only a pane that has a mod has a mod's failures to report: one
-        // atrium launched with the mod in this session, or one that holds a
-        // hello. A shell, a codex pane, a claude launched without the mod:
-        // refused, and nothing changes.
-        // And only in a session that uses the mod: with `"mod": false` there
-        // is no mod here for anything to be said about.
-        if !atrium::modfiles::session_enabled() {
-            return ctl::reply_err(
-                "this session does not use the mod (\"mod\": false), so there are no failures \
-                 of one to report",
-            );
-        }
+        // atrium launched with the mod in this session, or one whose hello
+        // was taken. From any other pane the request is refused and nothing
+        // changes.
         if !cx.mods.has_a_mod(me.0) {
             return ctl::reply_err(&format!(
-                "pane {me} has no mod (it was not launched with one and never said hello), \
-                 so it has no failures of one to report"
+                "pane {me} has no mod (it was not launched with one and no hello of its was \
+                 taken), so it has no failures of one to report"
             ));
         }
         let parents = ctl_parents(cx.windows);
@@ -1031,7 +1100,7 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
         || r.turns.is_some()
         || !r.touched.is_empty()
         || r.ask.is_some()
-        || r.failures.is_some();
+        || failures.is_some();
     if mod_only {
         if let Some(refusal) = set_aside_refusal(cx.mods, me) {
             return refusal;

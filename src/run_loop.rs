@@ -447,14 +447,12 @@ impl RunState<'_> {
                 // put back in the queue rather than lost: its next poll
                 // collects it, or it is typed once the mod has lost the cap.
                 Err(e) => {
-                    let back =
-                        crate::ctl_server::requeue_inbox(&mut self.pending_sends, pane, &items);
-                    self.ctl_audit.record(
-                        Some(pane),
-                        "inbox",
-                        "wait",
-                        false,
-                        &format!("held reply not delivered ({back} queued again): {e}"),
+                    crate::ctl_server::held_reply_lost(
+                        &mut self.pending_sends,
+                        &mut self.ctl_audit,
+                        pane,
+                        &items,
+                        &e.to_string(),
                     );
                 }
             }
@@ -489,6 +487,7 @@ impl RunState<'_> {
         if !self.mods.health_due(now) {
             return;
         }
+        let parents = crate::ctl_server::ctl_parents(&self.windows);
         let live: Vec<atrium::modstate::PaneSeen> = self
             .windows
             .iter()
@@ -496,6 +495,7 @@ impl RunState<'_> {
             .filter(|p| !p.exited)
             .map(|p| atrium::modstate::PaneSeen {
                 pane: p.agent_id.0,
+                root: root_of(&parents, p.agent_id).0,
                 // Asked only of a pane still owed its first sight, and only
                 // until it is seen.
                 started: self.mods.awaiting_start(p.agent_id.0)
@@ -506,16 +506,25 @@ impl RunState<'_> {
         if events.is_empty() {
             return;
         }
-        // The trip is kept against the Claude Code these panes run: one of
-        // them is asked its version (cached; two seconds at most), and only
-        // when the trip is one to remember.
-        let program = self
+        // The trip is kept against the Claude Code that ran the mod: a pane
+        // atrium launched with it, one that missed its window first, is asked
+        // its version (cached; two seconds at most), and only when the trip is
+        // one to remember ([`trip_program`]).
+        let candidates: Vec<(bool, bool, Option<String>)> = self
             .windows
             .iter()
             .flat_map(|w| w.panes.iter())
-            .find(|p| self.mods.has_a_mod(p.agent_id.0))
-            .and_then(|p| p.argv.first().cloned())
-            .unwrap_or_else(|| "claude".to_string());
+            .map(|p| {
+                (
+                    self.mods.expects(p.agent_id.0),
+                    self.mods.aside(p.agent_id.0) == Some(atrium::modstate::Aside::NoHello),
+                    p.argv.first().cloned(),
+                )
+            })
+            .collect();
+        let program = trip_program(&candidates, &|p| {
+            atrium::bind::is_claude_stem(&atrium::bind::command_stem(p))
+        });
         let (windows, host) = (&self.windows, &self.host);
         apply_health_events(
             events,
@@ -535,10 +544,9 @@ impl RunState<'_> {
             &mut |flash| host.report_flash(flash),
             &mut atrium::modfiles::recovered,
             &mut |reason, remember| {
-                let version = if remember {
-                    claude_version(&program)
-                } else {
-                    None
+                let version = match (&program, remember) {
+                    (Some(p), true) => claude_version(p),
+                    _ => None,
                 };
                 atrium::modfiles::trip(reason, version.as_deref(), remember)
             },

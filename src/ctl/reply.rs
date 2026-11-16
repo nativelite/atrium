@@ -142,6 +142,13 @@ pub enum Reply {
         path: String,
         panes: Vec<WhoEntry>,
     },
+    /// `{"ok":false,"err":"<msg>","final":true}` — a refusal that is the
+    /// broker's own decision about the caller's mod and will not change: its
+    /// mod was set aside, or its hello is not one this session takes. The mod
+    /// reads `final` and stops for the session; every other refusal (a busy
+    /// listener, a request too large, a verb it does not know) is one it may
+    /// ask again after.
+    Final(String),
     /// `{"ok":true,"atrium":V,"uptime_ms":N}` — the run loop answered a `ping`.
     Pong {
         uptime_ms: u64,
@@ -191,6 +198,9 @@ pub struct Metrics {
     /// `1` once the mod's circuit breaker tripped in this session (new claude
     /// panes launch without the mod), else `0`.
     pub mod_tripped: bool,
+    /// Panes atrium launched with the mod that said hello after the breaker
+    /// tripped: a sign the mod may be fine after all.
+    pub mod_late_hellos: u32,
 }
 
 impl Metrics {
@@ -304,6 +314,11 @@ impl Reply {
         let ok = ("ok", Value::Bool(true));
         match self {
             Reply::Err(msg) => obj(vec![("ok", Value::Bool(false)), ("err", s(msg))]),
+            Reply::Final(msg) => obj(vec![
+                ("ok", Value::Bool(false)),
+                ("err", s(msg)),
+                ("final", Value::Bool(true)),
+            ]),
             Reply::BoardEntry { key, entry } => obj(vec![
                 ok,
                 ("key", s(key)),
@@ -541,6 +556,7 @@ impl Reply {
                 ("open_decisions", i(m.open_decisions)),
                 ("mod_failures", u(m.mod_failures)),
                 ("mod_tripped", u(u64::from(m.mod_tripped))),
+                ("mod_late_hellos", u(u64::from(m.mod_late_hellos))),
             ]),
             Reply::Tree(nodes) => obj(vec![
                 ok,
@@ -587,6 +603,11 @@ impl std::fmt::Display for Reply {
 /// `{"ok":false,"err":"<msg>"}`
 pub fn reply_err(msg: &str) -> Reply {
     Reply::Err(msg.to_string())
+}
+
+/// `{"ok":false,"err":"<msg>","final":true}`: see [`Reply::Final`].
+pub fn reply_final(msg: &str) -> Reply {
+    Reply::Final(msg.to_string())
 }
 
 /// `{"ok":true,"pane":N,"accepted":[...]}` — a `hello` taken.

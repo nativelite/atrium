@@ -220,12 +220,13 @@ Once installed, every claude pane atrium spawns gets CLAUDE_CODE_PLUGIN_DIRS nam
 folder and reports its status to atrium for certain instead of by inference. ATRIUM_MOD
 names the folder outright; \"mod\": false in config.json or a fleet turns injection off.
 
-`install` marks the folder it writes; a launch keeps a marked folder current with the
-atrium that runs (one line when it rewrote a file) and never writes to any other. A pane
-whose mod says no hello within 30 s of starting, or reports that its hooks keep failing,
-runs as a pane without one. When two panes do, new claude panes launch without the mod for
-the session and nothing running is restarted; when atrium itself saw two miss the window,
-later sessions too, until Claude Code or the mod changes, or `atrium mod retry`.
+`install` marks the folder it writes and clears the breaker's record; a launch keeps a
+marked folder current with the atrium that runs (one line when it rewrote a file) and
+never writes to any other. A pane whose mod says no hello within 30 s of starting, or
+reports that its hooks keep failing, runs as a pane without one. When two panes do, new
+claude panes launch without the mod for the session and nothing running is restarted.
+Later sessions too, until Claude Code or the mod changes or `atrium mod retry`, only when
+atrium itself saw two separately launched panes miss the window and none say hello.
 See mod/README.md and docs/control-plane.md.
 ";
 

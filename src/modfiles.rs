@@ -604,14 +604,78 @@ pub enum Heal {
     Unmarked,
     /// Every file already matched.
     Current,
+    /// The folder was written by a newer atrium than this one (its marker
+    /// names a later mod version): left exactly as it is. Two atriums of
+    /// different versions sharing one folder would otherwise rewrite it back
+    /// and forth, and this one would be the downgrade.
+    Newer(String),
     /// These files were missing or differed, and were rewritten.
     Rewrote(Vec<&'static str>),
-    /// Some files could not be written: the folder now holds a mix of this
-    /// binary's files and older ones. `failed` names each with why.
-    Broken {
+    /// Files differ and none could be written: the folder is as it was
+    /// installed, whole, only not this binary's copy.
+    Stale(Vec<(&'static str, String)>),
+    /// Some files were rewritten and others could not be: the folder now
+    /// holds a mix of this binary's files and older ones.
+    Mixed {
         written: Vec<&'static str>,
         failed: Vec<(&'static str, String)>,
     },
+}
+
+/// The version and hash a folder's marker names.
+pub fn marker_at(dir: &Path) -> Option<(String, String)> {
+    let v = json::parse(&std::fs::read_to_string(dir.join(MARKER)).ok()?).ok()?;
+    Some((
+        v.get("mod")?.as_str()?.to_string(),
+        v.get("hash")?.as_str()?.to_string(),
+    ))
+}
+
+/// Is version `a` later than `b`, read as dotted whole numbers (`0.10.0` is
+/// later than `0.9.3`)? A part that is not a number counts as zero.
+pub fn later_version(a: &str, b: &str) -> bool {
+    let parts = |v: &str| -> Vec<u64> {
+        v.trim()
+            .split('.')
+            .map(|p| p.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    };
+    let (a, b) = (parts(a), parts(b));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Remove temporary files an interrupted write left in the mod's folders
+/// (`*.atrium-tmp`, see [`write_whole`]). Only names of that form, only in
+/// the folders the mod's own files live in.
+fn sweep_temporaries(dir: &Path) {
+    let mut folders: Vec<PathBuf> = vec![dir.to_path_buf()];
+    for (rel, _) in FILES {
+        if let Some(parent) = dir.join(rel).parent() {
+            if !folders.iter().any(|f| f == parent) {
+                folders.push(parent.to_path_buf());
+            }
+        }
+    }
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".atrium-tmp") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 /// The launch heal: in a folder `atrium mod install` wrote ([`Folder::Ours`]),
@@ -619,14 +683,25 @@ pub enum Heal {
 /// this binary. It goes on past a file it cannot write, so the result names
 /// every one; each file is replaced whole or not at all ([`write_whole`]); a
 /// file reached through a symbolic link is refused, not followed. Every path
-/// written is `dir` joined with one of [`FILES`]' own names. Any other
-/// folder is left untouched.
+/// written is `dir` joined with one of [`FILES`]' own names. A folder a newer
+/// atrium wrote is never downgraded, and any other folder is left untouched.
 pub fn heal_at(dir: &Path) -> Heal {
     match folder_at(dir) {
         Folder::Absent => return Heal::NotInstalled,
         Folder::Unmarked => return Heal::Unmarked,
         Folder::Ours => {}
     }
+    if let Some((version, _)) = marker_at(dir) {
+        if later_version(&version, &embedded_version()) {
+            return Heal::Newer(version);
+        }
+    }
+    sweep_temporaries(dir);
+    let was_mixed = std::fs::read_to_string(dir.join(MARKER))
+        .ok()
+        .and_then(|t| json::parse(&t).ok())
+        .and_then(|v| v.get("mixed").and_then(json::Value::as_bool))
+        .unwrap_or(false);
     let mut written = Vec::new();
     let mut failed = Vec::new();
     for (rel, text) in FILES {
@@ -647,7 +722,24 @@ pub fn heal_at(dir: &Path) -> Heal {
         }
     }
     if !failed.is_empty() {
-        return Heal::Broken { written, failed };
+        // Mixed once, mixed until a heal gets through: the marker carries it,
+        // since the next launch finds nothing left to write among the files
+        // this one managed, and would otherwise take the folder for merely old.
+        if written.is_empty() && !was_mixed {
+            return Heal::Stale(failed);
+        }
+        if !was_mixed {
+            if let Some((version, hash)) = marker_at(dir) {
+                let _ = write_whole(
+                    &dir.join(MARKER),
+                    &format!(
+                        "{{\"mod\":\"{version}\",\"hash\":\"{hash}\",\"mixed\":true}}
+"
+                    ),
+                );
+            }
+        }
+        return Heal::Mixed { written, failed };
     }
     // The marker follows the files: it names what the folder now holds.
     let marker = dir.join(MARKER);
@@ -661,20 +753,76 @@ pub fn heal_at(dir: &Path) -> Heal {
     }
 }
 
-/// The line a heal says, if it has one, and whether the folder may still be
-/// loaded into panes this session.
-pub fn heal_line(heal: &Heal, dir: &Path) -> (Option<String>, bool) {
+/// Is `dir` a developer's own folder: named outright by [`ENV_MOD`], or
+/// inside a git checkout (a `.git` in it or in a folder above it)? Such a
+/// folder is never advised into `atrium mod install`, which would opt it
+/// into being rewritten at every launch.
+pub fn developer_folder(dir: &Path, named_by_env: bool) -> bool {
+    named_by_env || dir.ancestors().any(|a| a.join(".git").exists())
+}
+
+/// What a heal means for the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealSaid {
+    /// The one line to say, if any.
+    pub line: Option<String>,
+    /// May the folder be loaded into panes this session?
+    pub loadable: bool,
+    /// Does the folder hold exactly this binary's mod, in a folder atrium
+    /// keeps? Only then is what runs in the panes "mod <embedded version>".
+    pub current: bool,
+}
+
+/// The line a heal says and what it means ([`HealSaid`]). `developer`:
+/// [`developer_folder`].
+pub fn heal_line(heal: &Heal, dir: &Path, developer: bool) -> HealSaid {
+    let failed_line = |failed: &[(&'static str, String)], tail: &str| {
+        format!(
+            "mod: {} file{} at {} could not be refreshed ({}: {}); {tail}",
+            failed.len(),
+            if failed.len() == 1 { "" } else { "s" },
+            dir.display(),
+            failed[0].0,
+            failed[0].1
+        )
+    };
+    let said = |line: Option<String>, loadable: bool, current: bool| HealSaid {
+        line,
+        loadable,
+        current,
+    };
     match heal {
-        Heal::NotInstalled | Heal::Current => (None, true),
-        Heal::Unmarked => (
+        Heal::NotInstalled => said(None, true, false),
+        Heal::Current => said(None, true, true),
+        Heal::Unmarked if developer => said(
+            Some(format!(
+                "mod: the mod at {} is loaded as it is (a folder atrium did not install into, \
+                 and never writes to)",
+                dir.display()
+            )),
+            true,
+            false,
+        ),
+        Heal::Unmarked => said(
             Some(format!(
                 "mod: the mod at {} was not installed by this atrium (no {MARKER} marker); it \
                  is loaded as it is. Run `atrium mod install` to have atrium keep it current",
                 dir.display()
             )),
             true,
+            false,
         ),
-        Heal::Rewrote(written) => (
+        Heal::Newer(version) => said(
+            Some(format!(
+                "mod: the mod at {} is {version}, newer than the {} in this atrium; it is \
+                 loaded as it is and not written to",
+                dir.display(),
+                embedded_version()
+            )),
+            true,
+            false,
+        ),
+        Heal::Rewrote(written) => said(
             Some(format!(
                 "mod: {} file{} at {} refreshed from this atrium ({})",
                 written.len(),
@@ -683,18 +831,26 @@ pub fn heal_line(heal: &Heal, dir: &Path) -> (Option<String>, bool) {
                 embedded_version()
             )),
             true,
+            true,
         ),
-        Heal::Broken { failed, .. } => (
-            Some(format!(
-                "mod: {} file{} at {} could not be refreshed ({}: {}); the folder may hold a \
-                 mix of versions, so claude panes launch without the mod this session. Fix the \
-                 file and run `atrium mod install`",
-                failed.len(),
-                if failed.len() == 1 { "" } else { "s" },
-                dir.display(),
-                failed[0].0,
-                failed[0].1
+        // Whole, only old: it loaded yesterday and loads today.
+        Heal::Stale(failed) => said(
+            Some(failed_line(
+                failed,
+                "nothing was changed, so the mod is loaded as it was installed. Fix the file \
+                 and run `atrium mod install`",
             )),
+            true,
+            false,
+        ),
+        Heal::Mixed { failed, .. } => said(
+            Some(failed_line(
+                failed,
+                "other files were rewritten, so the folder holds a mix of versions and claude \
+                 panes launch without the mod this session. Fix the file and run \
+                 `atrium mod install`",
+            )),
+            false,
             false,
         ),
     }
@@ -708,6 +864,9 @@ static TRIPPED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static RETRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The launch heal left the folder inconsistent: it is not loaded this session.
 static UNLOADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The folder panes load holds exactly this binary's mod, in a folder atrium
+/// keeps: what runs is what a record would name.
+static LOADED_CURRENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Why the mod is off for this session, if the breaker tripped (now, or on a
 /// record from an earlier one).
@@ -748,6 +907,7 @@ pub fn launch_once(claude: impl FnOnce() -> Option<String>) -> Vec<String> {
     if !state.loadable {
         UNLOADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    LOADED_CURRENT.store(state.current, std::sync::atomic::Ordering::Relaxed);
     match state.launch {
         Launch::Tripped(r) | Launch::TrippedUnknown(r) => {
             *TRIPPED.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.reason);
@@ -764,6 +924,8 @@ pub struct Launched {
     pub launch: Launch,
     /// May the folder be loaded into panes this session?
     pub loadable: bool,
+    /// Does the folder hold exactly this binary's mod ([`HealSaid::current`])?
+    pub current: bool,
 }
 
 /// [`launch_once`] over a given mod folder and state root: the heal, then
@@ -776,14 +938,27 @@ pub fn launch_at(
 ) -> (Vec<String>, Launched) {
     let mut lines = Vec::new();
     let heal = dir.map_or(Heal::NotInstalled, heal_at);
-    let (line, loadable) = dir.map_or((None, true), |d| heal_line(&heal, d));
-    lines.extend(line);
+    let said = match dir {
+        Some(d) => heal_line(
+            &heal,
+            d,
+            developer_folder(d, std::env::var_os(ENV_MOD).is_some_and(|v| !v.is_empty())),
+        ),
+        None => HealSaid {
+            line: None,
+            loadable: true,
+            current: false,
+        },
+    };
+    let (loadable, current) = (said.loadable, said.current);
+    lines.extend(said.line);
     let Some(root) = root else {
         return (
             lines,
             Launched {
                 launch: Launch::Clean,
                 loadable,
+                current,
             },
         );
     };
@@ -795,28 +970,72 @@ pub fn launch_at(
     let healed = matches!(heal, Heal::Rewrote(_));
     let launch = launch_of(true, record, version.as_deref(), healed);
     lines.extend(launch_line(&launch, now_ms));
-    (lines, Launched { launch, loadable })
+    (
+        lines,
+        Launched {
+            launch,
+            loadable,
+            current,
+        },
+    )
+}
+
+/// How far a trip reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// This session only.
+    Session,
+    /// This session only, because what the panes loaded was not this
+    /// binary's mod in a folder atrium keeps (an install from before the
+    /// marker, a checkout, a folder that could not be refreshed): a record
+    /// would name a mod that never ran. `atrium mod install` is the fix.
+    SessionNotCurrent,
+    /// Written down: later sessions keep the mod off while nothing changed.
+    Recorded,
+}
+
+/// Decide how far a trip reaches. It is written down only when the breaker
+/// found it worth remembering (`remember`: what atrium saw itself), the
+/// panes ran exactly this binary's mod (`current`), and the Claude Code
+/// version is known (a record against an unknown version would match
+/// nothing, or everything). Pure.
+pub fn kept_of(remember: bool, current: bool, claude_known: bool) -> Kept {
+    match (remember, current, claude_known) {
+        (false, _, _) => Kept::Session,
+        (true, false, _) => Kept::SessionNotCurrent,
+        (true, true, false) => Kept::Session,
+        (true, true, true) => Kept::Recorded,
+    }
 }
 
 /// The breaker tripped in this session: no claude pane gets the mod from
-/// here on. With `remember` (the trip rests on what atrium saw itself) it is
-/// also written down against `claude` (what `claude --version` prints) and
-/// this binary's mod. Returns whether it was written down: not without
-/// `remember`, not when the version is unknown (a record keyed by an unknown
-/// version would match nothing, or everything), not without a state root.
+/// here on. How far it reaches is [`kept_of`]'s to say; a record is written
+/// against `claude` (what `claude --version` prints) and this binary's mod.
 /// In a session that does not use the mod this does nothing at all.
-pub fn trip(reason: &str, claude: Option<&str>, remember: bool) -> bool {
+pub fn trip(reason: &str, claude: Option<&str>, remember: bool) -> Kept {
     if !session_enabled() {
-        return false;
+        return Kept::Session;
     }
     *TRIPPED.lock().unwrap_or_else(|e| e.into_inner()) = Some(record_text(reason));
     RETRYING.store(false, std::sync::atomic::Ordering::Relaxed);
-    if !remember {
-        return false;
+    let claude = claude.map(record_text).filter(|c| !c.is_empty());
+    let current = LOADED_CURRENT.load(std::sync::atomic::Ordering::Relaxed);
+    let kept = kept_of(remember, current, claude.is_some());
+    if kept != Kept::Recorded {
+        return kept;
     }
-    match crate::session_store::state_root() {
-        Some(root) => remember_trip(&root, reason, claude, crate::session_store::now_ms()),
-        None => false,
+    let written = crate::session_store::state_root().is_some_and(|root| {
+        remember_trip(
+            &root,
+            reason,
+            claude.as_deref(),
+            crate::session_store::now_ms(),
+        )
+    });
+    if written {
+        Kept::Recorded
+    } else {
+        Kept::Session
     }
 }
 
@@ -1269,9 +1488,26 @@ mod tests {
             !checkout.join(MARKER).exists(),
             "no marker appears by itself"
         );
-        let (line, loadable) = heal_line(&Heal::Unmarked, &checkout);
-        assert!(line.expect("a line").contains("atrium mod install"));
-        assert!(loadable, "it is loaded as it is");
+        // An install from before the marker is told how to be kept current.
+        let said = heal_line(&Heal::Unmarked, &checkout, false);
+        assert!(said.line.expect("a line").contains("atrium mod install"));
+        assert!(said.loadable, "it is loaded as it is");
+        assert!(
+            !said.current,
+            "what runs is not known to be this binary's mod"
+        );
+        // A developer's folder is not advised into being rewritten.
+        let said = heal_line(&Heal::Unmarked, &checkout, true);
+        let line = said.line.expect("a line");
+        assert!(
+            line.contains("loaded as it is") && !line.contains("mod install"),
+            "{line}"
+        );
+        assert!(developer_folder(&checkout, true), "named by ATRIUM_MOD");
+        assert!(
+            developer_folder(&Path::new(env!("CARGO_MANIFEST_DIR")).join("mod"), false),
+            "inside a git checkout"
+        );
         // The repo's own mod/ is such a folder.
         let repo_mod = Path::new(env!("CARGO_MANIFEST_DIR")).join("mod");
         assert_eq!(folder_at(&repo_mod), Folder::Unmarked);
@@ -1322,7 +1558,7 @@ mod tests {
     }
 
     #[test]
-    fn a_heal_that_cannot_write_every_file_names_each_and_the_folder_is_not_loaded() {
+    fn a_heal_that_cannot_write_every_file_names_each_and_a_mixed_folder_is_not_loaded() {
         let dir = temp("heal-broken");
         install_at(&dir).expect("install");
         // Three files differ; two of them cannot be replaced (a non-empty
@@ -1332,9 +1568,12 @@ mod tests {
             std::fs::create_dir_all(dir.join(rel).join("in-the-way")).expect("dir");
         }
         std::fs::write(dir.join("hooks/guard.ts"), "old").expect("edit");
+        // A temporary file an interrupted write left behind is swept.
+        std::fs::write(dir.join("hooks/view.ts.123.atrium-tmp"), "half").expect("write");
         let heal = heal_at(&dir);
-        let Heal::Broken { written, failed } = &heal else {
-            panic!("expected a broken heal, got {heal:?}");
+        assert!(!dir.join("hooks/view.ts.123.atrium-tmp").exists());
+        let Heal::Mixed { written, failed } = &heal else {
+            panic!("expected a mixed folder, got {heal:?}");
         };
         // It went on past the first failure: the one it could write is
         // written, and both it could not are named.
@@ -1343,21 +1582,150 @@ mod tests {
             failed.iter().map(|(rel, _)| *rel).collect::<Vec<_>>(),
             vec!["hooks/status.ts", "hooks/ctl.ts"]
         );
-        let (line, loadable) = heal_line(&heal, &dir);
-        let line = line.expect("a line");
+        let said = heal_line(&heal, &dir, false);
+        let line = said.line.expect("a line");
         assert!(
             line.contains("2 files")
                 && line.contains("hooks/status.ts")
+                && line.contains("mix of versions")
                 && line.contains("without the mod"),
             "{line}"
         );
-        assert!(!loadable, "a mix of versions is not loaded");
+        assert!(!said.loadable, "a mix of versions is not loaded");
+        assert!(!said.current);
+        // The next launch finds the same two files in the way and nothing
+        // else to write: the folder is still a mix, and it says so.
+        assert!(matches!(heal_at(&dir), Heal::Mixed { .. }));
         // So the launch says so, loads nothing, and a pane gets no folder.
         let state = temp("heal-broken-state");
         let (lines, launched) = launch_at(Some(&dir), Some(&state), || None, 0);
         assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(!launched.loadable);
+        assert!(!launched.loadable && !launched.current);
         assert_eq!(inject_dir(true, !launched.loadable, Some(&dir)), None);
+        // Once the files can be written the heal gets through, and the
+        // folder is whole and current again.
+        for rel in ["hooks/status.ts", "hooks/ctl.ts"] {
+            std::fs::remove_dir_all(dir.join(rel)).expect("clear");
+        }
+        assert_eq!(
+            heal_at(&dir),
+            Heal::Rewrote(vec!["hooks/status.ts", "hooks/ctl.ts"])
+        );
+        assert_eq!(heal_at(&dir), Heal::Current);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_folder_that_could_not_be_touched_is_stale_not_mixed_and_still_loads() {
+        let dir = temp("heal-stale");
+        install_at(&dir).expect("install");
+        // The one file that differs cannot be replaced; nothing else differs.
+        std::fs::remove_file(dir.join("hooks/status.ts")).expect("remove");
+        std::fs::create_dir_all(dir.join("hooks/status.ts").join("in-the-way")).expect("dir");
+        let heal = heal_at(&dir);
+        assert!(
+            matches!(&heal, Heal::Stale(failed) if failed.len() == 1),
+            "{heal:?}"
+        );
+        let said = heal_line(&heal, &dir, false);
+        let line = said.line.expect("a line");
+        assert!(
+            line.contains("could not be refreshed") && line.contains("loaded as it was installed"),
+            "{line}"
+        );
+        assert!(!line.contains("mix of versions"), "{line}");
+        // Whole, only old: it is loaded. But it is not this binary's mod, so
+        // a trip while it runs is never written down as "mod <embedded>".
+        assert!(said.loadable);
+        assert!(!said.current);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_a_newer_atrium_wrote_is_never_downgraded() {
+        let dir = temp("heal-newer");
+        install_at(&dir).expect("install");
+        // Another, newer atrium shares this folder: its marker says so and
+        // its files differ from ours.
+        std::fs::write(
+            dir.join(MARKER),
+            "{\"mod\":\"99.0.0\",\"hash\":\"00000000deadbeef\"}\n",
+        )
+        .expect("marker");
+        std::fs::write(dir.join("hooks/status.ts"), "// from the newer atrium").expect("write");
+        assert_eq!(marker_at(&dir).map(|(v, _)| v).as_deref(), Some("99.0.0"));
+        assert_eq!(heal_at(&dir), Heal::Newer("99.0.0".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("hooks/status.ts"))
+                .ok()
+                .as_deref(),
+            Some("// from the newer atrium")
+        );
+        let said = heal_line(&Heal::Newer("99.0.0".to_string()), &dir, false);
+        assert!(said.line.expect("a line").contains("newer than"));
+        assert!(said.loadable && !said.current);
+        // The same version, or an older one, is ours to bring current.
+        std::fs::write(
+            dir.join(MARKER),
+            format!(
+                "{{\"mod\":\"{}\",\"hash\":\"00000000deadbeef\"}}\n",
+                embedded_version()
+            ),
+        )
+        .expect("marker");
+        assert_eq!(heal_at(&dir), Heal::Rewrote(vec!["hooks/status.ts"]));
+        for (a, b, later) in [
+            ("0.10.0", "0.9.3", true),
+            ("0.3.1", "0.3.0", true),
+            ("1.0", "0.99.99", true),
+            ("0.3.0", "0.3.0", false),
+            ("0.3", "0.3.0", false),
+            ("0.2.9", "0.3.0", false),
+            ("junk", "0.0.1", false),
+        ] {
+            assert_eq!(later_version(a, b), later, "{a} later than {b}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trip_is_written_down_only_for_this_binarys_own_mod_seen_failing() {
+        // (worth remembering, the panes ran this binary's mod, version known)
+        for (remember, current, known, want) in [
+            (true, true, true, Kept::Recorded),
+            // What ran was an old or unmarked folder: a record would say
+            // "mod <embedded>" of a mod that never ran.
+            (true, false, true, Kept::SessionNotCurrent),
+            (true, false, false, Kept::SessionNotCurrent),
+            // No version to key it by.
+            (true, true, false, Kept::Session),
+            // A trip the breaker itself found not worth remembering.
+            (false, true, true, Kept::Session),
+            (false, false, true, Kept::Session),
+            (false, true, false, Kept::Session),
+            (false, false, false, Kept::Session),
+        ] {
+            assert_eq!(
+                kept_of(remember, current, known),
+                want,
+                "remember={remember} current={current} known={known}"
+            );
+        }
+        // And a launch says whether the folder is that mod.
+        let dir = temp("kept");
+        let state = temp("kept-state");
+        install_at(&dir).expect("install");
+        let (_, launched) = launch_at(Some(&dir), Some(&state), || None, 0);
+        assert!(launched.current, "a marked, byte-current folder");
+        std::fs::remove_file(dir.join(MARKER)).expect("remove");
+        let (_, launched) = launch_at(Some(&dir), Some(&state), || None, 0);
+        assert!(
+            !launched.current,
+            "unmarked: whatever it holds, it is not kept"
+        );
+        let (_, launched) = launch_at(None, Some(&state), || None, 0);
+        assert!(!launched.current, "no folder");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&state);
     }
@@ -1414,7 +1782,7 @@ mod tests {
         std::fs::write(&target, "untouched").expect("write");
         std::fs::remove_file(dir.join("hooks/status.ts")).expect("remove");
         std::os::unix::fs::symlink(&target, dir.join("hooks/status.ts")).expect("link");
-        assert!(matches!(heal_at(&dir), Heal::Broken { .. }));
+        assert!(matches!(heal_at(&dir), Heal::Stale(_)));
         assert_eq!(
             std::fs::read_to_string(&target).ok().as_deref(),
             Some("untouched")
@@ -1446,7 +1814,7 @@ mod tests {
             String::from_utf8_lossy(&made.stderr)
         );
         let heal = heal_at(&dir);
-        assert!(matches!(heal, Heal::Broken { .. }), "{heal:?}");
+        assert!(matches!(heal, Heal::Stale(_)), "{heal:?}");
         assert_eq!(
             std::fs::read_to_string(outside.join("status.ts"))
                 .ok()

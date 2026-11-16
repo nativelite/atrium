@@ -802,15 +802,11 @@ fn agent_args(
     // and before the folded system prompt, which terminates the variadic list —
     // the same placement `--allowedTools` relies on.
     if is_claude {
-        // A session whose subagent policy is `deny` holds it here too, as a
-        // tool rule Claude Code enforces itself: the mod's refusal of the
-        // Agent tool is only as good as the mod, and a pane's mod can fail.
-        let mut session = atrium::trust::session_deny();
-        session.extend(
-            atrium::modstate::subagent_deny(&atrium::modstate::session_subagents().0)
-                .map(str::to_string),
-        );
-        base.extend(atrium::trust::deny_args(&session, deny));
+        base.extend(claude_deny_args(
+            &atrium::trust::session_deny(),
+            &atrium::modstate::session_subagents().0,
+            deny,
+        ));
     }
     // When the ctl channel is live, teach every agent pane — the initial one and
     // ctl-spawned workers alike — to delegate through `atrium ctl` (visible panes)
@@ -1092,6 +1088,26 @@ fn pane_env(
     );
     base_env.extend_from_slice(extra_env);
     (base_env, token, pane_cgroup)
+}
+
+/// The `--disallowedTools` a claude pane is launched with: the built-in
+/// fail-safes and the session's rules, the agent's own, and under a `deny`
+/// subagent policy the subagent tool itself
+/// (`atrium::modstate::subagent_deny`). That last one is a rule Claude Code
+/// enforces: the mod's refusal of the tool is only as good as the mod, and a
+/// pane's mod can fail.
+pub(crate) fn claude_deny_args(
+    session: &[String],
+    subagents: &str,
+    agent: &[String],
+) -> Vec<String> {
+    let mut session = session.to_vec();
+    session.extend(
+        atrium::modstate::subagent_deny(subagents)
+            .iter()
+            .map(|t| t.to_string()),
+    );
+    atrium::trust::deny_args(&session, agent)
 }
 
 /// What `claude --version` prints (its first line), asked once per session

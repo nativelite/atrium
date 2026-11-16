@@ -323,7 +323,8 @@ fn ctl_status_reports_a_pane() {
 /// never satisfy them.
 #[test]
 fn ctl_hello_and_report_drive_the_panes_status() {
-    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    // A hello is a claude pane's: the stand-in runs a shell under that name.
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin("hello");
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl hello mod=0.1.0 caps=status,bogus\r\n").as_bytes())
         .unwrap();
@@ -414,7 +415,8 @@ fn ctl_answer_and_wait_collect_a_panes_reported_answer() {
 /// second `inbox` is empty. A pane without that cap is refused the verb.
 #[test]
 fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
-    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    // A hello is a claude pane's: the stand-in runs a shell under that name.
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin("inbox");
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl inbox\r\n").as_bytes())
         .unwrap();
@@ -464,10 +466,13 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
 /// into. The reply reaches the waiter well inside the 60 s hold.
 #[test]
 fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
-    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    // A hello is a claude pane's: the stand-in runs a shell under that name,
+    // and so do the workers it spawns.
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin("inboxwait");
+    let shell = "claude";
     let atrium = env!("CARGO_BIN_EXE_atrium");
     // A worker in its own window: the waiter.
-    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    let two: &[u8] = b"2:claude";
     p.write(format!("\"{atrium}\" ctl spawn --role waiter -- {shell}\r\n").as_bytes())
         .unwrap();
     read_until(&mut p, two, Duration::from_secs(20));
@@ -523,7 +528,10 @@ fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
 /// the `atrium` topic, and a trailing part of the path finds the file too.
 #[test]
 fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
-    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    // A hello is a claude pane's: the stand-in runs a shell under that name,
+    // and so do the workers it spawns.
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin("who");
+    let shell = "claude";
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl bus sub atrium\r\n").as_bytes())
         .unwrap();
@@ -544,7 +552,7 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
         String::from_utf8_lossy(&out)
     );
     // A worker in its own window reports the same file with its own token.
-    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    let two: &[u8] = b"2:claude";
     p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
         .unwrap();
     read_until(&mut p, two, Duration::from_secs(20));
@@ -604,7 +612,8 @@ fn ctl_who_lists_the_panes_that_edited_a_file_and_a_collision_is_posted_once() {
 /// the pane's shell (`&` in sh, `start /b` in cmd) with its output in a file.
 #[test]
 fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
-    let (mut p, _shell, _flag) = spawn_atrium_ctl_shell();
+    // A hello is a claude pane's: the stand-in runs a shell under that name.
+    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin("ask");
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl ask 0 anyone-home\r\n").as_bytes())
         .unwrap();
@@ -1446,16 +1455,10 @@ fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed()
         .join("sessions")
         .join("mod-breaker.json")
         .exists());
-    // A hello now is too late: recorded, and granted nothing.
-    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
-        .unwrap();
-    let said = read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
-    assert!(
-        contains(&said, b"\"accepted\":[]"),
-        "a late hello is granted nothing: {:?}",
-        String::from_utf8_lossy(&said)
-    );
-    // So a send is typed into the pane, under atrium's header.
+    // No decision was posted: one pane set aside is not a trip.
+    let feed = host_read(&p, &["bus", "feed", "--since", "0"]);
+    assert!(!feed.to_string().contains("decision_needed"), "{feed}");
+    // A send is typed into the pane, under atrium's header.
     p.write(format!("\"{atrium}\" ctl send 0 nohello-marker\r\n").as_bytes())
         .unwrap();
     let mut out = Vec::new();
@@ -1470,15 +1473,40 @@ fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed()
             out.extend_from_slice(&buf[..n]);
         }
     }
+    // A hello that comes late after all shows the mod works in this pane: it
+    // gets its capabilities, and the pane's mod is `ok` again.
+    // (First let the typed delivery be submitted, so the next line typed
+    // here is a line of its own.)
+    std::thread::sleep(Duration::from_millis(2500));
+    p.write(
+        b"
+",
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
+        .unwrap();
+    // Read as state, not off the screen: the reply is painted piecewise.
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while state(&p).as_deref() != Some("ok") {
+        assert!(
+            std::time::Instant::now() < end,
+            "a late hello did not bring the mod back: {}",
+            host_read(&p, &["status", "0"])
+        );
+        let _ = p.read_timeout(&mut buf, Duration::from_millis(200));
+    }
+    assert_eq!(state(&p).as_deref(), Some("ok"));
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }
 
 /// A session that does not use the mod (`"mod": false`) has no mod to watch,
-/// whatever its panes say: with the mod installed and a claude pane up, the
-/// pane is launched without it (no `mod` in its status), a hand-made hello is
-/// only a hello, a failure report is refused, and nothing is set aside,
-/// tripped or written down.
+/// whatever its panes say. With the mod installed and a claude pane up, the
+/// pane is launched without it (no `mod` in its status). A mod loaded by hand
+/// there says hello and reports: its status lands, the failure it counted is
+/// dropped without poisoning the report after it, and nothing is set aside,
+/// tripped, posted or written down.
 #[test]
 fn a_session_with_the_mod_off_watches_no_mod_whatever_its_panes_report() {
     let (mut p, dir, _guard) =
@@ -1490,37 +1518,62 @@ fn a_session_with_the_mod_off_watches_no_mod_whatever_its_panes_report() {
         "launched without the mod: {status}"
     );
     p.write(b"echo ? for shortcuts\r\n").unwrap();
-    // Any pane can run `atrium ctl hello`; here it says nothing about a mod.
-    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
+    // The documented hand-loaded case: a claude pane's own mod says hello.
+    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status\r\n").as_bytes())
         .unwrap();
-    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    read_until(&mut p, b"\"accepted\":[\"", Duration::from_secs(20));
+    let pane_status = |p: &pty::Pty| -> Option<String> {
+        host_read(p, &["status", "0"])
+            .get("status")
+            .and_then(json::Value::as_str)
+            .map(str::to_string)
+    };
+    // A report that carries a status and a counted failure: the status is
+    // taken, the failure is dropped.
     p.write(
         format!(
-            "\"{atrium}\" ctl report fail=session.start:9 fail_class=api fail_at=session.start\r\n"
+            "\"{atrium}\" ctl report status=working fail=session.start:9 fail_class=api \
+             fail_at=session.start fail_thrown=9\r\n"
         )
         .as_bytes(),
     )
     .unwrap();
-    let said = read_until(&mut p, b"does", Duration::from_secs(20));
-    assert!(
-        contains_shown(&said, b"this session does not use the mod"),
-        "the report is refused: {:?}",
-        String::from_utf8_lossy(&said)
-    );
-    // A moment on: nothing was set aside, nothing tripped.
+    let end = std::time::Instant::now() + Duration::from_secs(20);
     let mut buf = [0u8; 8192];
-    let end = std::time::Instant::now() + Duration::from_secs(2);
-    while std::time::Instant::now() < end {
-        let _ = p.read_timeout(&mut buf, Duration::from_millis(250));
+    while pane_status(&p).as_deref() != Some("working") {
+        assert!(
+            std::time::Instant::now() < end,
+            "the status of a report that also carried failures did not land: {}",
+            host_read(&p, &["status", "0"])
+        );
+        let _ = p.read_timeout(&mut buf, Duration::from_millis(200));
     }
+    // And the report after it lands too: nothing was poisoned.
+    p.write(format!("\"{atrium}\" ctl report status=waiting-prompt\r\n").as_bytes())
+        .unwrap();
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while pane_status(&p).as_deref() != Some("waiting-prompt") {
+        assert!(
+            std::time::Instant::now() < end,
+            "a later status did not land: {}",
+            host_read(&p, &["status", "0"])
+        );
+        let _ = p.read_timeout(&mut buf, Duration::from_millis(200));
+    }
+    // The state, not the words: the pane's mod is as it said hello, no
+    // failure was counted, nothing tripped, no decision is on the bus, and
+    // no record was written.
     let status = host_read(&p, &["status", "0"]);
+    let m = status.get("mod").expect("its hello was taken");
     assert_eq!(
-        status
-            .get("mod")
-            .and_then(|m| m.get("state"))
-            .and_then(json::Value::as_str),
+        m.get("state").and_then(json::Value::as_str),
         Some("ok"),
-        "a hello is a hello, and nothing more came of it: {status}"
+        "{status}"
+    );
+    assert_eq!(
+        m.get("failures").and_then(json::Value::as_i64),
+        Some(0),
+        "{status}"
     );
     let metrics = host_read(&p, &["metrics"]);
     assert_eq!(
@@ -1533,6 +1586,8 @@ fn a_session_with_the_mod_off_watches_no_mod_whatever_its_panes_report() {
         Some(0),
         "{metrics}"
     );
+    let feed = host_read(&p, &["bus", "feed", "--since", "0"]);
+    assert!(!feed.to_string().contains("decision_needed"), "{feed}");
     assert!(!dir
         .join("state")
         .join("sessions")

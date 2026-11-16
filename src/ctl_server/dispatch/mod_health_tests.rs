@@ -21,8 +21,7 @@ fn call(fx: &mut Fx, token: &str, body: &str) -> Value {
 
 const HELLO: &str = r#""cmd":"hello","mod":"0.3.0","caps":"status,inbox,answer""#;
 /// Five failures of its own hooks: what sets a pane's mod aside.
-const FIVE: &str =
-    r#""cmd":"report","fail":"tool.call:5","fail_class":"hook","fail_at":"tool.call""#;
+const FIVE: &str = r#""cmd":"report","fail":"tool.call:5","fail_class":"hook","fail_at":"tool.call","fail_thrown":5"#;
 
 /// Health ticks a second apart over `[from, to]`, every live pane seen started.
 fn ticks(fx: &mut Fx, from: u64, to: u64) -> Vec<HealthEvent> {
@@ -33,6 +32,7 @@ fn ticks(fx: &mut Fx, from: u64, to: u64) -> Vec<HealthEvent> {
         .map(|p| PaneSeen {
             pane: p.agent_id.0,
             started: true,
+            root: p.agent_id.0,
         })
         .collect();
     let mut all = Vec::new();
@@ -305,7 +305,7 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
         &mut fx,
         &a_tok,
         &format!(
-            r#""cmd":"report","status":"working","fail":"tool.call:3,whoami:1","fail_class":"hook","fail_msg":"{msg}""#
+            r#""cmd":"report","status":"working","fail":"tool.call:3,whoami:1","fail_class":"hook","fail_thrown":4,"fail_msg":"{msg}""#
         ),
     );
     assert!(ok(&told), "four failures are counted, not acted on: {told}");
@@ -350,7 +350,7 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
     let fifth = call(
         &mut fx,
         &a_tok,
-        r#""cmd":"report","fail":"tool.call:4,whoami:1""#,
+        r#""cmd":"report","fail":"tool.call:4,whoami:1","fail_thrown":5"#,
     );
     assert!(err(&fifth).starts_with(MOD_SET_ASIDE), "{fifth}");
     let status = status_of(&mut fx, &lead_tok, a);
@@ -529,4 +529,120 @@ fn a_delivery_whose_reply_never_arrived_is_queued_again() {
     let _ = ticks(&mut fx, 0, atrium::modstate::INBOX_SILENT_MS + 3_000);
     flush(&mut fx);
     assert_eq!(stages(&fx.pending)[0].2, "typed");
+}
+
+#[test]
+fn a_hello_is_taken_only_from_a_pane_that_could_have_a_mod() {
+    // Whose hello it is, by the three things the broker knows.
+    for (expects, session_injects, claude, want) in [
+        // atrium launched it with the mod: taken, whatever else.
+        (true, true, true, HelloFrom::Launched),
+        (true, false, true, HelloFrom::Launched),
+        // A claude in a session that injects no mod: loaded by hand.
+        (false, false, true, HelloFrom::HandLoaded),
+        // A claude atrium launched WITHOUT the mod in a session that does
+        // inject it (the breaker tripped, the folder was not loadable).
+        (false, true, true, HelloFrom::Nobody),
+        // A shell, another agent, a placeholder: never.
+        (false, false, false, HelloFrom::Nobody),
+        (false, true, false, HelloFrom::Nobody),
+    ] {
+        assert_eq!(
+            hello_from(expects, session_injects, claude),
+            want,
+            "expects={expects} injects={session_injects} claude={claude}"
+        );
+    }
+    // Through the verb: a shell and a codex pane say hello by hand.
+    let mut fx = Fx::new();
+    let (shell, shell_tok) = fx.pane("shell", None);
+    let (codex, codex_tok) = fx.agent_pane("codex", None);
+    pane_by_agent_mut(&mut fx.windows, codex)
+        .expect("pane")
+        .argv = vec!["codex".to_string()];
+    for (id, tok) in [(shell, &shell_tok), (codex, &codex_tok)] {
+        let v = call(&mut fx, tok, HELLO);
+        assert!(err(&v).contains("its hello is not taken"), "{v}");
+        // Final: a mod that somehow ran there stops, it does not retry.
+        assert_eq!(v.get("final"), Some(&Value::Bool(true)), "{v}");
+        assert!(!fx.mods.has_a_mod(id.0));
+        assert!(!fx.mods.has_cap(id.0, "inbox"));
+        // And so the request after it changes nothing either.
+        let v = call(&mut fx, tok, FIVE);
+        assert!(err(&v).contains("has no mod"), "{v}");
+        assert_eq!(fx.mods.aside(id.0), None);
+    }
+    let events = ticks(&mut fx, 0, 3_000);
+    assert!(events.is_empty(), "{events:?}");
+    // A claude pane in this session (which injects no mod) loads one by
+    // hand: taken, and it is nobody's voice and no evidence.
+    // (The session-wide fact is a process global: skipped if some other
+    // test in this process launched a pane with the mod.)
+    if atrium::modstate::ever_injected() {
+        return;
+    }
+    let (a, a_tok) = fx.agent_pane("a", None);
+    let (_b, b_tok) = fx.agent_pane("b", None);
+    assert!(ok(&call(&mut fx, &a_tok, HELLO)));
+    assert!(ok(&call(&mut fx, &b_tok, HELLO)));
+    assert!(fx.mods.has_cap(a.0, "inbox"));
+    let _ = call(&mut fx, &a_tok, FIVE);
+    let _ = call(&mut fx, &b_tok, FIVE);
+    let events = ticks(&mut fx, 4_000, 8_000);
+    assert!(!tripped(&events), "{events:?}");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, HealthEvent::Healthy { .. })),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn the_set_aside_refusal_is_final_and_any_other_refusal_is_not() {
+    let mut fx = Fx::new();
+    let (worker, worker_tok) = modded(&mut fx, "worker", None);
+    // An ordinary refusal: no marker, so the mod may ask again.
+    let v = call(
+        &mut fx,
+        &worker_tok,
+        r#""cmd":"report","ask":99,"reply":"x""#,
+    );
+    assert!(!ok(&v) && v.get("final").is_none(), "{v}");
+    let v = call(&mut fx, &worker_tok, FIVE);
+    assert_eq!(v.get("final"), Some(&Value::Bool(true)), "{v}");
+    let v = call(&mut fx, &worker_tok, r#""cmd":"inbox""#);
+    assert_eq!(v.get("final"), Some(&Value::Bool(true)), "{v}");
+    assert!(fx.mods.aside(worker.0).is_some());
+}
+
+#[test]
+fn a_held_reply_that_could_not_be_written_is_queued_again_and_recorded() {
+    let mut fx = Fx::new();
+    let (worker, _) = modded(&mut fx, "worker", None);
+    let items = vec![ctl::InboxItem {
+        kind: "send".to_string(),
+        text: "[atrium: from pane 0] run the tests".to_string(),
+        id: None,
+    }];
+    // What the run loop calls when `respond_parked` fails.
+    let back = held_reply_lost(
+        &mut fx.pending,
+        &mut fx.audit,
+        worker,
+        &items,
+        "the client left",
+    );
+    assert_eq!(back, 1);
+    assert_eq!(stages(&fx.pending).len(), 1, "back in the queue");
+    let row = fx
+        .log()
+        .into_iter()
+        .rev()
+        .find(|e| s(e, "action") == "inbox")
+        .expect("recorded");
+    assert!(
+        row.to_string().contains("1 queued again") && row.to_string().contains("the client left"),
+        "{row}"
+    );
 }

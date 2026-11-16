@@ -1097,6 +1097,7 @@ fn golden_metrics_reply_carries_every_state_and_counter() {
         open_decisions: 1,
         mod_failures: 9,
         mod_tripped: true,
+        mod_late_hellos: 2,
         ..Metrics::default()
     };
     for status in [
@@ -1114,7 +1115,7 @@ fn golden_metrics_reply_carries_every_state_and_counter() {
     assert_eq!(
         reply_metrics(m).to_json(),
         format!(
-            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500,"panes":{{"working":2,"waiting-approval":1,"waiting-prompt":0,"idle":1,"errored":1,"ended":0,"unbound":2}},"wakes_delivered":12,"held_inboxes":2,"bus_depth":40,"bus_last_seq":57,"open_decisions":1,"mod_failures":9,"mod_tripped":1}}"#,
+            r#"{{"ok":true,"atrium":"{}","uptime_ms":90500,"panes":{{"working":2,"waiting-approval":1,"waiting-prompt":0,"idle":1,"errored":1,"ended":0,"unbound":2}},"wakes_delivered":12,"held_inboxes":2,"bus_depth":40,"bus_last_seq":57,"open_decisions":1,"mod_failures":9,"mod_tripped":1,"mod_late_hellos":2}}"#,
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -1134,6 +1135,7 @@ fn report_carries_the_mods_own_failure_counts() {
             "fail=tool.call:2,feature.inbox:1",
             "fail_class=api",
             "fail_at=feature.inbox",
+            "fail_thrown=2",
             "fail_msg=HooksError: no implementation for prompt.submit",
         ]),
         Some(2),
@@ -1161,6 +1163,7 @@ fn report_carries_the_mods_own_failure_counts() {
                 class: Some(FailClass::Api),
                 message: Some("HooksError: no implementation for prompt.submit".to_string()),
                 at: Some("feature.inbox".to_string()),
+                thrown: Some(2),
             })
         ),
         other => panic!("expected report, got {other:?}"),
@@ -1184,12 +1187,29 @@ fn report_carries_the_mods_own_failure_counts() {
         r#"{"cmd":"report","fail_at":"hello"}"#,
         r#"{"cmd":"report","fail":"a:1","fail_at":"not a site"}"#,
         r#"{"cmd":"report","fail":"a:1","fail_at":7}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_thrown":-1}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_thrown":"many"}"#,
+        r#"{"cmd":"report","fail_thrown":3}"#,
     ] {
         assert!(parse_request(bad).is_err(), "{bad}");
     }
     // A report without them is as it always was.
     let line = build_request(&v(&["report", "status=idle"]), Some(2)).unwrap();
     assert!(matches!(parse_request(&line).unwrap().cmd, Cmd::Report(r) if r.failures.is_none()));
+}
+
+/// A refusal the broker will not change carries `final`, which is what the mod
+/// reads; every other refusal is one it may ask again after.
+#[test]
+fn a_final_refusal_is_marked_and_an_ordinary_one_is_not() {
+    assert_eq!(
+        reply_final("mod set aside: no hello within its window").to_json(),
+        r#"{"ok":false,"err":"mod set aside: no hello within its window","final":true}"#
+    );
+    assert_eq!(
+        reply_err("server busy; ask again").to_json(),
+        r#"{"ok":false,"err":"server busy; ask again"}"#
+    );
 }
 
 /// A pane's mod rides `status <target>` and `answer` under `"mod"`, and the

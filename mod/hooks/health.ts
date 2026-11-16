@@ -68,10 +68,11 @@ export function helloBackoffMs(attempt: number): number {
 }
 
 /**
- * After this many errors thrown by its hooks the mod switches itself off for
- * the session; after this many ctl exchanges in a row that got no reply it
- * could read, it pauses (its loops stop, and it says hello again on
- * `HELLO_BACKOFF_S`). Either way every hook passes straight through. Five: one failure is an accident, five is a broken mod or
+ * After this many errors thrown by its hooks within `FAIL_WINDOW_MS` the mod
+ * switches itself off for the session; after this many ctl exchanges in a
+ * row that got no reply it could read, it pauses (its loops stop, and it says
+ * hello again on `HELLO_BACKOFF_S`). Either way every hook passes straight
+ * through. Five: one failure is an accident, five is a broken mod or
  * a broker that is gone, and a mod that keeps failing costs every tool call a
  * caught exception for nothing.
  */
@@ -80,8 +81,25 @@ export const INERT_AFTER = 5
 /** How many refused inbox polls in a row end the polling (atrium said no). */
 export const INBOX_REFUSALS = 10
 
-/** What atrium's refusal starts with once it has set this pane's mod aside. */
-export const SET_ASIDE = 'mod set aside'
+/**
+ * The window the errors of the mod's own hooks are counted over, in
+ * milliseconds: `INERT_AFTER` of them within ten minutes switch the mod off.
+ * Five accidents spread over a long session are not a broken mod. atrium
+ * counts the same classes over the same window (`FAIL_WINDOW_MS` in
+ * `src/modstate.rs`).
+ */
+export const FAIL_WINDOW_MS = 600_000
+
+/**
+ * Is a refusal atrium's last word to this mod? Only when the reply says so
+ * itself (`"final": true`: the mod was set aside, or its hello is not one
+ * this session takes). Every other `ok: false` (a listener too busy to take
+ * the request, a request too large, a verb it does not know, an ask that is
+ * not this pane's) is an answer to that one request, and the mod goes on.
+ */
+export function isFinal(reply: { ok: boolean; final?: unknown }): boolean {
+  return reply.ok !== true && reply.final === true
+}
 
 /**
  * What went wrong, in five words atrium knows:
@@ -193,8 +211,20 @@ export function offeredCaps(all: readonly string[], interactive: boolean): strin
 }
 
 /**
- * The mod's failures this session: a count per hook, the last one's class and
- * scrubbed message, and whether the mod should switch itself off.
+ * The mod's failures this session: a count per hook, the last one's class,
+ * place and scrubbed message, and what they add up to.
+ *
+ * Two sums, of different classes, and they never mix:
+ *
+ * - **thrown**: errors of the mod's own hooks (`hook`, and `api` outside a
+ *   lost feature). `INERT_AFTER` within `FAIL_WINDOW_MS` and the mod is
+ *   broken: off for the session. This is the number atrium is told
+ *   (`fail_thrown`) and counts over the same window.
+ * - **unasked**: exchanges with atrium in a row (`ctl.<site>` keys) that got
+ *   no reply the mod could read (`timeout`, `ctl`, `shape`). `INERT_AFTER`
+ *   and the mod pauses. A timeout of one of the mod's own waits on the
+ *   engine (the file guard on a slow disk) is counted and shown and is in
+ *   neither sum: it says nothing of the mod's code or of atrium.
  */
 export class Failures {
   private readonly counts = new Map<string, number>()
@@ -202,17 +232,18 @@ export class Failures {
   private lastMessage = ''
   /** The key the last failure was counted under. */
   private lastAt = ''
-  /** Errors a hook threw (`hook`, `api`), all session. */
-  private thrown = 0
-  /**
-   * ctl exchanges in a row that got no reply the mod could read: nobody
-   * answered (`timeout`, `ctl`), or what came back was no reply (`shape`).
-   */
+  /** When each error of its own hooks was thrown, oldest first. */
+  private thrownAt: number[] = []
+  /** Every error of its own hooks, all session: what `fail_thrown` carries. */
+  private thrownTotal = 0
   private unasked = 0
-  private dirty = false
+  /** Grows with every failure: what a report carried is known by it. */
+  private generation = 0
+  /** The generation atrium has been told up to. */
+  private told = 0
 
-  /** Count one failure of `hook`. */
-  note(hook: string, cls: FailClass, err: unknown): void {
+  /** Count one failure of `hook`, at `now` (milliseconds). */
+  note(hook: string, cls: FailClass, err: unknown, now: number = Date.now()): void {
     let key = hookKey(hook)
     if (!this.counts.has(key) && this.counts.size >= HOOKS_CAP) key = 'other'
     this.counts.set(key, (this.counts.get(key) ?? 0) + 1)
@@ -221,9 +252,12 @@ export class Failures {
     this.lastMessage = typeof err === 'string' ? scrub(new Error(err)).replace(/^Error: /, '') : scrub(err)
     // A feature lost to a missing engine method costs that feature, and is
     // not one of the errors that switch the whole mod off.
-    if ((cls === 'hook' || cls === 'api') && !key.startsWith('feature.')) this.thrown += 1
-    if (cls === 'timeout' || cls === 'ctl' || cls === 'shape') this.unasked += 1
-    this.dirty = true
+    if ((cls === 'hook' || cls === 'api') && !key.startsWith('feature.')) {
+      this.thrownAt.push(now)
+      this.thrownTotal += 1
+    }
+    if ((cls === 'timeout' || cls === 'ctl' || cls === 'shape') && key.startsWith('ctl.')) this.unasked += 1
+    this.generation += 1
   }
 
   /** A ctl call was answered: the run of unanswered ones is over. */
@@ -248,9 +282,10 @@ export class Failures {
     return this.lastClass === undefined ? undefined : { cls: this.lastClass, message: this.lastMessage }
   }
 
-  /** Did its own hooks fail too often: off for the session? */
-  broken(): boolean {
-    return this.thrown >= INERT_AFTER
+  /** Did its own hooks fail too often, lately: off for the session? */
+  broken(now: number = Date.now()): boolean {
+    this.thrownAt = this.thrownAt.filter(at => now - at <= FAIL_WINDOW_MS)
+    return this.thrownAt.length >= INERT_AFTER
   }
 
   /** Did atrium stop answering: pause, and say hello again later? */
@@ -260,21 +295,37 @@ export class Failures {
 
   /** Is there something atrium has not been told? */
   unsent(): boolean {
-    return this.dirty
+    return this.generation > this.told
   }
 
-  /** The report fields that carry the counts: `fail`, `fail_class`, `fail_at`, `fail_msg`. */
-  fields(): Record<string, string> {
+  /**
+   * The report fields that carry the counts (`fail`, `fail_class`, `fail_at`,
+   * `fail_thrown`, `fail_msg`), and the generation they are a picture of:
+   * hand it back to `sent` when atrium has taken them.
+   */
+  snapshot(): { fields: Record<string, string>; generation: number } {
     const last = this.last()
-    if (last === undefined) return {}
+    if (last === undefined) return { fields: {}, generation: this.generation }
     const fail = Array.from(this.counts.entries())
       .map(([hook, n]) => `${hook}:${n}`)
       .join(',')
-    return { fail, fail_class: last.cls, fail_at: this.lastAt, fail_msg: last.message }
+    return {
+      fields: { fail, fail_class: last.cls, fail_at: this.lastAt, fail_thrown: String(this.thrownTotal), fail_msg: last.message },
+      generation: this.generation,
+    }
   }
 
-  /** The fields were sent and taken. */
-  sent(): void {
-    this.dirty = false
+  /** The fields alone. */
+  fields(): Record<string, string> {
+    return this.snapshot().fields
+  }
+
+  /**
+   * atrium took (or, answering, declined) the picture of `generation`. A
+   * failure counted since, while that report was in flight, is still to be
+   * told: only what the report carried is cleared.
+   */
+  sent(generation: number): void {
+    this.told = Math.max(this.told, generation)
   }
 }

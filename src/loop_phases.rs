@@ -404,6 +404,44 @@ pub(crate) fn pane_started(
     started_by(hint, reported, transcript_ms, pane.launch_ms)
 }
 
+/// Which claude to ask its version when a trip is to be written down: the
+/// recorded program of a pane atrium launched with the mod, one that missed
+/// its window before any other, and only if it is a claude (`is_claude`:
+/// `atrium::bind::is_claude_stem` of its stem). `None`: no such pane, so no
+/// version, so no record. Never "the first pane in window order", which may
+/// be a shell or another agent. Pure.
+pub(crate) fn trip_program(
+    panes: &[(bool, bool, Option<String>)],
+    is_claude: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    // (launched with the mod, missed its window, its program)
+    let pick = |want_missed: bool| {
+        panes
+            .iter()
+            .filter(|(launched, missed, _)| *launched && *missed == want_missed)
+            .filter_map(|(_, _, program)| program.clone())
+            .find(|p| is_claude(p))
+    };
+    pick(true).or_else(|| pick(false))
+}
+
+/// The pane at the top of `pane`'s spawn tree (itself when nothing spawned
+/// it), from the broker's own record of parents.
+pub(crate) fn root_of(parents: &[(AgentId, Option<AgentId>)], pane: AgentId) -> AgentId {
+    let mut at = pane;
+    for _ in 0..64 {
+        match parents
+            .iter()
+            .find(|(id, _)| *id == at)
+            .and_then(|(_, p)| *p)
+        {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    at
+}
+
 /// Does this session have a mod whose health is atrium's to watch: it uses
 /// the mod (`"mod": false` in the config or the fleet says no), it has a
 /// control plane for a hello to arrive on, and it has launched at least one
@@ -437,7 +475,7 @@ pub(crate) fn apply_health_events(
     label: &dyn Fn(usize) -> Option<String>,
     said: &mut dyn FnMut(&mut Flash),
     recovered: &mut dyn FnMut() -> Option<String>,
-    trip: &mut dyn FnMut(&str, bool) -> bool,
+    trip: &mut dyn FnMut(&str, bool) -> atrium::modfiles::Kept,
 ) {
     use atrium::modstate::HealthEvent;
     for event in events {
@@ -498,12 +536,12 @@ pub(crate) fn apply_health_events(
                 running,
                 remember,
             } => {
-                let remembered = trip(&reason, remember);
+                let kept = trip(&reason, remember);
                 let labels: Vec<String> = running.iter().filter_map(|id| label(*id)).collect();
                 out.audit.record(
                     None,
                     "mod-breaker",
-                    &format!("running={} remembered={remembered}", labels.len()),
+                    &format!("running={} kept={kept:?}", labels.len()),
                     true,
                     &reason,
                 );
@@ -519,20 +557,23 @@ pub(crate) fn apply_health_events(
                             .record(None, "mod-breaker", "decision not posted", false, &e);
                     }
                 }
-                *out.flash = Some((trip_line(&reason, remembered, labels.len()), Instant::now()));
+                *out.flash = Some((trip_line(&reason, kept, labels.len()), Instant::now()));
             }
         }
     }
 }
 
 /// The one line the bar says when the breaker trips.
-pub(crate) fn trip_line(reason: &str, remembered: bool, running: usize) -> String {
+pub(crate) fn trip_line(reason: &str, kept: atrium::modfiles::Kept, running: usize) -> String {
+    use atrium::modfiles::Kept;
     let mut line = format!(
         "mod backed out: {reason}. New claude panes launch without it{}",
-        if remembered {
-            ", in later sessions too until Claude Code or the mod changes"
-        } else {
-            " for this session"
+        match kept {
+            Kept::Recorded => ", in later sessions too until Claude Code or the mod changes",
+            Kept::Session => " for this session",
+            Kept::SessionNotCurrent =>
+                " for this session (the installed mod is not this atrium's own copy: run \
+                 `atrium mod install`)",
         }
     );
     if running > 0 {
@@ -877,7 +918,12 @@ mod tests {
     #[test]
     fn the_trip_line_says_why_how_long_and_that_running_panes_are_left() {
         use super::trip_line;
-        let line = trip_line("2 claude panes loaded it and never said hello", true, 2);
+        use atrium::modfiles::Kept;
+        let line = trip_line(
+            "2 claude panes loaded it and never said hello",
+            Kept::Recorded,
+            2,
+        );
         assert!(line.starts_with("mod backed out: 2 claude panes loaded it and never said hello."));
         assert!(
             line.contains("until Claude Code or the mod changes"),
@@ -889,10 +935,18 @@ mod tests {
         );
         assert!(!line.contains("relaunch"), "{line}");
         assert!(line.ends_with("`atrium mod status` says more"), "{line}");
-        let session_only = trip_line("why", false, 0);
+        let session_only = trip_line("why", Kept::Session, 0);
         assert!(session_only.contains("for this session"), "{session_only}");
         assert!(!session_only.contains("left as"));
-        let one = trip_line("why", true, 1);
+        // What ran was not this atrium's own copy: nothing is remembered, and
+        // the line names the fix.
+        let stale = trip_line("why", Kept::SessionNotCurrent, 0);
+        assert!(
+            stale.contains("for this session") && stale.contains("atrium mod install"),
+            "{stale}"
+        );
+        assert!(!stale.contains("later sessions"), "{stale}");
+        let one = trip_line("why", Kept::Recorded, 1);
         assert!(
             one.contains("the 1 pane that has it is left as it is"),
             "{one}"
@@ -995,7 +1049,7 @@ mod tests {
             },
             &mut |reason, remember| {
                 trips.push((reason.to_string(), remember));
-                true
+                atrium::modfiles::Kept::Recorded
             },
         );
         // Every line was said, in order; the last one is still on the bar.
@@ -1051,11 +1105,111 @@ mod tests {
             &mut || None,
             &mut |_, remember| {
                 asked = Some(remember);
-                false
+                atrium::modfiles::Kept::Session
             },
         );
         assert_eq!(asked, Some(false));
         assert!(bus.pending_decisions().is_empty());
         assert!(flash.expect("a line").0.contains("for this session"));
+    }
+
+    /// The claude asked its version at a trip is one atrium launched with the
+    /// mod, a pane that missed its window first: never whatever pane happens
+    /// to come first in window order.
+    #[test]
+    fn the_version_at_a_trip_is_asked_of_a_claude_that_ran_the_mod() {
+        use super::trip_program;
+        let claude = |p: &str| p == "claude" || p == "claude2";
+        let some = |s: &str| Some(s.to_string());
+        // (launched with the mod, missed its window, program)
+        // A shell first in window order, then an alias that missed.
+        assert_eq!(
+            trip_program(
+                &[
+                    (false, false, some("cmd")),
+                    (true, false, some("claude")),
+                    (true, true, some("claude2")),
+                ],
+                &claude
+            ),
+            some("claude2")
+        );
+        // Nobody missed (a trip made of reports): a pane launched with it.
+        assert_eq!(
+            trip_program(
+                &[(false, false, some("sh")), (true, false, some("claude"))],
+                &claude
+            ),
+            some("claude")
+        );
+        // A claude atrium launched without the mod is not asked.
+        assert_eq!(
+            trip_program(&[(false, false, some("claude"))], &claude),
+            None
+        );
+        // A pane launched with the mod whose program is no claude (it cannot
+        // be, but the record must not rest on it): no version, no record.
+        assert_eq!(trip_program(&[(true, true, some("cmd"))], &claude), None);
+        assert_eq!(trip_program(&[(true, true, None)], &claude), None);
+        assert_eq!(trip_program(&[], &claude), None);
+    }
+
+    /// The root of a pane's spawn tree, which is what two seats must differ
+    /// in for a trip to be written down.
+    #[test]
+    fn the_root_of_a_pane_is_the_top_of_its_spawn_tree() {
+        use super::root_of;
+        let parents = vec![
+            (AgentId(1), None),
+            (AgentId(2), Some(AgentId(1))),
+            (AgentId(3), Some(AgentId(2))),
+            (AgentId(4), None),
+            // A cycle cannot hang the walk.
+            (AgentId(8), Some(AgentId(9))),
+            (AgentId(9), Some(AgentId(8))),
+        ];
+        assert_eq!(root_of(&parents, AgentId(3)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(2)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(1)), AgentId(1));
+        assert_eq!(root_of(&parents, AgentId(4)), AgentId(4));
+        assert_eq!(
+            root_of(&parents, AgentId(77)),
+            AgentId(77),
+            "unknown: itself"
+        );
+        let _ = root_of(&parents, AgentId(8));
+    }
+
+    /// `pane_started` on a real pane: nothing yet, then the prompt hint on
+    /// its screen, or a status reported for it.
+    #[test]
+    fn a_live_pane_is_started_by_its_prompt_hint_or_a_reported_status() {
+        use super::pane_started;
+        let world = atrium::vendors::AgentState::default();
+        let mut mods = atrium::modstate::ModState::default();
+        let mut pane = idle_pane();
+        pane.title = "claude".to_string();
+        assert!(!pane_started(&pane, &world, &mods), "a blank screen");
+        // A startup dialog is not the prompt.
+        pane.term
+            .feed(b"Do you trust the files in this folder?\r\n");
+        assert!(!pane_started(&pane, &world, &mods));
+        // A status reported through ctl (its status hooks spoke).
+        mods.report(
+            pane.agent_id.0,
+            &atrium::modstate::Report {
+                status: Some(atrium::modstate::ModStatus::Working),
+                ..atrium::modstate::Report::default()
+            },
+            1,
+        );
+        assert!(pane_started(&pane, &world, &mods));
+        // Or the prompt hint on its screen.
+        let mods = atrium::modstate::ModState::default();
+        pane.term.feed(b"\r\n? for shortcuts\r\n");
+        assert!(pane_started(&pane, &world, &mods));
+        // The same hint in a pane that is no agent's says nothing.
+        pane.title = "cmd".to_string();
+        assert!(!pane_started(&pane, &world, &mods));
     }
 }

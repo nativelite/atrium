@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { DEADLINE, Failures, HELLO_BACKOFF_S, HOOKS_CAP, INERT_AFTER, MESSAGE_CAP, WATCHDOG_MS, classify, engineLacks, helloBackoffMs, hookKey, offeredCaps, scrub } from '../hooks/health'
+import { DEADLINE, FAIL_WINDOW_MS, Failures, HELLO_BACKOFF_S, HOOKS_CAP, INERT_AFTER, MESSAGE_CAP, WATCHDOG_MS, classify, engineLacks, helloBackoffMs, hookKey, isFinal, offeredCaps, scrub } from '../hooks/health'
 import { childMod } from '../hooks/agents'
 import { parseReply } from '../hooks/ctl'
 import { lexical } from '../hooks/guard'
@@ -45,21 +45,62 @@ test('a scrubbed message carries no quoted text, no path, no long token, and is 
   expect(scrub({ toString: () => 'secret' })).toBe('Error')
 })
 
-test('failures are counted per hook, carried as four fields, and marked sent', async () => {
+test('failures are counted per hook and carried as five fields', async () => {
   const f = new Failures()
   expect(f.fields()).toEqual({})
   expect(f.unsent()).toBe(false)
   f.note('tool.call', 'hook', new Error('boom'))
   f.note('tool.call', 'hook', new Error('boom'))
-  f.note('whoami', 'shape', 'a whoami reply that names no pane')
+  f.note('ctl.whoami', 'shape', 'a whoami reply that names no pane')
   expect(f.count('tool.call')).toBe(2)
   expect(f.total()).toBe(3)
   expect(f.unsent()).toBe(true)
-  expect(f.fields()).toEqual({ fail: 'tool.call:2,whoami:1', fail_class: 'shape', fail_at: 'whoami', fail_msg: 'a whoami reply that names no pane' })
-  f.sent()
-  expect(f.unsent()).toBe(false)
-  f.note('x', 'hook', new Error('again'))
+  expect(f.fields()).toEqual({
+    fail: 'tool.call:2,ctl.whoami:1',
+    fail_class: 'shape',
+    fail_at: 'ctl.whoami',
+    // What its own hooks threw: two. The reply of the wrong shape is not one.
+    fail_thrown: '2',
+    fail_msg: 'a whoami reply that names no pane',
+  })
+})
+
+test('a report clears only the failures it carried', async () => {
+  const f = new Failures()
+  f.note('tool.call', 'hook', new Error('one'))
+  // The report goes out with a picture of one failure...
+  const picture = f.snapshot()
+  expect(picture.fields.fail).toBe('tool.call:1')
+  // ...and while it is in flight a second failure is counted.
+  f.note('tool.call', 'hook', new Error('two'))
+  f.sent(picture.generation)
+  // atrium was told of one. The second is still to be told.
   expect(f.unsent()).toBe(true)
+  const next = f.snapshot()
+  expect(next.fields.fail).toBe('tool.call:2')
+  f.sent(next.generation)
+  expect(f.unsent()).toBe(false)
+  // An older picture acknowledged late un-tells nothing.
+  f.sent(picture.generation)
+  expect(f.unsent()).toBe(false)
+  // The same for a feature lost while a report was in flight.
+  const g = new Failures()
+  g.note('ctl.report', 'timeout', 'no reply in time')
+  const first = g.snapshot()
+  g.note('feature.inbox', 'api', new Error('no implementation for prompt.submit'))
+  g.sent(first.generation)
+  expect(g.unsent()).toBe(true)
+  expect(g.snapshot().fields.fail_at).toBe('feature.inbox')
+})
+
+test('only a refusal that says it is final is atrium\'s last word', async () => {
+  expect(isFinal({ ok: false, err: 'mod set aside: no hello within its window', final: true } as never)).toBe(true)
+  // What a listener too busy to take the request answers on unix.
+  expect(isFinal({ ok: false, err: 'server busy; ask again' } as never)).toBe(false)
+  expect(isFinal({ ok: false, err: 'request too large' } as never)).toBe(false)
+  expect(isFinal({ ok: false, err: 'mod set aside: looks final, says nothing' } as never)).toBe(false)
+  expect(isFinal({ ok: false, final: 'yes' } as never)).toBe(false)
+  expect(isFinal({ ok: true, final: true } as never)).toBe(false)
 })
 
 test('a hook name is a safe key, and past the cap the rest count as other', async () => {
@@ -72,23 +113,54 @@ test('a hook name is a safe key, and past the cap the rest count as other', asyn
   expect(f.count('other')).toBe(5)
 })
 
-test('five errors of its own hooks break the mod; five exchanges nobody answered pause it', async () => {
+test('five errors of its own hooks within ten minutes break the mod; five spread over hours do not', async () => {
+  const t0 = 1_000_000
   const thrown = new Failures()
-  for (let i = 0; i < INERT_AFTER - 1; i += 1) thrown.note('tool.call', 'hook', new Error('x'))
-  expect(thrown.broken()).toBe(false)
-  thrown.note('guard', 'hook', new Error('x'))
-  expect(thrown.broken()).toBe(true)
+  for (let i = 0; i < INERT_AFTER - 1; i += 1) thrown.note('tool.call', 'hook', new Error('x'), t0 + i * 1000)
+  expect(thrown.broken(t0 + 5_000)).toBe(false)
+  thrown.note('guard', 'hook', new Error('x'), t0 + 6_000)
+  expect(thrown.broken(t0 + 6_000)).toBe(true)
   expect(thrown.unreachable()).toBe(false)
+
+  // Five accidents, two hours apart: never five in the window.
+  const spread = new Failures()
+  for (let i = 0; i < 5; i += 1) {
+    const at = t0 + i * 2 * 3_600_000
+    spread.note('tool.call', 'hook', new Error('x'), at)
+    expect(spread.broken(at)).toBe(false)
+  }
+  // atrium is still told all five, and counts them the same way.
+  expect(spread.fields().fail_thrown).toBe('5')
+  // Four more inside ten minutes of the last: five in the window.
+  const last = t0 + 4 * 2 * 3_600_000
+  for (let i = 1; i <= 3; i += 1) spread.note('tool.call', 'hook', new Error('x'), last + i * 60_000)
+  expect(spread.broken(last + 3 * 60_000)).toBe(false)
+  spread.note('tool.call', 'hook', new Error('x'), last + 4 * 60_000)
+  expect(spread.broken(last + 4 * 60_000)).toBe(true)
+  // And it lapses: ten minutes with nothing thrown, and it is not broken.
+  expect(spread.broken(last + 4 * 60_000 + FAIL_WINDOW_MS + 1)).toBe(false)
 
   // A feature lost to a missing engine method costs that feature, however
   // many are lost: it is not one of the five.
   const features = new Failures()
   for (const name of ['pane', 'inbox', 'tools', 'guard', 'paths', 'captions', 'ask']) {
-    features.note(`feature.${name}`, 'api', new Error('no implementation for x'))
+    features.note(`feature.${name}`, 'api', new Error('no implementation for x'), t0)
   }
-  expect(features.broken()).toBe(false)
+  expect(features.broken(t0)).toBe(false)
   expect(features.fields().fail_at).toBe('feature.ask')
+  expect(features.fields().fail_thrown).toBe('0')
 
+  // A wait of the mod's own on the engine that timed out (the file guard on
+  // a slow disk): counted, shown, and neither broken nor a reason to pause.
+  const slow = new Failures()
+  for (let i = 0; i < 50; i += 1) slow.note('guard', 'timeout', new Error('the file guard timed out'), t0 + i)
+  expect(slow.broken(t0 + 50)).toBe(false)
+  expect(slow.unreachable()).toBe(false)
+  expect(slow.count('guard')).toBe(50)
+  expect(slow.fields().fail_thrown).toBe('0')
+})
+
+test('five exchanges in a row that atrium did not answer pause the mod', async () => {
   const unasked = new Failures()
   for (let i = 0; i < INERT_AFTER - 1; i += 1) unasked.note('ctl.report', 'timeout', 'no reply in time')
   // An answer in between: the broker is there after all.
@@ -97,8 +169,9 @@ test('five errors of its own hooks break the mod; five exchanges nobody answered
   expect(unasked.unreachable()).toBe(false)
   unasked.note('ctl.report', 'ctl', 'could not be asked')
   expect(unasked.unreachable()).toBe(true)
-  // Unreachable is a pause, never broken.
+  // Unreachable is a pause, never broken, and is not told as thrown.
   expect(unasked.broken()).toBe(false)
+  expect(unasked.fields().fail_thrown).toBe('0')
 
   // A broker that answers things that are no replies is as good as silent:
   // five in a row pause the mod, so it does not poll such a broker for ever.

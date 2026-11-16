@@ -577,9 +577,15 @@ pub(crate) fn render_overview_panel_with(
                     // The caption the mod reported beats the transcript's
                     // last action: it says what the pane is doing now.
                     let action = match n.doing.as_deref().filter(|d| !d.is_empty()) {
-                        Some(doing) => format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(doing, 60)),
+                        Some(doing) => format!(
+                            "  \x1b[2m\u{2014} {}\x1b[0m",
+                            truncate(&unbracketed(doing), 60)
+                        ),
                         None if n.action.is_empty() => String::new(),
-                        None => format!("  \x1b[2m\u{2014} {}\x1b[0m", truncate(&n.action, 60)),
+                        None => format!(
+                            "  \x1b[2m\u{2014} {}\x1b[0m",
+                            truncate(&unbracketed(&n.action), 60)
+                        ),
                     };
                     let bolt = if n.colliding && !n.exited {
                         " \x1b[1;38;2;255;200;70m\u{26A1}\x1b[0m"
@@ -603,7 +609,7 @@ pub(crate) fn render_overview_panel_with(
                     };
                     let line = format!(
                         "{cursor} {indent}{color}{glyph}\x1b[0m \x1b[1m{:<16}\x1b[0m \x1b[2m{status}\x1b[0m{bolt}{vtag_str}{ident}{usage}{action}",
-                        truncate(&n.label, 16),
+                        truncate(&unbracketed(&n.label), 16),
                     );
                     if selected {
                         // Faint bar background; `\x1b[K` fills the row, then the text.
@@ -630,6 +636,14 @@ pub(crate) fn render_overview_panel_with(
         "\x1b[{footer_row};1H\x1b[2m  j/k or \u{2191}\u{2193} move  \u{00b7}  Enter dive in  \u{00b7}  Esc / Ctrl+A o close\x1b[0m\x1b[K"
     ));
     out
+}
+
+/// A pane's own text (its role, its caption, its last action) as the overview
+/// row shows it: square brackets become parentheses. `[mod off]` and
+/// `[mod backed out]` are the broker's flags on this row, and nothing a pane
+/// wrote may read as one.
+pub(crate) fn unbracketed(s: &str) -> String {
+    s.replace('[', "(").replace(']', ")")
 }
 
 #[cfg(test)]

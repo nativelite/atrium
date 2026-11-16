@@ -31,11 +31,11 @@ import {
   Failures,
   GUARD_MS,
   INBOX_REFUSALS,
-  SET_ASIDE,
   WATCHDOG_MS,
   classify,
   engineLacks,
   helloBackoffMs,
+  isFinal,
   offeredCaps,
   scrub,
 } from './health'
@@ -75,6 +75,13 @@ type State = {
   commandReady: boolean
   /** The fallback to the native Agent tool was said, once. */
   saidNative: boolean
+  /**
+   * A subagent pane turned out to have no mod: panes cannot answer here, so
+   * the Agent tool is left to the engine for the rest of the session.
+   */
+  paneless: boolean
+  /** The session is over: no hello is said or scheduled again. */
+  ended: boolean
   status: Status | undefined
   accepted: ReadonlySet<string>
   reporter: Reporter | undefined
@@ -111,6 +118,8 @@ const state: State = {
   interactive: false,
   commandReady: false,
   saidNative: false,
+  paneless: false,
+  ended: false,
   status: undefined,
   accepted: new Set(),
   reporter: undefined,
@@ -198,6 +207,8 @@ function pause($: EngineInterface, why: string): void {
 /** Say hello again after the next wait of the backoff. One timer, one process when it fires. */
 function scheduleHello($: EngineInterface): void {
   stop(state.helloRetry)
+  state.helloRetry = undefined
+  if (state.ended) return
   const wait = helloBackoffMs(state.helloTry)
   state.helloTry += 1
   try {
@@ -217,7 +228,11 @@ function scheduleHello($: EngineInterface): void {
  * answered: try again later.
  */
 async function hello($: EngineInterface): Promise<void> {
+  if (state.ended) return
   const reply = await ctl($, 'hello', state.helloArgs, DEADLINE.hello)
+  // The session ended while the hello was in flight: nothing is switched on
+  // and nothing is scheduled.
+  if (state.ended) return
   if (reply.ok) {
     state.paused = false
     state.live = true
@@ -225,12 +240,15 @@ async function hello($: EngineInterface): Promise<void> {
     return
   }
   debug($, `atrium: hello not taken: ${reply.err ?? 'no reply'}`)
-  if (reply.fault === undefined) {
-    // atrium answered and said no.
+  if (isFinal(reply)) {
+    // atrium's own decision about this pane's mod, and it said it is final.
     state.paused = true
-    goInert($, 'atrium refused the hello', false)
+    goInert($, 'atrium does not take this hello', false)
     return
   }
+  // Anything else is not a decision: nobody answered, or a listener too busy
+  // to take the request answered for atrium ("server busy; ask again", which
+  // is exactly what a fleet launch produces). Ask again, on the backoff.
   state.paused = true
   scheduleHello($)
 }
@@ -379,9 +397,10 @@ async function ctl($: EngineInterface, site: string, args: readonly string[], ti
     failures.answered()
     // Real work was answered: the next silence starts the backoff over.
     if (site !== 'hello' && site !== 'whoami') state.helloTry = 0
-    // atrium set this pane's mod aside (its health window, its own reports):
-    // the pane runs as one without a mod, and the mod stops asking.
-    if (reply.ok !== true && String(reply.err ?? '').startsWith(SET_ASIDE)) goInert($, 'atrium set it aside', false)
+    // atrium set this pane's mod aside, and says the refusal is final: the
+    // pane runs as one without a mod, and the mod stops asking. No other
+    // refusal ends the mod.
+    if (isFinal(reply)) goInert($, 'atrium set it aside', false)
   } else {
     // A report that could not be made is not retried by another report.
     // Counted under `ctl.<site>`: an exchange with atrium that failed, which
@@ -542,9 +561,11 @@ async function pollInbox($: EngineInterface): Promise<void> {
     if (reply.ok !== true && reply.fault === undefined) {
       state.inboxRefused += 1
       if (state.inboxRefused >= INBOX_REFUSALS) {
-        debug($, `atrium: inbox refused ${state.inboxRefused} times (${reply.err ?? 'no reason'}); polling ends`)
-        stop(state.inbox)
-        state.inbox = undefined
+        // Not a decision about this mod (that would be final): atrium took
+        // the inbox back, or is too busy to answer. Stop asking, and say
+        // hello again later: a hello gets the capabilities as they are now.
+        state.inboxRefused = 0
+        pause($, `the inbox was refused ${INBOX_REFUSALS} times (${reply.err ?? 'no reason'})`)
       }
       return
     }
@@ -683,8 +704,13 @@ async function runSubagent(
   // one: close it now and say what to use instead.
   const gone = async (why: string): Promise<{ deny: string }> => {
     const closed = await ctl($, 'subagent', ['kill', String(pane)])
+    // From here the Agent tool is the engine's again in this pane, so what
+    // the message says to do is what will work; and atrium is asked anew what
+    // this session is, in case its mod was backed out meanwhile.
+    state.paneless = true
+    void settle($, 'whoami', () => refreshWho($))
     return {
-      deny: `atrium_subagent: pane ${pane} (${role}) ${why}, so it cannot report an answer; ${closed.ok ? 'it was closed' : 'close it with atrium_kill'}. Use the Agent tool for this task instead.`,
+      deny: `atrium_subagent: pane ${pane} (${role}) ${why}, so it cannot report an answer; ${closed.ok ? 'it was closed' : 'close it with atrium_kill'}. Subagents run with the Agent tool in this pane from now on: call it for this task.`,
     }
   }
   if (childMod(await ctl($, 'subagent', ['answer', String(pane)])) === 'none') return gone('has no atrium mod')
@@ -736,15 +762,20 @@ async function sendReport($: EngineInterface, fields: Fields): Promise<void> {
     if (!state.farewell) return
     state.farewell = false
   }
-  const carried = failures.unsent()
-  const all: Fields = carried ? { ...fields, ...failures.fields() } : fields
+  // A picture of the failures as they are now. One counted while this report
+  // is in flight is not in it, and stays to be told by the next.
+  const picture = failures.unsent() ? failures.snapshot() : undefined
+  const all: Fields = picture === undefined ? fields : { ...fields, ...picture.fields }
   if (Object.keys(all).length === 0) return
   const reply = await ctl($, 'report', ['report', ...toArgs(all)], DEADLINE.report)
-  if (reply.ok) {
-    if (carried) failures.sent()
-  } else {
-    debug($, `atrium: report refused: ${reply.err ?? 'no reply'}`)
-  }
+  if (!reply.ok) debug($, `atrium: report refused: ${reply.err ?? 'no reply'}`)
+  // Taken, or answered with a refusal (atrium read it and will not have it:
+  // sending the same again changes nothing). Only a report that was never
+  // answered leaves its failures to be sent again.
+  if (picture !== undefined && reply.fault === undefined) failures.sent(picture.generation)
+  // Something was counted meanwhile (or this report went unanswered and the
+  // mod is still live): it rides the next one.
+  if (failures.unsent() && reply.fault === undefined && (state.live || state.farewell)) state.reporter?.push({})
 }
 
 /**
@@ -763,6 +794,9 @@ async function activate($: EngineInterface, hello: Reply, interactive: boolean):
   }
   state.reporter = new Reporter(fields => sendReport($, fields))
   await settle($, 'whoami', () => refreshWho($, DEADLINE.whoami))
+  // The whoami may have been the fifth unanswered call, or atrium's final
+  // word: then nothing more is switched on, and no timer is started.
+  if (!state.live) return
   if (interactive && !state.off.has('pane')) {
     try {
       if (!state.commandReady) {
@@ -820,6 +854,7 @@ async function start($: EngineInterface, interactive: boolean): Promise<void> {
   state.tools = new Set()
   state.off = new Set()
   state.helloTry = 0
+  state.ended = false
   state.interactive = interactive
   stop(state.helloRetry)
   state.helloRetry = undefined
@@ -849,6 +884,7 @@ function subagentMode($: EngineInterface): string {
   const mode = state.who?.subagents ?? 'native'
   if (mode !== 'panes') return mode
   if (!state.tools.has('subagent')) return 'native'
+  if (state.paneless) return 'native'
   if (state.who?.modTripped === true) {
     if (!state.saidNative) {
       state.saidNative = true
@@ -1055,7 +1091,23 @@ export const register: Register = on => {
   })
 
   on('tool.call', async ($, e, next) => {
-    if (!state.live) return next(e)
+    if (!state.live) {
+      // The mod's own tools stay listed after it went off or paused (the
+      // engine has no call to take one back): each answers plainly.
+      let own = false
+      try {
+        own = isAtriumTool(String(e.tool)) && state.tools.has(String(e.tool).slice(TOOL_PREFIX.length))
+      } catch {
+        own = false
+      }
+      if (!own) return next(e)
+      return {
+        result: JSON.stringify({
+          ok: false,
+          err: `atrium's mod is ${state.paused ? 'paused (atrium is not answering it)' : 'off'} in this pane; run \`atrium ctl\` from the shell instead`,
+        }),
+      }
+    }
     let input: Record<string, unknown> = {}
     let toolUseId: unknown
     quiet($, 'tool.call', () => {
@@ -1126,21 +1178,24 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    if (state.live) {
+    // Every timer the mod owns stops here, live or not: a paused mod has a
+    // hello scheduled, and it must not fire into a session that is over.
+    const wasLive = state.live
+    stopLoops()
+    state.ended = true
+    stop(state.helloRetry)
+    state.helloRetry = undefined
+    state.paused = false
+    if (wasLive) {
       await settle($, 'session.end', async () => {
         say(transition(state.status, { kind: 'session.end', reason: e.reason }))
-        stop(state.inbox)
-        state.inbox = undefined
-        stop(state.viewTimer)
-        state.viewTimer = undefined
-        stop(state.helloRetry)
-        state.helloRetry = undefined
         // The process may be leaving: let the last report land first, for a
         // moment and no longer.
         const reporter = state.reporter
         if (reporter !== undefined) await within($, reporter.idle(), END_WAIT_MS)
       })
     }
+    state.live = false
     return next(e)
   })
 }
