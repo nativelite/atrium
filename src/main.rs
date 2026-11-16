@@ -304,6 +304,19 @@ fn launch() -> ExitCode {
     if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
         return atrium::tmux_shim::main(&args[1..]);
     }
+    // Operator tokens (`--operator-token-file <path>` first, or
+    // ATRIUM_OPERATOR_TOKEN_FILE): the file is read and checked once, here,
+    // before any dispatch, so every path that hosts a session (a plain launch,
+    // `fleet up`, `up`, `recover`) has them and none starts on a file that
+    // fails a check. The variable leaves atrium's environment in the same step,
+    // before any pane exists to inherit it.
+    let args = match atrium::operator::host_startup(args) {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("atrium: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     // Started inside a real tmux: its `TMUX` / `TMUX_PANE` must not reach a
     // pane, or Claude Code's teams there split the outer tmux window. A pane's
     // environment is this process's plus overrides, and an override cannot
@@ -495,6 +508,14 @@ fn launch() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Found here, the operator flag was written after another session flag or
+    // after the command, where it would be taken for the command to host or
+    // handed to it, and the session would start without its operators. Say
+    // where it goes.
+    if let Err(msg) = atrium::operator::misplaced(&rest) {
+        eprintln!("atrium: {msg}");
+        return ExitCode::FAILURE;
+    }
     // `atrium [--identity X] [--trust <policy>] [--allow-ctl] up <name>` is the
     // ergonomic alias for `atrium fleet up <name>`: the launch flags atrium just
     // parsed become the fleet's posture. Without this, `up` falls through to the
@@ -516,6 +537,11 @@ fn launch() -> ExitCode {
     } else {
         rest
     };
+    // A token file with the control plane off: no operator could connect.
+    if let Err(msg) = atrium::operator::require_ctl(allow_ctl) {
+        eprintln!("atrium: {msg}");
+        return ExitCode::FAILURE;
+    }
     // The last session in this project crashed: offer to pick it back up before
     // starting a fresh one. Ahead of the skip confirmation, because a resume
     // settles its own posture (and asks its own questions).

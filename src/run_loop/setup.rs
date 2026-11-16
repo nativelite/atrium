@@ -231,6 +231,12 @@ fn bind_ctl_channel(
                 *flash = Some((format!("ctl audit: {err}"), Instant::now()));
             }
         }
+        // The operators this session accepts (`--operator-token-file`), and
+        // what each may do: on the record before the first request. Names and
+        // verbs only.
+        for line in atrium::operator::startup_records(atrium::operator::session()) {
+            a.record(None, "operator-file", &line, true, "");
+        }
         a
     } else {
         atrium::audit::Audit::in_memory()

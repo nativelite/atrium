@@ -627,6 +627,11 @@ fn resume_session(
         ..
     } = plan;
     let policy = snap.policy.clone();
+    // A token file with the control plane off: no operator could connect.
+    if let Err(msg) = atrium::operator::require_ctl(allow_ctl) {
+        eprintln!("atrium recover: {msg}");
+        return ExitCode::FAILURE;
+    }
     if trust == atrium::ctl::TrustMode::Skip && !confirm_skip_permissions() {
         eprintln!("atrium recover: aborted.");
         return ExitCode::SUCCESS;

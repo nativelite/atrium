@@ -8,6 +8,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Operator tokens: a control-plane credential for a caller that is not a
+  pane** (#24). `--operator-token-file <path>` (the first argument; anywhere
+  among `fleet up`'s and `recover`'s flags) or `ATRIUM_OPERATOR_TOKEN_FILE`
+  names a JSON file of operators, each with a `name`, a `token` and the
+  `verbs` it may use. A request that carries a matching `operator_token` may
+  use those verbs on any pane of the session and is audited as
+  `operator:<name>`, allowed or refused; a token that matches nobody is
+  audited as `operator:?`. Nothing is granted by default and there is no
+  wildcard: `answer`, `asked` and `who`, which return model output, work only
+  when the entry names them, and a pane's own verbs (`hello`, `report`,
+  `whoami`, `inbox`, `bus sub`, `bus unsub`) are refused for every operator.
+  An operator's text is typed into agent panes only: `send` and `ask` are
+  refused for a pane running a shell or any other program, a `send` may not
+  open with `!` or `/`, and its `bus pub` wakes the agent panes subscribed to
+  the topic (a pane it only addresses with `--to` when the entry also names
+  `send`). An operator's `spawn` is a top-level caller's without privilege:
+  a bare command name (no path), capped at the launch trust, under the agent
+  allowlist, the argv vetting and the depth and pane caps, with no identity
+  but the session's own. `ping` and `metrics` answer an operator token as
+  they answer no token, unrecorded. A token file without the control plane
+  on, and the flag anywhere it would be dropped (before `ctl`, after another
+  flag or after the command), are startup errors. The file is read
+  once at startup and atrium refuses to start on one that is, on unix, not
+  owned by its user or open to group or others, or that holds a token under
+  32 characters, a repeated name or token, or an unknown key or verb. The
+  token is compared in constant time, lives in its own request field (a pane
+  token is never accepted as an operator token, nor the reverse; a request
+  with both is refused), is removed from the environment panes inherit, and
+  is in no log or reply. Every field an operator sends is bounded and checked
+  for control characters before use. Client: `atrium ctl
+  --operator-token-file <path> [--operator <name>] <verb> …`. What the file's
+  permissions do and do not protect against is in `docs/control-plane.md`.
+- **`by` in an audit entry** (additive): `"by":"operator:<name>"` on an
+  operator's entry, whose `caller` is `null`. A pane's entry is unchanged.
 - **`atrium --version --json`.** One object on one line for a script or a bug
   report: `{"version":"…","commit":…,"target":"…"}`. `commit` is the
   `ATRIUM_BUILD_COMMIT` the build was given, and `null` when it was given
@@ -75,6 +109,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now runs on a host (`run_loop::Host`: the attached terminal, or nobody),
   the seam an attach can plug into; an attached session asks its terminal
   exactly what it did before.
+
+### Changed
+- `ctl spawn --role` refuses, for every caller, a role that reads as an
+  operator's label on the board and the bus: `operator`, anything starting
+  `operator:`, and their look-alikes (padding, characters that do not show,
+  a non-ASCII letter standing in for a Latin one, a mark drawn like a colon).
+  `operators`, `operator_2` and `team:alpha` are ordinary roles.
+- The audit note of a request that does not parse is the parse error's own
+  words, without the request value it quotes (`unknown command`, not
+  `unknown command "…"`). The reply to the caller is unchanged.
+- `ctl::Request`'s `Debug` output shows `<redacted>` for a pane token.
 
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real

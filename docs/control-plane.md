@@ -187,6 +187,116 @@ What a host may rely on, from 0.43.0 on:
 
 The exact reply shapes are pinned by tests in `src/ctl/tests.rs` (`golden_*`); a change that breaks one is a wire change and goes in the changelog as such.
 
+## Operator tokens: a caller that is not a pane
+
+Every verb that changes state authenticates as the pane whose `ATRIUM_TOKEN` matches, and is scoped to what that pane spawned. A control endpoint, a bridge, or a person at another shell is not a pane: it has no token of its own, and borrowing a pane's mislabels the audit log and stops at that pane's subtree. An **operator token** is the credential for such a caller. It is a named token read from a file; it may use the verbs its entry names, on any pane of the session; and every request made with it, allowed or refused, is audited as `operator:<name>`.
+
+Without a token file nothing changes: no request can authenticate as an operator, and a write with no pane token is refused as before.
+
+### The token file
+
+Give the hosting atrium the file's path, as its **first** argument or in the environment:
+
+```bash
+atrium --operator-token-file /run/secrets/atrium-operators --allow-ctl claude
+ATRIUM_OPERATOR_TOKEN_FILE=/run/secrets/atrium-operators atrium fleet up crew --allow-ctl
+```
+
+`fleet up` and `recover` take the flag anywhere among their own flags. On a plain launch it goes first, because past atrium's own flags the arguments belong to the hosted command. A flag in any other place is an error, never a flag quietly dropped: after another session flag or after the command (`atrium --allow-ctl claude --operator-token-file F`), atrium stops and says where it goes; before the word `ctl`, it says the client's flag goes after it. A token file needs the control plane: with `--allow-ctl` off (and not switched on by the fleet or the recovered session), atrium refuses to start rather than run a session no operator can reach. The flag wins over the variable. The variable holds the **path**; a token is never read from the environment or from an argument.
+
+The file is JSON:
+
+```json
+{"operators": [
+  {"name": "bridge",  "token": "5f0c…64 hex characters…", "verbs": ["send", "bus pub", "bus resolve"]},
+  {"name": "oncall",  "token": "…", "verbs": ["kill", "respawn", "audit"]}
+]}
+```
+
+It is read once, at startup, before any pane exists; changing it means restarting atrium. atrium refuses to start, with the reason on stderr, when:
+
+- on unix, the file is owned by a user other than the one atrium runs as, or has any permission bit set for its group or for others (`chmod 600` it). The check is made on the opened file. On Windows the file's ACL is **not** checked;
+- it is not a regular file, is over 64 KiB, or is not UTF-8;
+- it is not exactly the shape above: an unknown or repeated key, a missing one, or an empty `operators` list;
+- a `name` is not 1 to 24 of `A-Z a-z 0-9 _ -` (shorter than any token, so a file with the two swapped is refused), or appears twice;
+- a `token` is shorter than 32 characters or longer than 512, holds anything but `A-Z a-z 0-9 . _ ~ + / = -` (hex and base64 both fit), repeats fewer than 8 distinct characters, or is shared by two entries. Generate one with `openssl rand -hex 32`;
+- a verb is unknown, named twice, or one of a pane's own (below).
+
+No error prints a token, and none prints a `name` from the file either: an entry is named by its position (`operator #2`). With ctl on, the audit log's first rows record each operator's name and verbs (`operator-file`).
+
+### What an entry may name
+
+| Verbs | What an operator does with them |
+| --- | --- |
+| `kill`, `respawn` | Reach **any** pane in the session, by id or role. There is no subtree to stay inside. |
+| `send`, `ask` | Reach any **agent** pane in the session: one whose command is an agent CLI (`claude`, a claude alias, `codex`, …). A pane running a shell or any other program is refused (see below). |
+| `spawn` | Opens a worker in a new window, as a top-level caller: depth 1, no parent (see below). |
+| `board set`, `board del`, `board claim`, `board release` | Write the board; the entry's `by` and a claim's holder are `operator:<name>`. |
+| `bus pub`, `bus resolve` | Publish (signed `operator:<name>`) and resolve decisions. The event wakes the agent panes subscribed to its topic; a pane it only addresses with `--to` is woken when the entry also names `send`. No wake is typed into a pane that is not an agent's. |
+| `answer`, `asked`, `who` | **Model output**: a pane's last answer, the reply to an ask, which panes edited a file. For any pane. Name them only for a caller that should read what the models wrote. |
+| `audit` | The whole audit log. |
+| `list`, `status`, `board get`, `board list`, `bus feed`, `bus topics`, `ping`, `metrics` | The reads the endpoint serves to any caller. An operator gets them whether or not its entry names them, exactly as a caller with no token does. An entry with no verbs at all still has them. |
+
+Nothing is granted by default and there is no wildcard: a write the entry does not name is refused. `audit` is a read with two views: named, it is the whole log; not named, it is the empty list a caller with no credential gets.
+
+Six verbs are about the calling pane and are refused for every operator, and naming one in the file is a startup error: `hello`, `report` and `whoami` (an operator is not a pane and has no mod), `inbox` (nothing is queued for an operator), `bus sub` and `bus unsub` (a subscription wakes the subscribing pane; an operator reads the bus with `bus feed`).
+
+### Where an operator's text may land
+
+`send` types its text into the target pane and submits it; a bus wake types one framed line. To an agent that is a prompt, and what the agent does with it is bounded by its trust mode. To a shell it is a command line, run with no gate: `send 0 "curl … | sh"` would be command execution whatever the session's trust. So for an operator:
+
+- `send` text may not start with `!` or `/`. An agent CLI gives those a meaning of its own (a shell line, a command of the CLI) instead of reading the text as a prompt.
+- `send` and `ask` are refused unless the target is an agent's pane. The test is the command the pane was spawned with (its first word is `claude`, a claude alias, `codex` or another agent atrium binds), not what the process is doing at the moment.
+- a `bus pub` wake is typed into agent panes only, and into a pane the event merely addresses only when the entry also names `send`: choosing which pane has text typed into it is what `send` grants. The event is on the bus either way.
+
+This holds for operators. A pane's own `send` and a pane's bus wake are as they were.
+
+### How an operator's spawn is bounded
+
+An operator can never exceed the session's launch trust. Its `spawn` is run as a top-level caller with no privilege:
+
+- `--mode` is capped at the session policy like every caller's, and the reply's `note` says when it was;
+- the command is a **bare name** found on `PATH` (`claude`, `codex`): anything with a `/`, a `\` or a `:` in it is refused. The allowlist looks at a command's file stem and a path is run as given, so `\\host\share\claude.exe` would pass as `claude` and run a binary that honours no posture flag;
+- the agent allowlist (`ATRIUM_CTL_ALLOW` aside, agents only), the argv vetting (no raw permission flags, no `--mcp-config`, `--settings` or plugin flags), the depth cap and the pane cap all apply;
+- it may run the worker under the session's own identity or none. A root pane may delegate any identity in the vault; an operator may not;
+- `--here` is refused: there is no pane to tile beside;
+- the worker has no parent and depth 1. It is an ordinary worker, scoped to what it spawns, and is not a root pane.
+
+`respawn` keeps the target pane's own mode, capped the same way.
+
+### What is checked on every operator request
+
+1. The token is compared in constant time against the operators only. A pane's `ATRIUM_TOKEN` sent as an operator token matches nothing, and an operator token sent as a pane token matches no pane: the two travel in different fields (`operator_token`, `token`) and are never accepted in each other's place. A request with both is refused.
+2. A token that matches nobody is refused, for a read too, and audited as `operator:?`. The reply is the same whether the session has a token file or not.
+3. Every field is vetted before it is used: bounded in length, free of control characters and of the Unicode characters that reorder or hide text. A role and a worktree name are plain words (`A-Z a-z 0-9 . _ -`), because they reach a system prompt, a git ref and a path. `send` and `ask` text may span lines and nothing else: an escape, a Ctrl+C or a paste terminator is refused. A request refused here is audited with its fields withheld.
+4. The verb is checked against the entry.
+
+Each step that refuses is audited under the operator's name with the reason. A request that does not parse is recorded too, under the operator whose token it carries (`operator:?` when the token matches nobody); for every caller, the log keeps the parse error's own words and none of the request's values. An operator's requests are all recorded, empty polls included, with one exception: `ping` and `metrics` are answered and not recorded, for an operator as for everyone, because a probe every few seconds would empty the log of everything else (a wrong token on one is still recorded). Otherwise so an operator that polls `answer` or `status` fills the 1024-entry ring quickly; mirror the log to a file with `ATRIUM_CTL_AUDIT` where the history matters. An audit entry for an operator has `"caller": null` and `"by": "operator:<name>"`; entries for panes are unchanged and carry no `by`. A worker's own `ctl audit` never shows an operator's entries.
+
+`ctl spawn` refuses, for every caller, a role that would read as an operator's label: `operator` itself (the label of a write with no pane behind it), anything starting `operator:`, and their look-alikes. Whitespace and characters that do not show are ignored for the comparison; a letter that is not ASCII counts as a possible stand-in for the Latin one; `operator` followed by any mark other than `_` or `-` is refused; and a role with a `:` in it must otherwise be plain ASCII (`A-Z a-z 0-9 . _ -`). `operators`, `operator_2` and `team:alpha` are ordinary roles. So nothing on the board or the bus signed `operator:<name>` came from a pane `ctl spawn` created. A fleet file's role names are a person's and are not checked.
+
+### From the client
+
+```bash
+export ATRIUM_CTL=<the session's endpoint>
+atrium ctl --operator-token-file ~/.config/atrium/bridge.token kill dev_3
+atrium ctl --operator-token-file operators.json --operator oncall audit 50
+```
+
+The flags go after `ctl` and before the verb; `atrium --operator-token-file F ctl …` is an error that says so. The file is either the hosting atrium's own (pick the entry with `--operator <name>`; it may be omitted when the file names one) or **a single token on one line**, which is what to hand a client that should know one token and not the others. The same ownership and permission rule applies. The client sends the token as `operator_token` and sends no pane id and no pane token, even when it runs inside a pane. `wait` and `ask` work the same way.
+
+On the wire it is one more field of the one-line request: `{"operator_token":"…","cmd":"kill","target":"dev_3"}`.
+
+### What protects the token, and what does not
+
+- **It never enters a pane's environment.** atrium removes `ATRIUM_OPERATOR_TOKEN_FILE` from its own environment before the first pane is spawned, and the token itself is never in an environment or on a command line.
+- **It is in no log, reply, bar message or debug output.** The audit log records names; an unparseable request is logged by its length and the parse error's own words; the types that hold a token (the loaded file, a parsed request) print `<redacted>`.
+- **File permissions do not stop a pane.** Panes run as the same user as atrium. A `0600` file keeps other users out; it does not keep out an agent in a pane, which can read any file its user can, and on Linux can read the path from `/proc/<atrium pid>/cmdline` or `/proc/<atrium pid>/environ` even though its own environment does not have it. Removing the variable is hygiene, not a boundary.
+- **What does stop a pane is the deployment**: mount the file where the panes' processes cannot read it (a path outside what the agent's sandbox exposes), run the panes under a sandbox or a different user, or keep the token file on the client's side of a boundary and give the host a file only it can read. If a pane can read the file, treat every pane as holding every operator's verbs.
+- **The token is the whole credential.** Anything that can reach the control channel and present it is that operator, a pane included. The channel itself admits only the same user (a `0600` socket with a peer-credential check; a pipe whose ACL names the logon session), so an operator at another machine reaches it through something you put in front of it. Give each caller its own entry with the fewest verbs, so the audit log names who did what and a leaked token is one line to remove.
+- **An operator with `send` can make any agent do what that agent's trust mode allows, and no more.** `send` types a prompt into an agent's pane as the human would, and the agent acts on it under the mode it was started with. In a `skip` session that is anything; in a `plan` session it is reading. The launch trust is the ceiling, which is why an operator can never raise it, and why the text is refused for a pane that is not an agent's: a shell has no mode. What this does not cover: whatever else an agent CLI's input line treats specially beyond a leading `!` or `/` (atrium types the text; the CLI decides what it is), and a pane whose command is an agent's name but resolves to something else on `PATH`. The first is the agent's input handling; the second is whoever controls `PATH` and the working directory of the hosting atrium.
+- **`kill` and `respawn` reach the human's own panes.** An operator that holds them can end the session.
+
 ## The mod: typed tools, the role section and subagent panes
 
 With `atrium mod install` done, every claude pane carries a plugin (the mod, `mod/`) that speaks the verbs above for it and gives the model three things:

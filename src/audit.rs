@@ -22,6 +22,11 @@ pub struct Entry {
     /// The caller pane's agent id, or `None` for the operator (no attributed
     /// pane).
     pub caller: Option<crate::ctl::AgentId>,
+    /// Who made the request, when it was not a pane: `operator:<name>` for an
+    /// operator token ([`crate::operator`]), `operator:?` for one that matched
+    /// no operator. `None` for a pane's request and for one with no credential,
+    /// which read as they always have. A name, never a token.
+    pub by: Option<String>,
     /// The verb: `spawn` | `send` | `status` | `list` | `kill` | `bad-request`.
     pub action: String,
     /// A compact, secret-free description (target, role, argv stem, identity
@@ -37,7 +42,17 @@ impl Entry {
     /// Serialize to a JSON object — used for both the on-disk line and the
     /// `ctl audit` reply. Stable key order for readable logs.
     pub fn to_json(&self) -> Value {
-        Value::Object(vec![
+        let mut members = self.base_members();
+        // Additive: the key is there only for an operator's entry, so every
+        // other entry keeps the exact shape it had.
+        if let Some(by) = &self.by {
+            members.push(("by".to_string(), Value::String(by.clone())));
+        }
+        Value::Object(members)
+    }
+
+    fn base_members(&self) -> Vec<(String, Value)> {
+        vec![
             (
                 "seq".to_string(),
                 Value::Number(Number::Int(self.seq as i64)),
@@ -52,7 +67,7 @@ impl Entry {
             ("detail".to_string(), Value::String(self.detail.clone())),
             ("ok".to_string(), Value::Bool(self.ok)),
             ("note".to_string(), Value::String(self.note.clone())),
-        ])
+        ]
     }
 }
 
@@ -107,10 +122,31 @@ impl Audit {
         ok: bool,
         note: &str,
     ) -> u64 {
+        self.push(caller, None, action, detail, ok, note)
+    }
+
+    /// Record a request made with an operator token: `by` is `operator:<name>`
+    /// (or `operator:?` for a token that matched nobody). It has no pane, so
+    /// `caller` is `null`, and a worker's scoped view hides it like any other
+    /// entry that is not from its own subtree.
+    pub fn record_as(&mut self, by: &str, action: &str, detail: &str, ok: bool, note: &str) -> u64 {
+        self.push(None, Some(by), action, detail, ok, note)
+    }
+
+    fn push(
+        &mut self,
+        caller: Option<crate::ctl::AgentId>,
+        by: Option<&str>,
+        action: &str,
+        detail: &str,
+        ok: bool,
+        note: &str,
+    ) -> u64 {
         self.seq += 1;
         let entry = Entry {
             seq: self.seq,
             caller,
+            by: by.map(str::to_string),
             action: action.to_string(),
             detail: detail.to_string(),
             ok,
@@ -226,6 +262,7 @@ mod tests {
         let e = Entry {
             seq: 7,
             caller: Some(crate::ctl::AgentId(3)),
+            by: None,
             action: "kill".to_string(),
             detail: "target=2".to_string(),
             ok: true,
@@ -236,6 +273,48 @@ mod tests {
         assert_eq!(j.get("caller").and_then(Value::as_i64), Some(3));
         assert_eq!(j.get("action").and_then(Value::as_str), Some("kill"));
         assert_eq!(j.get("ok").and_then(Value::as_bool), Some(true));
+        // A pane's entry has no `by`: its shape is what it was before
+        // operators existed.
+        assert_eq!(j.get("by"), None);
+        assert_eq!(
+            j.to_string(),
+            r#"{"seq":7,"caller":3,"action":"kill","detail":"target=2","ok":true,"note":"killed=2,4"}"#
+        );
+    }
+
+    /// An operator's entry: no pane, `by` names it, and the JSONL mirror and
+    /// the `ctl audit` reply both carry that name.
+    #[test]
+    fn an_operator_entry_names_the_operator_and_no_pane() {
+        let mut a = Audit::in_memory();
+        a.record(
+            Some(crate::ctl::AgentId(1)),
+            "send",
+            "target=2 len=3",
+            true,
+            "",
+        );
+        let seq = a.record_as("operator:bridge", "kill", "target=2", true, "killed=2");
+        a.record_as(
+            "operator:?",
+            "kill",
+            "target=2",
+            false,
+            "unknown operator token",
+        );
+        assert_eq!(seq, 2);
+        let v = a.view(None, |_| true);
+        assert_eq!(v[0].get("by"), None);
+        assert_eq!(
+            v[1].to_string(),
+            r#"{"seq":2,"caller":null,"action":"kill","detail":"target=2","ok":true,"note":"killed=2","by":"operator:bridge"}"#
+        );
+        assert_eq!(v[2].get("by").and_then(Value::as_str), Some("operator:?"));
+        assert_eq!(v[2].get("ok").and_then(Value::as_bool), Some(false));
+        // The scoped view a worker gets keeps entries by caller pane: an
+        // operator's has none, so it is not in any worker's view.
+        let scoped = a.view(None, |e| e.caller.is_some());
+        assert_eq!(scoped.len(), 1);
     }
 
     #[test]
@@ -243,6 +322,7 @@ mod tests {
         let e = Entry {
             seq: 1,
             caller: None,
+            by: None,
             action: "list".to_string(),
             detail: String::new(),
             ok: true,
