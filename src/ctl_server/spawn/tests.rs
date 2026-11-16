@@ -156,8 +156,15 @@ fn a_ctl_spawn_is_pinned_to_an_executable_on_an_absolute_path_entry() {
         pin_to_path("zzagent", Some(&path), None),
         Ok(Some(exe.to_string_lossy().into_owned()))
     );
-    // Not executable, a directory, not there: refused.
-    assert!(pin_to_path("zzplain", Some(&path), None).is_err());
+    // Not executable, a directory, not there: refused. A mount that ignores
+    // chmod (WSL's /mnt/*) reports every file as executable, so the
+    // execute-bit case can only be asked where the bit reads back clear.
+    let bit_held = std::fs::metadata(&plain).is_ok_and(|m| m.permissions().mode() & 0o111 == 0);
+    if bit_held {
+        assert!(pin_to_path("zzplain", Some(&path), None).is_err());
+    } else {
+        eprintln!("skipped the execute-bit case: this filesystem ignores chmod");
+    }
     assert!(pin_to_path("zzdir", Some(&path_of(&[&abs])), None).is_err());
     assert!(pin_to_path("zznothere", Some(&path), None).is_err());
     // The same folder by a relative name, `.`, an empty entry: not searched.
