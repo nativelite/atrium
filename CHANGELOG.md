@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.48.0] - 2026-11-16
+
 ### Added
 - **The mod is offered at first start.** It is offered, not installed
   silently: the first launch with a person at it asks once, before the
@@ -125,6 +127,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool itself, under both its names; before, only the mod refused it. `panes` remains the mod's
   takeover: without the mod the engine's own Agent tool works and its
   subagents are not atrium panes.
+- **`teams_env`: the variables a Claude Code lead may set on its teammates.**
+  An array of environment variable names in the user config and in a fleet
+  (`"teams_env": ["AWS_PROFILE", "HTTPS_PROXY"]`), empty by default. A
+  fleet's list replaces the config's, an empty one included; `atrium recover`
+  uses the config's. A listed name's value is taken from the lead's teammate
+  command line (plain text, at most 4096 bytes); on Windows a name matches in
+  any case. It is opt-in because the request can come from any process that
+  holds the pane's token: a base URL or proxy accepted from it could route a
+  teammate's prompts and credentials elsewhere.
+  - Never listable, in any case, and refused when the file loads: a name
+    containing `SKIP_PERMISSIONS`, an `ATRIUM_` name, `TMUX`, `TMUX_PANE`,
+    `PATH`, `PATHEXT`, `NODE_OPTIONS`, `BUN_OPTIONS`,
+    `CLAUDE_CODE_PLUGIN_DIRS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, a `DYLD_`
+    name, `BASH_ENV`, `ENV`, `ComSpec`, `SHELL`, `CLAUDE_CODE_SHELL`,
+    `GIT_SSH_COMMAND`, a `GIT_CONFIG_` name, `CARGO_MAKEFLAGS` and
+    `CLAUDE_CODE_TEAMMATE_COMMAND`.
+  - A non-empty list is shown before the session starts: in the fleet banner,
+    as one stderr line on a plain `--allow-ctl` launch, and by `atrium config
+    path` (which now also says why a config file does not load). Names that
+    move where settings are read from or where traffic goes
+    (`CLAUDE_CONFIG_DIR`, `HOME`, `USERPROFILE`, `APPDATA`,
+    `ANTHROPIC_BASE_URL`, anything ending `_PROXY`, `NODE_EXTRA_CA_CERTS`,
+    `SSL_CERT_FILE`, `SystemRoot`) are listable and follow a `WARNING:`.
+- **A dropped variable that mattered is named.** Each assignment on the line
+  that is neither applied nor listed is compared with the value the teammate
+  has anyway; the ones that differ are named in one line on the bar, in the
+  reply and in the audit log (`teammate researcher: 2 variable(s) from the
+  lead were not passed on: ANTHROPIC_BASE_URL, HTTPS_PROXY; add them to
+  teams_env to pass them`). Names only, at most eight and a count. A variable
+  the lead's identity sets is never compared or named (the answer would test
+  a guess of a credential), and on Windows the case variants of a name are
+  one comparison.
 
 ### Changed
 - **The launch says which path handles a named teammate, and no longer
@@ -257,40 +291,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mailbox, since the verify key arrives on the line. atrium's ceiling on a
   teammate is the permission mode it passes; Claude Code's in-team approval
   flow is outside what atrium can bind.
-
-### Added
-- **`teams_env`: the variables a Claude Code lead may set on its teammates.**
-  An array of environment variable names in the user config and in a fleet
-  (`"teams_env": ["AWS_PROFILE", "HTTPS_PROXY"]`), empty by default. A
-  fleet's list replaces the config's, an empty one included; `atrium recover`
-  uses the config's. A listed name's value is taken from the lead's teammate
-  command line (plain text, at most 4096 bytes); on Windows a name matches in
-  any case. It is opt-in because the request can come from any process that
-  holds the pane's token: a base URL or proxy accepted from it could route a
-  teammate's prompts and credentials elsewhere.
-  - Never listable, in any case, and refused when the file loads: a name
-    containing `SKIP_PERMISSIONS`, an `ATRIUM_` name, `TMUX`, `TMUX_PANE`,
-    `PATH`, `PATHEXT`, `NODE_OPTIONS`, `BUN_OPTIONS`,
-    `CLAUDE_CODE_PLUGIN_DIRS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, a `DYLD_`
-    name, `BASH_ENV`, `ENV`, `ComSpec`, `SHELL`, `CLAUDE_CODE_SHELL`,
-    `GIT_SSH_COMMAND`, a `GIT_CONFIG_` name, `CARGO_MAKEFLAGS` and
-    `CLAUDE_CODE_TEAMMATE_COMMAND`.
-  - A non-empty list is shown before the session starts: in the fleet banner,
-    as one stderr line on a plain `--allow-ctl` launch, and by `atrium config
-    path` (which now also says why a config file does not load). Names that
-    move where settings are read from or where traffic goes
-    (`CLAUDE_CONFIG_DIR`, `HOME`, `USERPROFILE`, `APPDATA`,
-    `ANTHROPIC_BASE_URL`, anything ending `_PROXY`, `NODE_EXTRA_CA_CERTS`,
-    `SSL_CERT_FILE`, `SystemRoot`) are listable and follow a `WARNING:`.
-- **A dropped variable that mattered is named.** Each assignment on the line
-  that is neither applied nor listed is compared with the value the teammate
-  has anyway; the ones that differ are named in one line on the bar, in the
-  reply and in the audit log (`teammate researcher: 2 variable(s) from the
-  lead were not passed on: ANTHROPIC_BASE_URL, HTTPS_PROXY; add them to
-  teams_env to pass them`). Names only, at most eight and a count. A variable
-  the lead's identity sets is never compared or named (the answer would test
-  a guess of a credential), and on Windows the case variants of a name are
-  one comparison.
 
 ## [0.47.0] - 2026-11-15
 
