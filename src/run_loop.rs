@@ -348,6 +348,7 @@ impl RunState<'_> {
                                 bus: &mut self.bus,
                                 mods: &mut self.mods,
                                 hold: &mut hold,
+                                flash: &mut self.flash,
                             },
                         );
                         match hold {

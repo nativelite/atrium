@@ -235,6 +235,20 @@ impl Cmd {
                 "send",
                 format!("target={} len={}", f(&sr.target), sr.text.chars().count()),
             ),
+            // A placeholder names no command, role or identity: where it goes
+            // is all it carries.
+            Cmd::Spawn(sp) if sp.hold => (
+                "spawn",
+                format!(
+                    "hold beside={} size={}",
+                    sp.beside
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    sp.size
+                        .map(SpawnSize::as_flag)
+                        .unwrap_or_else(|| "-".to_string())
+                ),
+            ),
             Cmd::Spawn(sp) => {
                 let stem = sp
                     .argv
@@ -304,14 +318,27 @@ impl Cmd {
                     BusOp::Topics => "topics".to_string(),
                 },
             ),
-            Cmd::Respawn(rr) => (
-                "respawn",
-                format!(
-                    "target={} worktree={}",
-                    f(&rr.target),
-                    f(rr.worktree.as_deref().unwrap_or("-"))
+            // A teammate command is the caller's text, and it carries a key:
+            // the names of the flags atrium knows, and counts, never a value
+            // ([`crate::tmux_shim::teammate_audit`]).
+            Cmd::Respawn(rr) => match &rr.teammate {
+                Some(command) => (
+                    "respawn",
+                    format!(
+                        "target={} {}",
+                        f(&rr.target),
+                        crate::tmux_shim::teammate_audit(command)
+                    ),
                 ),
-            ),
+                None => (
+                    "respawn",
+                    format!(
+                        "target={} worktree={}",
+                        f(&rr.target),
+                        f(rr.worktree.as_deref().unwrap_or("-"))
+                    ),
+                ),
+            },
             Cmd::Hello(h) => (
                 "hello",
                 format!("mod={} caps={}", f(&h.version), joined(&h.caps)),
@@ -407,6 +434,14 @@ pub struct RespawnReq {
     /// Name of an ad-hoc worktree to create (via `worktree::plan_for` +
     /// `worktree::ensure`) and use as the relaunched pane's cwd.
     pub worktree: Option<String>,
+    /// `--teammate <command line>`: what the tmux shim sends for Claude Code
+    /// 2.1.325's `respawn-pane -k -t %N -- <command line>`. A different
+    /// request from a plain respawn: the target must be a placeholder the
+    /// caller itself made (`spawn` with `hold`), and it becomes the teammate,
+    /// once. The line is the caller's text, a POSIX shell command; the server
+    /// never runs it, and takes from it only what
+    /// [`crate::tmux_shim::vet_teammate`] passes.
+    pub teammate: Option<String>,
 }
 
 /// An `audit` request's payload.
@@ -541,6 +576,14 @@ pub struct SpawnReq {
     /// (`--worktree <name>`). When set, atrium calls `worktree::plan_for` +
     /// `worktree::ensure` before spawning and passes `plan.dir` as cwd.
     pub worktree: Option<String>,
+    /// `--here --hold`: a **teammate placeholder** instead of a worker. What
+    /// the tmux shim sends for Claude Code 2.1.325's `split-window … -- cat`.
+    /// The request names no command: the server starts its own binary in a
+    /// mode that only waits (`atrium --tmux-hold`), beside the caller, as a
+    /// child of the caller, and marks the pane as a placeholder. A `hold`
+    /// request carries no `argv`, role, identity, mode or worktree (each is
+    /// a parse error with it), so it cannot be used to start anything else.
+    pub hold: bool,
 }
 
 /// The size a `spawn --here --size` asks for the **new** pane, as tmux's
@@ -609,14 +652,42 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
     };
     let cmd = match v.get("cmd").and_then(Value::as_str) {
         Some("spawn") => {
+            // Present but not a boolean is an error, never an absence: the
+            // flag changes what the request is.
+            let hold = match v.get("hold") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err("hold must be true or false".to_string()),
+            };
             let argv = match v.get("argv").and_then(Value::as_array) {
                 Some(items) => items
                     .iter()
                     .map(|it| it.as_str().map(str::to_string))
                     .collect::<Option<Vec<String>>>()
                     .ok_or_else(|| "argv must be an array of strings".to_string())?,
+                None if hold && v.get("argv").is_none() => Vec::new(),
                 None => return Err("spawn needs an argv array".to_string()),
             };
+            if hold {
+                // A placeholder is atrium's own program, beside the caller.
+                // Anything that would make it something else is refused,
+                // not ignored.
+                let extra = ["role", "identity", "mode", "worktree"]
+                    .into_iter()
+                    .find(|k| v.get(k).is_some());
+                if !argv.is_empty() || extra.is_some() {
+                    return Err(format!(
+                        "a hold spawn is a placeholder: it takes no {}",
+                        extra.unwrap_or("command")
+                    ));
+                }
+                if v.get("window").and_then(Value::as_bool) != Some(false) {
+                    return Err(
+                        "a hold spawn goes beside the caller (--here), not in a new window"
+                            .to_string(),
+                    );
+                }
+            }
             let role = v.get("role").and_then(Value::as_str).map(str::to_string);
             let new_window = v.get("window").and_then(Value::as_bool).unwrap_or(true);
             let focus = v.get("focus").and_then(Value::as_bool).unwrap_or(true);
@@ -664,6 +735,7 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                     .get("worktree")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                hold,
             })
         }
         Some("list") => Cmd::List,
@@ -724,7 +796,39 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .get("worktree")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            Cmd::Respawn(RespawnReq { target, worktree })
+            // Present but not a string is an error, never an absence: with
+            // it gone the request would be a plain respawn of the target.
+            let teammate = match v.get("teammate") {
+                None => None,
+                Some(Value::String(line)) => Some(line.clone()),
+                Some(_) => return Err("teammate must be a command line (a string)".to_string()),
+            };
+            if teammate.is_some() && v.get("worktree").is_some() {
+                return Err(
+                    "a teammate respawn takes no worktree (the teammate starts where its \
+                     command line says, if atrium allows that directory)"
+                        .to_string(),
+                );
+            }
+            // A teammate runs under its lead pane's own identity, from
+            // atrium's record of the lead. A request that names one, or a
+            // mode, is asking for something this verb does not grant.
+            if teammate.is_some() {
+                if let Some(extra) = ["identity", "mode", "role", "argv", "env"]
+                    .into_iter()
+                    .find(|k| v.get(k).is_some())
+                {
+                    return Err(format!(
+                        "a teammate respawn takes no {extra}: the teammate's identity, \
+                         mode, role and command are atrium's to decide"
+                    ));
+                }
+            }
+            Cmd::Respawn(RespawnReq {
+                target,
+                worktree,
+                teammate,
+            })
         }
         Some("audit") => {
             let tail = v

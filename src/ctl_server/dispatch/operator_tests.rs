@@ -42,6 +42,8 @@ pub(super) struct Fx {
     pub(super) max_depth: usize,
     /// Every reply served, as JSON text: no token may ever be in one.
     replies: Vec<String>,
+    /// What a handler last put on the bar.
+    pub(super) flash: Option<(String, Instant)>,
 }
 
 impl Fx {
@@ -57,6 +59,7 @@ impl Fx {
             extra_allow: Vec::new(),
             max_depth: atrium::ctl::DEFAULT_MAX_DEPTH,
             replies: Vec::new(),
+            flash: None,
         }
     }
 
@@ -131,6 +134,7 @@ impl Fx {
                 mods: &mut self.mods,
                 hold: &mut hold,
                 held_inboxes: 0,
+                flash: &mut self.flash,
             },
             ops,
         );

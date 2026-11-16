@@ -35,6 +35,18 @@ pub(crate) fn config_cmd(args: &[String]) -> ExitCode {
                 })
                 .unwrap_or_else(|| "(no platform config directory)".to_string());
             println!("global fleet file: {fleet}");
+            // What the file lets a pane's request set on a teammate, with
+            // the warning for names that move settings or traffic; a file
+            // that does not load says why (a name that may never be listed).
+            match config::load() {
+                Ok(Some(cfg)) => {
+                    if let Some(line) = atrium::tmux_shim::teams_env_disclosure(&cfg.teams_env) {
+                        println!("{line}");
+                    }
+                }
+                Ok(None) => {}
+                Err(why) => println!("config: does not load: {why}"),
+            }
             ExitCode::SUCCESS
         }
         Some("init") => {

@@ -557,6 +557,7 @@ mod tests {
             mod_enabled: None,
             teams: None,
             commands: None,
+            teams_env: None,
             title: None,
             notify: None,
             subagents: None,

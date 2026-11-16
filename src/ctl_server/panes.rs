@@ -17,6 +17,17 @@ pub(crate) fn pane_by_agent_mut(windows: &mut [Window], id: AgentId) -> Option<&
         .find(|p| p.agent_id == id)
 }
 
+/// Is this pane a **claude agent's**: was it started with a claude command
+/// (`claude`, a claude alias, a path to one), and is it not a placeholder?
+/// The test is the recorded command, as for
+/// [`is_agent_pane`](super::dispatch::is_agent_pane). What may use the tmux
+/// shim's two requests (a placeholder, and the teammate that takes it over):
+/// Claude Code is the shim's only caller.
+pub(crate) fn is_claude_pane(p: &Pane) -> bool {
+    let program = p.argv.first().map(String::as_str).unwrap_or(&p.title);
+    !p.placeholder && atrium::bind::is_claude_stem(&atrium::bind::command_stem(program))
+}
+
 /// `(agent_id, role)` for every live pane — the candidate set for target
 /// resolution.
 pub(crate) fn ctl_candidates(windows: &[Window]) -> Vec<(AgentId, Option<String>)> {
