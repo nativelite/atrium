@@ -589,6 +589,11 @@ fn run_session(launch: FleetLaunch, max_depth: usize, headless: Option<(u16, u16
         (None, None) => (24, 80),
     };
 
+    // Headless: take the termination events before any pane exists.
+    if headless.is_some() {
+        crate::run_loop::arm_headless();
+    }
+
     // When worktrees are active, hand the plans to the spawn so each member
     // pane's cwd is its worktree dir; an empty slice (inactive, or not a repo)
     // means every pane keeps its fleet-file cwd — today's behavior, unchanged.

@@ -50,6 +50,12 @@ impl<'a> RunState<'a> {
             Ok(windows) => windows,
             Err(e) => return Err(fail_first_window(out, command, &e)),
         };
+        // Started inside a real tmux: say once that its `TMUX` was kept from
+        // the panes (`tmux_shim::hide_outer`), unless something more urgent
+        // already has the bar.
+        if flash.is_none() {
+            flash = atrium::tmux_shim::outer_notice().map(|m| (m.to_string(), Instant::now()));
+        }
         let active = 0usize; // active window index
         let scanner = PrefixScanner::new();
         // Mouse capture is OFF by default so the terminal's own **text selection**

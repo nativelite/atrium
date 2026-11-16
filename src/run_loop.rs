@@ -17,7 +17,7 @@ mod teardown;
 mod tests;
 
 use crate::*;
-pub(crate) use host::{stderr_line, Host};
+pub(crate) use host::{arm_headless, stderr_line, Host};
 
 /// What a session is launched with: the three launch paths (a plain launch,
 /// `fleet up` and `recover`) each build one and hand it to [`run`]. Named fields,
@@ -74,6 +74,8 @@ pub(crate) fn run_on(host: Host<'_>, args: RunArgs<'_>) -> ExitCode {
         Ok(state) => state,
         Err(code) => return code,
     };
+    // What `ctl ping` and `ctl metrics` measure uptime from.
+    crate::ctl_server::mark_session_start();
     while state.tick() == Flow::Continue {}
     // A note raised on the last tick has no later tick to be said on.
     state.host.report_flash(&mut state.flash);

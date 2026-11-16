@@ -139,7 +139,19 @@ fn try_bind_ctl() -> Result<atrium::ipc::Listener, String> {
 /// up without it. `Ok(None)` when ctl is off or no socket was chosen: the
 /// per-process default keeps its non-fatal [`bind_ctl`].
 fn bind_ctl_chosen(allow_ctl: bool) -> Result<Option<atrium::ipc::Listener>, String> {
-    if !allow_ctl || matches!(atrium::ipc::endpoint(), Ok(e) if !e.explicit) {
+    let chosen = !matches!(atrium::ipc::endpoint(), Ok(e) if !e.explicit);
+    if !allow_ctl {
+        // Naming the endpoint does not switch the control plane on: an
+        // environment variable must never be what opens it. Said, not silent.
+        if chosen {
+            eprintln!(
+                "atrium: a ctl socket was named (--ctl-socket / ATRIUM_CTL_SOCKET) but the \
+                 control plane is off, so nothing is bound: add --allow-ctl"
+            );
+        }
+        return Ok(None);
+    }
+    if !chosen {
         return Ok(None);
     }
     try_bind_ctl().map(Some)
