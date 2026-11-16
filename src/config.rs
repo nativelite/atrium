@@ -68,7 +68,18 @@ pub struct GlobalConfig {
     /// default folder ([`crate::modfiles::default_dir`]).
     pub mod_path: Option<PathBuf>,
     /// `"mod": false`: inject the mod into no claude pane on this machine.
+    /// Also what a "no" to the first-run offer is kept as.
     pub mod_off: bool,
+    /// `"mod": true`: a yes to the mod, said to the first-run offer, by
+    /// `atrium mod install`, or written by hand. It is the permission a
+    /// launch needs to write the mod's folder again when it is missing
+    /// ([`crate::modfiles::launch_with`]).
+    pub mod_yes: bool,
+    /// `"mod"` is an object, whatever is in it (`{ "path": … }`, `{}`, a
+    /// mistyped key): the folder is the user's to manage. Nothing is asked,
+    /// and atrium never replaces the value. Unknown keys inside it are let
+    /// be, as unknown keys are everywhere else in this file.
+    pub mod_managed: bool,
     /// `"teams": "off"`: catch no Claude Code teammates as panes on this
     /// machine ([`crate::tmux_shim`]); `"show"` or absent catches them.
     pub teams_off: bool,
@@ -301,7 +312,7 @@ pub fn answer_to_path(line: &str, default: &Path, home: Option<&Path>) -> PathBu
 }
 
 /// Ask where the config should live and write it there. Only when a human is
-/// present (stdin is a terminal and `ATRIUM_YES` is unset) and nothing has
+/// present (stdin and stderr are terminals and `ATRIUM_YES` is unset) and nothing has
 /// decided yet ([`needs_first_run`]); a script or a test gets no question and
 /// no file. Errors are reported, not fatal: the launch goes on with defaults.
 pub fn first_run_setup() {
@@ -309,6 +320,8 @@ pub fn first_run_setup() {
     if !needs_first_run()
         || std::env::var_os("ATRIUM_YES").is_some()
         || !std::io::stdin().is_terminal()
+        // The question is written to stderr: redirected, nobody would see it.
+        || !std::io::stderr().is_terminal()
     {
         return;
     }
@@ -359,6 +372,8 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         memory_mb: None,
         mod_path: None,
         mod_off: false,
+        mod_yes: false,
+        mod_managed: false,
         teams_off: false,
         notify: None,
         commands: crate::ctl::parse_commands(get("commands"), "config.json")?.unwrap_or_default(),
@@ -368,12 +383,15 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
     cfg.memory_mb = whole(get("memory_mb"), "memory_mb")?;
-    // `mod`: `false` turns injection off; an object names the folder; `true`
-    // and `null` mean the defaults. Anything else is a typo, named.
+    // `mod`: `false` turns injection off; `true` is a yes to the mod (what
+    // the first-run offer and `atrium mod install` write); an object names
+    // the folder; `null` says nothing. Anything else is a typo, named.
     match get("mod") {
-        None | Some(json::Value::Null) | Some(json::Value::Bool(true)) => {}
+        None | Some(json::Value::Null) => {}
+        Some(json::Value::Bool(true)) => cfg.mod_yes = true,
         Some(json::Value::Bool(false)) => cfg.mod_off = true,
         Some(json::Value::Object(_)) => {
+            cfg.mod_managed = true;
             let v = get("mod").and_then(|v| v.as_object());
             let path = v.and_then(|o| o.iter().rev().find(|(k, _)| k == "path").map(|(_, v)| v));
             cfg.mod_path = opt_str(path, "mod.path")?
@@ -382,7 +400,7 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         }
         Some(_) => {
             return Err(
-                "config.json: \"mod\" must be false, or an object with \"path\"".to_string(),
+                "config.json: \"mod\" must be true, false, or an object with \"path\"".to_string(),
             )
         }
     }
@@ -566,10 +584,448 @@ pub fn install(cfg: GlobalConfig) {
     let _ = INSTALLED.set(cfg);
 }
 
-/// Load the file and install it. A missing file installs the defaults.
+/// Load the file and install it, with the answer file folded in
+/// ([`load_effective`]). A missing file installs the defaults.
 pub fn install_from_disk() -> Result<(), String> {
-    install(load()?.unwrap_or_default());
+    install(load_effective()?);
     Ok(())
+}
+
+// ---- The answer to the mod offer (PLAN 0.48.0, S3) ----
+//
+// atrium asks once, at first start, whether to install the mod
+// ([`crate::modfiles::first_run_offer`]). The answer is kept in the config
+// file as `"mod": true` or `"mod": false`, written by changing that one key
+// and no other byte ([`set_mod_key`]). Where there is no config file to keep
+// it in (a plain launch never asks for one), or the file cannot be edited
+// that narrowly, it is kept in one small file beside the config pointer
+// ([`mod_answer_path`]) instead. The config's key, when it says anything,
+// always wins over that file.
+
+/// The answer file's name under [`crate::fleet::global_dir`].
+pub const MOD_ANSWER_FILE: &str = "mod.answer";
+
+/// Where the answer is kept when the config file cannot hold it.
+pub fn mod_answer_path() -> Option<PathBuf> {
+    crate::fleet::global_dir().map(|d| d.join(MOD_ANSWER_FILE))
+}
+
+/// The answer in the file at `path`: its first line, `yes` or `no`, and
+/// nothing else. Anything else (no file, another word) is no answer.
+pub fn read_mod_answer_file(path: &Path) -> Option<bool> {
+    let text = std::fs::read_to_string(path).ok()?;
+    match text.lines().next().map(str::trim) {
+        Some("yes") => Some(true),
+        Some("no") => Some(false),
+        _ => None,
+    }
+}
+
+impl GlobalConfig {
+    /// Does the config's own `mod` key say anything (`true`, `false`, an
+    /// object)?
+    pub fn mod_said(&self) -> bool {
+        self.mod_off || self.mod_yes || self.mod_managed
+    }
+
+    /// Fold the answer file's say in: it counts only where the config's own
+    /// key says nothing. A "no" there is `"mod": false`, a "yes" `"mod": true`.
+    pub fn fold_mod_answer(&mut self, file: Option<bool>) {
+        if self.mod_said() {
+            return;
+        }
+        match file {
+            Some(true) => self.mod_yes = true,
+            Some(false) => self.mod_off = true,
+            None => {}
+        }
+    }
+}
+
+/// The config as a launch uses it: the file ([`load`], defaults when there
+/// is none) with the answer file folded in.
+pub fn load_effective() -> Result<GlobalConfig, String> {
+    let mut cfg = load()?.unwrap_or_default();
+    cfg.fold_mod_answer(mod_answer_path().and_then(|p| read_mod_answer_file(&p)));
+    Ok(cfg)
+}
+
+/// `text` (a config file) with its top-level `"mod"` key set to `yes`, and
+/// every other byte as it was. A `"mod"` key that is there has its value
+/// replaced (the last one, which is the one [`parse`] reads), and only when
+/// that value is `null`, `true` or `false`; otherwise the
+/// key is added as the first member, behind the same line break and indent
+/// the first member has. `None` when the text is not an object this scanner
+/// can walk: the caller then leaves the file alone.
+pub fn set_mod_key(text: &str, yes: bool) -> Option<String> {
+    let b = text.as_bytes();
+    let word = if yes { "true" } else { "false" };
+    let ws = |mut i: usize| {
+        while b.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+            i += 1;
+        }
+        i
+    };
+    let string_end = |i: usize| -> Option<usize> {
+        let mut j = i + 1;
+        loop {
+            match *b.get(j)? {
+                b'\\' => j += 2,
+                b'"' => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+    };
+    let value_end = |i: usize| -> Option<usize> {
+        match *b.get(i)? {
+            b'"' => string_end(i),
+            b'{' | b'[' => {
+                let (mut j, mut depth) = (i, 0usize);
+                loop {
+                    match *b.get(j)? {
+                        b'"' => {
+                            j = string_end(j)?;
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                return Some(j + 1);
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+            }
+            _ => {
+                let mut j = i;
+                while b
+                    .get(j)
+                    .is_some_and(|c| !c.is_ascii_whitespace() && !matches!(c, b',' | b'}' | b']'))
+                {
+                    j += 1;
+                }
+                (j > i).then_some(j)
+            }
+        }
+    };
+    let open = ws(0);
+    if b.get(open) != Some(&b'{') {
+        return None;
+    }
+    let mut i = open + 1;
+    let mut first_member = None;
+    let mut found: Option<(usize, usize)> = None;
+    loop {
+        i = ws(i);
+        match *b.get(i)? {
+            b'}' => break,
+            b'"' => {}
+            _ => return None,
+        }
+        first_member.get_or_insert(i);
+        let key_end = string_end(i)?;
+        let key = &text[i..key_end];
+        i = ws(key_end);
+        if b.get(i) != Some(&b':') {
+            return None;
+        }
+        i = ws(i + 1);
+        let end = value_end(i)?;
+        if key == "\"mod\"" {
+            found = Some((i, end));
+        }
+        i = ws(end);
+        match *b.get(i)? {
+            b',' => i += 1,
+            b'}' => break,
+            _ => return None,
+        }
+    }
+    // Only blanks may follow the object.
+    if ws(i + 1) != b.len() {
+        return None;
+    }
+    if let Some((start, end)) = found {
+        // Only a value that says nothing or yes or no is replaced: an
+        // object is the user's own say, and anything else is not a config.
+        if !["null", "true", "false"].contains(&&text[start..end]) {
+            return None;
+        }
+        return Some(format!("{}{word}{}", &text[..start], &text[end..]));
+    }
+    Some(match first_member {
+        Some(m) => {
+            let lead = &text[open + 1..m];
+            format!(
+                "{}{lead}\"mod\": {word},{}{}",
+                &text[..=open],
+                if lead.is_empty() { " " } else { lead },
+                &text[m..]
+            )
+        }
+        None => format!("{}\"mod\": {word}{}", &text[..=open], &text[open + 1..]),
+    })
+}
+
+/// Where an answer was kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept {
+    /// In the config file, as its `"mod"` key.
+    Config(PathBuf),
+    /// In the answer file ([`mod_answer_path`]).
+    File(PathBuf),
+}
+
+impl Kept {
+    /// "Where" for a person: the path and what stands there.
+    pub fn describe(&self, yes: bool) -> String {
+        match self {
+            Kept::Config(p) => format!("{} (\"mod\": {yes})", p.display()),
+            Kept::File(p) => format!("{} ({})", p.display(), if yes { "yes" } else { "no" }),
+        }
+    }
+
+    /// "Where" before there is an answer: the path and what will hold it.
+    pub fn place(&self) -> String {
+        match self {
+            Kept::Config(p) => format!("{} (its \"mod\" key, and nothing else there)", p.display()),
+            Kept::File(p) => format!("{} (one word)", p.display()),
+        }
+    }
+}
+
+/// The temporary name a whole-file write of `path` uses.
+fn temporary_for(path: &Path) -> PathBuf {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.atrium-tmp", std::process::id()));
+    PathBuf::from(tmp)
+}
+
+/// Write `text` at `path` whole: a sibling temporary file, renamed over.
+/// `like`: an existing file whose permissions the new one takes (the file
+/// being replaced), so a config kept at `0600` stays `0600`.
+fn write_whole(path: &Path, text: &str, like: Option<&Path>) -> Result<(), String> {
+    let tmp = temporary_for(path);
+    let fail = |e: std::io::Error| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", path.display())
+    };
+    std::fs::write(&tmp, text).map_err(fail)?;
+    if let Some(like) = like {
+        let perms = std::fs::metadata(like).map_err(fail)?.permissions();
+        std::fs::set_permissions(&tmp, perms).map_err(fail)?;
+    }
+    std::fs::rename(&tmp, path).map_err(fail)
+}
+
+/// May the file at `path` be replaced by a new one of the same name (which
+/// is what a whole-file write does)? Not a symbolic link (the link would be
+/// replaced, not its target); not read-only (someone said hands off); and,
+/// on unix, not a file with a second hard link (the other name would keep
+/// the old text) nor one another user owns (the new file would be ours).
+/// `Err` says which.
+fn replaceable(path: &Path) -> Result<(), String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let no = |why: &str| Err(format!("{} {why}", path.display()));
+    if meta.file_type().is_symlink() {
+        return no("is a symbolic link, which is not written through");
+    }
+    if meta.permissions().readonly() {
+        return no("is read-only");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if meta.nlink() > 1 {
+            return no("has more than one hard link");
+        }
+        // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+        if meta.uid() != unsafe { geteuid() } {
+            return no("belongs to another user");
+        }
+    }
+    Ok(())
+}
+
+/// What keeping an answer comes to, decided without writing anything.
+enum Plan {
+    /// The config already says it.
+    Already(PathBuf),
+    /// The config's one key is changed: the new text, and whether the
+    /// config's own key said the opposite before.
+    Edit {
+        path: PathBuf,
+        text: String,
+        said: bool,
+    },
+    /// The answer file.
+    File(PathBuf),
+}
+
+/// Decide where the answer `yes` goes ([`record_mod_answer_at`] has the
+/// rules). Reads, never writes.
+fn plan_mod_answer(config: Option<&Path>, file: Option<&Path>, yes: bool) -> Result<Plan, String> {
+    if let Some(path) = config.filter(|p| p.is_file()) {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Ok(was) = parse(&text) {
+            if was.mod_managed {
+                return Err(format!(
+                    "{} has its own \"mod\" object, which is left as it is",
+                    path.display()
+                ));
+            }
+            if was.mod_yes == yes && was.mod_off != yes {
+                return Ok(Plan::Already(path.to_path_buf()));
+            }
+            let said = was.mod_off || was.mod_yes;
+            let mut want = was;
+            want.mod_yes = yes;
+            want.mod_off = !yes;
+            let edited = replaceable(path).and_then(|()| {
+                set_mod_key(&text, yes)
+                    .filter(|new| parse(new).ok().as_ref() == Some(&want))
+                    .ok_or_else(|| {
+                        format!("{} could not be edited one key at a time", path.display())
+                    })
+            });
+            match edited {
+                Ok(text) => {
+                    return Ok(Plan::Edit {
+                        path: path.to_path_buf(),
+                        text,
+                        said,
+                    })
+                }
+                // The config's own key says the opposite and stays: an
+                // answer file would lose to it, so say what is in the way.
+                Err(why) if said => return Err(format!("{why}; set \"mod\": {yes} in it by hand")),
+                Err(_) => {}
+            }
+        }
+    }
+    file.map(|f| Plan::File(f.to_path_buf()))
+        .ok_or_else(|| "no platform config directory to keep it in".to_string())
+}
+
+/// Where an answer would be kept, for saying so before the question.
+pub fn mod_answer_target_at(config: Option<&Path>, file: Option<&Path>) -> Option<Kept> {
+    match plan_mod_answer(config, file, true).ok()? {
+        Plan::Already(p) | Plan::Edit { path: p, .. } => Some(Kept::Config(p)),
+        Plan::File(p) => Some(Kept::File(p)),
+    }
+}
+
+/// [`mod_answer_target_at`] for this machine.
+pub fn mod_answer_target() -> Option<Kept> {
+    mod_answer_target_at(resolve().path.as_deref(), mod_answer_path().as_deref())
+}
+
+/// Keep the answer to the mod offer: in the config file at `config` when
+/// there is one, else in the answer file at `file`.
+///
+/// The config file is edited only when all of this holds: it parses; its
+/// `"mod"` is not an object (that is the user's own say, whatever is in it);
+/// the file may be replaced ([`replaceable`]: not a symbolic link, not
+/// read-only, and on unix singly linked and the user's own); [`set_mod_key`]
+/// could place the key; and the edited text parses to the same config with
+/// only the `mod` say changed. Then exactly that key changes, and the new
+/// file keeps the old one's permissions. A config that already says the same
+/// is left untouched. A config whose own key says the opposite and cannot be
+/// edited is an error, since the answer file would lose to it. In every
+/// other case the answer goes to the answer file, and the config is not
+/// written.
+pub fn record_mod_answer_at(
+    config: Option<&Path>,
+    file: Option<&Path>,
+    yes: bool,
+) -> Result<Kept, String> {
+    // One place holds the answer: once the config's key does, the file goes.
+    let in_config = |path: PathBuf| {
+        if let Some(f) = file {
+            let _ = std::fs::remove_file(f);
+        }
+        Ok(Kept::Config(path))
+    };
+    let file = match plan_mod_answer(config, file, yes)? {
+        Plan::Already(path) => return in_config(path),
+        Plan::Edit { path, text, said } => match write_whole(&path, &text, Some(&path)) {
+            Ok(()) => return in_config(path),
+            Err(why) if said => return Err(format!("{why}; set \"mod\": {yes} in it by hand")),
+            Err(why) => file.ok_or(why)?.to_path_buf(),
+        },
+        Plan::File(file) => file,
+    };
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    write_whole(&file, if yes { "yes\n" } else { "no\n" }, None)?;
+    Ok(Kept::File(file))
+}
+
+/// Remove temporary files an interrupted write left beside `targets`
+/// (`<name>.<pid>.atrium-tmp`, see [`write_whole`]): only names of exactly
+/// that form, and only ones untouched for a minute, so a write another
+/// atrium is in the middle of is not pulled from under it.
+pub fn sweep_temporaries(targets: &[&Path]) {
+    for target in targets {
+        let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+            continue;
+        };
+        let prefix = format!("{}.", name.to_string_lossy());
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            let pid = file
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".atrium-tmp"));
+            let stale = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|at| at.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= 60);
+            if pid.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) && stale
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// [`record_mod_answer_at`] for this machine's config and answer file.
+pub fn record_mod_answer(yes: bool) -> Result<Kept, String> {
+    record_mod_answer_at(resolve().path.as_deref(), mod_answer_path().as_deref(), yes)
+}
+
+/// The recorded answer and where it is kept, for `atrium mod status`:
+/// `Some((yes, where))`, or `None` when nothing is recorded. A config whose
+/// `"mod"` is an object is not an answer and reads as none here.
+pub fn mod_answer_kept_at(config: Option<&Path>, file: Option<&Path>) -> Option<(bool, Kept)> {
+    if let Some(path) = config {
+        if let Some(cfg) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| parse(&t).ok())
+        {
+            if cfg.mod_off || cfg.mod_yes {
+                return Some((cfg.mod_yes, Kept::Config(path.to_path_buf())));
+            }
+            if cfg.mod_managed {
+                return None;
+            }
+        }
+    }
+    let file = file?;
+    read_mod_answer_file(file).map(|yes| (yes, Kept::File(file.to_path_buf())))
+}
+
+/// [`mod_answer_kept_at`] for this machine.
+pub fn mod_answer_kept() -> Option<(bool, Kept)> {
+    mod_answer_kept_at(resolve().path.as_deref(), mod_answer_path().as_deref())
 }
 
 /// The installed config, or the defaults when nothing was installed (tests, the
@@ -580,6 +1036,9 @@ pub fn get() -> &'static GlobalConfig {
         .get()
         .unwrap_or_else(|| DEFAULT.get_or_init(GlobalConfig::default))
 }
+
+#[cfg(test)]
+mod answer_tests;
 
 #[cfg(test)]
 mod tests {

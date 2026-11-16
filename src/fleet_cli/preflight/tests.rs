@@ -51,6 +51,8 @@ fn facts() -> BannerFacts {
         mod_line: "mod: installed 0.1.0 at /cfg/mod".to_string(),
         mod_missing: false,
         teams_on: true,
+        mod_expect: atrium::modfiles::Expect::On,
+        teams_var: false,
         codex_hooks_unreviewed: Vec::new(),
         codex_hooks_reviewed: Vec::new(),
     }
@@ -386,6 +388,75 @@ fn the_banner_states_the_mod_and_warns_when_claude_panes_would_load_none() {
         !lines.iter().any(|l| l.contains("mod:")),
         "no claude pane, nothing to say: {lines:#?}"
     );
+}
+
+/// The banner says which path handles a named teammate in this session:
+/// the mod, the tmux shim, or neither. It no longer announces teams whenever
+/// the shim is on.
+#[test]
+fn the_banner_says_which_path_handles_a_named_teammate() {
+    let teams = |fleet: &str, allow_ctl: bool, facts: &BannerFacts| -> String {
+        let lines = banner_lines(&launch_of(fleet, allow_ctl, &[]), facts);
+        let found: Vec<&String> = lines.iter().filter(|l| l.contains(" teams: ")).collect();
+        assert_eq!(found.len(), 1, "one line, once: {lines:#?}");
+        found[0].clone()
+    };
+    // (a) The mod is on: it takes the Agent tool over and makes the pane.
+    assert_eq!(
+        teams(TWO_AGENTS, true, &facts()),
+        "atrium fleet: teams: named subagents and teammates become atrium panes through the \
+         mod (subagents: panes)"
+    );
+    // Not settled before a pane starts (the launch has yet to write the
+    // folder, or is trying the mod again): "expected", not a flat statement.
+    let mut likely = facts();
+    likely.mod_expect = atrium::modfiles::Expect::Likely;
+    assert_eq!(
+        teams(TWO_AGENTS, true, &likely),
+        "atrium fleet: teams: named subagents and teammates are expected to become atrium \
+         panes through the mod (subagents: panes); the first claude pane settles whether the \
+         mod loads"
+    );
+    // (b) The mod is off and the shim is on: Claude Code's own teams, which
+    // need a variable atrium cannot see unless it is in its environment.
+    let mut shim = facts();
+    shim.mod_expect = atrium::modfiles::Expect::Off;
+    assert_eq!(
+        teams(TWO_AGENTS, true, &shim),
+        "atrium fleet: teams: the mod is off; Claude Code's own teammates land as panes \
+         through the tmux shim; teams also need CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the \
+         environment or in Claude Code's settings (atrium cannot see it in its environment)"
+    );
+    shim.teams_var = true;
+    assert_eq!(
+        teams(TWO_AGENTS, true, &shim),
+        "atrium fleet: teams: the mod is off; Claude Code's own teammates land as panes \
+         through the tmux shim"
+    );
+    // (c) Neither.
+    let mut neither = facts();
+    neither.mod_expect = atrium::modfiles::Expect::Off;
+    neither.teams_on = false;
+    assert_eq!(
+        teams(TWO_AGENTS, true, &neither),
+        "atrium fleet: teams: the mod is off and the tmux shim is off: subagents and \
+         teammates run inside their agent and are not visible to atrium"
+    );
+    // Without a control plane neither path exists, and nothing is said.
+    let lines = banner_lines(&launch_of(TWO_AGENTS, false, &[]), &facts());
+    assert!(!lines.iter().any(|l| l.contains("teams:")), "{lines:#?}");
+    // The fleet's `subagents` policy is the one named.
+    let native = TWO_AGENTS.replacen('{', r#"{"subagents":"native","#, 1);
+    assert!(teams(&native, true, &facts()).contains("(subagents: native)"));
+    let deny = TWO_AGENTS.replacen('{', r#"{"subagents":"deny","#, 1);
+    assert!(teams(&deny, true, &facts()).contains("(subagents: deny)"));
+    // The old line is gone.
+    let all = banner_lines(&launch_of(TWO_AGENTS, true, &[]), &facts()).join("\n");
+    assert!(!all.contains("teammateMode"), "{all}");
+    // No claude pane: nothing to say about teammates.
+    let codex_only = r#"{"agents":[{"name":"cx","cmd":["codex"]}]}"#;
+    let lines = banner_lines(&launch_of(codex_only, true, &[]), &facts());
+    assert!(!lines.iter().any(|l| l.contains("teams:")), "{lines:#?}");
 }
 
 /// The slash commands a fleet lets `ctl command` deliver are in the banner,

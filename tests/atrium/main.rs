@@ -14,6 +14,7 @@ mod cli;
 mod ctl;
 mod fleet;
 mod headless;
+mod offer;
 mod process_tree;
 mod recover;
 #[cfg(any(windows, target_os = "linux"))]

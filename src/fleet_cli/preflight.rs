@@ -206,9 +206,15 @@ pub(super) struct BannerFacts {
     /// ([`atrium::modfiles::describe`]), and whether it is a warning.
     pub(super) mod_line: String,
     pub(super) mod_missing: bool,
-    /// Whether a Claude Code lead's teammates are caught as panes
-    /// ([`atrium::tmux_shim::describe`]).
+    /// Whether the tmux shim is put into this fleet's claude panes (its
+    /// `teams` key).
     pub(super) teams_on: bool,
+    /// Whether this fleet's claude panes are expected to run the mod
+    /// ([`atrium::modfiles::expected`]).
+    pub(super) mod_expect: atrium::modfiles::Expect,
+    /// Whether Claude Code's teams are switched on in atrium's environment
+    /// ([`atrium::modfiles::ENV_AGENT_TEAMS`]).
+    pub(super) teams_var: bool,
     /// The codex agents whose program takes `--dangerously-bypass-hook-trust`
     /// (their enabled hooks run without codex's review, see
     /// [`atrium::vendors::codex_hooks_unreviewed`]), and those whose program
@@ -219,10 +225,12 @@ pub(super) struct BannerFacts {
 
 impl BannerFacts {
     pub(super) fn read(fleet: &atrium::fleet::Fleet) -> BannerFacts {
-        let (mod_line, mod_missing) = atrium::modfiles::describe(
-            &atrium::modfiles::status(),
-            fleet.mod_enabled.unwrap_or(true),
-        );
+        let enabled = fleet.mod_enabled.unwrap_or(true);
+        // A recorded yes has the launch write a missing folder, so that is
+        // not a warning; never for a folder that is the user's to manage.
+        let yes = atrium::modfiles::session_yes();
+        let (mod_line, mod_missing) =
+            atrium::modfiles::describe(&atrium::modfiles::status(), enabled, yes);
         let (mut codex_hooks_unreviewed, mut codex_hooks_reviewed) = (Vec::new(), Vec::new());
         for a in fleet.agents.iter().filter(|a| is_codex_agent(a)) {
             let program = a.cmd.first().map(String::as_str).unwrap_or_default();
@@ -244,6 +252,21 @@ impl BannerFacts {
             mod_line,
             mod_missing,
             teams_on: fleet.teams.unwrap_or(true),
+            // Decided as the launch will decide it; claude is asked its
+            // version only when the breaker left a record to hold it against.
+            mod_expect: atrium::modfiles::expected(enabled, yes, || {
+                fleet
+                    .agents
+                    .iter()
+                    .filter_map(|a| a.cmd.first())
+                    .find(|c| atrium::bind::is_claude_stem(&atrium::bind::command_stem(c)))
+                    .and_then(|c| crate::pane_spawn::claude_version(c))
+            }),
+            teams_var: atrium::modfiles::teams_var_on(
+                std::env::var(atrium::modfiles::ENV_AGENT_TEAMS)
+                    .ok()
+                    .as_deref(),
+            ),
             codex_hooks_unreviewed,
             codex_hooks_reviewed,
         }
@@ -308,10 +331,24 @@ pub(super) fn banner_lines(launch: &FleetLaunch, facts: &BannerFacts) -> Vec<Str
         } else {
             out.push(format!("atrium fleet: {}", facts.mod_line));
         }
-        if fleet.allow_ctl.unwrap_or(false) {
+        // Which path handles a subagent the model names: the mod, the tmux
+        // shim, or neither. Said for what this session will do, not for what
+        // Claude Code could do elsewhere; only with the control plane on,
+        // without which neither path exists and nothing was ever said.
+        if launch.allow_ctl {
             out.push(format!(
                 "atrium fleet: {}",
-                atrium::tmux_shim::describe(facts.teams_on)
+                atrium::modfiles::teammates_line(&atrium::modfiles::TeammateFacts {
+                    ctl: launch.allow_ctl,
+                    mod_expect: facts.mod_expect,
+                    subagents: fleet
+                        .subagents
+                        .as_deref()
+                        .and_then(atrium::modstate::Subagents::parse)
+                        .unwrap_or(atrium::modstate::Subagents::Panes),
+                    shim_on: facts.teams_on,
+                    teams_var: facts.teams_var,
+                })
             ));
         }
     }
