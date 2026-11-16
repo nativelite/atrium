@@ -157,6 +157,9 @@ pub(crate) fn respawn(
     p.paste_wanted = false;
     let new_id = p.agent_id;
     let role = p.role.clone();
+    // The same seat, a new process: to the mod's breaker it is the voice it
+    // was (`atrium::modstate::ModState::respawned`).
+    cx.mods.respawned(id.0, new_id.0);
     // Re-tile the window so the new pane (and every sibling) holds its
     // exact inner rect — the backstop `ctl spawn --here` already relies on.
     resize_window(&mut windows[wi], rows, cols);

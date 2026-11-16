@@ -1133,6 +1133,7 @@ fn report_carries_the_mods_own_failure_counts() {
             "status=working",
             "fail=tool.call:2,feature.inbox:1",
             "fail_class=api",
+            "fail_at=feature.inbox",
             "fail_msg=HooksError: no implementation for prompt.submit",
         ]),
         Some(2),
@@ -1159,6 +1160,7 @@ fn report_carries_the_mods_own_failure_counts() {
                 ],
                 class: Some(FailClass::Api),
                 message: Some("HooksError: no implementation for prompt.submit".to_string()),
+                at: Some("feature.inbox".to_string()),
             })
         ),
         other => panic!("expected report, got {other:?}"),
@@ -1179,6 +1181,9 @@ fn report_carries_the_mods_own_failure_counts() {
         r#"{"cmd":"report","fail":"a:1;rm -rf:2"}"#,
         r#"{"cmd":"report","fail":{"a":1}}"#,
         r#"{"cmd":"report","fail":""}"#,
+        r#"{"cmd":"report","fail_at":"hello"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_at":"not a site"}"#,
+        r#"{"cmd":"report","fail":"a:1","fail_at":7}"#,
     ] {
         assert!(parse_request(bad).is_err(), "{bad}");
     }
@@ -1196,6 +1201,7 @@ fn a_panes_mod_is_shown_beside_its_status_and_its_answer() {
         why: Some("it reported repeated failures".to_string()),
         version: Some("0.3.0".to_string()),
         failures: 5,
+        lost: vec!["inbox".to_string()],
         hooks: vec![("tool.call".to_string(), 4), ("whoami".to_string(), 1)],
         class: Some("hook".to_string()),
         error: Some("Error: boom".to_string()),
@@ -1206,7 +1212,7 @@ fn a_panes_mod_is_shown_beside_its_status_and_its_answer() {
     );
     assert_eq!(
         status.to_json(),
-        r#"{"ok":true,"pane":2,"status":"working","idle_ms":0,"mod":{"state":"set-aside","why":"it reported repeated failures","version":"0.3.0","failures":5,"hooks":{"tool.call":4,"whoami":1},"class":"hook","error":"Error: boom"}}"#
+        r#"{"ok":true,"pane":2,"status":"working","idle_ms":0,"mod":{"state":"set-aside","why":"it reported repeated failures","version":"0.3.0","failures":5,"lost":["inbox"],"hooks":{"tool.call":4,"whoami":1},"class":"hook","error":"Error: boom"}}"#
     );
     let answer = with_mod_health(reply_answer(AgentId(2), None, None), Some(health));
     assert!(answer.to_json().contains(r#""mod":{"state":"set-aside""#));

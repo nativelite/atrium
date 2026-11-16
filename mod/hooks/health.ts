@@ -14,9 +14,10 @@
  * `WATCHDOG_MS` later, should the engine's timeout not.
  *
  * - `hello`, `whoami`: awaited inside `session.start`, which the engine awaits
- *   before the first prompt, so together they bound what the mod can add to a
- *   start (8 s, against the hook's own 10 s budget). A healthy reply takes
- *   tens of milliseconds: one process start and one line on a local socket.
+ *   before the first prompt. With the watchdog behind each, the two can hold
+ *   a start for 4 + 1 + 2 + 1 = 8 s at the very worst, against the hook's own
+ *   10 s budget. A healthy reply takes tens of milliseconds: one process
+ *   start and one line on a local socket.
  * - `report`, `poll`, `view`: background work nobody waits on; 5 s is past any
  *   healthy reply and short enough that a dead broker is noticed within a few
  *   calls.
@@ -24,8 +25,8 @@
  *   so it may take the 10 s it always had; its failure is the tool's result.
  */
 export const DEADLINE = {
-  hello: 5_000,
-  whoami: 3_000,
+  hello: 4_000,
+  whoami: 2_000,
   report: 5_000,
   poll: 5_000,
   view: 5_000,
@@ -38,13 +39,39 @@ export const WATCHDOG_MS = 1_000
 /** How long `session.end` waits for the last report before letting go. */
 export const END_WAIT_MS = 3_000
 
-/** How long after a hello that could not be asked the one retry is made. */
-export const HELLO_RETRY_MS = 5_000
+/**
+ * How long the file guard waits on the engine for the session's directory or
+ * a file's real path before it gives up and lets the edit through, counted.
+ * An edit is a tool call a person is waiting on.
+ */
+export const GUARD_MS = 2_000
 
 /**
- * After this many hook errors, or this many ctl calls in a row that could not
- * be asked, the mod switches itself off for the session: every hook passes
- * straight through. Five: one failure is an accident, five is a broken mod or
+ * How long the mod waits before each next hello, in seconds, when atrium
+ * could not be asked: at the start, and again whenever it stops answering.
+ * The last value repeats. Inside the thirty seconds atrium gives a pane to
+ * say hello that is four tries when each fails at once (at 0, 3, 9 and 21 s)
+ * and three when each hangs for its full five seconds (at 0, 8 and 19 s).
+ * It keeps trying after that, more and more slowly: an atrium that was only
+ * stalled finds its mods again without anyone doing anything.
+ *
+ * It is also the worst the mod can cost in processes while atrium is gone:
+ * one `atrium ctl hello` per wait, so one every two minutes once the list
+ * has run out, and nothing else (its loops are stopped while it waits).
+ */
+export const HELLO_BACKOFF_S: readonly number[] = [3, 6, 12, 24, 30, 60, 120]
+
+/** The wait before hello number `attempt` (0 is the first retry), in milliseconds. */
+export function helloBackoffMs(attempt: number): number {
+  const i = Math.max(0, Math.min(Math.floor(attempt), HELLO_BACKOFF_S.length - 1))
+  return (HELLO_BACKOFF_S[i] ?? 120) * 1000
+}
+
+/**
+ * After this many errors thrown by its hooks the mod switches itself off for
+ * the session; after this many ctl exchanges in a row that got no reply it
+ * could read, it pauses (its loops stop, and it says hello again on
+ * `HELLO_BACKOFF_S`). Either way every hook passes straight through. Five: one failure is an accident, five is a broken mod or
  * a broker that is gone, and a mod that keeps failing costs every tool call a
  * caught exception for nothing.
  */
@@ -78,21 +105,31 @@ export const MESSAGE_CAP = 120
 /** The most distinct hooks counted; the rest fall under `other`. */
 export const HOOKS_CAP = 16
 
-/** Which class a thrown value is. */
+/**
+ * Which class a thrown value is. A `TypeError` or a `ReferenceError` inside a
+ * hook's own code (a null dereference on an event's data, a typo) is a bug in
+ * the mod: `hook`, counted toward switching it off. `api` is kept for what
+ * the engine itself says of a `$` call nothing answers or a plugin withheld;
+ * a missing method found at the call is told apart by where it was thrown,
+ * not by its text (`engineLacks`).
+ */
 export function classify(err: unknown): FailClass {
-  const name = err instanceof Error ? err.name : ''
   const message = err instanceof Error ? err.message : String(err)
-  if (
-    name === 'TypeError' &&
-    /is not a function|is not iterable|is not a constructor|Cannot read propert|undefined is not|null is not|is not defined/i.test(message)
-  ) {
-    return 'api'
-  }
-  if (name === 'ReferenceError') return 'api'
-  // What the engine says of a `$` call nothing answers, or one a plugin withheld.
-  if (/no implementation for|removed by plugin|not available in this|unknown (event|noun|method)/i.test(message)) return 'api'
+  if (/no implementation for|removed by plugin/i.test(message)) return 'api'
   if (/timed? ?out|deadline/i.test(message)) return 'timeout'
   return 'hook'
+}
+
+/**
+ * Did a call on the engine (`$.noun.method(...)`) fail because the engine
+ * does not have it? Asked only where the mod is making such a call: there, a
+ * `TypeError` that the thing is not a function, or was read off `undefined`,
+ * is the method or its noun missing; anywhere else the same text is a bug.
+ */
+export function engineLacks(err: unknown): boolean {
+  if (classify(err) === 'api') return true
+  if (!(err instanceof Error) || err.name !== 'TypeError') return false
+  return /is not a function|Cannot read propert(y|ies) of undefined|undefined is not an object/i.test(err.message)
 }
 
 /**
@@ -163,9 +200,14 @@ export class Failures {
   private readonly counts = new Map<string, number>()
   private lastClass: FailClass | undefined
   private lastMessage = ''
+  /** The key the last failure was counted under. */
+  private lastAt = ''
   /** Errors a hook threw (`hook`, `api`), all session. */
   private thrown = 0
-  /** ctl calls in a row that could not be asked (`timeout`, `ctl`). */
+  /**
+   * ctl exchanges in a row that got no reply the mod could read: nobody
+   * answered (`timeout`, `ctl`), or what came back was no reply (`shape`).
+   */
   private unasked = 0
   private dirty = false
 
@@ -175,9 +217,12 @@ export class Failures {
     if (!this.counts.has(key) && this.counts.size >= HOOKS_CAP) key = 'other'
     this.counts.set(key, (this.counts.get(key) ?? 0) + 1)
     this.lastClass = cls
+    this.lastAt = key
     this.lastMessage = typeof err === 'string' ? scrub(new Error(err)).replace(/^Error: /, '') : scrub(err)
-    if (cls === 'hook' || cls === 'api') this.thrown += 1
-    if (cls === 'timeout' || cls === 'ctl') this.unasked += 1
+    // A feature lost to a missing engine method costs that feature, and is
+    // not one of the errors that switch the whole mod off.
+    if ((cls === 'hook' || cls === 'api') && !key.startsWith('feature.')) this.thrown += 1
+    if (cls === 'timeout' || cls === 'ctl' || cls === 'shape') this.unasked += 1
     this.dirty = true
   }
 
@@ -203,9 +248,14 @@ export class Failures {
     return this.lastClass === undefined ? undefined : { cls: this.lastClass, message: this.lastMessage }
   }
 
-  /** Should the mod switch itself off? */
-  spent(): boolean {
-    return this.thrown >= INERT_AFTER || this.unasked >= INERT_AFTER
+  /** Did its own hooks fail too often: off for the session? */
+  broken(): boolean {
+    return this.thrown >= INERT_AFTER
+  }
+
+  /** Did atrium stop answering: pause, and say hello again later? */
+  unreachable(): boolean {
+    return this.unasked >= INERT_AFTER
   }
 
   /** Is there something atrium has not been told? */
@@ -213,14 +263,14 @@ export class Failures {
     return this.dirty
   }
 
-  /** The report fields that carry the counts: `fail`, `fail_class`, `fail_msg`. */
+  /** The report fields that carry the counts: `fail`, `fail_class`, `fail_at`, `fail_msg`. */
   fields(): Record<string, string> {
     const last = this.last()
     if (last === undefined) return {}
     const fail = Array.from(this.counts.entries())
       .map(([hook, n]) => `${hook}:${n}`)
       .join(',')
-    return { fail, fail_class: last.cls, fail_msg: last.message }
+    return { fail, fail_class: last.cls, fail_at: this.lastAt, fail_msg: last.message }
   }
 
   /** The fields were sent and taken. */

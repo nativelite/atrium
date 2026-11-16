@@ -1225,6 +1225,7 @@ fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             "fail" => pairs.push(("fail", Value::String(val))),
             "fail_class" => pairs.push(("fail_class", Value::String(val))),
             "fail_msg" => pairs.push(("fail_msg", Value::String(val))),
+            "fail_at" => pairs.push(("fail_at", Value::String(val))),
             "reply" => pairs.push(("reply", Value::String(val))),
             "ask" => {
                 let n = parse_whole(&val)
@@ -1262,7 +1263,7 @@ fn report_req(args: &[String], pairs: &mut Pairs) -> Result<(), String> {
             other => {
                 return Err(format!(
                     "report: unknown field {other:?} (use status, reason, context, cost, turns, \
-                     answer, doing, touched, ask, reply, fail, fail_class, fail_msg)"
+                     answer, doing, touched, ask, reply, fail, fail_class, fail_at, fail_msg)"
                 ))
             }
         }

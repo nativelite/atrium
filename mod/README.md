@@ -69,54 +69,71 @@ switches it on.
 
 ## When the mod fails
 
-A failure of the mod is never a failure of the pane. Three rules, in
-`hooks/health.ts` and at the top of every hook in `hooks/register.ts`:
+The aim: a failure of the mod is not a failure of the pane. What holds it:
 
 1. **Every hook catches what its own code throws**, counts it, and lets the
-   engine go on exactly as if the mod were not loaded. (The engine also skips
-   a hook that throws; the mod does not lean on that, because a skipped hook
-   is silent and the mod's job is to say what broke.)
+   engine go on as if the mod were not loaded. (The engine also skips a hook
+   that throws; the mod does not lean on that, because a skipped hook is
+   silent and the mod's job is to say what broke.)
 2. **Every `atrium ctl` exchange has a deadline**, and a watchdog of the mod's
-   own one second behind it in case the engine's timeout does not fire.
+   own one second behind it in case the engine's timeout does not fire. The
+   file guard's own questions to the engine have two seconds.
 3. **Only atrium says no.** A tool call is refused on a verdict atrium gave:
    the files an item owns (`whoami`), the session's subagent policy. A hook
    that could not ask atrium, or could not judge, lets the call through.
 
+What that does not cover: a module that fails to load, or an engine that
+kills the hooks worker, is outside any hook's reach. atrium sees that from
+its side, as a hello that never comes (below).
+
 | deadline | value | why |
 | --- | --- | --- |
-| `hello` | 5 s | awaited inside `session.start`, which the engine awaits before the first prompt; a healthy reply takes tens of milliseconds |
-| `whoami` at start | 3 s | the same wait; with `hello`, 8 s at the very worst, under the hook's own 10 s budget |
+| `hello` | 4 s | awaited inside `session.start`, which the engine awaits before the first prompt; a healthy reply takes tens of milliseconds |
+| `whoami` at start | 2 s | the same wait. With the 1 s watchdog behind each, the two can hold a start for 4 + 1 + 2 + 1 = 8 s at the very worst, under the hook's own 10 s budget. The registrations that follow are engine calls with no deadline of the mod's |
 | `report`, inbox poll, pane refresh, `whoami` between turns | 5 s | background work nobody waits on; past any healthy reply, short enough that a dead broker is noticed in a few calls |
+| the file guard | 2 s in all | it asks the engine for the session's directory and each path's real path; a person is waiting on the edit |
 | an `atrium_*` tool | 10 s (`ask`: its own timeout + 30 s) | the call is the tool, and its failure is the tool's result |
 | `inbox --wait` | 100 s | a request atrium holds for up to 60 s by design; it runs outside every hook |
 | the last report at `session.end` | 3 s | the process may be leaving; a moment, not a hang |
-| retry of a hello that could not be asked | once, 5 s later | outside the start, so nobody waits on it |
 
 **Counting and telling.** Failures are counted per hook and ride the next
-`report` as three fields: `fail=<hook>:<n>,…` (cumulative), `fail_class` and
-`fail_msg` of the last one. The classes: `api` (the plugin interface is not
-what the mod was written for: a missing method, `no implementation for …`),
-`timeout`, `ctl` (the call could not be made), `shape` (a reply that is not
-what the verb answers), `hook` (anything else a hook threw). The message is
-the error's name and text with every quoted span, every path and every long
-unbroken run replaced by `…`, cut to 120 characters: a tool's input, a file's
-contents and the environment never ride in it. A count is keyed by the
-hook's name (`tool.call`, `guard`, `feature.inbox`) when the mod's own code
-failed, and by `ctl.<site>` (`ctl.hello`, `ctl.report`) when an exchange with
-atrium did; atrium holds only the first family against the mod.
+`report` as four fields: `fail=<hook>:<n>,…` (cumulative), and the last one's
+`fail_class`, `fail_at` (the key it was counted under) and `fail_msg`. The
+classes: `api` (the engine has no implementation for a `$` call the mod
+makes), `timeout`, `ctl` (the call could not be made), `shape` (a reply that
+is not what the verb answers), `hook` (anything else a hook threw: a
+`TypeError` on an event's data is a bug in the mod, not a changed engine).
+The message is the error's name and text with every quoted span, every path
+and every long unbroken run replaced by `…`, cut to 120 characters. A count
+is keyed three ways, and atrium treats each differently:
 
-**Switching itself off.** After five errors thrown by its hooks, or five ctl
-calls in a row that could not be asked, the mod is off for the session: every
-hook passes straight through, the loops stop, one last report says why. The
-same when atrium answers `mod set aside: …` or accepts no capability.
+- a hook's own name (`tool.call`, `guard`): the mod's code failed. Five of
+  these and the mod is off for the session, on both sides.
+- `feature.<name>`: the engine lacks a method that one feature calls. That
+  feature is off; the mod goes on. Features: `pane` (`/atrium` and the band),
+  `inbox` (native delivery), `tools`, `guard`, `paths` (real paths; without
+  `$.fs.stat` they are compared by their text), `captions`, `ask`. The
+  engine's validator lets a hooks module spell `$` only as a call, never read
+  a method as a value, so the mod cannot ask beforehand: it finds out at the
+  call.
+- `ctl.<site>` (`ctl.hello`, `ctl.report`): an exchange with atrium failed.
+  Shown, counted, and never held against the mod: a slow or absent broker is
+  not a broken mod.
 
-**A missing method switches off one feature.** The engine's validator lets a
-hooks module spell `$` only as a call, never read a method as a value, so
-the mod cannot ask beforehand whether `$.prompt.submit` exists: it finds out
-at the call. The first `api` failure of a feature switches that feature off
-for the session and is reported as `feature.<name>`: `pane` (`/atrium` and
-the band), `inbox` (native delivery), `tools`, `guard`, `paths` (real paths;
-without `$.fs.stat` they are compared by their text), `captions`, `ask`.
+**Off, or paused.** Two different things:
+
+- *Off for the session*: five errors thrown by its own hooks, or atrium's own
+  refusal (`mod set aside: …`, a hello granted nothing). Every hook passes
+  straight through, the loops stop, one last report says why, no hello is
+  said again.
+- *Paused*: five ctl exchanges in a row got no reply the mod could read
+  (nobody answered, or what came back was no reply). The loops stop, every
+  hook passes straight through, and the mod says hello again after 3, 6, 12,
+  24, 30, 60 and then every 120 s, for as long as it takes. The same backoff
+  runs from the start when the first hello cannot be asked. An atrium that
+  was only stalled, or still spawning its roster, finds its mods again.
+  While it waits the mod starts one `atrium ctl hello` per step and nothing
+  else: at the worst, one process every two minutes.
 
 ### The audit
 
@@ -126,57 +143,111 @@ out and the chain continues, with one line in the debug log.
 
 | hook | what it does | a failure in 0.2.0 | now (0.3.0) |
 | --- | --- | --- | --- |
-| `session.start` | `hello`, `whoami`, registers `/atrium`, the pane timer, the inbox loop, the tools; reports the first status | `hello` and `whoami` could each take 10 s, in front of the first prompt; a throw part-way (say `$.command.register`) skipped the hook and silently left everything after it unset; a `hello` reply without an `accepted` list read as "nothing accepted", silently | 5 s + 3 s; each piece (pane, inbox, tools, first status) stands alone and is counted when it fails; a hello that could not be asked is retried once in the background; a reply of the wrong shape is counted (`ctl.hello`, `shape`) |
+| `session.start` | `hello`, `whoami`, registers `/atrium`, the pane timer, the inbox loop, the tools; reports the first status | `hello` and `whoami` could each take 10 s, in front of the first prompt; a throw part-way (say `$.command.register`) skipped the hook and silently left everything after it unset; a `hello` reply without an `accepted` list read as "nothing accepted", silently | 4 s + 2 s; each piece (pane, inbox, tools, first status) stands alone and is counted when it fails; a hello that could not be asked is retried on the backoff, outside the start; a reply of the wrong shape is counted (`ctl.hello`, `shape`) |
 | `command.run` `/atrium` | opens the pane | a throw skipped the hook: the command answered nothing | answers a line that says the pane could not be opened; counted |
 | `ui.render` `Pane` | draws the board, decisions and feed | a throw skipped the hook; the pane fell to the engine's own node, uncounted. The board and the feed never parsed at all: `ctl board list` and `ctl bus feed` were run without `--json` and print a table for a person | the engine's node, counted; ctl is run with `--json`, so the pane shows the board and the feed |
 | `ui.render` `AbovePrompt` | the band that counts open decisions | as above | the engine's own band, counted; nothing when the mod is off |
-| `agent.spawn`, `agent.offer` | under the `panes` policy, refuses the Agent tool with a pointer to `atrium_subagent` and hides the agent types | refused under `panes` even when `atrium_subagent` did not exist (the `tools` cap not accepted, or its registration failed): the pane was left with no subagents at all | refuses only when the tool it points to was registered; `deny` is atrium's own policy and stands; with the mod off the engine is left alone |
+| `agent.spawn`, `agent.offer` | under the `panes` policy, refuses the Agent tool with a pointer to `atrium_subagent` and hides the agent types | refused under `panes` even when `atrium_subagent` did not exist (the `tools` cap not accepted, or its registration failed): the pane was left with no subagents at all | takes the Agent tool over only while a pane could answer for it: the tool is registered and the session's mod is not backed out (`whoami`'s `mod_tripped`); otherwise the engine's own Agent tool runs, said once. Under `deny` the mod refuses, and atrium also launches the pane with `--disallowedTools Agent`, so that one holds without the mod |
 | `prompt.compose` | adds the `atrium:role` section | a throw skipped the hook (the prompt stood), uncounted | the composed prompt as it was, counted |
-| `tool.call` `Edit`, `Write`, `NotebookEdit` | the file guard, then the edit, then the touch report | a guard that threw (`$.session.cwd` failing) skipped the hook and the edit ran, uncounted; a path whose folder did not exist yet was refused as "cannot be placed", the file the item owns included, whenever the item owned another file that did exist; a touch report that failed was an unhandled rejection | a guard that cannot judge lets the edit through and is counted; a path the filesystem cannot place is compared by its text, so atrium's list still decides; an edit outside the item's files is refused as before; the touch is caught |
+| `tool.call` `Edit`, `Write`, `NotebookEdit` | the file guard, then the edit, then the touch report | a guard that threw (`$.session.cwd` failing) skipped the hook and the edit ran, uncounted; a guard that hung on the engine held the edit for as long as the engine took; a path whose folder did not exist yet was refused as "cannot be placed", the file the item owns included, whenever the item owned another file that did exist; a touch report that failed was an unhandled rejection | a guard that cannot judge, or does not answer in 2 s, lets the edit through and is counted; a path the filesystem cannot place is compared by its text, so atrium's list still decides; an edit outside the item's files is refused as before; the touch is caught |
 | `turn.step` | reads the step's text for a caption; passes every chunk through | a caption failure was logged; a throw while reading text left the stream where it stood | the chunks pass whatever happens; a missing `$.model.complete` switches captions off |
 | `turn.start` | reports `working`, re-reads `whoami` | a throw skipped the hook; the background `whoami` had 10 s | counted; 5 s |
 | `tool.check` | answers an ask for an `atrium_*` tool with allow; reports `waiting-approval` | a throw after the verdict skipped the hook (the verdict stood) | the verdict as the engine gave it, counted; a deny is never touched |
-| `tool.call` (every tool) | reports `working` and a caption; runs an `atrium_*` tool as one ctl call | a throw in the reporting half skipped the hook and the engine ran the tool; `atrium_list`, `atrium_status`, `atrium_board_*` and `atrium_bus_feed` returned the table for a person inside an `err` field (no `--json`) | the reporting half is caught and counted and the tool runs; an `atrium_*` tool returns the reply itself, and its own failure is its result, never a refusal of another tool |
+| `tool.call` (every tool) | reports `working` and a caption; runs an `atrium_*` tool as one ctl call | a throw in the reporting half skipped the hook and the engine ran the tool; `atrium_list`, `atrium_status`, `atrium_board_*` and `atrium_bus_feed` returned the table for a person inside an `err` field (no `--json`); `atrium_subagent` waited thirty minutes for an answer from a pane that had no mod to report one | the reporting half is caught and counted and the tool runs; an `atrium_*` tool returns the reply itself, and its own failure is its result, never a refusal of another tool; `atrium_subagent` closes a child that has no mod, or whose mod is set aside, within thirty seconds and names the Agent tool instead |
 | `turn.complete` | reports the status, clears the caption, sends the answer | a throw skipped the hook | counted; the turn's result as it was |
 | `session.measure` | reports context fill and cost | a throw skipped the hook | counted |
 | `session.end` | reports `ended`, stops the loops, waits for the last report | waited on the reporter with no bound of its own (10 s per report still queued) | 3 s, then lets go |
 | the reporter | one `report` in flight at a time | 10 s each; a refusal was logged | 5 s; a report that could not be made is counted and not retried by another report; the failure counts ride the next one that goes |
-| the inbox loop | holds `inbox --wait`, submits each delivery through `$.prompt.submit` | a refused poll was retried every 1.5 s for the life of the session; a submit that failed was logged and the delivery lost | ten refusals in a row end the polling, and `mod set aside` ends it at once; a failed submit is counted, and when it is the engine lacking the method the inbox is switched off and atrium, told, types the next delivery. The one delivery whose submit failed is still lost: see below |
+| the inbox loop | holds `inbox --wait`, submits each delivery through `$.prompt.submit` | a refused poll was retried every 1.5 s for the life of the session; a delivery that arrived as the loop was being stopped was dropped; a submit that failed was logged and the delivery lost | what a reply carries is submitted first, whatever became of the mod meanwhile; ten refusals in a row end the polling, and `mod set aside` ends it at once; a broker answering things that are no replies pauses the mod after five; a failed submit is counted, and when the engine lacks the method the inbox is switched off and atrium, told, types the next delivery. A delivery whose submit itself failed is still lost: see below |
 | the pane timer | refreshes the view every 3 s open, 30 s closed | 10 s per call, and (see `ui.render`) never a reply it could read | 5 s per call; stops when the pane feature is off |
 
 ### What atrium does with it
 
-- **The hello window.** A claude pane launched with the mod is expected to
-  say `hello` within 30 s of the moment atrium sees it started (its prompt
-  hint on screen, or a status known for its session). One that does not is
+- **The hello window.** A claude pane atrium launched with the mod is
+  expected to say `hello` within 30 s of the moment atrium sees it started:
+  its prompt hint on screen, a status reported for it through ctl, or its
+  transcript written to after the launch (a transcript that was already
+  there for a resumed session does not count). The 30 s run on the loop's
+  own clock, which stands still while atrium does. A pane that misses it is
   *set aside*: a pane without a mod from then on. Its sends are typed, its
   status comes from atrium's status hooks or by inference, and a late hello
   is granted nothing.
-- **Its own reports.** An `api` failure, or five failures of its own hooks,
-  set aside the mod of the pane that reported them, and no other.
+- **Its own reports**, taken only from a pane that has a mod (launched with
+  one, or holding a hello). A lost feature takes back the capability behind
+  it. An `api` failure at `session.start`, `hello` or `report`, or five
+  failures of its own hooks, set aside the mod of the pane that reported
+  them, and no other.
 - **The inbox.** A mod that took `inbox` and stops asking for three minutes
   loses that cap alone; what was queued for it is typed.
-- **The breaker.** Two voices trip it (two panes atrium saw miss the window;
-  or panes set aside by their own reports that are not each other's parent
-  and child): new claude panes launch without the mod, a pane that had not
-  started is relaunched once without it, a working pane is left alone and
-  flagged, and the trip is remembered against the Claude Code version and
-  the mod's version and hash until one changes or `atrium mod retry`.
+- **The breaker.** Two voices trip it for the session: new claude panes
+  launch without the mod, and every pane already running is left exactly as
+  it is, flagged, and offered a respawn in one decision on the bus. A voice
+  is a seat (a pane, and whatever it is respawned as) that atrium saw miss
+  the window, or one set aside by its own reports with no such seat above it
+  in the spawn tree. The trip is written down for later sessions only when
+  two seats missed the window as atrium itself observed; a trip made of
+  reports ends with the session.
 
 `atrium ctl status <pane>` shows a pane's mod under `"mod"`; `atrium ctl
 metrics` counts `mod_failures`; `atrium mod status` says whether the breaker
 tripped, against what, and when.
 
+### What a pane loses when its mod is off
+
+Everything in the list at the top of this file is the mod's, and exists only
+while the mod runs. A pane whose mod failed to load, switched itself off or
+was set aside has none of it, and a pane can bring that about itself (its
+agent can kill the mod's `atrium ctl` children until the mod pauses):
+
+- the **edit guard**. It was advisory to begin with: it refuses `Edit`,
+  `Write` and `NotebookEdit`, and a shell command can write any file.
+- the **collision radar's** reports for that pane (`touched=`), so `⚡` and
+  the `collision` decision never fire for its edits;
+- **context and cost** reports, and with them the `respawn_at` offer;
+- **certain status** from the engine: the status hooks, when the pane has
+  them, or the transcript inference take over;
+- **native delivery**: a send is typed into the pane, on Windows as one line;
+- **captions, asks, the `/atrium` pane, the typed `atrium_*` tools**;
+- the **`panes` subagent takeover**: the engine's own Agent tool works, and
+  its subagents are not atrium panes.
+
+What does not depend on the mod, and holds in a pane without one: the
+session's trust ceiling and the posture flags the pane was launched with;
+the deny list (`--disallowedTools`, and under a `deny` subagent policy the
+Agent tool is on it); the spawn policy and depth; a pane's reach being its
+own subtree; text landing only in agent panes; atrium's header on every
+send.
+
 ### Known limits
 
-- A delivery the mod took from its inbox and then could not submit is lost
-  (one, the one in hand). atrium learns of the failure from the next report;
-  when it was the engine lacking the method, the following ones are typed.
+- A delivery the mod took from its inbox and whose `$.prompt.submit` then
+  failed is lost (the one in hand). The protocol has no acknowledgement, so
+  atrium cannot tell it from one that was submitted. What atrium can see it
+  puts back: a reply to a held `inbox --wait` that could not be written is
+  queued again.
 - A failure before `session.start`, or of a module that does not load at
   all, cannot be counted by the mod. atrium sees it as a hello that never
   came.
-- The launch refreshes the installed files from the binary, so a hand edit
-  of the installed mod does not survive a launch.
+- Two panes that are not each other's ancestor (two children of one lead,
+  for example) can trip the breaker for the session by both reporting
+  failures. It ends with the session and restarts nothing.
+- The breaker's record is a file in the user's own state directory. Any
+  process of that user can delete it or write one: it is a convenience that
+  saves a known-broken mod from being loaded again, not a control.
+
+## Developing the mod
+
+- `ATRIUM_MOD=<this folder>` loads this checkout into every claude pane as
+  it is. atrium never writes into a folder without its marker
+  (`.atrium-mod`, which only `atrium mod install` leaves), so edits here are
+  safe from the launch refresh; one line at launch says the folder is loaded
+  as it is.
+- Under `cargo test` and `cargo run` in this repository, `.cargo/config.toml`
+  sets `ATRIUM_MOD` to `target/test-mod`, so that a test session with a
+  claude pane cannot read, or refresh, the mod you installed for real. It
+  also means `cargo run -- mod install` writes to `target/test-mod`, not to
+  your config directory: name the folder (`--at <dir>`), set `ATRIUM_MOD`
+  yourself, or use an installed `atrium` to act on the real one.
 
 ## Loading it
 
@@ -192,8 +263,10 @@ writes them to `mod/` under the platform config directory (or `--at <dir>`),
 and every claude pane atrium then spawns gets `CLAUDE_CODE_PLUGIN_DIRS` naming
 that folder and `ATRIUM_BIN` naming the atrium that hosts it. `atrium mod
 status` says what is installed; `"mod": false` in `config.json` or in a fleet
-turns the injection off. Once installed, a launch keeps the folder current
-with the atrium that runs, and says so in one line when it rewrote a file.
+turns the injection off. `atrium mod install` leaves a marker in the folder
+(`.atrium-mod`); a launch keeps a folder that has it current with the atrium
+that runs, and says so in one line when it rewrote a file. A folder without
+the marker is loaded as it is and never written to.
 
 Check it: `claude plugin validate mod` and `claude plugin test mod`
 (`python dev.py check` runs both when `claude` is on PATH).

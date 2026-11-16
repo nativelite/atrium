@@ -756,7 +756,7 @@ fn inbox(req: ctl::InboxReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     };
     // The mod is asking for its deliveries: that is how the broker knows it
     // is still collecting them (`modstate::INBOX_SILENT_MS`).
-    cx.mods.note_inbox(me.0, atrium::session_store::now_ms());
+    cx.mods.note_inbox(me.0);
     if let Some(refusal) = set_aside_refusal(cx.mods, me) {
         return refusal;
     }
@@ -864,32 +864,35 @@ fn answer(
     )
 }
 
-/// Relaunch `pane` in place, as `ctl respawn` does, on atrium's own
-/// authority: what the breaker does, once, to a pane that was launched with
-/// the mod and never started. By the time this runs the breaker has tripped
-/// (`atrium::modfiles::trip`), so the spawn path gives the new process no
-/// plugin folder, and its new agent id is one the health check never
-/// expected: it cannot be relaunched a second time.
-pub(crate) fn mod_relaunch(pane: AgentId, cx: &mut CtlSession<'_>) -> ctl::Reply {
-    let reply = respawn(
-        ctl::RespawnReq {
-            target: pane.to_string(),
-            worktree: None,
-            teammate: None,
-        },
-        None,
-        true,
-        cx,
-    );
-    let (ok, note) = audit_outcome(&reply);
-    cx.audit.record(
-        None,
-        "mod-relaunch",
-        &format!("pane={pane} without the mod"),
-        ok,
-        &note,
-    );
-    reply
+/// Put back what an `inbox` reply carried when the reply never reached the
+/// pane's mod (its `inbox --wait` connection was gone by the time a delivery
+/// landed): each send and wake is queued again, to be collected by the next
+/// poll or, if the mod has lost the cap by then, typed. An ask is not a
+/// delivery and is not put back: its asker sees it pending and times out.
+/// Returns how many were queued.
+///
+/// This is what the wire lets the broker know. A reply that *was* written is
+/// taken as received: there is no acknowledgement in the protocol, so a mod
+/// that reads its items and then fails to submit one cannot be told from one
+/// that submitted it, and the mod delivers what it has in hand before it
+/// stops (`mod/hooks/register.ts`).
+pub(crate) fn requeue_inbox(
+    pending: &mut Vec<PendingSend>,
+    pane: AgentId,
+    items: &[ctl::InboxItem],
+) -> usize {
+    let mut queued = 0;
+    for item in items {
+        let origin = match item.kind.as_str() {
+            "send" => SendOrigin::Ctl,
+            "wake" => SendOrigin::BusWake,
+            _ => continue,
+        };
+        if queue_send(pending, pane, item.text.clone(), origin, SentBy::default()) {
+            queued += 1;
+        }
+    }
+    queued
 }
 
 /// The refusal a pane gets once its mod was set aside
@@ -931,6 +934,11 @@ pub(crate) fn mod_health(
         hooks: failures
             .map(|f| f.counts.iter().map(|(h, n)| (h.clone(), *n)).collect())
             .unwrap_or_default(),
+        lost: mods
+            .features_lost(pane.0)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
         class: failures.and_then(|f| f.class.map(|c| c.label().to_string())),
         error: failures.and_then(|f| f.message.clone()),
     })
@@ -968,6 +976,24 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
     // record of the spawn tree, which the breaker needs to tell one voice
     // from two (`modstate::ModState::failures_reported`).
     if let Some(f) = &r.failures {
+        // Only a pane that has a mod has a mod's failures to report: one
+        // atrium launched with the mod in this session, or one that holds a
+        // hello. A shell, a codex pane, a claude launched without the mod:
+        // refused, and nothing changes.
+        // And only in a session that uses the mod: with `"mod": false` there
+        // is no mod here for anything to be said about.
+        if !atrium::modfiles::session_enabled() {
+            return ctl::reply_err(
+                "this session does not use the mod (\"mod\": false), so there are no failures \
+                 of one to report",
+            );
+        }
+        if !cx.mods.has_a_mod(me.0) {
+            return ctl::reply_err(&format!(
+                "pane {me} has no mod (it was not launched with one and never said hello), \
+                 so it has no failures of one to report"
+            ));
+        }
         let parents = ctl_parents(cx.windows);
         let mut above: Vec<usize> = Vec::new();
         let mut at = me;
@@ -982,7 +1008,7 @@ fn report(r: ctl::ReportReq, caller: Option<AgentId>, cx: &mut CtlSession<'_>) -
             above.push(parent.0);
             at = parent;
         }
-        if let Some(why) = cx.mods.failures_reported(me.0, &above, f, now) {
+        if let Some(why) = cx.mods.failures_reported(me.0, &above, f) {
             cx.audit.record(
                 Some(me),
                 "mod-set-aside",
@@ -1255,6 +1281,13 @@ fn whoami(caller: Option<AgentId>, cx: &CtlSession<'_>) -> ctl::Reply {
     let (subagents, keep) = atrium::modstate::session_subagents();
     fields.push(("subagents".to_string(), s(subagents.as_str())));
     fields.push(("subagents_keep".to_string(), Value::Bool(keep)));
+    // Whether the session's mod was backed out (the breaker tripped, here or
+    // on a record): a pane spawned now has no mod, so it reports no answer,
+    // and the mod must not hand its subagents to panes.
+    fields.push((
+        "mod_tripped".to_string(),
+        Value::Bool(cx.mods.tripped().is_some() || atrium::modfiles::session_tripped().is_some()),
+    ));
     // Whether the mod may spend a small model call on captions.
     fields.push((
         "captions".to_string(),

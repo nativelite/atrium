@@ -80,12 +80,36 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
                 modfiles::embedded_version(),
                 modfiles::embedded_hash()
             );
-            // The breaker's memory, against the claude on PATH now.
-            let claude = claude_version("claude");
+            // The breaker's memory, against the claude a pane would run: the
+            // `claude` on PATH and every command the config or the
+            // environment names as one (`claude_aliases`).
+            let mut programs = vec!["claude".to_string()];
+            for alias in atrium::bind::session_claude_aliases() {
+                if !programs.contains(&alias) {
+                    programs.push(alias);
+                }
+            }
+            let versions: Vec<(String, Option<String>)> = programs
+                .into_iter()
+                .map(|p| {
+                    let v = claude_version(&p);
+                    (p, v)
+                })
+                .collect();
+            for (program, version) in &versions {
+                println!(
+                    "claude: `{program}` is {}",
+                    version
+                        .as_deref()
+                        .unwrap_or("not answering --version (unknown, which is not \"changed\")")
+                );
+            }
             match atrium::session_store::state_root() {
                 Some(root) => {
+                    let record = modfiles::read_record(&root);
+                    let claude = version_for(&record, &versions);
                     for line in modfiles::breaker_lines(
-                        &modfiles::read_record(&root),
+                        &record,
                         claude.as_deref(),
                         atrium::session_store::now_ms(),
                     ) {
@@ -152,6 +176,22 @@ pub(crate) fn mod_cmd(args: &[String]) -> ExitCode {
     }
 }
 
+/// The version to hold the record against, among the claudes a pane could
+/// run: the one the record names if any of them is it (the mod stays off for
+/// that claude), else the first that answered, else none (unknown).
+pub(crate) fn version_for(
+    record: &atrium::modfiles::RecordRead,
+    versions: &[(String, Option<String>)],
+) -> Option<String> {
+    let known = || versions.iter().filter_map(|(_, v)| v.clone());
+    match record {
+        atrium::modfiles::RecordRead::Tripped(r) => {
+            known().find(|v| r.matches(v)).or_else(|| known().next())
+        }
+        _ => known().next(),
+    }
+}
+
 /// What a running session says of its mods, in one line: the failures they
 /// reported and whether its breaker tripped, read from `ctl metrics` (counts
 /// only, served without a token) at the session this shell is in, or the one
@@ -211,6 +251,42 @@ pub(crate) fn session_line_of(reply: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_record_is_held_against_the_claude_it_names_among_the_ones_a_pane_could_run() {
+        use atrium::modfiles::{RecordRead, TripRecord};
+        let record = RecordRead::Tripped(TripRecord::now("2.1.325", "why", 0));
+        let v = |list: &[(&str, Option<&str>)]| -> Vec<(String, Option<String>)> {
+            list.iter()
+                .map(|(p, v)| (p.to_string(), v.map(str::to_string)))
+                .collect()
+        };
+        // The alias is the claude that tripped: the mod stays off for it,
+        // whatever the plain `claude` on PATH is.
+        assert_eq!(
+            version_for(
+                &record,
+                &v(&[("claude", Some("2.2.0")), ("claude2", Some("2.1.325"))])
+            ),
+            Some("2.1.325".to_string())
+        );
+        assert_eq!(
+            version_for(&record, &v(&[("claude", Some("2.2.0"))])),
+            Some("2.2.0".to_string())
+        );
+        // Nobody answered: unknown, not "changed".
+        assert_eq!(
+            version_for(&record, &v(&[("claude", None), ("claude2", None)])),
+            None
+        );
+        assert_eq!(
+            version_for(
+                &RecordRead::None,
+                &v(&[("claude", None), ("c2", Some("9"))])
+            ),
+            Some("9".to_string())
+        );
+    }
 
     #[test]
     fn the_session_line_reads_the_counters_and_says_when_there_are_none() {

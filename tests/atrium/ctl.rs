@@ -1275,7 +1275,7 @@ fn the_tmux_shim_splits_a_pane_from_inside_a_ctl_pane() {
 /// config and its spawn log live in the scratch directory, not the user's.
 /// Returns the pty, the scratch directory and its guard.
 fn spawn_atrium_ctl_claude_standin(tag: &str) -> (pty::Pty, std::path::PathBuf, StandinDir) {
-    spawn_atrium_ctl_claude_standin_mod(tag, false)
+    spawn_atrium_ctl_claude_standin_mod(tag, false, "{}")
 }
 
 /// [`spawn_atrium_ctl_claude_standin`], and with `with_mod` the mod installed
@@ -1285,6 +1285,7 @@ fn spawn_atrium_ctl_claude_standin(tag: &str) -> (pty::Pty, std::path::PathBuf, 
 fn spawn_atrium_ctl_claude_standin_mod(
     tag: &str,
     with_mod: bool,
+    config: &str,
 ) -> (pty::Pty, std::path::PathBuf, StandinDir) {
     let dir = std::env::temp_dir().join(format!("atrium-standin-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -1318,7 +1319,7 @@ fn spawn_atrium_ctl_claude_standin_mod(
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::fs::write(dir.join("config.json"), "{}").unwrap();
+    std::fs::write(dir.join("config.json"), config).unwrap();
     let mut dirs = vec![dir.clone()];
     dirs.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1396,7 +1397,7 @@ fn host_read(p: &pty::Pty, args: &[&str]) -> json::Value {
 /// for an inbox nobody collects.
 #[test]
 fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed() {
-    let (mut p, _dir, _guard) = spawn_atrium_ctl_claude_standin_mod("nohello", true);
+    let (mut p, dir, _guard) = spawn_atrium_ctl_claude_standin_mod("nohello", true, "{}");
     let atrium = env!("CARGO_BIN_EXE_atrium");
     let state = |p: &pty::Pty| -> Option<String> {
         host_read(p, &["status", "0"])
@@ -1432,13 +1433,19 @@ fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed()
         Some("no hello within its window"),
         "{why}"
     );
-    // One pane is one voice: the breaker stays shut.
+    // One pane is one voice: the breaker stays shut, and nothing is written
+    // down for later sessions.
     let metrics = host_read(&p, &["metrics"]);
     assert_eq!(
         metrics.get("mod_tripped").and_then(json::Value::as_i64),
         Some(0),
         "{metrics}"
     );
+    assert!(!dir
+        .join("state")
+        .join("sessions")
+        .join("mod-breaker.json")
+        .exists());
     // A hello now is too late: recorded, and granted nothing.
     p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
         .unwrap();
@@ -1463,6 +1470,74 @@ fn a_claude_pane_whose_mod_never_says_hello_is_set_aside_and_its_send_is_typed()
             out.extend_from_slice(&buf[..n]);
         }
     }
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// A session that does not use the mod (`"mod": false`) has no mod to watch,
+/// whatever its panes say: with the mod installed and a claude pane up, the
+/// pane is launched without it (no `mod` in its status), a hand-made hello is
+/// only a hello, a failure report is refused, and nothing is set aside,
+/// tripped or written down.
+#[test]
+fn a_session_with_the_mod_off_watches_no_mod_whatever_its_panes_report() {
+    let (mut p, dir, _guard) =
+        spawn_atrium_ctl_claude_standin_mod("modoff", true, r#"{"mod": false}"#);
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let status = host_read(&p, &["status", "0"]);
+    assert!(
+        status.get("mod").is_none(),
+        "launched without the mod: {status}"
+    );
+    p.write(b"echo ? for shortcuts\r\n").unwrap();
+    // Any pane can run `atrium ctl hello`; here it says nothing about a mod.
+    p.write(format!("\"{atrium}\" ctl hello mod=0.3.0 caps=status,inbox\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"accepted\":[", Duration::from_secs(20));
+    p.write(
+        format!(
+            "\"{atrium}\" ctl report fail=session.start:9 fail_class=api fail_at=session.start\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    let said = read_until(&mut p, b"does", Duration::from_secs(20));
+    assert!(
+        contains_shown(&said, b"this session does not use the mod"),
+        "the report is refused: {:?}",
+        String::from_utf8_lossy(&said)
+    );
+    // A moment on: nothing was set aside, nothing tripped.
+    let mut buf = [0u8; 8192];
+    let end = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < end {
+        let _ = p.read_timeout(&mut buf, Duration::from_millis(250));
+    }
+    let status = host_read(&p, &["status", "0"]);
+    assert_eq!(
+        status
+            .get("mod")
+            .and_then(|m| m.get("state"))
+            .and_then(json::Value::as_str),
+        Some("ok"),
+        "a hello is a hello, and nothing more came of it: {status}"
+    );
+    let metrics = host_read(&p, &["metrics"]);
+    assert_eq!(
+        metrics.get("mod_tripped").and_then(json::Value::as_i64),
+        Some(0),
+        "{metrics}"
+    );
+    assert_eq!(
+        metrics.get("mod_failures").and_then(json::Value::as_i64),
+        Some(0),
+        "{metrics}"
+    );
+    assert!(!dir
+        .join("state")
+        .join("sessions")
+        .join("mod-breaker.json")
+        .exists());
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
 }

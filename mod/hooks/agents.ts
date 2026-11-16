@@ -52,7 +52,31 @@ export function reportedAnswer(reply: Reply): { answer: string; seq: number } | 
   return { answer: reply.answer, seq: reply.seq }
 }
 
-/** How many `wait --timeout 300` slices a subagent may take: thirty minutes. */
-export const WAIT_SLICES = 6
+/**
+ * How many `wait` slices a subagent may take: thirty minutes in all. Between
+ * two slices the mod looks at the child's mod (`childMod`), so a child that
+ * will never answer is noticed within one slice, not after thirty minutes.
+ */
+export const WAIT_SLICES = 60
 /** One slice, in seconds. */
-export const WAIT_SLICE_S = 300
+export const WAIT_SLICE_S = 30
+
+/**
+ * What an `answer` reply says of the child pane's mod, which is what reports
+ * the answer a subagent pane is waited on for:
+ *
+ * - `none`: the pane has no mod (the session's mod is backed out, or the mod
+ *   is not installed): no answer will ever come.
+ * - `off`: its mod was set aside: no answer will come either.
+ * - `ok`: it has one, or is still expected to say hello.
+ * - `unknown`: the reply could not be read; the wait goes on.
+ */
+export function childMod(reply: Reply): 'none' | 'off' | 'ok' | 'unknown' {
+  if (reply.ok !== true) return 'unknown'
+  const mod = reply.mod
+  if (mod === undefined || mod === null) return 'none'
+  if (typeof mod !== 'object') return 'unknown'
+  const state = (mod as Record<string, unknown>).state
+  if (state === 'set-aside') return 'off'
+  return typeof state === 'string' ? 'ok' : 'unknown'
+}

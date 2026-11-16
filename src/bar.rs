@@ -64,6 +64,11 @@ pub struct PaneInfo {
     /// scrubbed and cut by `attention::pane_badge`. Rendered as ` [title]`
     /// after the name, before the marker: `1:claude:lead [fix tests]*`.
     pub badge: Option<String>,
+    /// The flag on the pane's mod, from the broker's own state
+    /// (`modstate::NOTE_*`): `mod off`, `mod backed out`. Its own segment in
+    /// its own colour, after the entry: nothing a pane can write (its title
+    /// is the `badge`, in brackets) can be taken for it.
+    pub mod_note: Option<&'static str>,
 }
 
 /// The color role of a bar segment. Text is identical to [`bar_text`]; only the
@@ -80,6 +85,8 @@ enum Role {
     Keys,
     /// An identity `·name` tag in its per-identity color.
     Identity(String),
+    /// The flag on a pane's mod, from the broker's state (amber, like a note).
+    ModFlag,
 }
 
 /// A window entry's state → its color, sharing the tile-border language.
@@ -126,13 +133,19 @@ fn bar_segments(panes: &[PaneInfo], note: &str) -> Vec<Segment> {
         };
         // The program's own title, when it set one, in brackets after the name.
         let own = match &p.badge {
-            Some(b) => format!(" [{b}]"),
+            // Braces are the mod flag's own (below): a title cannot hold them.
+            Some(b) => format!(" [{}]", b.replace(['{', '}'], "")),
             None => String::new(),
         };
         segs.push(seg(
             format!("| {}:{}{}{} ", i + 1, name, own, mark),
             Role::Entry(state),
         ));
+        // The flag on the pane's mod: atrium's own words in their own segment,
+        // never joined to the title the pane's program chose.
+        if let Some(note) = p.mod_note {
+            segs.push(seg(format!("{{{note}}} "), Role::ModFlag));
+        }
         // The identity name-tag rides next to the window entry — the name only,
         // never the secret. Its own segment so the painter can color it; the
         // `·<name>` text is the load-bearing channel and is always present.
@@ -213,6 +226,7 @@ fn role_style(role: &Role) -> Style {
         Role::Note(false) => on_bar(theme::EXITED, false),
         Role::Keys => on_bar(theme::KEYS, false),
         Role::Identity(name) => on_bar(Color::Indexed(identity::palette_index(name)), false),
+        Role::ModFlag => on_bar(theme::WAITING, false),
     }
 }
 
@@ -299,6 +313,7 @@ mod tests {
             identity: None,
             role: None,
             badge: None,
+            mod_note: None,
         }
     }
 
@@ -357,6 +372,33 @@ mod tests {
     }
 
     #[test]
+    fn the_mod_flag_is_its_own_segment_and_a_title_cannot_spell_it() {
+        // The broker's flag: after the entry, in braces, in the note colour.
+        let mut flagged = pane("claude", true, false);
+        flagged.mod_note = Some("mod backed out");
+        let text = bar_text(&[flagged.clone()], 80, "");
+        assert!(text.contains("| 1:claude* {mod backed out} "), "{text}");
+        let segs = bar_segments(&[flagged], "");
+        let flag = segs
+            .iter()
+            .find(|s| s.text == "{mod backed out} ")
+            .expect("the flag is a segment of its own");
+        assert!(matches!(flag.role, Role::ModFlag));
+        // A pane whose program titles itself like the flag gets its title in
+        // brackets, in the entry's colour, with the braces taken out: it is
+        // not the flag, and no segment of the flag's role exists for it.
+        let mut liar = pane("claude", true, false);
+        liar.badge = crate::attention::pane_badge(Some("x] {mod off} [y"), "claude");
+        let segs = bar_segments(&[liar.clone()], "");
+        assert!(!segs.iter().any(|s| matches!(s.role, Role::ModFlag)));
+        let text = bar_text(&[liar], 80, "");
+        assert!(!text.contains("{mod off}"), "{text}");
+        // No flag, no segment.
+        let segs = bar_segments(&[pane("claude", true, false)], "");
+        assert!(!segs.iter().any(|s| matches!(s.role, Role::ModFlag)));
+    }
+
+    #[test]
     fn a_panes_own_title_is_a_bracketed_badge_before_the_marker() {
         // The program's title rides after the name (and the role) and before
         // the state marker; a pane without one is unchanged.
@@ -404,6 +446,7 @@ mod tests {
             identity: None,
             role: None,
             badge: None,
+            mod_note: None,
         }
     }
 
@@ -416,6 +459,7 @@ mod tests {
             identity: None,
             role: None,
             badge: None,
+            mod_note: None,
         }
     }
 

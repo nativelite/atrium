@@ -596,7 +596,8 @@ fn spawn_pane_as(
             true,
             atrium::modfiles::inject_dir(
                 true,
-                atrium::modfiles::session_tripped().is_some(),
+                atrium::modfiles::session_tripped().is_some()
+                    || atrium::modfiles::session_unloadable(),
                 installed.as_deref(),
             ),
             std::env::var(atrium::modfiles::ENV_PLUGIN_DIRS)
@@ -801,10 +802,15 @@ fn agent_args(
     // and before the folded system prompt, which terminates the variadic list —
     // the same placement `--allowedTools` relies on.
     if is_claude {
-        base.extend(atrium::trust::deny_args(
-            &atrium::trust::session_deny(),
-            deny,
-        ));
+        // A session whose subagent policy is `deny` holds it here too, as a
+        // tool rule Claude Code enforces itself: the mod's refusal of the
+        // Agent tool is only as good as the mod, and a pane's mod can fail.
+        let mut session = atrium::trust::session_deny();
+        session.extend(
+            atrium::modstate::subagent_deny(&atrium::modstate::session_subagents().0)
+                .map(str::to_string),
+        );
+        base.extend(atrium::trust::deny_args(&session, deny));
     }
     // When the ctl channel is live, teach every agent pane — the initial one and
     // ctl-spawned workers alike — to delegate through `atrium ctl` (visible panes)

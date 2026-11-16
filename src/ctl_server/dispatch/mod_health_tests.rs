@@ -1,11 +1,11 @@
 //! The mod's health through the control plane (PLAN 0.48.0, S1 and S2): what
-//! a pane's mod may say of its own failures and what that can do, and that a
-//! pane whose mod is gone, or was set aside, is a pane text is typed into,
-//! against real panes.
+//! a pane's mod may say of its own failures and what that can do, who may say
+//! it at all, and that a pane whose mod is gone, or was set aside, is a pane
+//! text is typed into, against real panes.
 
 use super::super::panes::pane_by_agent_mut;
 use super::super::sends::{backdate, flush_sends, stages};
-use super::operator_tests::{err, ok, operators, s, Fx};
+use super::operator_tests::{err, ok, op, operators, s, Fx, BRIDGE};
 use super::*;
 use atrium::modstate::{HealthEvent, PaneSeen, HELLO_WINDOW_MS, MOD_SET_ASIDE};
 use json::Value;
@@ -20,6 +20,9 @@ fn call(fx: &mut Fx, token: &str, body: &str) -> Value {
 }
 
 const HELLO: &str = r#""cmd":"hello","mod":"0.3.0","caps":"status,inbox,answer""#;
+/// Five failures of its own hooks: what sets a pane's mod aside.
+const FIVE: &str =
+    r#""cmd":"report","fail":"tool.call:5","fail_class":"hook","fail_at":"tool.call""#;
 
 /// Health ticks a second apart over `[from, to]`, every live pane seen started.
 fn ticks(fx: &mut Fx, from: u64, to: u64) -> Vec<HealthEvent> {
@@ -39,6 +42,12 @@ fn ticks(fx: &mut Fx, from: u64, to: u64) -> Vec<HealthEvent> {
         t += 1_000;
     }
     all
+}
+
+fn tripped(events: &[HealthEvent]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, HealthEvent::Tripped { .. }))
 }
 
 /// One pass of the delivery flush, with every pane drawn and quiet and every
@@ -70,6 +79,23 @@ fn send(fx: &mut Fx, from: &str, to: AgentId, text: &str) -> Value {
     )
 }
 
+/// A claude pane atrium launched with the mod, which said hello.
+fn modded(fx: &mut Fx, role: &str, parent: Option<AgentId>) -> (AgentId, String) {
+    let (id, tok) = fx.agent_pane(role, parent);
+    fx.mods.expect_mod(id.0);
+    let hello = call(fx, &tok, HELLO);
+    assert!(ok(&hello), "{hello}");
+    (id, tok)
+}
+
+fn status_of(fx: &mut Fx, as_token: &str, pane: AgentId) -> Value {
+    call(
+        fx,
+        as_token,
+        &format!(r#""cmd":"status","target":"{pane}""#),
+    )
+}
+
 #[test]
 fn a_pane_launched_with_the_mod_that_never_says_hello_gets_its_send_typed() {
     let mut fx = Fx::new();
@@ -86,8 +112,7 @@ fn a_pane_launched_with_the_mod_that_never_says_hello_gets_its_send_typed() {
     assert_eq!(stages(&fx.pending)[0].2, "typed");
     flush(&mut fx);
     assert!(fx.pending.is_empty(), "delivered, not lost");
-    // The window runs out: the pane is set aside, and stays a typed pane
-    // even if a hello arrives after all.
+    // The window runs out: the pane is set aside.
     let events = ticks(&mut fx, 0, HELLO_WINDOW_MS);
     assert!(
         events.contains(&HealthEvent::SetAside {
@@ -102,23 +127,26 @@ fn a_pane_launched_with_the_mod_that_never_says_hello_gets_its_send_typed() {
 fn a_send_waiting_on_a_mod_that_is_set_aside_is_typed_not_lost() {
     let mut fx = Fx::new();
     let (_lead, lead_tok) = fx.pane("lead", None);
-    let (worker, worker_tok) = fx.agent_pane("worker", None);
-    let hello = call(&mut fx, &worker_tok, HELLO);
-    assert!(ok(&hello), "{hello}");
+    let (worker, worker_tok) = modded(&mut fx, "worker", None);
     assert!(fx.mods.has_cap(worker.0, "inbox"));
+    // Its mod reported `working` a moment ago.
+    assert!(ok(&call(
+        &mut fx,
+        &worker_tok,
+        r#""cmd":"report","status":"working""#
+    )));
     assert!(ok(&send(&mut fx, &lead_tok, worker, "run the tests")));
     // The mod collects its own deliveries: atrium types nothing.
     flush(&mut fx);
     flush(&mut fx);
     assert_eq!(stages(&fx.pending)[0].2, "queued");
-    // Its mod reports that the plugin interface changed under it.
-    let told = call(
-        &mut fx,
-        &worker_tok,
-        r#""cmd":"report","fail":"feature.inbox:1","fail_class":"api","fail_msg":"HooksError: no implementation for prompt.submit""#,
-    );
+    // Its mod reports that its hooks keep failing.
+    let told = call(&mut fx, &worker_tok, FIVE);
     assert!(err(&told).starts_with(MOD_SET_ASIDE), "{told}");
     assert!(!fx.mods.has_cap(worker.0, "inbox"));
+    // The status its mod held is dropped at once, not in two minutes.
+    let seen = status_of(&mut fx, &lead_tok, worker);
+    assert_eq!(seen.get("status"), Some(&Value::Null), "{seen}");
     // The same queue entry is now the pty path's.
     flush(&mut fx);
     assert_eq!(stages(&fx.pending)[0].2, "typed");
@@ -135,11 +163,7 @@ fn a_send_waiting_on_a_mod_that_is_set_aside_is_typed_not_lost() {
         r#""cmd":"report","status":"waiting-approval""#,
     );
     assert!(ok(&hooked), "{hooked}");
-    let seen = call(
-        &mut fx,
-        &lead_tok,
-        &format!(r#""cmd":"status","target":"{worker}""#),
-    );
+    let seen = status_of(&mut fx, &lead_tok, worker);
     assert_eq!(s(&seen, "status"), "waiting-approval", "{seen}");
     // What only a mod sends is the mod still talking: refused.
     let caption = call(
@@ -162,19 +186,51 @@ fn a_send_waiting_on_a_mod_that_is_set_aside_is_typed_not_lost() {
 }
 
 #[test]
+fn a_mod_that_lost_its_inbox_keeps_the_rest_and_its_queue_is_typed() {
+    let mut fx = Fx::new();
+    let (_lead, lead_tok) = fx.pane("lead", None);
+    let (worker, worker_tok) = modded(&mut fx, "worker", None);
+    assert!(ok(&send(&mut fx, &lead_tok, worker, "run the tests")));
+    flush(&mut fx);
+    assert_eq!(stages(&fx.pending)[0].2, "queued");
+    // This Claude Code has no `$.prompt.submit`: one feature is gone.
+    let told = call(
+        &mut fx,
+        &worker_tok,
+        r#""cmd":"report","fail":"feature.inbox:1","fail_class":"api","fail_at":"feature.inbox","fail_msg":"HooksError: no implementation for prompt.submit""#,
+    );
+    assert!(ok(&told), "one lost feature is not a broken mod: {told}");
+    assert_eq!(fx.mods.aside(worker.0), None);
+    assert!(!fx.mods.has_cap(worker.0, "inbox"));
+    assert!(fx.mods.has_cap(worker.0, "status") && fx.mods.has_cap(worker.0, "answer"));
+    // What was queued for the inbox is typed.
+    flush(&mut fx);
+    assert_eq!(stages(&fx.pending)[0].2, "typed");
+    // Its status and its answer still count, and `status` says what it lost.
+    assert!(ok(&call(
+        &mut fx,
+        &worker_tok,
+        r#""cmd":"report","status":"working","answer":"done""#
+    )));
+    let seen = status_of(&mut fx, &lead_tok, worker);
+    let m = seen.get("mod").expect("its mod is shown");
+    assert_eq!(s(m, "state"), "ok", "{seen}");
+    assert_eq!(
+        m.get("lost").and_then(Value::as_array).map(<[Value]>::len),
+        Some(1),
+        "{seen}"
+    );
+    assert_eq!(s(&seen, "status"), "working");
+}
+
+#[test]
 fn a_mod_that_stops_collecting_gives_its_queue_back_to_the_pty_path() {
     let mut fx = Fx::new();
     let (_lead, lead_tok) = fx.pane("lead", None);
-    let (worker, worker_tok) = fx.agent_pane("worker", None);
-    assert!(ok(&call(&mut fx, &worker_tok, HELLO)));
+    let (worker, worker_tok) = modded(&mut fx, "worker", None);
     assert!(ok(&send(&mut fx, &lead_tok, worker, "run the tests")));
-    let hello_at = atrium::session_store::now_ms();
     // It never asks for its inbox. Three minutes on, the cap is taken back.
-    let events = ticks(
-        &mut fx,
-        hello_at,
-        hello_at + atrium::modstate::INBOX_SILENT_MS + 3_000,
-    );
+    let events = ticks(&mut fx, 0, atrium::modstate::INBOX_SILENT_MS + 3_000);
     assert!(
         events.contains(&HealthEvent::InboxLost { pane: worker.0 }),
         "{events:?}"
@@ -187,13 +243,62 @@ fn a_mod_that_stops_collecting_gives_its_queue_back_to_the_pty_path() {
 }
 
 #[test]
+fn only_a_pane_that_has_a_mod_may_report_a_mods_failures() {
+    let mut fx = Fx::new();
+    let (_lead, lead_tok) = fx.pane("lead", None);
+    const LIE: &str =
+        r#""cmd":"report","fail":"session.start:9","fail_class":"api","fail_at":"session.start""#;
+    // A shell; a claude pane atrium launched without the mod; a codex pane.
+    let (shell, shell_tok) = fx.pane("shell", None);
+    let (bare, bare_tok) = fx.agent_pane("bare-claude", None);
+    let (codex, codex_tok) = fx.agent_pane("codex", None);
+    pane_by_agent_mut(&mut fx.windows, codex)
+        .expect("pane")
+        .argv = vec!["codex".to_string()];
+    for (id, tok) in [(shell, &shell_tok), (bare, &bare_tok), (codex, &codex_tok)] {
+        for _ in 0..3 {
+            let v = call(&mut fx, tok, LIE);
+            assert!(err(&v).contains("has no mod"), "{v}");
+        }
+        assert_eq!(fx.mods.failures_for(id.0), None);
+        assert_eq!(fx.mods.aside(id.0), None);
+        let seen = status_of(&mut fx, &lead_tok, id);
+        assert!(seen.get("mod").is_none(), "{seen}");
+        // Its `answer` says the same, which is how a parent's mod knows no
+        // answer will ever come from it.
+        let answer = call(
+            &mut fx,
+            &lead_tok,
+            &format!(r#""cmd":"answer","target":"{id}""#),
+        );
+        assert!(ok(&answer) && answer.get("mod").is_none(), "{answer}");
+        // The rest of such a request is refused with it: nothing changes.
+        let v = call(
+            &mut fx,
+            tok,
+            r#""cmd":"report","status":"working","fail":"x:1""#,
+        );
+        assert!(!ok(&v), "{v}");
+        let seen = status_of(&mut fx, &lead_tok, id);
+        assert_eq!(seen.get("status"), Some(&Value::Null), "{seen}");
+    }
+    // An operator is nobody's mod: `report` is not a verb it has.
+    let v = fx.apply(&operators(&[]), &op(BRIDGE, LIE));
+    assert!(!ok(&v), "{v}");
+    // Three panes, nine reports: no counter moved, nothing tripped.
+    let metrics = fx.apply(&operators(&[]), r#"{"cmd":"metrics"}"#);
+    assert_eq!(metrics.get("mod_failures").and_then(Value::as_i64), Some(0));
+    let events = ticks(&mut fx, 0, 5_000);
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(fx.mods.tripped(), None);
+}
+
+#[test]
 fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane() {
     let mut fx = Fx::new();
     let (_lead, lead_tok) = fx.pane("lead", None);
-    let (a, a_tok) = fx.agent_pane("a", None);
-    let (b, b_tok) = fx.agent_pane("b", None);
-    assert!(ok(&call(&mut fx, &a_tok, HELLO)));
-    assert!(ok(&call(&mut fx, &b_tok, HELLO)));
+    let (a, a_tok) = modded(&mut fx, "a", None);
+    let (b, b_tok) = modded(&mut fx, "b", None);
     // A hostile message: escapes, a bidi override, far too long.
     let msg = format!("Error: boom \\u001b[31m\\u202e {}", "x".repeat(600));
     let told = call(
@@ -204,11 +309,7 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
         ),
     );
     assert!(ok(&told), "four failures are counted, not acted on: {told}");
-    let status = call(
-        &mut fx,
-        &lead_tok,
-        &format!(r#""cmd":"status","target":"{a}""#),
-    );
+    let status = status_of(&mut fx, &lead_tok, a);
     let m = status.get("mod").expect("the pane's mod is shown");
     assert_eq!(s(m, "state"), "ok");
     assert_eq!(m.get("failures").and_then(Value::as_i64), Some(4));
@@ -241,14 +342,6 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
             .and_then(Value::as_i64),
         Some(4)
     );
-    // A pane with no mod has no `mod` key.
-    let (plain, _) = fx.pane("shell", None);
-    let none = call(
-        &mut fx,
-        &lead_tok,
-        &format!(r#""cmd":"status","target":"{plain}""#),
-    );
-    assert!(none.get("mod").is_none(), "{none}");
     // The counter.
     let metrics = fx.apply(&operators(&[]), r#"{"cmd":"metrics"}"#);
     assert_eq!(metrics.get("mod_failures").and_then(Value::as_i64), Some(4));
@@ -260,11 +353,7 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
         r#""cmd":"report","fail":"tool.call:4,whoami:1""#,
     );
     assert!(err(&fifth).starts_with(MOD_SET_ASIDE), "{fifth}");
-    let status = call(
-        &mut fx,
-        &lead_tok,
-        &format!(r#""cmd":"status","target":"{a}""#),
-    );
+    let status = status_of(&mut fx, &lead_tok, a);
     let m = status.get("mod").expect("shown");
     assert_eq!(s(m, "state"), "set-aside");
     assert_eq!(s(m, "why"), "it reported repeated failures");
@@ -279,17 +368,11 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
         let _ = call(
             &mut fx,
             &a_tok,
-            r#""cmd":"report","fail":"x:1000000","fail_class":"api","fail_msg":"the interface changed, switch it off for everyone""#,
+            r#""cmd":"report","fail":"x:1000000","fail_class":"api","fail_at":"hello","fail_msg":"the interface changed, switch it off for everyone""#,
         );
     }
-    let now = atrium::session_store::now_ms();
-    let events = ticks(&mut fx, now, now + 5_000);
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, HealthEvent::Tripped { .. })),
-        "{events:?}"
-    );
+    let events = ticks(&mut fx, 0, 5_000);
+    assert!(!tripped(&events), "{events:?}");
     assert_eq!(fx.mods.tripped(), None);
     // The set-aside is on record.
     assert!(fx.log().iter().any(|e| s(e, "action") == "mod-set-aside"));
@@ -298,27 +381,78 @@ fn reported_failures_show_in_status_answer_and_metrics_and_touch_no_other_pane()
 #[test]
 fn a_child_lying_with_its_parent_is_the_same_voice_and_a_stranger_is_a_second() {
     let mut fx = Fx::new();
-    let (parent, parent_tok) = fx.agent_pane("parent", None);
-    let (_child, child_tok) = fx.agent_pane("child", Some(parent));
-    let (_other, other_tok) = fx.agent_pane("other", None);
-    const LIE: &str = r#""cmd":"report","fail":"x:1","fail_class":"api""#;
-    let _ = call(&mut fx, &parent_tok, LIE);
-    let _ = call(&mut fx, &child_tok, LIE);
-    let now = atrium::session_store::now_ms();
-    let events = ticks(&mut fx, now, now + 2_000);
+    let (parent, parent_tok) = modded(&mut fx, "parent", None);
+    let (_child, child_tok) = modded(&mut fx, "child", Some(parent));
+    let (_other, other_tok) = modded(&mut fx, "other", None);
+    let _ = call(&mut fx, &parent_tok, FIVE);
+    let _ = call(&mut fx, &child_tok, FIVE);
+    let events = ticks(&mut fx, 0, 2_000);
+    assert!(!tripped(&events), "{events:?}");
+    // A pane the parent did not spawn says the same: two voices. Enough for
+    // this session, and never for the next: it is their word, not atrium's.
+    let _ = call(&mut fx, &other_tok, FIVE);
+    let events = ticks(&mut fx, 3_000, 4_000);
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, HealthEvent::Tripped { .. })),
+        events.iter().any(|e| matches!(
+            e,
+            HealthEvent::Tripped {
+                remember: false,
+                ..
+            }
+        )),
         "{events:?}"
     );
-    // A pane the parent did not spawn says the same: two voices.
-    let _ = call(&mut fx, &other_tok, LIE);
-    let events = ticks(&mut fx, now + 3_000, now + 4_000);
+    // Every pane's mod learns it: the session's mod is backed out.
+    let who = call(&mut fx, &other_tok, r#""cmd":"whoami""#);
+    assert_eq!(who.get("mod_tripped"), Some(&Value::Bool(true)), "{who}");
+}
+
+#[test]
+fn a_pane_respawned_through_ctl_is_the_voice_it_was() {
+    let mut fx = Fx::new();
+    let (_lead, lead_tok) = fx.pane("lead", None);
+    let (worker, worker_tok) = fx.agent_pane("worker", None);
+    let who = call(&mut fx, &worker_tok, r#""cmd":"whoami""#);
+    assert_eq!(who.get("mod_tripped"), Some(&Value::Bool(false)), "{who}");
+    // A shell stands in for the claude, so the respawn has something to run.
+    let shell = pane_by_agent_mut(&mut fx.windows, worker)
+        .expect("the pane")
+        .title
+        .clone();
+    pane_by_agent_mut(&mut fx.windows, worker)
+        .expect("the pane")
+        .argv = vec![shell];
+    let mut id = worker;
+    let mut t = 0;
+    // Launched with the mod, it misses its window; the human respawns it;
+    // it misses again; and again. One seat, one voice.
+    for round in 0..3 {
+        fx.mods.expect_mod(id.0);
+        let events = ticks(&mut fx, t, t + HELLO_WINDOW_MS + 1_000);
+        assert!(fx.mods.aside(id.0).is_some(), "round {round}: {events:?}");
+        assert!(!tripped(&events), "round {round}: {events:?}");
+        t += HELLO_WINDOW_MS + 2_000;
+        let v = call(
+            &mut fx,
+            &lead_tok,
+            &format!(r#""cmd":"respawn","target":"{id}""#),
+        );
+        assert!(ok(&v), "{v}");
+        let new_id = AgentId(v.get("pane").and_then(Value::as_i64).expect("a pane") as usize);
+        assert_ne!(new_id, id);
+        assert_eq!(fx.mods.aside(new_id.0), None, "a new process starts clean");
+        id = new_id;
+    }
+    assert_eq!(fx.mods.tripped(), None);
+    // A second seat missing its window is the second voice, and atrium saw
+    // both itself: this one is remembered.
+    let (other, _) = fx.agent_pane("other", None);
+    fx.mods.expect_mod(other.0);
+    let events = ticks(&mut fx, t, t + HELLO_WINDOW_MS + 1_000);
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, HealthEvent::Tripped { .. })),
+            .any(|e| matches!(e, HealthEvent::Tripped { remember: true, .. })),
         "{events:?}"
     );
 }
@@ -326,15 +460,16 @@ fn a_child_lying_with_its_parent_is_the_same_voice_and_a_stranger_is_a_second() 
 #[test]
 fn a_malformed_failure_report_is_refused_whole() {
     let mut fx = Fx::new();
-    let (a, a_tok) = fx.agent_pane("a", None);
-    assert!(ok(&call(&mut fx, &a_tok, HELLO)));
+    let (a, a_tok) = modded(&mut fx, "a", None);
     for body in [
         r#""cmd":"report","fail":"no-count""#,
         r#""cmd":"report","fail":"a b:1""#,
         r#""cmd":"report","fail":["a:1"]"#,
         r#""cmd":"report","fail":"a:1","fail_class":"catastrophe""#,
         r#""cmd":"report","fail":"a:1","fail_msg":7"#,
+        r#""cmd":"report","fail":"a:1","fail_at":"a b""#,
         r#""cmd":"report","fail_class":"api""#,
+        r#""cmd":"report","fail_at":"hello""#,
         r#""cmd":"report","fail_msg":"only words""#,
     ] {
         let v = call(&mut fx, &a_tok, body);
@@ -343,7 +478,7 @@ fn a_malformed_failure_report_is_refused_whole() {
     assert_eq!(fx.mods.failures_for(a.0), None);
     assert_eq!(fx.mods.aside(a.0), None);
     // Nobody reports for someone else: the pane is the token's.
-    let (b, _) = fx.agent_pane("b", None);
+    let (b, _) = modded(&mut fx, "b", None);
     let v = call(
         &mut fx,
         &a_tok,
@@ -354,46 +489,44 @@ fn a_malformed_failure_report_is_refused_whole() {
 }
 
 #[test]
-fn the_relaunch_gives_the_pane_a_new_process_under_a_new_id() {
+fn a_delivery_whose_reply_never_arrived_is_queued_again() {
     let mut fx = Fx::new();
-    let (worker, _) = fx.agent_pane("worker", None);
-    // A shell stands in for the claude that never started.
-    let shell = pane_by_agent_mut(&mut fx.windows, worker)
-        .expect("the pane")
-        .title
-        .clone();
-    pane_by_agent_mut(&mut fx.windows, worker)
-        .expect("the pane")
-        .argv = vec![shell];
-    fx.mods.expect_mod(worker.0);
-    let mut hold = None;
-    let reply = mod_relaunch(
-        worker,
-        &mut CtlSession {
-            windows: &mut fx.windows,
-            rows: 24,
-            cols: 80,
-            max_depth: fx.max_depth,
-            extra_allow: &fx.extra_allow,
-            pending: &mut fx.pending,
-            world: &fx.world,
-            session_identity: None,
-            audit: &mut fx.audit,
-            board: &mut fx.board,
-            bus: &mut fx.bus,
-            mods: &mut fx.mods,
-            hold: &mut hold,
-            held_inboxes: 0,
-            flash: &mut fx.flash,
+    let (worker, _) = modded(&mut fx, "worker", None);
+    // What a held `inbox --wait` was answered with, on a connection that was
+    // already gone: a send, a wake, and a question.
+    let items = vec![
+        ctl::InboxItem {
+            kind: "send".to_string(),
+            text: "[atrium: from pane 0] run the tests".to_string(),
+            id: None,
         },
+        ctl::InboxItem {
+            kind: "wake".to_string(),
+            text: "[atrium bus #4] work: done".to_string(),
+            id: None,
+        },
+        ctl::InboxItem {
+            kind: "ask".to_string(),
+            text: "what are you doing".to_string(),
+            id: Some(3),
+        },
+    ];
+    assert_eq!(requeue_inbox(&mut fx.pending, worker, &items), 2);
+    // The mod's next poll collects them, in order, as it would have.
+    let again = inbox_items(worker, &mut fx.pending, &mut fx.mods);
+    assert_eq!(
+        again
+            .iter()
+            .map(|i| (i.kind.as_str(), i.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("send", "[atrium: from pane 0] run the tests"),
+            ("wake", "[atrium bus #4] work: done"),
+        ]
     );
-    let ctl::Reply::Spawned { pane: new_id, .. } = reply else {
-        panic!("the relaunch is a respawn: {}", reply.to_json());
-    };
-    assert_ne!(new_id, worker);
-    // The old id is forgotten and the new one was never expected: the
-    // breaker has nothing left to relaunch a second time.
-    assert!(!fx.mods.expects(worker.0));
-    assert!(!fx.mods.expects(new_id.0));
-    assert!(fx.log().iter().any(|e| s(e, "action") == "mod-relaunch"));
+    // And if the mod has lost its inbox by then, they are typed.
+    assert_eq!(requeue_inbox(&mut fx.pending, worker, &items), 2);
+    let _ = ticks(&mut fx, 0, atrium::modstate::INBOX_SILENT_MS + 3_000);
+    flush(&mut fx);
+    assert_eq!(stages(&fx.pending)[0].2, "typed");
 }

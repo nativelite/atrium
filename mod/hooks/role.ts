@@ -20,6 +20,11 @@ export type Who = {
   subagentsKeep: boolean
   /** May the mod spend a small model call on this pane's caption? */
   captions: boolean
+  /**
+   * The session's mod was backed out: a pane spawned now has no mod, so it
+   * reports no answer, and a subagent cannot be run as a pane.
+   */
+  modTripped: boolean
 }
 
 /** A `whoami` reply as `Who`, or undefined when it is not one. */
@@ -43,6 +48,7 @@ export function parseWho(reply: Record<string, unknown>): Who | undefined {
     subagents: str('subagents') ?? 'panes',
     subagentsKeep: reply.subagents_keep === true,
     captions: reply.captions === true,
+    modTripped: reply.mod_tripped === true,
   }
 }
 

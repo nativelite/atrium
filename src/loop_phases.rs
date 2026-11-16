@@ -360,42 +360,173 @@ pub(crate) fn adopt_sessions(windows: &mut [Window], world: &atrium::vendors::Ag
     }
 }
 
-/// A window's badge with the flag on its pane's mod beside it: `mod off` for
-/// a pane whose mod was set aside, `mod backed out` for one that still runs
-/// with the mod loaded after the breaker tripped.
-pub(crate) fn mod_flagged_badge(
-    badge: Option<String>,
-    note: Option<&'static str>,
-) -> Option<String> {
-    match (badge, note) {
-        (Some(b), Some(n)) => Some(format!("{b} \u{00B7} {n}")),
-        (None, Some(n)) => Some(n.to_string()),
-        (b, None) => b,
-    }
+/// Is the agent in a pane up, as far as atrium can tell, so that its mod
+/// could have said hello by now? One of three things, each of which this
+/// very process caused:
+///
+/// - its vendor's prompt hint is on its screen (what a queued send waits for);
+/// - something reported a status for it through `ctl report` (its status
+///   hooks or its mod: either means the engine is running this pane's hooks);
+/// - its session's transcript holds an event newer than the pane's launch.
+///
+/// A status that merely *exists* is not enough: a resumed or recovered
+/// session has a transcript, and a status inferred from it, before its
+/// claude has drawn a thing. Nor is a startup dialog (folder trust, a login),
+/// however long it sits there. Pure.
+pub(crate) fn started_by(
+    hint_on_screen: bool,
+    reported: bool,
+    transcript_ms: Option<u64>,
+    launch_ms: u64,
+) -> bool {
+    hint_on_screen || reported || transcript_ms.is_some_and(|t| t > launch_ms)
 }
 
-/// Is the agent in `pane` up, as far as atrium can tell: its vendor's prompt
-/// hint is on its screen (what a queued send waits for, `vendors::prompt_marker`),
-/// or a status is known for its session (its transcript exists, or its status
-/// hooks spoke)? The moment the mod's hello window starts
-/// (`atrium::modstate::HELLO_WINDOW_MS`). A pane showing a startup dialog
-/// (folder trust, a login) is not up, however long it sits there.
-pub(crate) fn pane_started(pane: &Pane, world: &atrium::vendors::AgentState) -> bool {
-    if world.status_for(pane.session_id.as_deref()).is_some() {
-        return true;
-    }
-    atrium::vendors::vendor_for_stem(&pane.title)
+/// [`started_by`] for a live pane.
+pub(crate) fn pane_started(
+    pane: &Pane,
+    world: &atrium::vendors::AgentState,
+    mods: &atrium::modstate::ModState,
+) -> bool {
+    let hint = atrium::vendors::vendor_for_stem(&pane.title)
         .and_then(atrium::vendors::prompt_marker)
-        .is_some_and(|hint| crate::ctl_server::screen_has(pane.term.screen(), hint))
+        .is_some_and(|hint| crate::ctl_server::screen_has(pane.term.screen(), hint));
+    let reported = mods
+        .report_for(pane.agent_id.0)
+        .is_some_and(|r| r.status.is_some());
+    let transcript_ms = pane.session_id.as_deref().and_then(|id| {
+        world
+            .sessions()
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.last_ts_ms)
+    });
+    started_by(hint, reported, transcript_ms, pane.launch_ms)
+}
+
+/// Does this session have a mod whose health is atrium's to watch: it uses
+/// the mod (`"mod": false` in the config or the fleet says no), it has a
+/// control plane for a hello to arrive on, and it has launched at least one
+/// pane with the mod? Otherwise the health phase does nothing: no window, no
+/// bar line, no decision, no record, whatever any pane reports. Pure.
+pub(crate) fn health_runs(enabled: bool, ctl_on: bool, ever_injected: bool) -> bool {
+    enabled && ctl_on && ever_injected
+}
+
+/// The bar's one flash slot: a line and when it was raised.
+pub(crate) type Flash = Option<(String, Instant)>;
+
+/// What the health phase writes to, lent for one pass.
+pub(crate) struct HealthOut<'a> {
+    pub(crate) flash: &'a mut Option<(String, Instant)>,
+    pub(crate) audit: &'a mut atrium::audit::Audit,
+    pub(crate) bus: &'a mut atrium::bus::Bus,
+}
+
+/// Act on what a health tick found (`atrium::modstate::HealthEvent`): say
+/// each on the bar (`said` is called before each new line, so a headless
+/// session prints every one), record it, and for a trip post the one
+/// decision that offers a respawn of the panes still running the mod.
+/// Nothing here restarts, kills or types into a pane. `label` names a pane
+/// for a person; `recovered` and `trip` are `atrium::modfiles`' two calls,
+/// passed in so this is testable without the session's globals.
+pub(crate) fn apply_health_events(
+    events: Vec<atrium::modstate::HealthEvent>,
+    now_ms: u64,
+    out: &mut HealthOut<'_>,
+    label: &dyn Fn(usize) -> Option<String>,
+    said: &mut dyn FnMut(&mut Flash),
+    recovered: &mut dyn FnMut() -> Option<String>,
+    trip: &mut dyn FnMut(&str, bool) -> bool,
+) {
+    use atrium::modstate::HealthEvent;
+    for event in events {
+        said(out.flash);
+        match event {
+            HealthEvent::Healthy { .. } => {
+                if let Some(line) = recovered() {
+                    out.audit.record(None, "mod-back", "", true, "");
+                    *out.flash = Some((line, Instant::now()));
+                }
+            }
+            HealthEvent::SetAside { pane, why } => {
+                out.audit.record(
+                    None,
+                    "mod-set-aside",
+                    &format!("pane={pane}"),
+                    true,
+                    why.label(),
+                );
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: mod set aside ({}); it runs as a pane without one \
+                         (sends are typed)",
+                        why.label()
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::InboxLost { pane } => {
+                out.audit
+                    .record(None, "mod-inbox-lost", &format!("pane={pane}"), true, "");
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: its mod stopped collecting deliveries; sends are typed \
+                         into it now"
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::FeatureLost { pane, feature } => {
+                out.audit.record(
+                    None,
+                    "mod-feature-lost",
+                    &format!("pane={pane} feature={feature}"),
+                    true,
+                    "",
+                );
+                *out.flash = Some((
+                    format!(
+                        "pane {pane}: its mod lost `{feature}` (this Claude Code lacks what it \
+                         calls); the rest of the mod goes on"
+                    ),
+                    Instant::now(),
+                ));
+            }
+            HealthEvent::Tripped {
+                reason,
+                running,
+                remember,
+            } => {
+                let remembered = trip(&reason, remember);
+                let labels: Vec<String> = running.iter().filter_map(|id| label(*id)).collect();
+                out.audit.record(
+                    None,
+                    "mod-breaker",
+                    &format!("running={} remembered={remembered}", labels.len()),
+                    true,
+                    &reason,
+                );
+                if !labels.is_empty() {
+                    if let Err(e) = out.bus.publish(
+                        "atrium",
+                        atrium::bus::Kind::DecisionNeeded,
+                        None,
+                        &[("msg".to_string(), trip_decision(&reason, &labels))],
+                        now_ms,
+                    ) {
+                        out.audit
+                            .record(None, "mod-breaker", "decision not posted", false, &e);
+                    }
+                }
+                *out.flash = Some((trip_line(&reason, remembered, labels.len()), Instant::now()));
+            }
+        }
+    }
 }
 
 /// The one line the bar says when the breaker trips.
-pub(crate) fn trip_line(
-    reason: &str,
-    remembered: bool,
-    relaunched: usize,
-    running: usize,
-) -> String {
+pub(crate) fn trip_line(reason: &str, remembered: bool, running: usize) -> String {
     let mut line = format!(
         "mod backed out: {reason}. New claude panes launch without it{}",
         if remembered {
@@ -404,17 +535,12 @@ pub(crate) fn trip_line(
             " for this session"
         }
     );
-    if relaunched > 0 {
-        line.push_str(&format!(
-            "; {relaunched} pane{} that had not started {} relaunched without it",
-            if relaunched == 1 { "" } else { "s" },
-            if relaunched == 1 { "was" } else { "were" }
-        ));
-    }
     if running > 0 {
         line.push_str(&format!(
-            "; {running} running pane{} left as {} (see the bus)",
+            "; the {running} pane{} that {} it {} left as {} (see the bus)",
             if running == 1 { "" } else { "s" },
+            if running == 1 { "has" } else { "have" },
+            if running == 1 { "is" } else { "are" },
             if running == 1 { "it is" } else { "they are" }
         ));
     }
@@ -449,12 +575,12 @@ pub(crate) fn bar_infos(
             title: w.bar_pane().map(|p| p.title.clone()).unwrap_or_default(),
             // The pane's own title (`OSC 0`/`2`, kept by its emulator), as
             // its badge; never when it only repeats the program.
-            badge: mod_flagged_badge(
-                w.bar_pane()
-                    .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
-                w.bar_pane()
-                    .and_then(|p| world.mod_note_for(p.session_id.as_deref())),
-            ),
+            badge: w
+                .bar_pane()
+                .and_then(|p| atrium::attention::pane_badge(p.term.title(), &p.title)),
+            // The flag on its mod, from the broker's state, in a segment of
+            // its own: a pane's title cannot spell it.
+            mod_note: w.bar_pane().and_then(|p| world.mod_note_for(p.agent_id.0)),
             active: i == active,
             // A window is "waiting" when a bound agent pane in it is blocked
             // on the human (§4.2 rung 3). Status only.
@@ -747,31 +873,30 @@ mod tests {
     }
 
     /// The breaker's one bar line says why, what happens to new panes, for
-    /// how long, and what became of the panes that were there.
+    /// how long, and that nothing running was touched.
     #[test]
-    fn the_trip_line_says_why_how_long_and_what_became_of_each_pane() {
+    fn the_trip_line_says_why_how_long_and_that_running_panes_are_left() {
         use super::trip_line;
-        let line = trip_line("2 claude panes loaded it and never said hello", true, 1, 2);
+        let line = trip_line("2 claude panes loaded it and never said hello", true, 2);
         assert!(line.starts_with("mod backed out: 2 claude panes loaded it and never said hello."));
         assert!(
             line.contains("until Claude Code or the mod changes"),
             "{line}"
         );
         assert!(
-            line.contains("1 pane that had not started was relaunched without it"),
+            line.contains("the 2 panes that have it are left as they are"),
             "{line}"
         );
-        assert!(line.contains("2 running panes left as they are"), "{line}");
+        assert!(!line.contains("relaunch"), "{line}");
         assert!(line.ends_with("`atrium mod status` says more"), "{line}");
-        let session_only = trip_line("why", false, 0, 0);
+        let session_only = trip_line("why", false, 0);
         assert!(session_only.contains("for this session"), "{session_only}");
-        assert!(!session_only.contains("relaunched") && !session_only.contains("running"));
-        let two = trip_line("why", true, 2, 1);
+        assert!(!session_only.contains("left as"));
+        let one = trip_line("why", true, 1);
         assert!(
-            two.contains("2 panes that had not started were relaunched"),
-            "{two}"
+            one.contains("the 1 pane that has it is left as it is"),
+            "{one}"
         );
-        assert!(two.contains("1 running pane left as it is"), "{two}");
     }
 
     /// A working pane is offered a respawn on the bus, by name, never given one.
@@ -791,16 +916,146 @@ mod tests {
         );
     }
 
-    /// The bar flags a pane's mod beside whatever badge it already had.
+    /// The hello window opens on something this process's pane did: a status
+    /// that was already there for a resumed or recovered session is not it.
     #[test]
-    fn a_flag_on_the_mod_joins_the_windows_badge() {
-        use super::mod_flagged_badge as badge;
-        assert_eq!(badge(None, None), None);
-        assert_eq!(badge(Some("build".into()), None), Some("build".to_string()));
-        assert_eq!(badge(None, Some("mod off")), Some("mod off".to_string()));
-        assert_eq!(
-            badge(Some("build".into()), Some("mod backed out")),
-            Some("build \u{00B7} mod backed out".to_string())
+    fn a_pane_is_started_by_its_own_doing_not_by_a_transcript_that_was_already_there() {
+        use super::started_by;
+        let launch: u64 = 10_000_000;
+        // A recovered session: its transcript, and the status inferred from
+        // it, are an hour old when the pane is launched. Not started.
+        assert!(!started_by(false, false, Some(launch - 3_600_000), launch));
+        assert!(!started_by(false, false, Some(launch), launch));
+        // It writes to the transcript: started.
+        assert!(started_by(false, false, Some(launch + 1), launch));
+        // No transcript at all (a fresh session at a trust dialog): not started.
+        assert!(!started_by(false, false, None, launch));
+        // The prompt hint, or a status reported through ctl: started.
+        assert!(started_by(true, false, None, launch));
+        assert!(started_by(false, true, Some(launch - 3_600_000), launch));
+    }
+
+    /// A session with no mod to watch runs no health phase.
+    #[test]
+    fn the_health_phase_runs_only_where_there_is_a_mod_to_watch() {
+        use super::health_runs;
+        assert!(health_runs(true, true, true));
+        assert!(!health_runs(false, true, true), "\"mod\": false");
+        assert!(!health_runs(true, false, true), "no control plane");
+        assert!(!health_runs(true, true, false), "no pane was given the mod");
+    }
+
+    /// What the health phase does with each thing a tick finds, with the
+    /// session's two globals stood in for.
+    #[test]
+    fn health_events_become_bar_lines_audit_rows_and_one_decision() {
+        use super::{apply_health_events, HealthOut};
+        use atrium::modstate::{Aside, HealthEvent};
+        let mut flash = None;
+        let mut audit = atrium::audit::Audit::in_memory();
+        let mut bus = atrium::bus::Bus::new();
+        let mut said: Vec<String> = Vec::new();
+        let mut trips: Vec<(String, bool)> = Vec::new();
+        let mut recoveries = 0;
+        let events = vec![
+            HealthEvent::Healthy { pane: 3 },
+            HealthEvent::SetAside {
+                pane: 1,
+                why: Aside::NoHello,
+            },
+            HealthEvent::InboxLost { pane: 4 },
+            HealthEvent::FeatureLost {
+                pane: 3,
+                feature: "inbox",
+            },
+            HealthEvent::Tripped {
+                reason: "2 claude panes loaded it and never said hello".to_string(),
+                running: vec![1, 2, 99],
+                remember: true,
+            },
+        ];
+        apply_health_events(
+            events,
+            5,
+            &mut HealthOut {
+                flash: &mut flash,
+                audit: &mut audit,
+                bus: &mut bus,
+            },
+            // Pane 99 left between the tick and here: it is simply not named.
+            &|id| (id != 99).then(|| format!("{id} (builder)")),
+            &mut |flash| {
+                if let Some((line, _)) = flash.take() {
+                    said.push(line);
+                }
+            },
+            &mut || {
+                recoveries += 1;
+                Some("mod: back on".to_string())
+            },
+            &mut |reason, remember| {
+                trips.push((reason.to_string(), remember));
+                true
+            },
         );
+        // Every line was said, in order; the last one is still on the bar.
+        assert_eq!(said.len(), 4, "{said:?}");
+        assert_eq!(said[0], "mod: back on");
+        assert!(said[1].starts_with("pane 1: mod set aside (no hello within its window)"));
+        assert!(said[2].starts_with("pane 4: its mod stopped collecting"));
+        assert!(said[3].starts_with("pane 3: its mod lost `inbox`"));
+        let last = flash.expect("the trip line").0;
+        assert!(
+            last.starts_with("mod backed out:") && last.contains("the 2 panes"),
+            "{last}"
+        );
+        assert_eq!(recoveries, 1);
+        // The trip went to modfiles once, with what the tick decided.
+        assert_eq!(
+            trips,
+            vec![(
+                "2 claude panes loaded it and never said hello".to_string(),
+                true
+            )]
+        );
+        // One decision, naming the panes, offering a respawn.
+        let open = bus.pending_decisions();
+        assert_eq!(open.len(), 1);
+        let msg = open[0].fields.get("msg").cloned().unwrap_or_default();
+        assert!(
+            msg.contains("1 (builder), 2 (builder) still run")
+                && msg.contains("atrium ctl respawn"),
+            "{msg}"
+        );
+        // And nothing here could have restarted a pane: it holds no pane.
+
+        // A trip with nobody running posts no decision; one not to remember
+        // is passed on as such.
+        let mut flash = None;
+        let mut bus = atrium::bus::Bus::new();
+        let mut asked = None;
+        apply_health_events(
+            vec![HealthEvent::Tripped {
+                reason: "why".to_string(),
+                running: vec![],
+                remember: false,
+            }],
+            5,
+            &mut HealthOut {
+                flash: &mut flash,
+                audit: &mut audit,
+                bus: &mut bus,
+            },
+            &|_| None,
+            &mut |_| {},
+            &mut || None,
+            &mut |_, remember| {
+                asked = Some(remember);
+                false
+            },
+        );
+        assert_eq!(asked, Some(false));
+        assert!(bus.pending_decisions().is_empty());
+        assert!(flash.expect("a line").0.contains("for this session"));
     }
 }

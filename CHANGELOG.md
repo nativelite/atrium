@@ -8,53 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **A broken mod recovers by itself** (the mod 0.3.0). The mod is on its way
-  to being the default for claude panes, so it must not be able to break one.
-  - **Its hooks fail open.** Every hook catches what its own code throws,
-    every `atrium ctl` exchange has a deadline (`hello` 5 s and `whoami` 3 s
-    at the start, 5 s for a report or a poll, a watchdog one second behind
-    each), and a tool call is refused only on a verdict atrium gave (the
-    files an item owns, the subagent policy), never because atrium could not
-    be asked. A method the engine lacks switches off the one feature that
-    calls it. After five errors of its own, or five calls in a row nobody
-    answered, the mod switches itself off for the session. `mod/README.md`
-    has the audit: every hook, what a failure did before, what it does now.
+- **A broken mod is backed out by atrium, not left to break panes** (the mod
+  0.3.0). The mod is on its way to being the default for claude panes.
+  - **Its hooks are written to fail open.** Every hook catches what its own
+    code throws; every `atrium ctl` exchange has a deadline (`hello` 4 s and
+    `whoami` 2 s at the start, 8 s with their watchdogs; 5 s for a report or
+    a poll; 2 s for the file guard); a tool call is refused only on a verdict
+    atrium gave. A method the engine lacks costs the one feature that calls
+    it. Five errors of its own hooks switch the mod off for the session; an
+    atrium that stops answering pauses it, and it says hello again on a
+    backoff until atrium is back. `mod/README.md` has the audit: every hook,
+    what a failure did before, what it does now, and what a pane loses when
+    its mod is off.
   - **It counts its failures and tells atrium.** `report` takes `fail`
-    (a count per hook), `fail_class` and `fail_msg`; the broker bounds and
-    scrubs them and shows them under `"mod"` in `ctl status <pane>` and
-    `ctl answer`, and `ctl metrics` counts `mod_failures`
-    (`atrium_mod_failures_total`) and says whether the breaker tripped
-    (`atrium_mod_breaker_tripped`).
-  - **atrium checks each pane's mod.** A claude pane launched with the mod
-    that says no `hello` within 30 s of starting is set aside: it runs as a
-    pane without one (sends typed, a late hello granted nothing). So is a
-    pane whose mod reports that the plugin interface changed, or five
-    failures of its own hooks. A mod that stops collecting its inbox for
+    (a count per hook), `fail_class`, `fail_at` and `fail_msg`, from a pane
+    that has a mod and no other; the broker bounds and scrubs them and shows
+    them under `"mod"` in `ctl status <pane>` and `ctl answer`, and
+    `ctl metrics` counts `mod_failures` (`atrium_mod_failures_total`) and
+    says whether the breaker tripped (`atrium_mod_breaker_tripped`).
+  - **atrium checks each pane's mod**, in a session that uses the mod. A
+    claude pane launched with it that says no `hello` within 30 s of starting
+    is set aside: it runs as a pane without one (sends typed, a late hello
+    granted nothing). The 30 s run on the loop's own clock, so time atrium
+    was stalled counts against nobody. A pane whose mod reports five failures
+    of its own hooks is set aside too; one whose mod lost a single feature
+    loses that capability only. A mod that stops collecting its inbox for
     three minutes loses that capability, and what was queued for it is typed.
-  - **A circuit breaker backs the mod out.** Two panes failing (never one:
-    a pane's reports can switch off its own mod only, and a pane and the
-    children it spawned count once) stop new claude panes from loading the
-    mod. A pane that had not started is relaunched once without it; a working
-    pane is left alone, flagged on the bar and in the overview, and offered a
-    respawn through one decision on the bus. The trip is remembered under the
-    state directory against the Claude Code version and the mod's version
-    and content hash: the next launch keeps the mod off while both are
-    unchanged (one line says so) and tries it again when either changes.
-    `"mod": false` still means off and silent, and a trip never edits it.
-  - **The installed files heal.** A launch compares an installed mod with
-    the copy in the binary and rewrites what differs or is missing, saying so
-    in one line; it never creates a folder the user did not install into.
-  - `atrium mod status` shows the breaker and a running session's failure
-    count; `atrium mod retry` forgets a trip.
+  - **A circuit breaker stops loading the mod.** Two voices trip it for the
+    session (a pane and whatever it is respawned as is one voice; so are a
+    pane and the children it spawned): new claude panes launch without the
+    mod. Nothing that is running is restarted: each pane that has the mod is
+    left as it is, flagged on the bar and in the overview, and offered a
+    respawn through one decision on the bus. The trip is written down for
+    later sessions only when atrium itself saw two panes miss the hello
+    window, against the Claude Code version and the mod's version and
+    content hash; the next launch keeps the mod off while both are unchanged
+    (one line says so) and tries it again when either changes. `"mod": false`
+    runs none of this.
+  - **The installed files heal.** `atrium mod install` marks the folder it
+    writes; a launch compares a marked folder with the copy in the binary and
+    rewrites what differs or is missing, each file whole. A folder without
+    the marker (an install from before 0.48, a checkout named by
+    `ATRIUM_MOD`) is loaded as it is and never written to: run
+    `atrium mod install` once to have it kept current.
+  - `atrium mod status` shows the breaker, each claude a pane could run with
+    its version, and a running session's failure count; `atrium mod retry`
+    forgets a trip.
   - **Seen running** against Claude Code 2.1.325 on Windows, headless: a
-    healthy mod (hello within four seconds, no failure in a minute); a mod
-    whose module cannot load, in two panes (both set aside thirty seconds
-    after their prompts, the breaker tripped, the decision posted, the record
-    written, and a second launch kept the mod out); a hook that throws on
-    every status edge (the turn ran, each throw was counted per hook, its
-    message scrubbed). **Not seen:** a relaunch of a pane that never started,
-    a real change of Claude Code's plugin interface, anything on Linux or
+    healthy mod; a healthy mod in two panes with atrium's loop stalled for
+    twenty seconds at the start (the hellos failed, were retried and were
+    taken; nothing was set aside); a mod whose module cannot load, in two
+    panes (both set aside thirty seconds after their prompts, the breaker
+    tripped, the decision posted, the record written, and a second launch
+    kept the mod out); a hook that throws on every status edge (the turn ran,
+    each throw was counted per hook, its message scrubbed). **Not seen:** a
+    real change of Claude Code's plugin interface, anything on Linux or
     macOS.
+- **A fleet's `subagents: "deny"` holds without the mod.** The pane is
+  launched with `--disallowedTools Agent`, so Claude Code refuses the tool
+  itself; before, only the mod refused it. `panes` remains the mod's
+  takeover: without the mod the engine's own Agent tool works and its
+  subagents are not atrium panes.
 
 ### Fixed
 - **The mod's `/atrium` pane and its `atrium_list`, `atrium_status`,
@@ -68,7 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A subagent is not refused without something to use instead.** Under the
   `panes` policy the mod refused the Agent tool even when its own
   `atrium_subagent` tool had not been registered; it leaves the engine alone
-  then.
+  then, and when the session's mod has been backed out. `atrium_subagent`
+  no longer waits thirty minutes on a pane that has no mod to answer with:
+  it closes the pane and names the Agent tool.
 - **Claude Code's split-pane teams work again with Claude Code 2.1.325.**
   That release starts a teammate differently: it splits with the placeholder
   command `cat`, styles the pane, then sends `respawn-pane -k -t %N --

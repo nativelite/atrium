@@ -218,6 +218,8 @@ pub struct ModHealth {
     pub why: Option<String>,
     pub version: Option<String>,
     pub failures: u64,
+    /// The features its mod lost to a missing engine method.
+    pub lost: Vec<String>,
     pub hooks: Vec<(String, u64)>,
     pub class: Option<String>,
     pub error: Option<String>,
@@ -231,6 +233,12 @@ impl ModHealth {
         }
         pairs.push(("version", opt_s(&self.version)));
         pairs.push(("failures", u(self.failures)));
+        if !self.lost.is_empty() {
+            pairs.push((
+                "lost",
+                Value::Array(self.lost.iter().map(|f| s(f)).collect()),
+            ));
+        }
         pairs.push((
             "hooks",
             Value::Object(self.hooks.iter().map(|(h, n)| (h.clone(), u(*n))).collect()),

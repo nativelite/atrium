@@ -969,20 +969,36 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                                 .to_string(),
                         ),
                     };
+                    // Where the last one happened: the key of its count.
+                    let at = match v.get("fail_at") {
+                        None => None,
+                        Some(a) => Some(crate::modstate::parse_fail_site(
+                            a.as_str()
+                                .ok_or_else(|| "fail_at must be a hook's name".to_string())?,
+                        )?),
+                    };
                     Some(crate::modstate::FailureReport {
                         counts: crate::modstate::parse_fail_counts(counts)?,
                         class,
                         message,
+                        at,
                     })
                 }
                 _ => {
                     return Err(
                         "a failure report names its counts: report fail=<hook>:<n>[,...] \
-                         [fail_class=<class>] [fail_msg=<text>]"
+                         [fail_class=<class>] [fail_at=<hook>] [fail_msg=<text>]"
                             .to_string(),
                     )
                 }
             };
+            if failures.is_none() && v.get("fail_at").is_some() {
+                return Err(
+                    "a failure report names its counts: report fail=<hook>:<n>[,...] \
+                     [fail_class=<class>] [fail_at=<hook>] [fail_msg=<text>]"
+                        .to_string(),
+                );
+            }
             let r = ReportReq {
                 status,
                 reason,

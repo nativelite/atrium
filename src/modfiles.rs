@@ -9,9 +9,11 @@
 //! The folder is atrium's own, regenerated from the binary: `install` writes
 //! what differs and leaves what matches, so an upgrade of atrium is an
 //! upgrade of the mod, and a hand edit is restored. `atrium mod install`
-//! creates it; after that a launch keeps it current by itself ([`heal_at`]),
-//! saying so in one line when it rewrote something, and never creates a
-//! folder the user did not install into.
+//! creates it and leaves a marker in it ([`MARKER`]); after that a launch
+//! keeps it current by itself ([`heal_at`]), saying so in one line when it
+//! rewrote something. A folder without the marker (a developer's checkout
+//! named by `ATRIUM_MOD`, an install from before 0.48) is loaded as it is
+//! and never written to.
 //!
 //! Where it lives: `ATRIUM_MOD` (the folder's full path) when set, else the
 //! config's `mod.path`, else `mod/` under the platform config directory.
@@ -112,7 +114,9 @@ pub struct Install {
 
 /// Write the mod under `dir`, creating it. Idempotent: a file that already
 /// holds the embedded text is left untouched; one that differs, or is missing,
-/// is written. The folder is regenerated from the binary, never merged.
+/// is written, whole ([`write_whole`]). The folder is regenerated from the
+/// binary, never merged. Last, the [`MARKER`] is written: it is what makes
+/// the folder one a later launch may keep current ([`heal_at`]).
 pub fn install_at(dir: &Path) -> Result<Install, String> {
     let mut done = Install {
         dir: dir.to_path_buf(),
@@ -125,13 +129,10 @@ pub fn install_at(dir: &Path) -> Result<Install, String> {
             done.unchanged.push(rel);
             continue;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-        }
-        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        write_whole(&path, text)?;
         done.written.push(rel);
     }
+    write_whole(&dir.join(MARKER), &marker_text())?;
     Ok(done)
 }
 
@@ -335,9 +336,12 @@ impl TripRecord {
 
     /// Does it describe this Claude Code and this binary's mod?
     pub fn matches(&self, claude: &str) -> bool {
-        self.claude == record_text(claude)
-            && self.mod_version == record_text(&embedded_version())
-            && self.mod_hash == embedded_hash()
+        self.claude == record_text(claude) && self.mod_matches()
+    }
+
+    /// Does it describe this binary's mod (its version and its hash)?
+    pub fn mod_matches(&self) -> bool {
+        self.mod_version == record_text(&embedded_version()) && self.mod_hash == embedded_hash()
     }
 
     fn to_json(&self) -> String {
@@ -459,60 +463,107 @@ pub enum Launch {
     Clean,
     /// A record for this very Claude Code and mod: the mod stays off.
     Tripped(TripRecord),
-    /// A record for another Claude Code or another mod: the mod is tried
-    /// again, and the record goes when a pane's mod says hello.
+    /// A record, and `claude --version` gave no answer in time: the version
+    /// is unknown, which is not the same as changed. The mod stays off.
+    TrippedUnknown(TripRecord),
+    /// A record for another Claude Code or another mod, or for files this
+    /// launch has just rewritten: the mod is tried again, and the record
+    /// goes when a pane's mod says hello.
     Retrying(TripRecord),
 }
 
-/// Decide a launch from the record and the Claude Code version (`None`:
-/// `claude --version` gave none, which cannot be the version on record).
-/// Pure.
-pub fn launch_of(enabled: bool, record: RecordRead, claude: Option<&str>) -> Launch {
+/// Decide a launch from the record, the Claude Code version (`None`:
+/// `claude --version` gave none in time) and whether this launch's heal
+/// rewrote files of the installed mod (then the mod on disk is not the one
+/// that tripped, whatever the versions say). Pure.
+pub fn launch_of(enabled: bool, record: RecordRead, claude: Option<&str>, healed: bool) -> Launch {
     if !enabled {
         return Launch::Off;
     }
     match record {
         RecordRead::None | RecordRead::Unreadable => Launch::Clean,
+        RecordRead::Tripped(r) if healed => Launch::Retrying(r),
         RecordRead::Tripped(r) => match claude {
             Some(c) if r.matches(c) => Launch::Tripped(r),
-            _ => Launch::Retrying(r),
+            Some(_) => Launch::Retrying(r),
+            // Unknown is not "changed": a probe that timed out must not
+            // bring a broken mod back.
+            None if r.mod_matches() => Launch::TrippedUnknown(r),
+            None => Launch::Retrying(r),
         },
     }
 }
 
 /// The one line a launch says of the breaker, if it has one to say.
 pub fn launch_line(launch: &Launch, now_ms: u64) -> Option<String> {
+    let ago = |r: &TripRecord| crate::ctl::humanize_idle(now_ms.saturating_sub(r.at_ms));
     match launch {
         Launch::Off | Launch::Clean => None,
         Launch::Tripped(r) => Some(format!(
             "mod: off since {} ago ({}); Claude Code {} and mod {} are unchanged, so it stays \
              off: `atrium mod retry` tries it again, `atrium mod status` says more",
-            crate::ctl::humanize_idle(now_ms.saturating_sub(r.at_ms)),
+            ago(r),
             r.reason,
             r.claude,
             r.mod_version,
         )),
+        Launch::TrippedUnknown(r) => Some(format!(
+            "mod: off since {} ago ({}); the mod is unchanged and claude did not say its \
+             version, so it stays off: `atrium mod retry` tries it again",
+            ago(r),
+            r.reason,
+        )),
         Launch::Retrying(r) => Some(format!(
-            "mod: backed out {} ago against Claude Code {} and mod {}; one of them changed, so \
+            "mod: backed out {} ago against Claude Code {} and mod {}; that has changed, so \
              it is tried again now",
-            crate::ctl::humanize_idle(now_ms.saturating_sub(r.at_ms)),
+            ago(r),
             r.claude,
             r.mod_version,
         )),
     }
 }
 
-/// Was the mod installed in `dir` before: the folder is there and holds at
-/// least one of the mod's own files? An empty folder, or one that is not
-/// there, was never installed into, and the launch creates nothing in it (the
-/// first-run offer does that).
-pub fn was_installed_at(dir: &Path) -> bool {
-    dir.is_dir() && FILES.iter().any(|(rel, _)| dir.join(rel).is_file())
+/// The marker `atrium mod install` leaves in the folder it wrote: the one
+/// thing that says "this folder is atrium's to rewrite".
+pub const MARKER: &str = ".atrium-mod";
+
+/// The marker's text for this binary's mod.
+fn marker_text() -> String {
+    format!(
+        "{{\"mod\":\"{}\",\"hash\":\"{}\"}}\n",
+        embedded_version(),
+        embedded_hash()
+    )
 }
 
-/// Is `path`, or the folder it sits in under `dir`, a symbolic link? The
-/// heal writes only into atrium's own folder, and a link could point it at
-/// someone else's file.
+/// What kind of folder `dir` is to a launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Folder {
+    /// No plugin manifest: not a mod. Nothing is written, nothing injected.
+    Absent,
+    /// A plugin manifest and no marker: a mod atrium did not install here
+    /// with this scheme. An install from before 0.48, or a developer's own
+    /// checkout named by `ATRIUM_MOD`. Loaded as it is, never rewritten.
+    Unmarked,
+    /// A manifest and the marker `atrium mod install` wrote: atrium's own
+    /// folder, kept current by the launch.
+    Ours,
+}
+
+/// [`Folder`] of `dir`.
+pub fn folder_at(dir: &Path) -> Folder {
+    if !dir.join(MANIFEST).is_file() {
+        Folder::Absent
+    } else if dir.join(MARKER).is_file() {
+        Folder::Ours
+    } else {
+        Folder::Unmarked
+    }
+}
+
+/// Is `path`, or the folder it sits in under `dir`, a symbolic link or a
+/// junction? The heal writes only into atrium's own folder, and a link could
+/// point it at someone else's file.
 fn through_a_link(dir: &Path, rel: &str) -> bool {
     let is_link = |p: &Path| {
         std::fs::symlink_metadata(p)
@@ -526,23 +577,127 @@ fn through_a_link(dir: &Path, rel: &str) -> bool {
             .is_some_and(|parent| parent != dir && is_link(parent))
 }
 
-/// The launch heal: when the mod was installed in `dir` before
-/// ([`was_installed_at`]), rewrite every file that is missing or differs from
-/// the copy built into this binary, as `atrium mod install` does by hand.
-/// `Ok(None)` when it was never installed there (nothing is created). A file
-/// reached through a symbolic link is refused, not followed. Every path
-/// written is `dir` joined with one of [`FILES`]' own names.
-pub fn heal_at(dir: &Path) -> Result<Option<Install>, String> {
-    if !was_installed_at(dir) {
-        return Ok(None);
+/// Write `text` at `path` whole: to a sibling temporary name, then renamed
+/// over, so a reader (a claude loading the plugin) never sees half a file and
+/// a write that fails leaves the old file as it was.
+fn write_whole(path: &Path, text: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
-    if let Some((rel, _)) = FILES.iter().find(|(rel, _)| through_a_link(dir, rel)) {
-        return Err(format!(
-            "{} is a symbolic link; the mod's files are not written through one",
-            dir.join(rel).display()
-        ));
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".{}.atrium-tmp", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("cannot write {}: {e}", path.display())
+    })
+}
+
+/// What the launch heal did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Heal {
+    /// Not atrium's folder to write ([`Folder::Absent`]): nothing done.
+    NotInstalled,
+    /// A mod without the marker ([`Folder::Unmarked`]): left exactly as it is.
+    Unmarked,
+    /// Every file already matched.
+    Current,
+    /// These files were missing or differed, and were rewritten.
+    Rewrote(Vec<&'static str>),
+    /// Some files could not be written: the folder now holds a mix of this
+    /// binary's files and older ones. `failed` names each with why.
+    Broken {
+        written: Vec<&'static str>,
+        failed: Vec<(&'static str, String)>,
+    },
+}
+
+/// The launch heal: in a folder `atrium mod install` wrote ([`Folder::Ours`]),
+/// rewrite every file that is missing or differs from the copy built into
+/// this binary. It goes on past a file it cannot write, so the result names
+/// every one; each file is replaced whole or not at all ([`write_whole`]); a
+/// file reached through a symbolic link is refused, not followed. Every path
+/// written is `dir` joined with one of [`FILES`]' own names. Any other
+/// folder is left untouched.
+pub fn heal_at(dir: &Path) -> Heal {
+    match folder_at(dir) {
+        Folder::Absent => return Heal::NotInstalled,
+        Folder::Unmarked => return Heal::Unmarked,
+        Folder::Ours => {}
     }
-    install_at(dir).map(Some)
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    for (rel, text) in FILES {
+        let path = dir.join(rel);
+        if through_a_link(dir, rel) {
+            failed.push((
+                *rel,
+                "it is a symbolic link, which is not written through".to_string(),
+            ));
+            continue;
+        }
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(*text) {
+            continue;
+        }
+        match write_whole(&path, text) {
+            Ok(()) => written.push(*rel),
+            Err(e) => failed.push((*rel, e)),
+        }
+    }
+    if !failed.is_empty() {
+        return Heal::Broken { written, failed };
+    }
+    // The marker follows the files: it names what the folder now holds.
+    let marker = dir.join(MARKER);
+    if std::fs::read_to_string(&marker).ok().as_deref() != Some(marker_text().as_str()) {
+        let _ = write_whole(&marker, &marker_text());
+    }
+    if written.is_empty() {
+        Heal::Current
+    } else {
+        Heal::Rewrote(written)
+    }
+}
+
+/// The line a heal says, if it has one, and whether the folder may still be
+/// loaded into panes this session.
+pub fn heal_line(heal: &Heal, dir: &Path) -> (Option<String>, bool) {
+    match heal {
+        Heal::NotInstalled | Heal::Current => (None, true),
+        Heal::Unmarked => (
+            Some(format!(
+                "mod: the mod at {} was not installed by this atrium (no {MARKER} marker); it \
+                 is loaded as it is. Run `atrium mod install` to have atrium keep it current",
+                dir.display()
+            )),
+            true,
+        ),
+        Heal::Rewrote(written) => (
+            Some(format!(
+                "mod: {} file{} at {} refreshed from this atrium ({})",
+                written.len(),
+                if written.len() == 1 { "" } else { "s" },
+                dir.display(),
+                embedded_version()
+            )),
+            true,
+        ),
+        Heal::Broken { failed, .. } => (
+            Some(format!(
+                "mod: {} file{} at {} could not be refreshed ({}: {}); the folder may hold a \
+                 mix of versions, so claude panes launch without the mod this session. Fix the \
+                 file and run `atrium mod install`",
+                failed.len(),
+                if failed.len() == 1 { "" } else { "s" },
+                dir.display(),
+                failed[0].0,
+                failed[0].1
+            )),
+            false,
+        ),
+    }
 }
 
 /// Set once this session's first claude pane ran [`launch_once`].
@@ -551,6 +706,8 @@ static LAUNCHED: OnceLock<()> = OnceLock::new();
 static TRIPPED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// A record for other versions was found: the first healthy hello clears it.
 static RETRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The launch heal left the folder inconsistent: it is not loaded this session.
+static UNLOADABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Why the mod is off for this session, if the breaker tripped (now, or on a
 /// record from an earlier one).
@@ -558,10 +715,16 @@ pub fn session_tripped() -> Option<String> {
     TRIPPED.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Did this launch's heal leave the installed folder inconsistent?
+pub fn session_unloadable() -> bool {
+    UNLOADABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The folder a claude pane is told to load: `installed` when the session
-/// uses the mod and the breaker has not tripped, else none. Pure.
-pub fn inject_dir(enabled: bool, tripped: bool, installed: Option<&Path>) -> Option<&Path> {
-    installed.filter(|_| enabled && !tripped)
+/// uses the mod and nothing holds it back (the breaker tripped, or the
+/// launch heal left the folder inconsistent), else none. Pure.
+pub fn inject_dir(enabled: bool, held_back: bool, installed: Option<&Path>) -> Option<&Path> {
+    installed.filter(|_| enabled && !held_back)
 }
 
 /// Once per session, before the first claude pane gets the mod: heal the
@@ -569,73 +732,105 @@ pub fn inject_dir(enabled: bool, tripped: bool, installed: Option<&Path>) -> Opt
 /// `claude --version` prints, and is asked only when there is a record to
 /// hold it against (the probe starts a process; a session with no record
 /// never pays for it). Returns the lines to say, at most two. A session that
-/// does not use the mod reads and says nothing.
+/// does not use the mod reads nothing, writes nothing and says nothing.
 pub fn launch_once(claude: impl FnOnce() -> Option<String>) -> Vec<String> {
-    let mut lines = Vec::new();
     let mut first = false;
     LAUNCHED.get_or_init(|| first = true);
     if !first || !session_enabled() {
-        return lines;
+        return Vec::new();
     }
-    if let Some(dir) = configured_dir() {
-        match heal_at(&dir) {
-            Ok(Some(done)) if !done.written.is_empty() => lines.push(format!(
-                "mod: {} file{} at {} refreshed from this atrium ({})",
-                done.written.len(),
-                if done.written.len() == 1 { "" } else { "s" },
-                dir.display(),
-                embedded_version()
-            )),
-            Ok(_) => {}
-            Err(e) => lines.push(format!("mod: not refreshed: {e}")),
-        }
+    let (lines, state) = launch_at(
+        configured_dir().as_deref(),
+        crate::session_store::state_root().as_deref(),
+        claude,
+        crate::session_store::now_ms(),
+    );
+    if !state.loadable {
+        UNLOADABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let Some(root) = crate::session_store::state_root() else {
-        return lines;
-    };
-    let record = read_record(&root);
-    let version = match record {
-        RecordRead::Tripped(_) => claude(),
-        RecordRead::None | RecordRead::Unreadable => None,
-    };
-    let launch = launch_of(true, record, version.as_deref());
-    if let Some(line) = launch_line(&launch, crate::session_store::now_ms()) {
-        lines.push(line);
-    }
-    match launch {
-        Launch::Tripped(r) => {
+    match state.launch {
+        Launch::Tripped(r) | Launch::TrippedUnknown(r) => {
             *TRIPPED.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.reason);
         }
-        Launch::Retrying(_) => {
-            RETRYING.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        Launch::Retrying(_) => RETRYING.store(true, std::sync::atomic::Ordering::Relaxed),
         Launch::Off | Launch::Clean => {}
     }
     lines
 }
 
+/// What [`launch_at`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launched {
+    pub launch: Launch,
+    /// May the folder be loaded into panes this session?
+    pub loadable: bool,
+}
+
+/// [`launch_once`] over a given mod folder and state root: the heal, then
+/// the record. Touches nothing else.
+pub fn launch_at(
+    dir: Option<&Path>,
+    root: Option<&Path>,
+    claude: impl FnOnce() -> Option<String>,
+    now_ms: u64,
+) -> (Vec<String>, Launched) {
+    let mut lines = Vec::new();
+    let heal = dir.map_or(Heal::NotInstalled, heal_at);
+    let (line, loadable) = dir.map_or((None, true), |d| heal_line(&heal, d));
+    lines.extend(line);
+    let Some(root) = root else {
+        return (
+            lines,
+            Launched {
+                launch: Launch::Clean,
+                loadable,
+            },
+        );
+    };
+    let record = read_record(root);
+    let version = match record {
+        RecordRead::Tripped(_) => claude(),
+        RecordRead::None | RecordRead::Unreadable => None,
+    };
+    let healed = matches!(heal, Heal::Rewrote(_));
+    let launch = launch_of(true, record, version.as_deref(), healed);
+    lines.extend(launch_line(&launch, now_ms));
+    (lines, Launched { launch, loadable })
+}
+
 /// The breaker tripped in this session: no claude pane gets the mod from
-/// here on, and the trip is remembered against `claude` (what
-/// `claude --version` prints) and this binary's mod. Returns whether it was
-/// written down (it is not when no version could be read, or there is no
-/// state root: then the trip holds for this session alone).
-pub fn trip(reason: &str, claude: Option<&str>) -> bool {
+/// here on. With `remember` (the trip rests on what atrium saw itself) it is
+/// also written down against `claude` (what `claude --version` prints) and
+/// this binary's mod. Returns whether it was written down: not without
+/// `remember`, not when the version is unknown (a record keyed by an unknown
+/// version would match nothing, or everything), not without a state root.
+/// In a session that does not use the mod this does nothing at all.
+pub fn trip(reason: &str, claude: Option<&str>, remember: bool) -> bool {
+    if !session_enabled() {
+        return false;
+    }
     *TRIPPED.lock().unwrap_or_else(|e| e.into_inner()) = Some(record_text(reason));
     RETRYING.store(false, std::sync::atomic::Ordering::Relaxed);
-    let claude = claude.map(record_text).filter(|c| !c.is_empty());
-    match (crate::session_store::state_root(), claude) {
-        (Some(root), Some(claude)) => write_record(
-            &root,
-            &TripRecord::now(&claude, reason, crate::session_store::now_ms()),
-        )
-        .is_ok(),
-        _ => false,
+    if !remember {
+        return false;
+    }
+    match crate::session_store::state_root() {
+        Some(root) => remember_trip(&root, reason, claude, crate::session_store::now_ms()),
+        None => false,
     }
 }
 
-/// A pane's mod said hello and was granted something. When this session was
-/// retrying after an earlier trip, the record is cleared and the line to say
-/// comes back, once.
+/// Write the record of a trip under `root`, when `claude`'s version is known.
+pub fn remember_trip(root: &Path, reason: &str, claude: Option<&str>, now_ms: u64) -> bool {
+    match claude.map(record_text).filter(|c| !c.is_empty()) {
+        Some(claude) => write_record(root, &TripRecord::now(&claude, reason, now_ms)).is_ok(),
+        None => false,
+    }
+}
+
+/// A pane atrium launched with the mod said hello and was granted something.
+/// When this session was retrying after an earlier trip, the record is
+/// cleared and the line to say comes back, once.
 pub fn recovered() -> Option<String> {
     if !RETRYING.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return None;
@@ -643,15 +838,22 @@ pub fn recovered() -> Option<String> {
     if session_tripped().is_some() {
         return None;
     }
-    let root = crate::session_store::state_root()?;
-    clear_record(&root);
-    Some(format!(
-        "mod: back on; mod {} works with this Claude Code",
-        embedded_version()
-    ))
+    recover_at(&crate::session_store::state_root()?)
 }
 
-/// The lines `atrium mod status` prints about the breaker.
+/// Clear the record under `root` and say the mod is back.
+pub fn recover_at(root: &Path) -> Option<String> {
+    clear_record(root).then(|| {
+        format!(
+            "mod: back on; mod {} works with this Claude Code",
+            embedded_version()
+        )
+    })
+}
+
+/// The lines `atrium mod status` prints about the breaker. `claude` is what
+/// the claude a pane would run says of its version, `None` when it gave no
+/// answer.
 pub fn breaker_lines(record: &RecordRead, claude: Option<&str>, now_ms: u64) -> Vec<String> {
     match record {
         RecordRead::None => vec!["breaker: closed (the mod has not been backed out)".to_string()],
@@ -661,30 +863,35 @@ pub fn breaker_lines(record: &RecordRead, claude: Option<&str>, now_ms: u64) -> 
                 .to_string(),
         ],
         RecordRead::Tripped(r) => {
-            let same = claude.is_some_and(|c| r.matches(c));
-            vec![
-                format!(
-                    "breaker: tripped {} ago against Claude Code {} and mod {} ({}): {}",
-                    crate::ctl::humanize_idle(now_ms.saturating_sub(r.at_ms)),
-                    r.claude,
-                    r.mod_version,
-                    r.mod_hash,
-                    r.reason
-                ),
-                if same {
+            let first = format!(
+                "breaker: tripped {} ago against Claude Code {} and mod {} ({}): {}",
+                crate::ctl::humanize_idle(now_ms.saturating_sub(r.at_ms)),
+                r.claude,
+                r.mod_version,
+                r.mod_hash,
+                r.reason
+            );
+            let second = match claude {
+                Some(c) if r.matches(c) => {
                     "         both are unchanged: claude panes launch without the mod until one \
                      changes, or `atrium mod retry`"
                         .to_string()
-                } else {
-                    format!(
-                        "         now Claude Code {} and mod {} ({}): the next session tries the \
-                         mod again",
-                        claude.unwrap_or("(no version)"),
-                        embedded_version(),
-                        embedded_hash()
-                    )
-                },
-            ]
+                }
+                None if r.mod_matches() => {
+                    "         the mod is unchanged and claude did not say its version: claude \
+                     panes launch without the mod until that is known to have changed, or \
+                     `atrium mod retry`"
+                        .to_string()
+                }
+                _ => format!(
+                    "         now Claude Code {} and mod {} ({}): the next session tries the \
+                     mod again",
+                    claude.unwrap_or("(no version)"),
+                    embedded_version(),
+                    embedded_hash()
+                ),
+            };
+            vec![first, second]
         }
     }
 }
@@ -884,53 +1091,6 @@ mod tests {
     }
 
     #[test]
-    fn a_launch_stays_tripped_on_the_same_versions_and_retries_when_either_changed() {
-        let r = TripRecord::now("2.1.325 (Claude Code)", "why", 0);
-        let rec = || RecordRead::Tripped(r.clone());
-        assert_eq!(
-            launch_of(true, rec(), Some("2.1.325 (Claude Code)")),
-            Launch::Tripped(r.clone())
-        );
-        assert_eq!(
-            launch_of(true, rec(), Some("2.1.400 (Claude Code)")),
-            Launch::Retrying(r.clone())
-        );
-        // No version could be read: it cannot be the one on record.
-        assert_eq!(launch_of(true, rec(), None), Launch::Retrying(r.clone()));
-        let old_mod = TripRecord {
-            mod_hash: "00000000deadbeef".to_string(),
-            ..r.clone()
-        };
-        assert_eq!(
-            launch_of(
-                true,
-                RecordRead::Tripped(old_mod.clone()),
-                Some("2.1.325 (Claude Code)")
-            ),
-            Launch::Retrying(old_mod)
-        );
-        assert_eq!(launch_of(true, RecordRead::None, Some("x")), Launch::Clean);
-        assert_eq!(
-            launch_of(true, RecordRead::Unreadable, Some("x")),
-            Launch::Clean
-        );
-        // `"mod": false` wins over everything, record or not, and says nothing.
-        assert_eq!(
-            launch_of(false, rec(), Some("2.1.325 (Claude Code)")),
-            Launch::Off
-        );
-        assert_eq!(launch_line(&Launch::Off, 0), None);
-        assert_eq!(launch_line(&Launch::Clean, 0), None);
-        let stays = launch_line(&Launch::Tripped(r.clone()), 3_600_000).expect("a line");
-        assert!(
-            stays.contains("atrium mod retry") && stays.contains("2.1.325"),
-            "{stays}"
-        );
-        let again = launch_line(&Launch::Retrying(r), 3_600_000).expect("a line");
-        assert!(again.contains("tried again"), "{again}");
-    }
-
-    #[test]
     fn a_damaged_or_hand_edited_record_is_ignored() {
         let root = temp("badrecord");
         std::fs::create_dir_all(&root).expect("dir");
@@ -956,7 +1116,7 @@ mod tests {
             std::fs::write(record_path(&root), &text).expect("write");
             assert_eq!(read_record(&root), RecordRead::Unreadable, "{text:.80}");
             assert_eq!(
-                launch_of(true, read_record(&root), Some("2.1.325")),
+                launch_of(true, read_record(&root), Some("2.1.325"), false),
                 Launch::Clean
             );
         }
@@ -974,42 +1134,273 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_heal_rewrites_what_changed_and_never_creates_the_folder() {
-        // Never installed: nothing is created.
+    fn a_launch_stays_tripped_on_the_same_versions_and_retries_when_either_changed() {
+        let r = TripRecord::now("2.1.325 (Claude Code)", "why", 0);
+        let rec = || RecordRead::Tripped(r.clone());
+        assert_eq!(
+            launch_of(true, rec(), Some("2.1.325 (Claude Code)"), false),
+            Launch::Tripped(r.clone())
+        );
+        assert_eq!(
+            launch_of(true, rec(), Some("2.1.400 (Claude Code)"), false),
+            Launch::Retrying(r.clone())
+        );
+        // No version could be read: unknown is not "changed". The mod is the
+        // same one, so it stays off.
+        assert_eq!(
+            launch_of(true, rec(), None, false),
+            Launch::TrippedUnknown(r.clone())
+        );
+        // The launch has just rewritten the installed files: what tripped is
+        // not what is on disk any more, whatever the versions say.
+        assert_eq!(
+            launch_of(true, rec(), Some("2.1.325 (Claude Code)"), true),
+            Launch::Retrying(r.clone())
+        );
+        let old_mod = TripRecord {
+            mod_hash: "00000000deadbeef".to_string(),
+            ..r.clone()
+        };
+        assert_eq!(
+            launch_of(
+                true,
+                RecordRead::Tripped(old_mod.clone()),
+                Some("2.1.325 (Claude Code)"),
+                false
+            ),
+            Launch::Retrying(old_mod.clone())
+        );
+        assert_eq!(
+            launch_of(true, RecordRead::Tripped(old_mod.clone()), None, false),
+            Launch::Retrying(old_mod),
+            "a changed mod is a change, version read or not"
+        );
+        assert_eq!(
+            launch_of(true, RecordRead::None, Some("x"), false),
+            Launch::Clean
+        );
+        assert_eq!(
+            launch_of(true, RecordRead::Unreadable, Some("x"), false),
+            Launch::Clean
+        );
+        // `"mod": false` wins over everything, record or not, and says nothing.
+        assert_eq!(
+            launch_of(false, rec(), Some("2.1.325 (Claude Code)"), true),
+            Launch::Off
+        );
+        assert_eq!(launch_line(&Launch::Off, 0), None);
+        assert_eq!(launch_line(&Launch::Clean, 0), None);
+        let stays = launch_line(&Launch::Tripped(r.clone()), 3_600_000).expect("a line");
+        assert!(
+            stays.contains("atrium mod retry") && stays.contains("2.1.325"),
+            "{stays}"
+        );
+        let unknown = launch_line(&Launch::TrippedUnknown(r.clone()), 3_600_000).expect("a line");
+        assert!(unknown.contains("did not say its version"), "{unknown}");
+        let again = launch_line(&Launch::Retrying(r), 3_600_000).expect("a line");
+        assert!(again.contains("tried again"), "{again}");
+    }
+
+    #[test]
+    fn a_trip_is_written_only_against_a_known_version_and_a_hello_clears_it() {
+        let root = temp("remember");
+        // No version: a record keyed by nothing would match nothing, or everything.
+        assert!(!remember_trip(&root, "why", None, 5));
+        assert!(!remember_trip(&root, "why", Some("  "), 5));
+        assert_eq!(read_record(&root), RecordRead::None);
+        assert!(remember_trip(
+            &root,
+            "why",
+            Some("2.1.325 (Claude Code)"),
+            5
+        ));
+        assert!(matches!(read_record(&root), RecordRead::Tripped(_)));
+        // The mod came back: the record goes, and it is said once.
+        let line = recover_at(&root).expect("a line");
+        assert!(line.contains("back on"), "{line}");
+        assert_eq!(read_record(&root), RecordRead::None);
+        assert_eq!(
+            recover_at(&root),
+            None,
+            "nothing left to clear, nothing to say"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_a_folder_atrium_installed_into_is_healed() {
+        // Not there: nothing is created.
         let never = temp("heal-never");
-        assert_eq!(heal_at(&never), Ok(None));
+        assert_eq!(folder_at(&never), Folder::Absent);
+        assert_eq!(heal_at(&never), Heal::NotInstalled);
         assert!(!never.exists());
-        // An empty folder was not installed into either.
+        // A folder that merely holds one of the mod's file names is not a mod.
         std::fs::create_dir_all(&never).expect("dir");
-        assert_eq!(heal_at(&never), Ok(None));
-        assert_eq!(std::fs::read_dir(&never).expect("read").count(), 0);
+        std::fs::write(never.join("README.md"), "mine").expect("write");
+        assert_eq!(heal_at(&never), Heal::NotInstalled);
+        assert_eq!(
+            std::fs::read_to_string(never.join("README.md"))
+                .ok()
+                .as_deref(),
+            Some("mine")
+        );
+        assert_eq!(std::fs::read_dir(&never).expect("read").count(), 1);
         let _ = std::fs::remove_dir_all(&never);
 
+        // A mod with no marker: a developer's checkout named by ATRIUM_MOD,
+        // or an install from before the marker. Loaded as it is, never
+        // rewritten, edits and all.
+        let checkout = temp("heal-checkout");
+        for (rel, text) in FILES {
+            let path = checkout.join(rel);
+            std::fs::create_dir_all(path.parent().expect("a parent")).expect("dir");
+            std::fs::write(&path, text).expect("write");
+        }
+        std::fs::write(checkout.join("hooks/register.ts"), "// my work in progress").expect("edit");
+        assert_eq!(folder_at(&checkout), Folder::Unmarked);
+        assert_eq!(heal_at(&checkout), Heal::Unmarked);
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("hooks/register.ts"))
+                .ok()
+                .as_deref(),
+            Some("// my work in progress")
+        );
+        assert!(
+            !checkout.join(MARKER).exists(),
+            "no marker appears by itself"
+        );
+        let (line, loadable) = heal_line(&Heal::Unmarked, &checkout);
+        assert!(line.expect("a line").contains("atrium mod install"));
+        assert!(loadable, "it is loaded as it is");
+        // The repo's own mod/ is such a folder.
+        let repo_mod = Path::new(env!("CARGO_MANIFEST_DIR")).join("mod");
+        assert_eq!(folder_at(&repo_mod), Folder::Unmarked);
+        // `atrium mod install` is what makes it atrium's.
+        install_at(&checkout).expect("install");
+        assert_eq!(folder_at(&checkout), Folder::Ours);
+        assert!(status_at(&checkout).current);
+        let _ = std::fs::remove_dir_all(&checkout);
+    }
+
+    #[test]
+    fn the_launch_heal_rewrites_what_changed_in_atriums_own_folder() {
         let dir = temp("heal");
         install_at(&dir).expect("install");
+        assert_eq!(folder_at(&dir), Folder::Ours);
         // Current: the heal writes nothing.
-        let same = heal_at(&dir).expect("heal").expect("installed");
-        assert!(same.written.is_empty());
+        assert_eq!(heal_at(&dir), Heal::Current);
         // An edited file and a missing one are both put back.
         std::fs::write(dir.join("hooks/register.ts"), "throw new Error('broken')").expect("edit");
         std::fs::remove_file(dir.join("hooks/health.ts")).expect("remove");
-        let healed = heal_at(&dir).expect("heal").expect("installed");
-        assert_eq!(healed.written, vec!["hooks/register.ts", "hooks/health.ts"]);
+        assert_eq!(
+            heal_at(&dir),
+            Heal::Rewrote(vec!["hooks/register.ts", "hooks/health.ts"])
+        );
         assert!(status_at(&dir).current);
-        // Even the manifest: the folder is still an install without it.
-        std::fs::remove_file(dir.join(MANIFEST)).expect("remove");
-        let healed = heal_at(&dir).expect("heal").expect("installed");
-        assert_eq!(healed.written, vec![MANIFEST]);
-        // A file of the user's own in the folder is not touched.
+        // A file of the user's own in the folder is not touched, and no
+        // temporary file is left behind.
         std::fs::write(dir.join("notes.txt"), "mine").expect("write");
-        heal_at(&dir).expect("heal");
+        assert_eq!(heal_at(&dir), Heal::Current);
         assert_eq!(
             std::fs::read_to_string(dir.join("notes.txt"))
                 .ok()
                 .as_deref(),
             Some("mine")
         );
+        let stray: Vec<String> = std::fs::read_dir(dir.join("hooks"))
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".atrium-tmp"))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+        // Without its manifest the folder is no longer a mod: left alone.
+        std::fs::remove_file(dir.join(MANIFEST)).expect("remove");
+        assert_eq!(heal_at(&dir), Heal::NotInstalled);
+        assert!(!dir.join(MANIFEST).exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heal_that_cannot_write_every_file_names_each_and_the_folder_is_not_loaded() {
+        let dir = temp("heal-broken");
+        install_at(&dir).expect("install");
+        // Three files differ; two of them cannot be replaced (a non-empty
+        // directory sits where each file should be, on every platform).
+        for rel in ["hooks/status.ts", "hooks/ctl.ts"] {
+            std::fs::remove_file(dir.join(rel)).expect("remove");
+            std::fs::create_dir_all(dir.join(rel).join("in-the-way")).expect("dir");
+        }
+        std::fs::write(dir.join("hooks/guard.ts"), "old").expect("edit");
+        let heal = heal_at(&dir);
+        let Heal::Broken { written, failed } = &heal else {
+            panic!("expected a broken heal, got {heal:?}");
+        };
+        // It went on past the first failure: the one it could write is
+        // written, and both it could not are named.
+        assert_eq!(written, &vec!["hooks/guard.ts"]);
+        assert_eq!(
+            failed.iter().map(|(rel, _)| *rel).collect::<Vec<_>>(),
+            vec!["hooks/status.ts", "hooks/ctl.ts"]
+        );
+        let (line, loadable) = heal_line(&heal, &dir);
+        let line = line.expect("a line");
+        assert!(
+            line.contains("2 files")
+                && line.contains("hooks/status.ts")
+                && line.contains("without the mod"),
+            "{line}"
+        );
+        assert!(!loadable, "a mix of versions is not loaded");
+        // So the launch says so, loads nothing, and a pane gets no folder.
+        let state = temp("heal-broken-state");
+        let (lines, launched) = launch_at(Some(&dir), Some(&state), || None, 0);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(!launched.loadable);
+        assert_eq!(inject_dir(true, !launched.loadable, Some(&dir)), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_launch_reads_the_record_once_the_files_are_healed() {
+        let dir = temp("launch");
+        let state = temp("launch-state");
+        install_at(&dir).expect("install");
+        // No record: nothing to say, and claude is never asked its version.
+        let (lines, launched) = launch_at(Some(&dir), Some(&state), || panic!("not asked"), 0);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(launched.launch, Launch::Clean);
+        assert!(launched.loadable);
+        // A record for these very versions: off, one line.
+        let v = "2.1.325 (Claude Code)";
+        assert!(remember_trip(&state, "why", Some(v), 0));
+        let (lines, launched) = launch_at(Some(&dir), Some(&state), || Some(v.to_string()), 60_000);
+        assert!(matches!(launched.launch, Launch::Tripped(_)));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        // The probe timed out: still off.
+        let (_, launched) = launch_at(Some(&dir), Some(&state), || None, 60_000);
+        assert!(matches!(launched.launch, Launch::TrippedUnknown(_)));
+        // The installed files were damaged and this launch put them back:
+        // what tripped may have been the damage. Tried again, two lines.
+        std::fs::write(dir.join("hooks/register.ts"), "broken").expect("edit");
+        let (lines, launched) = launch_at(Some(&dir), Some(&state), || Some(v.to_string()), 60_000);
+        assert!(
+            matches!(launched.launch, Launch::Retrying(_)),
+            "{launched:?}"
+        );
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[0].contains("refreshed") && lines[1].contains("tried again"),
+            "{lines:?}"
+        );
+        // The record is still there until a pane's mod says hello.
+        assert!(matches!(read_record(&state), RecordRead::Tripped(_)));
+        // No mod folder at all: the record is still read.
+        let (_, launched) = launch_at(None, Some(&state), || Some(v.to_string()), 60_000);
+        assert!(matches!(launched.launch, Launch::Tripped(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[cfg(unix)]
@@ -1023,7 +1414,7 @@ mod tests {
         std::fs::write(&target, "untouched").expect("write");
         std::fs::remove_file(dir.join("hooks/status.ts")).expect("remove");
         std::os::unix::fs::symlink(&target, dir.join("hooks/status.ts")).expect("link");
-        assert!(heal_at(&dir).is_err());
+        assert!(matches!(heal_at(&dir), Heal::Broken { .. }));
         assert_eq!(
             std::fs::read_to_string(&target).ok().as_deref(),
             Some("untouched")
@@ -1032,11 +1423,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
+    /// A Windows junction is a link to a folder that needs no privilege to
+    /// make: the heal must not write the mod's files through one.
+    #[cfg(windows)]
     #[test]
-    fn a_pane_gets_the_mod_only_while_the_session_uses_it_and_the_breaker_is_shut() {
+    fn the_heal_does_not_write_through_a_junction() {
+        let dir = temp("heal-junction");
+        install_at(&dir).expect("install");
+        let outside = temp("heal-junction-target");
+        std::fs::create_dir_all(&outside).expect("dir");
+        std::fs::write(outside.join("status.ts"), "untouched").expect("write");
+        std::fs::remove_dir_all(dir.join("hooks")).expect("remove");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.join("hooks"))
+            .arg(&outside)
+            .output()
+            .expect("cmd runs");
+        assert!(
+            made.status.success(),
+            "mklink /J: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let heal = heal_at(&dir);
+        assert!(matches!(heal, Heal::Broken { .. }), "{heal:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("status.ts"))
+                .ok()
+                .as_deref(),
+            Some("untouched")
+        );
+        assert!(
+            !outside.join("register.ts").exists(),
+            "nothing was written on the far side of the junction"
+        );
+        // Remove the junction itself, not what it points at.
+        let _ = std::fs::remove_dir(dir.join("hooks"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn a_pane_gets_the_mod_only_while_the_session_uses_it_and_nothing_holds_it_back() {
         let dir = Path::new("/cfg/mod");
         assert_eq!(inject_dir(true, false, Some(dir)), Some(dir));
-        assert_eq!(inject_dir(true, true, Some(dir)), None, "tripped");
+        assert_eq!(
+            inject_dir(true, true, Some(dir)),
+            None,
+            "tripped, or unloadable"
+        );
         assert_eq!(inject_dir(false, false, Some(dir)), None, "\"mod\": false");
         assert_eq!(inject_dir(false, true, Some(dir)), None);
         assert_eq!(inject_dir(true, false, None), None, "not installed");
@@ -1047,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn the_breaker_lines_say_closed_tripped_or_about_to_retry() {
+    fn the_breaker_lines_say_closed_tripped_unknown_or_about_to_retry() {
         let closed = breaker_lines(&RecordRead::None, Some("2.1.325"), 0);
         assert!(closed[0].contains("closed"), "{closed:?}");
         let ignored = breaker_lines(&RecordRead::Unreadable, Some("2.1.325"), 0);
@@ -1063,6 +1498,11 @@ mod tests {
             "{same:?}"
         );
         assert!(same[1].contains("atrium mod retry"), "{same:?}");
+        let unknown = breaker_lines(&RecordRead::Tripped(r.clone()), None, 60_000);
+        assert!(
+            unknown[1].contains("did not say its version") && !unknown[1].contains("tries the mod"),
+            "{unknown:?}"
+        );
         let changed = breaker_lines(&RecordRead::Tripped(r), Some("2.2.0"), 60_000);
         assert!(changed[1].contains("tries the mod again"), "{changed:?}");
     }

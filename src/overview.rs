@@ -119,7 +119,7 @@ pub(crate) fn overview_nodes_with(
                 agent_id: p.agent_id.0,
                 doing,
                 colliding: facts.is_some_and(|f| f.colliding),
-                mod_note: world.mod_note_for(p.session_id.as_deref()),
+                mod_note: world.mod_note_for(p.agent_id.0),
                 leads_team,
             });
         }
