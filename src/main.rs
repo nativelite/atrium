@@ -275,6 +275,17 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some(atrium::tmux_shim::FLAG) {
         return atrium::tmux_shim::main(&args[1..]);
     }
+    // Started inside a real tmux: its `TMUX` / `TMUX_PANE` must not reach a
+    // pane, or Claude Code's teams there split the outer tmux window. A pane's
+    // environment is this process's plus overrides, and an override cannot
+    // remove a variable, so the two are dropped from this process, here: after
+    // the shim (which runs inside a pane, on the values atrium gave it), before
+    // any thread or pane exists, and on every path that can host a pane (a
+    // plain launch, `up`, `fleet up`, `recover`). Not for `atrium ctl`, a
+    // client inside a pane. `tmux_shim::outer_notice` remembers it for the bar.
+    if args.first().map(String::as_str) != Some("ctl") {
+        atrium::tmux_shim::hide_outer();
+    }
     // Watchdog mode: a re-exec of atrium that outlives this session and cleans up
     // if it dies in a way no handler can catch (SIGKILL, panic, OOM). Dispatched
     // before anything else — it must never touch the terminal.
@@ -405,7 +416,13 @@ fn main() -> ExitCode {
         rest.first().map(String::as_str),
         Some("--version") | Some("-V")
     ) {
-        println!("atrium {}", env!("CARGO_PKG_VERSION"));
+        // `--version --json`: the same answer for a script (version, the
+        // commit when the build knew it, the target), one object on one line.
+        if rest.get(1).map(String::as_str) == Some("--json") {
+            println!("{}", atrium::help::version_json());
+        } else {
+            println!("atrium {}", env!("CARGO_PKG_VERSION"));
+        }
         return ExitCode::SUCCESS;
     }
     if rest.first().is_some_and(|a| atrium::help::wants(a)) {

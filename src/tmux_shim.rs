@@ -329,6 +329,74 @@ pub fn pane_env(
     ]
 }
 
+/// The bar line for a session that started inside a real tmux.
+pub const OUTER_NOTICE: &str = "running inside tmux; outer TMUX hidden from panes";
+
+/// Whether [`hide_outer`] found a non-empty `TMUX` to drop.
+static OUTER_HIDDEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Is `name` one of the two variables a tmux gives its panes? Windows folds
+/// the case of environment names, so it is folded here too.
+fn is_outer_name(name: &OsStr) -> bool {
+    [ENV_TMUX, ENV_TMUX_PANE].iter().any(|k| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(k)
+        } else {
+            name == OsStr::new(k)
+        }
+    })
+}
+
+/// What a hosting atrium must drop from the environment it inherited: every
+/// `TMUX` / `TMUX_PANE` entry, by the name it is spelled with, and whether a
+/// non-empty `TMUX` was among them (a tmux is really out there).
+pub fn outer_vars<K, V>(env: impl IntoIterator<Item = (K, V)>) -> (Vec<K>, bool)
+where
+    K: AsRef<OsStr>,
+    V: AsRef<OsStr>,
+{
+    let mut names = Vec::new();
+    let mut inside = false;
+    for (k, v) in env {
+        if !is_outer_name(k.as_ref()) {
+            continue;
+        }
+        if !v.as_ref().is_empty()
+            && k.as_ref()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(ENV_TMUX))
+        {
+            inside = true;
+        }
+        names.push(k);
+    }
+    (names, inside)
+}
+
+/// Drop an inherited `TMUX` / `TMUX_PANE` from this process, so the only ones
+/// a pane can be born with are the ones [`pane_env`] sets. A pane's
+/// environment is this process's with overrides laid over it; an override can
+/// replace a variable but never remove one, so a pane without the shim (ctl
+/// off, not claude, `teams: off`) would otherwise carry the outer tmux's
+/// values, and Claude Code's teams would split the outer tmux window.
+///
+/// For the hosting process only, once, at the top of `main` before any thread
+/// or pane exists. Never on the shim path or for `atrium ctl`: those run
+/// inside a pane and the values there are the ones atrium gave it. Returns
+/// whether a tmux was out there; [`outer_notice`] remembers it for the bar.
+pub fn hide_outer() -> bool {
+    let (names, inside) = outer_vars(std::env::vars_os());
+    for name in names {
+        std::env::remove_var(name);
+    }
+    *OUTER_HIDDEN.get_or_init(|| inside)
+}
+
+/// The bar line to show once when [`hide_outer`] hid an outer tmux.
+pub fn outer_notice() -> Option<&'static str> {
+    (OUTER_HIDDEN.get() == Some(&true)).then_some(OUTER_NOTICE)
+}
+
 /// The `teams` key, in `config.json` and per fleet: `"show"` (or `true`, or
 /// absent) catches a Claude Code lead's teammates as atrium panes; `"off"` (or
 /// `false`) sets no `TMUX` and prepends nothing, so Claude Code's teams run
@@ -423,6 +491,86 @@ mod tests {
         );
         assert!(path.ends_with("old"));
         assert!(pane_env("addr", "7", None, None).is_empty());
+    }
+
+    /// A pane's environment as the pty crate builds it: the hosting process's
+    /// own, with the overrides laid over it (an override wins by key and can
+    /// never remove a variable). `inherited` is what atrium was started with;
+    /// the scrub is [`outer_vars`], exactly what [`hide_outer`] removes.
+    fn born_with(
+        inherited: &[(&str, &str)],
+        overrides: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let (drop, _) = outer_vars(inherited.iter().copied());
+        let mut env: Vec<(String, String)> = inherited
+            .iter()
+            .filter(|(k, _)| !drop.contains(k))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        for (k, v) in overrides {
+            env.retain(|(have, _)| have != k);
+            env.push((k.clone(), v.clone()));
+        }
+        env
+    }
+
+    #[test]
+    fn an_outer_tmux_never_reaches_a_pane_and_the_shims_own_values_do() {
+        let outer = [
+            ("HOME", "/home/u"),
+            ("TMUX", "/tmp/tmux-1000/default,4242,0"),
+            ("TMUX_PANE", "%4"),
+            ("PATH", "/usr/bin"),
+        ];
+        let (names, inside) = outer_vars(outer.iter().copied());
+        assert_eq!(names, ["TMUX", "TMUX_PANE"]);
+        assert!(inside, "a non-empty TMUX is a tmux out there");
+
+        // No shim (ctl off, not claude, `teams: off`): nothing tmux at all.
+        let plain = born_with(&outer, &pane_env("addr", "7", None, None));
+        assert!(
+            !plain.iter().any(|(k, _)| k == "TMUX" || k == "TMUX_PANE"),
+            "{plain:?}"
+        );
+        assert!(plain.iter().any(|(k, v)| k == "HOME" && v == "/home/u"));
+        assert!(plain.iter().any(|(k, v)| k == "PATH" && v == "/usr/bin"));
+
+        // With the shim: atrium's values, and only those.
+        let shim = Path::new(if cfg!(windows) {
+            r"C:\s\shim\tmux.exe"
+        } else {
+            "/s/shim/tmux"
+        });
+        let ours = pane_env("addr", "7", Some(shim), Some(OsStr::new("/usr/bin")));
+        let led = born_with(&outer, &ours);
+        let all = |k: &str| -> Vec<&str> {
+            led.iter()
+                .filter(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .collect()
+        };
+        assert_eq!(
+            all("TMUX"),
+            [format!("addr,{},0", std::process::id()).as_str()]
+        );
+        assert_eq!(all("TMUX_PANE"), ["%7"]);
+    }
+
+    #[test]
+    fn outer_vars_names_only_tmuxs_two_and_needs_a_value_to_say_inside() {
+        let none: [(&str, &str); 2] = [("TMUXINATOR", "x"), ("PATH", "p")];
+        assert_eq!(outer_vars(none), (Vec::new(), false));
+        // A stray pane id, or an empty TMUX, is dropped but is not "inside tmux".
+        assert_eq!(
+            outer_vars([("TMUX_PANE", "%1"), ("TMUX", "")]),
+            (vec!["TMUX_PANE", "TMUX"], false)
+        );
+        let (names, inside) = outer_vars([("tmux", "/s,1,0")]);
+        if cfg!(windows) {
+            assert_eq!((names, inside), (vec!["tmux"], true));
+        } else {
+            assert_eq!((names, inside), (Vec::new(), false));
+        }
     }
 
     #[test]

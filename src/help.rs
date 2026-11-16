@@ -28,7 +28,8 @@ session flags:
   -n <N> | --grid <R>x<C>   open N copies of the command in a grid, or an exact R×C grid
   --reap-orphans            first kill pane groups whose atrium is gone (as `atrium reap`)
 
-  --version, -V             print the version         --help, -h   this text
+  --version, -V [--json]    print the version; --json: one object (version, commit, target)
+  --help, -h                this text
   --stdin-probe             show the raw bytes the terminal sends (a diagnostic)
 
 families:  atrium fleet --help     saved rosters: up, init, ls, clean
@@ -44,6 +45,57 @@ Mouse capture is off so text selection works; Ctrl+A m turns it on.
 ",
         v = env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The target triple this binary was built for, put together from the
+/// compiler's own `cfg` values (no build script hands us `TARGET`). It is the
+/// rustc triple on the targets atrium ships for: `x86_64`/`aarch64` with
+/// `pc-windows-msvc`, `pc-windows-gnu`, `unknown-linux-gnu`,
+/// `unknown-linux-musl` and `apple-darwin`.
+pub fn target_triple() -> String {
+    let vendor = if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    };
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        os => os,
+    };
+    let env = if cfg!(target_env = "msvc") {
+        "-msvc"
+    } else if cfg!(target_env = "gnu") {
+        "-gnu"
+    } else if cfg!(target_env = "musl") {
+        "-musl"
+    } else {
+        ""
+    };
+    format!("{}-{vendor}-{os}{env}", std::env::consts::ARCH)
+}
+
+/// The commit this binary was built from, when the build was told: the
+/// `ATRIUM_BUILD_COMMIT` environment variable at compile time. atrium has no
+/// build script, so nothing asks git; an ordinary `cargo install` has none.
+pub fn build_commit() -> Option<&'static str> {
+    option_env!("ATRIUM_BUILD_COMMIT").filter(|c| !c.is_empty())
+}
+
+/// `atrium --version --json`: one object on one line, keys in this order.
+/// `commit` is always present and is `null` when the build did not know it.
+pub fn version_json() -> String {
+    version_value(env!("CARGO_PKG_VERSION"), build_commit(), &target_triple()).to_string()
+}
+
+fn version_value(version: &str, commit: Option<&str>, target: &str) -> json::Value {
+    let s = |t: &str| json::Value::String(t.to_string());
+    json::Value::Object(vec![
+        ("version".to_string(), s(version)),
+        ("commit".to_string(), commit.map_or(json::Value::Null, s)),
+        ("target".to_string(), s(target)),
+    ])
 }
 
 /// `atrium ctl --help`. Shown on stdout for `--help`/`-h`, and on stderr after
@@ -171,6 +223,55 @@ pub fn wants(arg: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn version_json_is_one_object_of_version_commit_and_target() {
+        let text = version_json();
+        assert!(!text.contains('\n'), "one line: {text}");
+        let v = json::parse(&text).expect("valid json");
+        let keys: Vec<&str> = v
+            .as_object()
+            .expect("an object")
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(keys, ["version", "commit", "target"]);
+        assert_eq!(
+            v.get("version").and_then(json::Value::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        // The commit is a string when the build was told, else null: never absent.
+        match (v.get("commit"), build_commit()) {
+            (Some(json::Value::Null), None) => {}
+            (Some(json::Value::String(c)), Some(want)) => assert_eq!(c, want),
+            other => panic!("commit: {other:?}"),
+        }
+        let target = v
+            .get("target")
+            .and_then(json::Value::as_str)
+            .expect("target");
+        assert_eq!(target, target_triple());
+        assert!(target.starts_with(std::env::consts::ARCH), "{target}");
+        assert!(target.split('-').count() >= 3, "{target}");
+        #[cfg(all(windows, target_arch = "x86_64", target_env = "msvc"))]
+        assert_eq!(target, "x86_64-pc-windows-msvc");
+        #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+        assert_eq!(target, "x86_64-unknown-linux-gnu");
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(target, "aarch64-apple-darwin");
+    }
+
+    #[test]
+    fn version_json_carries_a_known_commit_as_a_string() {
+        assert_eq!(
+            version_value("1.2.3", Some("68af6fe"), "x86_64-unknown-linux-gnu").to_string(),
+            r#"{"version":"1.2.3","commit":"68af6fe","target":"x86_64-unknown-linux-gnu"}"#
+        );
+        assert_eq!(
+            version_value("1.2.3", None, "t").to_string(),
+            r#"{"version":"1.2.3","commit":null,"target":"t"}"#
+        );
+    }
+
     /// Every family's help names every command its parser accepts, and only
     /// flags the parser accepts — the list here is the inventory, kept beside
     /// the text so a new subcommand is added to both or the test says so.
@@ -258,6 +359,7 @@ mod tests {
             "--reap-orphans",
             "--version",
             "-V",
+            "--json",
             "--help",
             "-h",
             "--stdin-probe",
