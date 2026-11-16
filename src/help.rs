@@ -24,6 +24,8 @@ session flags:
   --skip-permissions        the same as --trust skip
   --allow-ctl               switch the control plane on (atrium ctl in every pane)
   --max-depth <N>           how deep spawned teammates may spawn (default 6; 0 = unlimited)
+  --ctl-socket <path>       where the control plane listens, instead of a per-process address
+                            (or ATRIUM_CTL_SOCKET; refused when another session is live on it)
   --identity <name>, -I     run every pane under a vault identity (name only; see docs/identity.md)
   -n <N> | --grid <R>x<C>   open N copies of the command in a grid, or an exact R×C grid
   --reap-orphans            first kill pane groups whose atrium is gone (as `atrium reap`)

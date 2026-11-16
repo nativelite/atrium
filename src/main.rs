@@ -99,28 +99,50 @@ const WARDEN_INTERVAL: Duration = Duration::from_secs(3);
 /// How often the run loop checks whether the session snapshot needs refreshing.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Bind the per-process ctl endpoint and publish its address to [`CTL_ADDRESS`]
+/// Bind the ctl endpoint and publish its address to [`CTL_ADDRESS`]
 /// so every pane spawned afterward is born with `ATRIUM_CTL`/`ATRIUM_PANE` in its
-/// env. Returns the [`atrium::ipc::Listener`] to poll, or `None` on a bind failure
-/// (surfaced in the bar, non-fatal). `CTL_ADDRESS` is a `OnceLock`, so only the
+/// env. The endpoint is the operator's `--ctl-socket` / `ATRIUM_CTL_SOCKET` when
+/// one was given and the per-process default otherwise
+/// (`atrium::ipc::endpoint`). Returns the [`atrium::ipc::Listener`] to poll, or
+/// `None` on a bind failure (surfaced in the bar, non-fatal; a launch that must
+/// not go on without a chosen socket asks [`bind_ctl_chosen`] first).
+/// `CTL_ADDRESS` is a `OnceLock`, so only the
 /// first successful bind per process publishes the address. The listener's
 /// accept thread rings the run loop's doorbell on every connect
 /// (`atrium::ipc::set_bell`), so a request is served when it arrives, not on
 /// the next tick; the loop's per-tick poll stays as the fallback.
 fn bind_ctl(flash: &mut Option<(String, Instant)>) -> Option<atrium::ipc::Listener> {
-    let addr = atrium::ipc::default_address();
-    match atrium::ipc::bind(&addr) {
-        Ok(l) => {
-            let _ = CTL_ADDRESS.set(addr);
-            Some(l)
-        }
-        Err(e) => {
+    match try_bind_ctl() {
+        Ok(l) => Some(l),
+        Err(why) => {
             if flash.is_none() {
-                *flash = Some((format!("ctl channel disabled: {e}"), Instant::now()));
+                *flash = Some((format!("ctl channel disabled: {why}"), Instant::now()));
             }
             None
         }
     }
+}
+
+/// [`bind_ctl`]'s work: resolve the endpoint, bind it, publish the address to
+/// the spawn path and to the discovery file. `Err` is the reason to show.
+fn try_bind_ctl() -> Result<atrium::ipc::Listener, String> {
+    let endpoint = atrium::ipc::endpoint()?;
+    let (listener, address) = atrium::ipc::bind_endpoint(&endpoint)?;
+    atrium::ipc::publish_endpoint(&address);
+    let _ = CTL_ADDRESS.set(address);
+    Ok(listener)
+}
+
+/// Bind an operator-chosen ctl socket before the terminal is taken, so a path
+/// that is live in another session (or cannot be an endpoint at all) fails the
+/// launch with a line on stderr instead of a bar flash in a session that came
+/// up without it. `Ok(None)` when ctl is off or no socket was chosen: the
+/// per-process default keeps its non-fatal [`bind_ctl`].
+fn bind_ctl_chosen(allow_ctl: bool) -> Result<Option<atrium::ipc::Listener>, String> {
+    if !allow_ctl || matches!(atrium::ipc::endpoint(), Ok(e) if !e.explicit) {
+        return Ok(None);
+    }
+    try_bind_ctl().map(Some)
 }
 
 /// Set at startup from the `--trust` / `--skip-permissions` flags (or a fleet's
@@ -260,6 +282,13 @@ fn cap_trust_to_ancestor(mut trust: atrium::ctl::TrustMode) -> atrium::ctl::Trus
 }
 
 fn main() -> ExitCode {
+    let code = launch();
+    // The discovery file names a running session; this one is over.
+    atrium::ipc::retract_endpoint();
+    code
+}
+
+fn launch() -> ExitCode {
     // Before anything else: a closed terminal window (SIGHUP) must reach the
     // event loop's normal exit, not kill atrium where it stands and orphan every
     // hosted agent onto `init`. Installed here so every path — single pane,
@@ -435,7 +464,20 @@ fn main() -> ExitCode {
     // atrium's own launch meta-flags (`--allow-ctl` / `--max-depth <N>` / `--trust`)
     // are stripped next — after `--identity`, before mass-spawn flags and the
     // hosted command. A bad `--max-depth` is a startup error, never a silent
-    // fallback.
+    // fallback. `--ctl-socket <path>` stands anywhere among them and is taken
+    // out first; it names the endpoint `bind_ctl` binds.
+    let rest = match atrium::ipc::take_socket_flag(&rest) {
+        Ok((socket, rest)) => {
+            if let Some(address) = socket {
+                atrium::ipc::set_socket_flag(address);
+            }
+            rest
+        }
+        Err(msg) => {
+            eprintln!("atrium: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let (allow_ctl, max_depth, mut trust, rest) = match atrium::ctl::parse_flags(&rest) {
         Ok(quad) => quad,
         Err(msg) => {
@@ -488,6 +530,15 @@ fn main() -> ExitCode {
         eprintln!("atrium: aborted (use --trust for safe hands-off: edits + a dev allowlist, dangerous commands still prompt).");
         return ExitCode::SUCCESS;
     }
+    // A chosen ctl socket is bound here, while stderr is still a plain
+    // terminal: live elsewhere, it ends the launch.
+    let ctl_listener = match bind_ctl_chosen(allow_ctl) {
+        Ok(listener) => listener,
+        Err(msg) => {
+            eprintln!("atrium: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => {
@@ -505,7 +556,7 @@ fn main() -> ExitCode {
             allow_ctl,
             max_depth,
             trust,
-            ctl_listener: None,
+            ctl_listener,
             attention: atrium::attention::Setup {
                 name: atrium::attention::Setup::project_dir_name(),
                 notify: atrium::config::get()

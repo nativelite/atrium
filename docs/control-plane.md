@@ -37,6 +37,25 @@ When ctl is on, atrium opens a **per-instance control channel** (a **named pipe*
 
 Any process in a pane (a shell command, or an agent via a tool or hook) issues control by running **`atrium ctl <cmd>`**, which speaks one JSON request per line and prints the one-line JSON reply.
 
+### A stable endpoint: `--ctl-socket`
+
+By default the endpoint is named after atrium's process id (`\\.\pipe\atrium-ctl-<pid>` on Windows, `<tmp>/atrium-ctl-<pid>.sock` elsewhere), so two sessions never collide and a helper outside the session has to be told the address. To choose it instead:
+
+```bash
+atrium --allow-ctl --ctl-socket /run/user/1000/atrium.sock claude   # unix: an absolute socket path
+atrium --allow-ctl --ctl-socket atrium-main claude                  # Windows: a pipe name (\\.\pipe\atrium-main)
+ATRIUM_CTL_SOCKET=/run/user/1000/atrium.sock atrium --allow-ctl up team
+```
+
+- **The flag wins over `ATRIUM_CTL_SOCKET`**, and either one only names the endpoint: the control plane is still switched on by `--allow-ctl` (or the fleet file). The flag is a session flag and goes before the command, among the others in any order; `atrium fleet up <name>` and `atrium recover`, which parse their own flags, take the choice from `ATRIUM_CTL_SOCKET`.
+- **Panes receive the chosen address as `ATRIUM_CTL`**, exactly as they receive the default one.
+- **A path with a live listener is refused.** If another session is serving on it, the launch ends with `atrium: ctl socket <path> could not be bound: a server is already listening on <path>` before the terminal is taken, and that session keeps its endpoint. (A resumed or recovered session reports the same failure in the bar and runs without ctl.)
+- **A stale path is taken over.** On unix a socket file left by a session that was killed refuses a connect; atrium removes it and binds. A file at the path that is not a socket is never removed: the launch fails. A Windows pipe name cannot go stale.
+- **What a path may be.** On unix an absolute path, short enough for a socket address (under 108 bytes on Linux, 104 on macOS). On Windows a named-pipe name, bare or with the `\\.\pipe\` prefix. A comma is refused on both, because Claude Code's teams are handed the address inside `TMUX=<address>,<pid>,0`.
+- **The hardening is unchanged**: the socket is `0600` and every peer's uid is checked; the pipe admits the current user only. Choosing the path chooses where the endpoint is, not who may use it.
+
+**The discovery file.** Every ctl session, with a chosen address or the default, writes `ctl/<pid>.endpoint` under the per-user state directory (`%LOCALAPPDATA%\atrium\sessions` on Windows, `$XDG_STATE_HOME/atrium/sessions` or `~/.local/state/atrium/sessions` elsewhere, or `ATRIUM_STATE_DIR`): one line, the session's address, owner-only. It is removed when atrium exits; a file whose endpoint no longer answers (the session was killed) is treated as stale and removed by the next reader. `atrium ctl` run outside a pane, with no `ATRIUM_CTL`, uses it when exactly one session is running, and says so when there are none or several. Outside a pane there is no `ATRIUM_TOKEN`, so that reaches the token-free reads only.
+
 ## The command surface
 
 Targets are a pane **id** (its numeric agent id) or a **role** label (`dev_1`); an ambiguous role is a clear error.
@@ -134,7 +153,7 @@ The multiplier: many workers, coordinated by a few of them, driven by one human,
 
 ## Reading the control plane from a host
 
-A terminal or dashboard that hosts atrium can read the session's state over the control channel instead of the `ATRIUM_BUS` sidecar, which it still writes. The channel is `\.\pipetrium-ctl-<pid>` on Windows and the `0600` socket named by `ATRIUM_CTL` elsewhere; one JSON line in, one JSON line out, one request per connection. The verbs that need **no token** are the reads: `list`, `status`, `audit`, `board get`, `board list`, `bus feed`, `bus topics`. Everything that mutates the fleet or its shared state, and every verb that returns a model's words (`answer`, `asked`, `inbox`, `who`), needs the caller pane's `ATRIUM_TOKEN` and is scoped to that pane's subtree.
+A terminal or dashboard that hosts atrium can read the session's state over the control channel instead of the `ATRIUM_BUS` sidecar, which it still writes. The channel is `\\.\pipe\atrium-ctl-<pid>` on Windows and the `0600` socket `<tmp>/atrium-ctl-<pid>.sock` elsewhere, or the address the operator chose with `--ctl-socket` (see [A stable endpoint](#a-stable-endpoint---ctl-socket)); a host that was handed neither reads it from the session's discovery file; one JSON line in, one JSON line out, one request per connection. The verbs that need **no token** are the reads: `list`, `status`, `audit`, `board get`, `board list`, `bus feed`, `bus topics`. Everything that mutates the fleet or its shared state, and every verb that returns a model's words (`answer`, `asked`, `inbox`, `who`), needs the caller pane's `ATRIUM_TOKEN` and is scoped to that pane's subtree.
 
 What a host may rely on, from 0.43.0 on:
 

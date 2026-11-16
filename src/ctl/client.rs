@@ -24,12 +24,20 @@ pub fn ctl_cmd(args: &[String]) -> ExitCode {
         eprint!("{}", crate::help::CTL);
         return ExitCode::FAILURE;
     }
-    let Some(address) = std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty()) else {
-        eprintln!(
-            "atrium ctl: not inside a ctl-enabled atrium session ({ENV_ADDRESS} unset).\n\
-             Start atrium with `--allow-ctl` and run `atrium ctl` from one of its panes."
-        );
-        return ExitCode::FAILURE;
+    // Outside a pane there is no `ATRIUM_CTL`: fall back to the discovery file
+    // when it names exactly one running session (token-free reads only, since
+    // no pane token comes with it).
+    let from_env = std::env::var(ENV_ADDRESS).ok().filter(|a| !a.is_empty());
+    let address = match from_env.map_or_else(crate::ipc::discover_one, Ok) {
+        Ok(address) => address,
+        Err(why) => {
+            eprintln!(
+                "atrium ctl: not inside a ctl-enabled atrium session ({ENV_ADDRESS} unset), \
+                 and {why}.\n\
+                 Start atrium with `--allow-ctl` and run `atrium ctl` from one of its panes."
+            );
+            return ExitCode::FAILURE;
+        }
     };
     let caller = std::env::var(ENV_PANE)
         .ok()

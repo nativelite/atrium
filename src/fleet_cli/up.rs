@@ -506,22 +506,25 @@ fn run_session(launch: FleetLaunch, max_depth: usize) -> ExitCode {
         wt_active,
         ..
     } = launch;
+    let mut flash: Option<(String, Instant)> = None;
+    // Bind the ctl endpoint BEFORE spawning the fleet's panes, so each agent is
+    // born with `ATRIUM_CTL`/`ATRIUM_PANE` in its env and can drive the board/bus.
+    // (The default path binds inside run() after its single spawn; a fleet spawns
+    // its whole roster up front, so it must publish the address first.) And
+    // before the terminal is taken: a chosen socket (`--ctl-socket`) that is
+    // live in another session ends the launch with a line on stderr.
+    let ctl_listener = match crate::bind_ctl_chosen(allow_ctl) {
+        Ok(Some(listener)) => Some(listener),
+        Ok(None) if allow_ctl => bind_ctl(&mut flash),
+        Ok(None) => None,
+        Err(msg) => return fail(&format!("atrium: {msg}")),
+    };
     let mut term = match rawterm::Terminal::raw() {
         Ok(t) => t,
         Err(e) => return fail(&format!("atrium: stdin/stdout must be a terminal: {e}")),
     };
     let (rows, cols) = term.size().unwrap_or((24, 80));
 
-    let mut flash: Option<(String, Instant)> = None;
-    // Bind the ctl endpoint BEFORE spawning the fleet's panes, so each agent is
-    // born with `ATRIUM_CTL`/`ATRIUM_PANE` in its env and can drive the board/bus.
-    // (The default path binds inside run() after its single spawn; a fleet spawns
-    // its whole roster up front, so it must publish the address first.)
-    let ctl_listener = if allow_ctl {
-        bind_ctl(&mut flash)
-    } else {
-        None
-    };
     // When worktrees are active, hand the plans to the spawn so each member
     // pane's cwd is its worktree dir; an empty slice (inactive, or not a repo)
     // means every pane keeps its fleet-file cwd — today's behavior, unchanged.
