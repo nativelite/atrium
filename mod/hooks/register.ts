@@ -306,7 +306,12 @@ async function runSubagent(
   if (pane === undefined) return { deny: `atrium_subagent: cannot spawn a pane: ${spawned.err ?? 'no reply'}` }
   if (toolUseId !== undefined) $.ui.notice(toolUseId, `running as atrium pane ${pane} (${role})`)
   const sent = await ctl($, ['send', String(pane), task])
-  if (!sent.ok) return { deny: `atrium_subagent: pane ${pane} opened but the task was not delivered: ${sent.err ?? 'no reply'}` }
+  if (!sent.ok) {
+    // The pane this call opened has no task and nothing will give it one:
+    // close it, so a refused send does not leave an idle agent behind.
+    const closed = await ctl($, ['kill', String(pane)])
+    return { deny: `atrium_subagent: the task was not delivered to pane ${pane} (${sent.err ?? 'no reply'}); ${closed.ok ? 'the pane was closed' : `the pane could not be closed (${closed.err ?? 'no reply'}): kill it with atrium_kill`}` }
+  }
   let answer: { answer: string; seq: number } | undefined
   for (let i = 0; i < WAIT_SLICES && answer === undefined; i += 1) {
     const reply = await ctl($, ['wait', String(pane), '--for', 'answer', '--timeout', String(WAIT_SLICE_S)], (WAIT_SLICE_S + 30) * 1000)

@@ -59,6 +59,7 @@ pub const VERBS: &[&str] = &[
     "spawn",
     "list",
     "send",
+    "command",
     "status",
     "kill",
     "respawn",
@@ -613,6 +614,10 @@ pub fn pick_client_token(text: &str, name: Option<&str>) -> Result<String, Strin
 /// * it holds a `:` together with any character that is not an ASCII letter,
 ///   digit, `_`, `-`, `.` or `:`.
 ///
+/// The same test refuses a role that reads as `atrium`, the label of a
+/// delivery with no pane and no operator behind it and the word on every
+/// frame atrium writes (`atrium-dev` and `atrium_2` are ordinary roles).
+///
 /// `operators`, `operator_2` and `co-operator` are ordinary roles. The rule
 /// errs toward refusing: an eight-character role in a non-Latin script reads
 /// as a look-alike to it. The audit log is not fooled either way: it records
@@ -625,16 +630,50 @@ pub fn role_reserved(role: &str) -> bool {
         .filter(|c| !c.is_whitespace() && !has_unsafe(c.encode_utf8(&mut [0; 4])))
         .collect();
     let word = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.');
-    let reads_as_operator = kept.len() >= 8
-        && "operator"
-            .chars()
-            .zip(&kept)
-            .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
-        && !kept
-            .get(8)
-            .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'));
+    // Does the role read as `name`: each letter that one in either case, or
+    // not ASCII (and so possibly drawn like it), ending there or going on
+    // with anything but an ASCII letter, digit, `_` or `-`?
+    let reads_as = |name: &str| {
+        let n = name.chars().count();
+        kept.len() >= n
+            && name
+                .chars()
+                .zip(&kept)
+                .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+            && !kept
+                .get(n)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'))
+    };
     let colon_with_marks = kept.contains(&':') && kept.iter().any(|c| !word(*c) && *c != ':');
-    reads_as_operator || colon_with_marks
+    // `atrium` is the label of a delivery with no pane and no operator
+    // behind it (`ctl::Sender::Atrium`), and the name on every frame atrium
+    // writes: not a pane's to wear either. It is a short word, so the
+    // look-alike test asks for one thing more than `operator`'s does: at
+    // least one of its letters must be there as itself (ASCII or fullwidth).
+    // A six-letter role in another script is an ordinary role.
+    let fullwidth = |c: char| match c {
+        '\u{ff21}'..='\u{ff3a}' => char::from_u32(c as u32 - 0xff21 + 'a' as u32).unwrap_or(c),
+        '\u{ff41}'..='\u{ff5a}' => char::from_u32(c as u32 - 0xff41 + 'a' as u32).unwrap_or(c),
+        c => c,
+    };
+    let folded: Vec<char> = kept.iter().map(|c| fullwidth(*c)).collect();
+    let reads_as_atrium = {
+        let name = "atrium";
+        let n = name.len();
+        folded.len() >= n
+            && name
+                .chars()
+                .zip(&folded)
+                .all(|(want, got)| !got.is_ascii() || got.eq_ignore_ascii_case(&want))
+            && name
+                .chars()
+                .zip(&folded)
+                .any(|(want, got)| got.eq_ignore_ascii_case(&want))
+            && !folded
+                .get(n)
+                .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, '_' | '-'))
+    };
+    reads_as("operator") || reads_as_atrium || colon_with_marks
 }
 
 // ---- vetting what an operator sends ---------------------------------------
@@ -672,35 +711,43 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             for a in &sp.argv {
                 plain("argv", a, 4096)?;
             }
-            // The command is a bare name, found on PATH. The spawn allowlist
+            // The command is a bare name with no extension, found on PATH. The spawn allowlist
             // looks at the file stem alone and a command with a separator is
             // run as given, so `\\host\share\claude.exe` or `./x/claude` would
             // pass as `claude` and run a binary of the caller's choosing,
             // which honours no posture flag. An empty argv is the server's
-            // default (claude).
+            // default (claude). The predicate is the one every caller's spawn
+            // is held to (`ctl::is_bare_command`); checked here as well so an
+            // operator's refused path never reaches the audit detail.
+            // A positional argument of an agent's command is the new agent's
+            // first prompt, and no header can be put in front of it: refused
+            // at any trust (the policy passed is the one that would exempt a
+            // pane, and does not exempt an operator).
+            crate::ctl::vet_spawn_args(
+                &sp.argv,
+                crate::ctl::TextFrom::Operator,
+                crate::ctl::TrustMode::Skip,
+            )
+            .map_err(str::to_string)?;
             if let Some(program) = sp.argv.first() {
-                word("argv[0]", program).map_err(|_| {
-                    "argv[0] must be a bare command name (no path, no drive): 1 to 64 of \
-                     A-Z a-z 0-9 . _ -"
-                        .to_string()
-                })?;
+                if !crate::ctl::is_ctl_command(program) {
+                    return Err(
+                        "argv[0] must be a bare command name (no path, no drive, no \
+                         extension): 1 to 64 of A-Z a-z 0-9 _ -"
+                            .to_string(),
+                    );
+                }
             }
             Ok(())
         }
         Cmd::Send(sr) => {
             plain("target", &sr.target, 128)?;
-            lines("text", &sr.text)?;
-            // What is typed is meant as a prompt. An agent CLI gives a leading
-            // `!` or `/` a meaning of its own (a shell line, a command of the
-            // CLI), which is not the agent acting under its trust mode.
-            if sr.text.trim_start().starts_with(['!', '/']) {
-                return Err(
-                    "text may not start with ! or /: an agent CLI reads those as a shell line \
-                     or a command of its own, not as a prompt"
-                        .to_string(),
-                );
-            }
-            Ok(())
+            // Plain text, which may span lines. What it starts with does not
+            // matter: atrium puts its attribution header in front of every
+            // send (`ctl::with_send_header`), so no character of the caller's
+            // is ever the first of an agent's prompt. A slash command goes
+            // through the `command` verb and the session's allowlist.
+            lines("text", &sr.text)
         }
         Cmd::Ask(a) => {
             plain("target", &a.target, 128)?;
@@ -711,6 +758,18 @@ pub fn vet(cmd: &Cmd) -> Result<(), String> {
             None => Ok(()),
         },
         Cmd::Kill(kr) => plain("target", &kr.target, 128),
+        // The name is checked against the session's allowlist by the
+        // handler; here it only has to be well formed, like every field.
+        Cmd::Command(c) => {
+            plain("target", &c.target, 128)?;
+            if !crate::ctl::is_command_name(&c.name) {
+                return Err(
+                    "name must be a slash command name: / then 1 to 64 of a-z A-Z 0-9 _ - :"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
         Cmd::Answer(a) => plain("target", &a.target, 128),
         Cmd::Asked(a) => plain("target", &a.target, 128),
         Cmd::Respawn(rr) => {
@@ -818,12 +877,8 @@ fn lines(what: &str, s: &str) -> Result<(), String> {
 /// system prompt (a role, a worktree): `[A-Za-z0-9._-]{1,64}`, starting with
 /// a letter, a digit or `_`.
 fn word(what: &str, s: &str) -> Result<(), String> {
-    let ok = !s.is_empty()
-        && s.len() <= 64
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && !s.starts_with(['.', '-']);
-    if !ok {
+    // One definition, shared with every caller's spawn command.
+    if !crate::ctl::is_bare_command(s) {
         return Err(format!(
             "{what} must be 1 to 64 of A-Z a-z 0-9 . _ - and not start with . or -"
         ));

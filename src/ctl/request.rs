@@ -78,6 +78,9 @@ pub enum Cmd {
     /// Terminate a target pane **and its whole subtree** (design §5: a kill
     /// tears down descendants, so a lead's `kill` reaps its ICs too).
     Kill(KillReq),
+    /// `command`: one allowlisted slash command, delivered to an agent's pane
+    /// as its own prompt line.
+    Command(CommandReq),
     /// Report the ctl request log (subtree-scoped for a worker), most recent
     /// `tail` entries or all of the in-memory ring.
     Audit(AuditReq),
@@ -176,6 +179,7 @@ impl Cmd {
         match self {
             Cmd::List | Cmd::Status(_) | Cmd::Audit(_) => true,
             Cmd::Spawn(_) | Cmd::Send(_) | Cmd::Kill(_) | Cmd::Respawn(_) => false,
+            Cmd::Command(_) => false,
             // A mod's reports write broker state, and `whoami` answers about
             // the caller, which an unauthenticated request does not have.
             Cmd::Hello(_) | Cmd::Report(_) | Cmd::Whoami => false,
@@ -214,18 +218,22 @@ impl Cmd {
     /// **secret-free** description (identity *names* only; `send` logs the text
     /// *length*, never the body).
     pub fn audit_label(&self) -> (&'static str, String) {
+        // Every field is the caller's, and a request is recorded whether or
+        // not it carried a credential: each is scrubbed and bounded on its way
+        // in (`audit::field`), so the label never holds raw request text.
+        use crate::audit::field as f;
         match self {
             Cmd::List => ("list", String::new()),
             Cmd::Status(sr) => (
                 "status",
                 match &sr.target {
-                    Some(t) => format!("target={t}"),
+                    Some(t) => format!("target={}", f(t)),
                     None => "scope=subtree".to_string(),
                 },
             ),
             Cmd::Send(sr) => (
                 "send",
-                format!("target={} len={}", sr.target, sr.text.chars().count()),
+                format!("target={} len={}", f(&sr.target), sr.text.chars().count()),
             ),
             Cmd::Spawn(sp) => {
                 let stem = sp
@@ -237,25 +245,39 @@ impl Cmd {
                     "spawn",
                     format!(
                         "role={} argv={} identity={}",
-                        sp.role.as_deref().unwrap_or("-"),
-                        stem,
-                        sp.identity.as_deref().unwrap_or("-")
+                        f(sp.role.as_deref().unwrap_or("-")),
+                        f(&stem),
+                        f(sp.identity.as_deref().unwrap_or("-"))
                     ),
                 )
             }
-            Cmd::Kill(kr) => ("kill", format!("target={}", kr.target)),
+            Cmd::Kill(kr) => ("kill", format!("target={}", f(&kr.target))),
+            // The name is logged whole only when it is well formed (it is then
+            // one of a short alphabet); anything else is shown by its length.
+            Cmd::Command(c) => (
+                "command",
+                if crate::ctl::is_command_name(&c.name) {
+                    format!("target={} name={}", f(&c.target), c.name)
+                } else {
+                    format!(
+                        "target={} name=<malformed, {} chars>",
+                        f(&c.target),
+                        c.name.chars().count()
+                    )
+                },
+            ),
             Cmd::Audit(_) => ("audit", String::new()),
             Cmd::Board(op) => (
                 "board",
                 match op {
                     BoardOp::Set { key, fields } => {
-                        format!("set {key} fields={}", fields.len())
+                        format!("set {} fields={}", f(key), fields.len())
                     }
-                    BoardOp::Get { key } => format!("get {key}"),
+                    BoardOp::Get { key } => format!("get {}", f(key)),
                     BoardOp::List => "list".to_string(),
-                    BoardOp::Del { key } => format!("del {key}"),
-                    BoardOp::Claim { key, .. } => format!("claim {key}"),
-                    BoardOp::Release { key } => format!("release {key}"),
+                    BoardOp::Del { key } => format!("del {}", f(key)),
+                    BoardOp::Claim { key, .. } => format!("claim {}", f(key)),
+                    BoardOp::Release { key } => format!("release {}", f(key)),
                 },
             ),
             Cmd::Bus(op) => (
@@ -268,10 +290,15 @@ impl Cmd {
                         create,
                     } => {
                         let new = if *create { " --new" } else { "" };
-                        format!("pub {topic}{new} {} fields={}", kind.as_str(), fields.len())
+                        format!(
+                            "pub {}{new} {} fields={}",
+                            f(topic),
+                            kind.as_str(),
+                            fields.len()
+                        )
                     }
-                    BusOp::Sub { topics } => format!("sub {}", topics.join(",")),
-                    BusOp::Unsub { topics } => format!("unsub {}", topics.join(",")),
+                    BusOp::Sub { topics } => format!("sub {}", joined(topics)),
+                    BusOp::Unsub { topics } => format!("unsub {}", joined(topics)),
                     BusOp::Feed { since } => format!("feed since={since}"),
                     BusOp::Resolve { seq } => format!("resolve {seq}"),
                     BusOp::Topics => "topics".to_string(),
@@ -281,13 +308,13 @@ impl Cmd {
                 "respawn",
                 format!(
                     "target={} worktree={}",
-                    rr.target,
-                    rr.worktree.as_deref().unwrap_or("-")
+                    f(&rr.target),
+                    f(rr.worktree.as_deref().unwrap_or("-"))
                 ),
             ),
             Cmd::Hello(h) => (
                 "hello",
-                format!("mod={} caps={}", h.version, h.caps.join(",")),
+                format!("mod={} caps={}", f(&h.version), joined(&h.caps)),
             ),
             // The answer's length, never its text: it is the model's output.
             Cmd::Report(r) => (
@@ -302,7 +329,7 @@ impl Cmd {
                 ),
             ),
             Cmd::Whoami => ("whoami", String::new()),
-            Cmd::Answer(a) => ("answer", format!("target={}", a.target)),
+            Cmd::Answer(a) => ("answer", format!("target={}", f(&a.target))),
             Cmd::Inbox(i) => (
                 "inbox",
                 if i.wait {
@@ -314,14 +341,29 @@ impl Cmd {
             // The question's length, never its text.
             Cmd::Ask(a) => (
                 "ask",
-                format!("target={} len={}", a.target, a.text.chars().count()),
+                format!("target={} len={}", f(&a.target), a.text.chars().count()),
             ),
-            Cmd::Asked(a) => ("asked", format!("target={} id={}", a.target, a.id)),
-            Cmd::Who(w) => ("who", format!("path={}", w.path)),
+            Cmd::Asked(a) => ("asked", format!("target={} id={}", f(&a.target), a.id)),
+            Cmd::Who(w) => ("who", format!("path={}", crate::audit::field_tail(&w.path))),
             Cmd::Ping => ("ping", String::new()),
             Cmd::Metrics => ("metrics", String::new()),
         }
     }
+}
+
+/// A list field (topics, caps) for an audit detail: each item scrubbed and
+/// bounded, at most eight shown and the rest counted.
+fn joined(items: &[String]) -> String {
+    const SHOWN: usize = 8;
+    let mut out: Vec<String> = items
+        .iter()
+        .take(SHOWN)
+        .map(|i| crate::audit::scrub(i, 32))
+        .collect();
+    if items.len() > SHOWN {
+        out.push(format!("(+{} more)", items.len() - SHOWN));
+    }
+    out.join(",")
 }
 
 /// A `hello` request's payload: what a pane's mod says about itself.
@@ -372,6 +414,15 @@ pub struct RespawnReq {
 pub struct AuditReq {
     /// Show only the most recent `n` entries; `None` = the whole in-memory ring.
     pub tail: Option<usize>,
+}
+
+/// A `command` request's payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandReq {
+    /// Pane id (numeric) or role label to deliver to.
+    pub target: String,
+    /// The slash command, `/<name>`, with no arguments.
+    pub name: String,
 }
 
 /// A `send` request's payload.
@@ -642,6 +693,26 @@ pub fn parse_request(line: &str) -> Result<Request, String> {
                 .ok_or_else(|| "kill needs a target".to_string())?
                 .to_string();
             Cmd::Kill(KillReq { target })
+        }
+        Some("command") => {
+            let target = v
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "command needs a target".to_string())?
+                .to_string();
+            let name = v
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    "command needs a name (a slash command, such as /compact)".to_string()
+                })?
+                .to_string();
+            // The request is the bare name. A field that would carry more is
+            // refused, never dropped: this release delivers no arguments.
+            if v.get("args").is_some() || v.get("text").is_some() || v.get("argv").is_some() {
+                return Err("command takes a name and no arguments".to_string());
+            }
+            Cmd::Command(CommandReq { target, name })
         }
         Some("respawn") => {
             let target = v

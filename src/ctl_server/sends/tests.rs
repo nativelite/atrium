@@ -23,13 +23,15 @@ fn sends_queued_for_a_respawned_pane_are_delivered_whole_to_its_new_process() {
         &mut pending,
         old,
         "resume from PLAN.md".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         other,
         "keep going".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     pending[0].written = 6;
     pending[0].text_written_at = Some(Instant::now());
@@ -54,21 +56,24 @@ fn a_target_that_never_takes_delivery_cannot_grow_the_queue_without_bound() {
             &mut pending,
             wedged,
             "task".into(),
-            SendOrigin::Ctl
+            SendOrigin::Ctl,
+            SentBy::default()
         ));
     }
     assert!(!queue_send(
         &mut pending,
         wedged,
         "one too many".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert_eq!(pending.len(), MAX_PENDING_PER_TARGET);
     assert!(queue_send(
         &mut pending,
         AgentId(2),
         "other".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
 }
 
@@ -82,7 +87,8 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
             &mut pending,
             t,
             format!("w{i}"),
-            SendOrigin::BusWake
+            SendOrigin::BusWake,
+            SentBy::default()
         ));
     }
     assert_eq!(pending.len(), 1, "coalesced");
@@ -96,7 +102,8 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
             &mut pending,
             t,
             "later".into(),
-            SendOrigin::BusWake
+            SendOrigin::BusWake,
+            SentBy::default()
         ));
     }
     pending.last_mut().unwrap().written = 1;
@@ -104,14 +111,16 @@ fn bus_wakes_have_their_own_cap_and_never_consume_send_slots() {
         &mut pending,
         t,
         "one too many".into(),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     // A send is still accepted: wakes do not count against it.
     assert!(queue_send(
         &mut pending,
         t,
         "operator".into(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
 }
 
@@ -120,18 +129,26 @@ fn a_coalesced_wake_stops_growing_at_the_limit_and_points_at_the_feed() {
     let mut pending = Vec::new();
     let t = AgentId(1);
     let big = "x".repeat(WAKE_COALESCE_CHARS - 10);
-    assert!(queue_send(&mut pending, t, big, SendOrigin::BusWake));
+    assert!(queue_send(
+        &mut pending,
+        t,
+        big,
+        SendOrigin::BusWake,
+        SentBy::default()
+    ));
     assert!(queue_send(
         &mut pending,
         t,
         "y".repeat(50),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         t,
         "z".repeat(50),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     assert_eq!(pending.len(), 1);
     assert!(pending[0].text.ends_with("+more: atrium ctl bus feed"));
@@ -149,19 +166,22 @@ fn take_for_hands_a_pane_its_untyped_deliveries_and_nothing_else() {
         &mut pending,
         AgentId(1),
         "first".to_string(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         AgentId(2),
         "other".to_string(),
-        SendOrigin::Ctl
+        SendOrigin::Ctl,
+        SentBy::default()
     ));
     assert!(queue_send(
         &mut pending,
         AgentId(1),
         "[atrium bus #1 fyi] second".to_string(),
-        SendOrigin::BusWake
+        SendOrigin::BusWake,
+        SentBy::default()
     ));
     pending[0].written = 2; // the pty path began typing this one
     let delivered = wakes_delivered();
@@ -261,4 +281,110 @@ fn a_codex_startup_screen_holds_a_send_past_the_prompt_wait() {
     prompt.feed(b">_ OpenAI Codex\r\n  ? for shortcuts\r\n");
     assert!(dialog_up(agsess::Vendor::Codex, prompt.screen()).is_none());
     assert!(prompt_up("codex", prompt.screen(), Duration::ZERO));
+}
+
+/// The last guard before the pty: nothing is typed into a pane that is not
+/// an agent's below `skip`.
+#[test]
+fn nothing_is_typed_into_a_non_agent_pane_below_skip() {
+    use atrium::ctl::TrustMode::{Auto, Edits, Off, Plan, Skip};
+    for policy in [Off, Plan, Edits, Auto] {
+        assert!(!may_type_into(false, policy), "{policy:?}");
+        assert!(may_type_into(true, policy), "{policy:?}");
+    }
+    assert!(may_type_into(false, Skip));
+}
+
+/// One `send`, one prompt. Whatever form a delivery takes, no byte of a
+/// two-line text can submit before the Enter that follows it: a paste
+/// carries its line break between the markers, a flat delivery has none
+/// left, and the raw form is only for a pane that is not an agent's (a
+/// `skip` session) or a one-word command.
+#[test]
+fn a_line_break_inside_a_delivery_cannot_submit_on_any_path() {
+    let text = "[atrium: from lead] line one\n!line two\r\nthree\rfour\tfive";
+    let flat = delivery_bytes(text, TypeAs::Flat);
+    assert_eq!(
+        String::from_utf8(flat.clone()).unwrap(),
+        "[atrium: from lead] line one \u{21b5} !line two \u{21b5} three \u{21b5} four five"
+    );
+    assert!(
+        !flat.iter().any(|b| *b < 0x20 || *b == 0x7f),
+        "no control byte at all in a flat delivery"
+    );
+    for odd in ["a\u{b}b", "a\u{c}b", "a\u{85}b", "a\u{2028}b", "a\u{2029}b"] {
+        assert_eq!(
+            String::from_utf8(delivery_bytes(odd, TypeAs::Flat)).unwrap(),
+            "a \u{21b5} b"
+        );
+    }
+    let pasted = delivery_bytes("a\n!b", TypeAs::Paste);
+    if cfg!(unix) {
+        assert_eq!(pasted, b"\x1b[200~a\n!b\x1b[201~");
+    }
+    assert_eq!(delivery_bytes("/compact", TypeAs::Raw), b"/compact");
+    for how in [TypeAs::Flat, TypeAs::Paste, TypeAs::Raw] {
+        assert!(!delivery_bytes("a\nb", how).ends_with(b"\r"), "{how:?}");
+    }
+}
+
+/// Which form each pane gets. An agent's pane: a paste on unix where its app
+/// or its CLI takes one, one flat line otherwise, and always flat on Windows;
+/// never raw. A pane that is not an agent's (a `skip` session): as it always
+/// was, a paste on unix when its app turned paste mode on, else raw. A
+/// command: raw everywhere.
+#[test]
+fn an_agents_pane_is_typed_as_a_paste_or_as_one_line_never_raw() {
+    for origin in [SendOrigin::Ctl, SendOrigin::BusWake] {
+        for app in [false, true] {
+            for cli in [false, true] {
+                let how = type_as(true, origin, app, cli);
+                assert_ne!(how, TypeAs::Raw, "{origin:?} app={app} cli={cli}");
+                if cfg!(unix) && (app || cli) {
+                    assert_eq!(how, TypeAs::Paste);
+                } else {
+                    assert_eq!(how, TypeAs::Flat);
+                }
+                let shell = type_as(false, origin, app, cli);
+                if cfg!(unix) && app {
+                    assert_eq!(shell, TypeAs::Paste, "as before 0.47.0");
+                } else {
+                    assert_eq!(shell, TypeAs::Raw);
+                }
+            }
+        }
+    }
+    for agent in [false, true] {
+        assert_eq!(type_as(agent, SendOrigin::Command, true, true), TypeAs::Raw);
+    }
+}
+
+/// An unbound agent CLI that never showed its prompt is not typed into when
+/// the wait runs out: the delivery is dropped (`flush_sends`), where it used
+/// to be typed into whatever the pane was showing.
+#[test]
+fn a_prompt_that_never_came_drops_the_delivery_instead_of_typing_it() {
+    let mut dialog = vterm::Term::new(6, 40);
+    dialog.feed(b"Do you trust the files in this folder?\r\n 1. Yes\r\n 2. No\r\n");
+    let mut prompt = vterm::Term::new(6, 40);
+    prompt.feed(b"> \r\n  ? for shortcuts\r\n");
+    for title in ["codex", "claude"] {
+        assert!(prompt_never_came(title, dialog.screen(), SEND_PROMPT_WAIT));
+        assert!(!prompt_never_came(
+            title,
+            dialog.screen(),
+            SEND_PROMPT_WAIT - Duration::from_secs(1)
+        ));
+        assert!(!prompt_never_came(
+            title,
+            prompt.screen(),
+            SEND_PROMPT_WAIT * 2
+        ));
+    }
+    // A program with no hint to wait for is not held to one.
+    assert!(!prompt_never_came(
+        "bash",
+        dialog.screen(),
+        SEND_PROMPT_WAIT * 2
+    ));
 }

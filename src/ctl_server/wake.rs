@@ -34,14 +34,16 @@ fn is_unsafe_in_wake(c: char) -> bool {
         )
 }
 
-/// The frame's opening, which a message body may not reproduce: a publisher
-/// could otherwise append a second, fully formed frame naming any sender.
+/// The frame's opening.
 const WAKE_FRAME: &str = "[atrium bus";
 
-/// A message body with any imitation of the frame defanged (`[atrium bus` →
-/// `(atrium bus`), so exactly one frame per line, the real one.
-fn defang_frame(body: &str) -> String {
-    body.replace(WAKE_FRAME, "(atrium bus")
+/// A caller-supplied part of a wake (the body, the detail, the sender's
+/// label, the topic) with any imitation of an atrium frame defanged: the bus
+/// frame, and the send header too (`[atrium: from …]`), which a wake could
+/// otherwise carry up the tree to a pane no send of the publisher's reaches.
+/// The rule is the shared one, [`atrium::ctl::defang_frames`].
+fn defang_frame(part: &str) -> String {
+    atrium::ctl::defang_frames(part)
 }
 
 /// The one line a bus event becomes when typed into a pane: framed so the

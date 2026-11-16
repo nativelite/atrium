@@ -151,7 +151,8 @@ fn request_host(args: &[&str]) -> String {
 
 /// Every `soak-<n>` marker carried as a `send` item in an inbox reply.
 fn markers_in(reply: &str) -> Vec<u64> {
-    const KEY: &str = "\"text\":\"soak-";
+    // A send arrives behind atrium's attribution header (`[atrium: from …] `).
+    const KEY: &str = "] soak-";
     let mut out = Vec::new();
     let mut rest = reply;
     while let Some(i) = rest.find(KEY) {

@@ -445,6 +445,8 @@ fn approve(launch: &FleetLaunch) -> Result<Option<Teardown>, String> {
     atrium::modfiles::set_session_enabled(fleet.mod_enabled.unwrap_or(true));
     // And whether a Claude Code lead's teammates are caught as panes.
     atrium::tmux_shim::set_session_enabled(fleet.teams.unwrap_or(true));
+    // And which slash commands `ctl command` may deliver (the banner shows them).
+    atrium::ctl::set_session_commands(fleet.commands.clone().unwrap_or_default());
     // And when an idle pane's parent is asked to checkpoint and respawn it.
     atrium::modstate::set_session_respawn_at(fleet.respawn_at);
     // And whether the mod may spend a small model call on captions.

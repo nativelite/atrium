@@ -75,6 +75,11 @@ pub struct GlobalConfig {
     /// `"notify"`: how a "needs you" transition rings the host terminal
     /// ([`crate::attention`]): `both` (default), `bell`, `toast` or `off`.
     pub notify: Option<crate::attention::Notify>,
+    /// `"commands"`: the slash commands `atrium ctl command` may deliver to an
+    /// agent's pane (`["/compact", "/clear"]`). Empty by default; a fleet's
+    /// own `commands` replaces it. Each entry is a grant to every pane that
+    /// may reach another: see [`crate::ctl::vet_command`].
+    pub commands: Vec<String>,
     pub fleet_defaults: FleetDefaults,
 }
 
@@ -121,6 +126,8 @@ impl GlobalConfig {
             fleet.teams = fleet.teams.or(Some(false));
         }
         fleet.notify = fleet.notify.or(self.notify);
+        // A fleet's own list replaces the config's, an empty one included.
+        fleet.commands = fleet.commands.or_else(|| Some(self.commands.clone()));
         fleet
     }
 }
@@ -223,6 +230,7 @@ pub const STARTER: &str = r#"{
   "mod": null,
   "teams": null,
   "notify": null,
+  "commands": [],
   "fleet_defaults": {
     "trust": null,
     "identity": null,
@@ -346,6 +354,7 @@ pub fn parse_with_home(text: &str, home: Option<&Path>) -> Result<GlobalConfig, 
         mod_off: false,
         teams_off: false,
         notify: None,
+        commands: crate::ctl::parse_commands(get("commands"), "config.json")?.unwrap_or_default(),
         fleet_defaults: FleetDefaults::default(),
     };
     cfg.build_jobs = whole(get("build_jobs"), "build_jobs")?.map(|n| n as usize);
@@ -839,6 +848,45 @@ mod tests {
         assert_eq!(
             answer_to_path("\"/x/y.json\"", d, Some(h)),
             PathBuf::from("/x/y.json")
+        );
+    }
+
+    /// `commands` is empty unless set, validated when the file is loaded, and
+    /// a fleet's own list replaces it (an empty one too).
+    #[test]
+    fn the_commands_key_is_validated_and_a_fleets_list_replaces_it() {
+        assert!(parse_with_home("{}", home()).unwrap().commands.is_empty());
+        let cfg = parse_with_home(r#"{"commands": ["/compact", "/clear"]}"#, home()).unwrap();
+        assert_eq!(cfg.commands, ["/compact", "/clear"]);
+        for bad in [
+            r#"{"commands": "/compact"}"#,
+            r#"{"commands": ["compact"]}"#,
+            r#"{"commands": ["/compact now"]}"#,
+            r#"{"commands": ["!rm -rf x"]}"#,
+            r#"{"commands": ["/a\nb"]}"#,
+        ] {
+            let err = parse_with_home(bad, home()).unwrap_err();
+            assert!(err.contains("commands"), "{bad}: {err}");
+        }
+        let fleet = |body: &str| {
+            let roster = format!(
+                r#"{{"fleets":{{"a":{{{body}"agents":[{{"name":"x","cmd":["claude"]}}]}}}}}}"#
+            );
+            crate::fleet::parse(&roster).map(|f| f.get("a").unwrap().clone())
+        };
+        // Absent in the fleet: the config's list.
+        let filled = cfg.apply_to_fleet(fleet("").unwrap());
+        assert_eq!(filled.commands.as_deref(), Some(&cfg.commands[..]));
+        // Set in the fleet: it replaces the config's, whole.
+        let own = cfg.apply_to_fleet(fleet(r#""commands": ["/review"],"#).unwrap());
+        assert_eq!(own.commands, Some(vec!["/review".to_string()]));
+        let none = cfg.apply_to_fleet(fleet(r#""commands": [],"#).unwrap());
+        assert_eq!(none.commands, Some(Vec::new()), "an empty list is a list");
+        // A fleet's bad name is a load error too.
+        let err = fleet(r#""commands": ["/ok", "rm -rf"],"#).unwrap_err();
+        assert!(
+            err.contains("fleet \"a\"") && err.contains("commands"),
+            "{err}"
         );
     }
 

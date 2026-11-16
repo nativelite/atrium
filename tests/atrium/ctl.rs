@@ -29,6 +29,191 @@ fn spawn_atrium_ctl_shell() -> (pty::Pty, &'static str, &'static str) {
     (p, shell, flag)
 }
 
+/// The scratch directory a stand-in agent lives in, removed when the test
+/// that made it ends (best effort: a still-running copy is left to the OS).
+struct StandinDir(std::path::PathBuf);
+
+impl Drop for StandinDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// [`spawn_atrium_ctl_shell`] with its panes running under an **agent's
+/// name**: the same shell, placed in a scratch directory as `aider` and found
+/// through `PATH` (the directory is absolute). On Windows it is a copy of the
+/// command interpreter; elsewhere a two-line script that execs `/bin/sh`
+/// with its arguments (a symlink would not do: a busybox `sh` reads its own
+/// name and fails as an unknown applet). To the control plane that is an
+/// agent's pane, which is what text may be typed into; to the test it is
+/// still a shell that echoes what reaches its pty. So the tests that prove a
+/// delivery landed run the legitimate flow at the default trust, with nothing
+/// to confirm and nothing an outer session can cap. (`aider` is an agent stem
+/// atrium adds no arguments to.) `launch` goes before the command (`-n 2`).
+fn spawn_atrium_ctl_agent_standin(
+    tag: &str,
+    launch: &[&str],
+    cols: u16,
+) -> (pty::Pty, &'static str, &'static str, StandinDir) {
+    let (shell, flag): (&str, &str) = if cfg!(windows) {
+        ("cmd", "/Q")
+    } else {
+        ("sh", "-i")
+    };
+    let dir = std::env::temp_dir().join(format!("atrium-standin-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let guard = StandinDir(dir.clone());
+    #[cfg(windows)]
+    {
+        let comspec =
+            std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+        std::fs::copy(comspec, dir.join("aider.exe")).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("aider");
+        std::fs::write(&script, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(
+        dir.is_absolute(),
+        "the stand-in is found on an absolute PATH entry"
+    );
+    let mut dirs = vec![dir];
+    dirs.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let path = std::env::join_paths(dirs).unwrap();
+    let mut args: Vec<&str> = vec!["--allow-ctl"];
+    args.extend(launch);
+    args.extend(["aider", flag]);
+    let mut p = pty::Pty::spawn_full(
+        env!("CARGO_BIN_EXE_atrium"),
+        &args,
+        24,
+        cols,
+        &[
+            ("ATRIUM_CTL_ALLOW".to_string(), shell.to_string()),
+            ("PATH".to_string(), path.to_string_lossy().into_owned()),
+            // A short prompt, so a delivered line fits a half-width tile.
+            ("PROMPT".to_string(), "$G".to_string()),
+            ("PS1".to_string(), "> ".to_string()),
+        ],
+        None,
+    )
+    .unwrap();
+    read_until(&mut p, b"1:aider", Duration::from_secs(15));
+    (p, shell, flag, guard)
+}
+
+/// A send typed into **another** agent's pane: two root panes under an
+/// agent's name, tiled side by side. The focused one sends a marker to each
+/// pane id; both arrive behind the header naming the same sender, so one of
+/// the two crossed from one pane into the other (the self-send test alone
+/// would not show that).
+#[test]
+fn ctl_send_is_typed_into_another_agents_pane_behind_the_header() {
+    let (mut p, _shell, _flag, _dir) = spawn_atrium_ctl_agent_standin("cross", &["-n", "2"], 160);
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let (a, b): (&str, &str) = if cfg!(windows) {
+        ("QZ^A7", "QZ^B8")
+    } else {
+        ("QZ'A'7", "QZ'B'8")
+    };
+    p.write(format!("\"{atrium}\" ctl send 0 {a}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, b"\"queued\"", Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl send 1 {b}\r\n").as_bytes())
+        .unwrap();
+    let mut out = read_until(&mut p, b"QZB8", Duration::from_secs(25));
+    if !contains(&out, b"QZA7") {
+        out.extend(read_until(&mut p, b"QZA7", Duration::from_secs(25)));
+    }
+    let text = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+    assert!(
+        text.contains("QZA7") && text.contains("QZB8"),
+        "both panes received their send: {text:?}"
+    );
+    // The pane repaints word by word with cursor moves in between, so the
+    // spaces of a line are not in the byte stream: compare without them.
+    let squeezed = text.replace(' ', "");
+    let from = |pane: u8| {
+        squeezed
+            .matches(&format!("[atrium:frompane{pane}]"))
+            .count()
+    };
+    assert!(
+        (from(0) >= 2 && from(1) == 0) || (from(1) >= 2 && from(0) == 0),
+        "both deliveries are headed with the one sender's pane id: {text:?}"
+    );
+}
+
+/// Below `--trust skip`, a `ctl send` into a pane that is not an agent's is
+/// refused with the reason, and nothing is typed there: the worker window
+/// never shows the marker. (Before 0.47.0 the text was typed into the shell
+/// and run.)
+#[test]
+fn ctl_send_into_a_shell_pane_is_refused_below_skip() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
+    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+        .unwrap();
+    read_until(&mut p, two, Duration::from_secs(20));
+    p.write(format!("\"{atrium}\" ctl send dev_1 echo SHELLMARK9\r\n").as_bytes())
+        .unwrap();
+    // A space-free needle from the refusal (the pane repaints word by word).
+    let out = read_until(&mut p, b"ceiling", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"ceiling"),
+        "the send was not refused with its reason: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // The worker's window: past the unbound grace, nothing was typed into it.
+    p.write(b"\x012").unwrap();
+    let out = read_until(&mut p, b"SHELLMARK9", Duration::from_secs(4));
+    assert!(
+        !contains(&out, b"SHELLMARK9"),
+        "the text reached the shell: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
+/// A `ctl spawn` whose command is a path is refused with the reason, for a
+/// pane as for an operator: the allowlist reads a command by its file name,
+/// and a path would start any program.
+#[test]
+fn ctl_spawn_by_path_is_refused() {
+    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let atrium = env!("CARGO_BIN_EXE_atrium");
+    p.write(format!("\"{atrium}\" ctl spawn -- ./{shell}\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"PATH", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"bare"),
+        "a path was not refused: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    // A name with an extension is not a bare name either: it would be found
+    // nowhere on PATH and run from the pane's directory.
+    p.write(format!("\"{atrium}\" ctl spawn -- {shell}.bat\r\n").as_bytes())
+        .unwrap();
+    let out = read_until(&mut p, b"extension", Duration::from_secs(20));
+    assert!(
+        contains(&out, b"\"ok\":false") && contains(&out, b"extension"),
+        "a name with an extension was not refused: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+    p.write(b"\x01q").unwrap();
+    let _ = wait_exit(&mut p, 15);
+}
+
 /// `atrium ctl list`, run inside a live `--allow-ctl` atrium pane, connects over the
 /// real channel and returns the org chart as JSON — proving the whole loop:
 /// bind → inject env → client connect → non-blocking server drain → reply.
@@ -253,7 +438,10 @@ fn ctl_inbox_hands_a_modded_pane_its_deliveries_instead_of_typing_them() {
         .unwrap();
     let out = read_until(&mut p, b"\"items\":[", Duration::from_secs(20));
     assert!(
-        contains(&out, b"{\"kind\":\"send\",\"text\":\"inbox-marker-one\"}"),
+        contains(
+            &out,
+            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-marker-one\"}"
+        ),
         "the send was handed over, not typed: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -308,11 +496,14 @@ fn ctl_inbox_wait_is_held_until_a_send_lands_for_the_waiting_pane() {
     p.write(b"\x012").unwrap();
     let out = read_until(
         &mut p,
-        b"{\"kind\":\"send\",\"text\":\"inbox-wait-marker\"}",
+        b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}",
         Duration::from_secs(20),
     );
     assert!(
-        contains(&out, b"{\"kind\":\"send\",\"text\":\"inbox-wait-marker\"}"),
+        contains(
+            &out,
+            b"{\"kind\":\"send\",\"text\":\"[atrium: from pane 0] inbox-wait-marker\"}"
+        ),
         "the held inbox was answered with the send: {:?}",
         String::from_utf8_lossy(&out)
     );
@@ -485,27 +676,34 @@ fn ctl_ask_rides_the_inbox_and_the_reported_reply_ends_the_wait() {
     let _ = wait_exit(&mut p, 15);
 }
 
-/// `atrium ctl send <role> <text>` delivers the text to the worker as input. We
-/// spawn the worker in a *new* window, task it from the caller window, then
-/// switch to the worker window to observe: the marker appears there only if the
-/// send actually reached the worker's pty (the caller's command echo lives in a
-/// different window, so it can't produce a false positive).
+/// `atrium ctl send <target> <text>` types the text into an agent's pane,
+/// behind atrium's attribution header. The target is pane 0 under an agent's
+/// name (a shell that echoes what reaches its pty), sending to itself: the
+/// header and the marker appear together only if the send was delivered. The
+/// typed command never spells the marker (the shell drops the caret or the
+/// quotes), so its own echo cannot stand in for the delivery. (Before
+/// 0.47.0 this test sent into a plain shell worker, which is now refused:
+/// `ctl_send_into_a_shell_pane_is_refused_below_skip`.)
 #[test]
 fn ctl_send_delivers_a_task_to_a_worker() {
-    let (mut p, shell, _flag) = spawn_atrium_ctl_shell();
+    let (mut p, _shell, _flag, _dir) = spawn_atrium_ctl_agent_standin("send", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
-    let two: &[u8] = if cfg!(windows) { b"2:cmd" } else { b"2:sh" };
-    p.write(format!("\"{atrium}\" ctl spawn --role dev_1 -- {shell}\r\n").as_bytes())
+    let typed: &str = if cfg!(windows) {
+        "WORKER^MARK7"
+    } else {
+        "WORKER'MARK'7"
+    };
+    p.write(format!("\"{atrium}\" ctl send 0 {typed}\r\n").as_bytes())
         .unwrap();
-    read_until(&mut p, two, Duration::from_secs(20)); // worker window opened
-    p.write(format!("\"{atrium}\" ctl send dev_1 echo WORKERMARK7\r\n").as_bytes())
-        .unwrap();
-    p.write(b"\x012").unwrap(); // Ctrl+A 2 -> watch the worker window
     let out = read_until(&mut p, b"WORKERMARK7", Duration::from_secs(20));
+    let text = String::from_utf8_lossy(&strip_csi_bytes(&out)).into_owned();
     assert!(
-        contains(&out, b"WORKERMARK7"),
-        "worker never received the send: {:?}",
-        String::from_utf8_lossy(&out)
+        text.contains("WORKERMARK7"),
+        "the pane never received the send: {text:?}"
+    );
+    assert!(
+        text.contains("[atrium:"),
+        "the delivery did not start with the attribution header: {text:?}"
     );
     p.write(b"\x01q").unwrap();
     let _ = wait_exit(&mut p, 15);
@@ -864,10 +1062,12 @@ fn ctl_audit_records_requests() {
 /// run `bus feed`. The lead is a shell (unbound), so the wake lands after the
 /// unbound grace and is echoed by the shell, where the marker is read. The
 /// marker is spelled with the worker shell's quoting so the typed command's
-/// echo never contains it; only the delivered wake does.
+/// echo never contains it; only the delivered wake does. The lead runs under
+/// an agent's name: a wake is typed only into an agent's pane (a plain shell
+/// is not woken below `--trust skip`, `ctl_server::dispatch::ceiling_tests`).
 #[test]
 fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_subtree() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let (mut p, shell, flag, _dir) = spawn_atrium_ctl_agent_standin("sub", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl bus --json sub work\r\n").as_bytes())
         .unwrap();
@@ -913,10 +1113,11 @@ fn a_publish_on_a_subscribed_topic_wakes_the_subscriber_outside_the_publishers_s
 
 /// A worker's `--to` hand-off up to the pane that spawned it wakes that pane.
 /// The subtree rule used to drop it silently: the lead is not in the worker's
-/// subtree, so the most common hand-off of all never landed.
+/// subtree, so the most common hand-off of all never landed. The lead runs
+/// under an agent's name, as above.
 #[test]
 fn a_workers_to_wakes_the_pane_that_spawned_it() {
-    let (mut p, shell, flag) = spawn_atrium_ctl_shell();
+    let (mut p, shell, flag, _dir) = spawn_atrium_ctl_agent_standin("to", &[], 100);
     let atrium = env!("CARGO_BIN_EXE_atrium");
     p.write(format!("\"{atrium}\" ctl spawn --here --role w -- {shell} {flag}\r\n").as_bytes())
         .unwrap();

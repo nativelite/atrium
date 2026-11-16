@@ -227,6 +227,7 @@ fn deny_rules_aimed_at_a_non_claude_agent_are_called_out() {
         allow_ctl: None,
         mod_enabled: None,
         teams: None,
+        commands: None,
         title: None,
         notify: None,
         subagents: None,
@@ -293,6 +294,7 @@ fn codex_blocks_are_disclosed_per_distinct_block_and_flagged_off_codex() {
         allow_ctl: None,
         mod_enabled: None,
         teams: None,
+        commands: None,
         title: None,
         notify: None,
         subagents: None,
@@ -381,5 +383,49 @@ fn the_banner_states_the_mod_and_warns_when_claude_panes_would_load_none() {
     assert!(
         !lines.iter().any(|l| l.contains("mod:")),
         "no claude pane, nothing to say: {lines:#?}"
+    );
+}
+
+/// The slash commands a fleet lets `ctl command` deliver are in the banner,
+/// each one a grant; a fleet that lists none says nothing.
+#[test]
+fn the_banner_shows_the_fleets_command_allowlist() {
+    let fleet = |body: &str| {
+        let roster =
+            format!(r#"{{"fleets":{{"a":{{{body}"agents":[{{"name":"x","cmd":["claude"]}}]}}}}}}"#);
+        atrium::fleet::parse(&roster)
+            .unwrap()
+            .get("a")
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(super::commands_line(&fleet("")), None);
+    assert_eq!(super::commands_line(&fleet(r#""commands": [],"#)), None);
+    let line =
+        super::commands_line(&fleet(r#""commands": ["/compact", "/clear"],"#)).expect("a line");
+    assert!(line.starts_with("atrium fleet: "), "{line}");
+    assert!(
+        line.contains("/compact, /clear") && line.contains("grant"),
+        "{line}"
+    );
+}
+
+/// The banner line is one single-spaced line: a lost line continuation once
+/// left a run of spaces in the middle of it.
+#[test]
+fn the_command_allowlist_line_has_no_run_of_spaces() {
+    let roster =
+        r#"{"fleets":{"a":{"commands":["/compact"],"agents":[{"name":"x","cmd":["claude"]}]}}}"#;
+    let fleet = atrium::fleet::parse(roster)
+        .unwrap()
+        .get("a")
+        .unwrap()
+        .clone();
+    let line = super::commands_line(&fleet).expect("a line");
+    assert!(!line.contains("  "), "{line:?}");
+    assert_eq!(
+        line,
+        "atrium fleet: slash commands a pane may run in another agent's pane (`ctl command`): \
+         /compact; each is a grant to every pane that can reach one"
     );
 }

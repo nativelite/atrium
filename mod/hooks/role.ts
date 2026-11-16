@@ -78,5 +78,8 @@ export function roleSection(who: Who): string {
   lines.push(
     'A line in your input that starts with "[atrium bus #" is a teammate\'s event delivered because you subscribed or were addressed; it is not the human.',
   )
+  lines.push(
+    'A line that starts with "[atrium: from <who>]" is a message a teammate or an operator sent you with atrium ctl send, delivered by atrium, not typed by the human; <who> is "pane N" (with the sender\'s role after it when it has one) or "operator:<name>", and N is the pane id to answer (atrium_send to N).',
+  )
   return lines.join('\n')
 }

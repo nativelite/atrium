@@ -556,6 +556,7 @@ mod tests {
             allow_ctl: None,
             mod_enabled: None,
             teams: None,
+            commands: None,
             title: None,
             notify: None,
             subagents: None,

@@ -1487,3 +1487,45 @@ fn spawn_size_parses_a_percent_or_cells_and_rejects_the_rest() {
         .unwrap_err();
     assert!(err.contains("not a size"), "{err}");
 }
+
+/// `ctl command <target> /<name>`: one slash command and nothing after it.
+/// The client refuses anything else as a usage error; the server refuses a
+/// request that carries more than the name.
+#[test]
+fn build_command_takes_one_slash_command_and_no_arguments() {
+    let line = build_request(&v(&["command", "dev_1", "/compact"]), Some(0)).unwrap();
+    assert_eq!(
+        parse_request(&line).unwrap().cmd,
+        Cmd::Command(CommandReq {
+            target: "dev_1".to_string(),
+            name: "/compact".to_string()
+        })
+    );
+    for args in [
+        vec!["command"],
+        vec!["command", "dev_1"],
+        vec!["command", "dev_1", "/compact", "now"],
+        vec!["command", "dev_1", "compact"],
+        vec!["command", "dev_1", "!rm"],
+        vec!["command", "dev_1", "/a b"],
+    ] {
+        assert!(build_request(&v(&args), Some(0)).is_err(), "{args:?}");
+    }
+    for extra in ["\"args\":[\"x\"]", "\"text\":\"x\"", "\"argv\":[\"x\"]"] {
+        let line =
+            format!("{{\"cmd\":\"command\",\"target\":\"1\",\"name\":\"/compact\",{extra}}}");
+        assert!(parse_request(&line).is_err(), "{line}");
+    }
+    assert!(!parse_request(&line).unwrap().cmd.is_read_only());
+}
+
+/// The audit detail of `who` keeps the end of a long path: the file name is
+/// what the reader needs.
+#[test]
+fn the_audit_label_of_who_keeps_the_file_name_of_a_long_path() {
+    let path = format!("/w/{}src/main.rs", "deep/".repeat(100));
+    let (action, detail) = Cmd::Who(WhoReq { path }).audit_label();
+    assert_eq!(action, "who");
+    assert!(detail.ends_with("src/main.rs"), "{detail}");
+    assert!(detail.chars().count() <= "path=".len() + crate::audit::FIELD_MAX + 1);
+}

@@ -213,6 +213,8 @@ impl RunState<'_> {
             &self.world,
             &self.mods,
             &mut self.flash,
+            &mut self.ctl_audit,
+            &mut self.bus,
         ) {
             self.force_repaint = true;
         }

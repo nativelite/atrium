@@ -44,6 +44,23 @@ To run agents at a higher posture, set it at launch with `--trust`, where it is
 one visible, deliberate choice rather than something a pane can ask for
 mid-session.
 
+### What the ceiling covers on the control plane
+
+A mode caps what an agent does through its own tools. The control plane is another way to act, so the ceiling is held there too, for every pane, below `skip`:
+
+- **A spawn starts an agent CLI found on `PATH`.** The command of a `ctl spawn` is a bare name with no extension; a path of any kind (`\\host\share\claude.exe`, `./x/claude.sh`, `/tmp/claude`) and a dotted name (`claude.bat`) are refused, because either would pass the allowlist on its file name and start a program that ignores the flags above. atrium resolves the name itself, on every platform, over the absolute directories of `PATH` and spawns that file; a name it does not find is refused, never left for the system (or the child, after it has changed into the pane's directory) to look for. A relative entry such as `./node_modules/.bin` is not searched. A fleet file's `cmd` may be a path: a person wrote it.
+- **Text is typed only into an agent's pane.** A `ctl send` or a bus wake into a shell is a command line, run with no gate. A pane whose command is not an agent CLI takes neither, unless its own mod collects its deliveries (`inbox`: nothing is typed).
+- **On an empty prompt, no character a caller chose is the first one.** Every `send` into an agent is delivered behind atrium's header, `[atrium: from pane <id> (<role>)] ` or `[atrium: from operator:<name>] `, so a text that starts with `!` (a shell line in Claude Code, run with no permission prompt), `/`, `#` or `@` is read as text. The id is the sender's ctl id, the one to answer. Neither this header nor the bus frame can be reproduced in a send or in a wake: any bracket that opens the word `atrium` is defanged in caller-supplied text. One `send` is one prompt: its line breaks travel inside a paste or are flattened, never submit, and deliveries to one pane are typed one at a time, each with its own Enter. The text is plain: no control character but a newline and a tab, and none of the characters that do not show, so it cannot press Shift+Tab, Esc or Ctrl+C.
+- **A delivery waits for a prompt.** It is not typed into a tool-use approval, nor into a claude or codex pane that has not shown its prompt hint; one that never does is dropped after 300 s, and a dropped delivery is reported to its sender (the bar, an audit row, one `fyi`). What atrium cannot see is listed below.
+- **A slash command needs the human's list.** `ctl command` delivers `/<name>` only when the `commands` allowlist (user config or fleet, empty by default, shown in the launch banner) holds it. Each entry is a grant to every pane that can reach another: `/permissions` or `/add-dir` there is that power, in the target's pane.
+- **A spawned agent's arguments are not prompts in disguise.** An argument of an agent CLI's command may not open with `!`, `/`, `#` or `@`. This one is a list: no header can go in front of an argument.
+
+At `skip` the rules about where text lands and what it may hold are lifted for a pane's request: every command already runs with no gate, so there is nothing to step over. That includes a wake typed into a shell pane that subscribed or is addressed, which the shell runs as a line (`… & calc` on `cmd.exe`). The header is still put on, the delivery forms are the same (a Windows agent pane still gets one flat line), and `command` still needs the list. With no `--trust` at all the rules hold: the agents run under their own permission settings, and a command typed into a shell would sidestep those just the same. An [operator](control-plane.md#operator-tokens-a-caller-that-is-not-a-pane) is held to them at any trust. What you type at the keyboard is not a ctl request.
+
+What this does not cover: `PATH` is trusted as the human set it, and an absolute entry inside the project (`C:\work\app\node_modules\.bin`) is searched and is writable by a pane; on Windows an npm-installed claude is a `.cmd` shim that starts `node` by name, which `cmd.exe` looks for in the pane's working directory first (atrium pins the shim, not what it runs); the header is first only on an empty prompt, and a human's draft left untouched for 300 s has a delivery appended to it; an idle agent showing a picker of its own, and gemini, aider or cursor-agent two seconds after their screen went still, are typed into whatever they show; a session brought back with `atrium recover` uses the config's `commands`, not the fleet's. And a pane's token is in the environment of that pane's processes, readable by other processes of the same user: the rules bound what any pane's token can do, not which process presents it.
+
+See [what a pane's request is held to](control-plane.md#what-a-panes-request-is-held-to) for the exact tests, the bytes of each delivery and the refusals.
+
 ### Why the root pane is no longer carved out
 
 This policy used to carve out the root pane, on the reading that the root pane is
@@ -290,7 +307,11 @@ limits, each one unit-tested as a pure function:
    `ctl spawn -- rm -rf`. Extend it per-session, set by the human who launches
    atrium, with **`ATRIUM_CTL_ALLOW`** (comma-separated stems, for example for
    another agent CLI) or `ctl_allow` in the user-global `config.json`. It never
-   weakens a session that didn't set it.
+   weakens a session that didn't set it. The command is a **bare name** looked
+   up on `PATH`, with no extension, for every caller: the allowlist reads
+   the file stem, so a path that ends in `claude`, or `claude.bat`, is refused
+   rather than run as given. An argument of an agent's command may not open
+   with `!`, `/`, `#` or `@`.
 3. **No count cap; a depth guard.** A fleet designed for 32 runs 32; width is
    unlimited. Only *recursion* is bounded, by **`--max-depth`** (default 6, `0`
    removes it): a spawn past the ceiling is refused, so a self-spawning agent
@@ -300,6 +321,12 @@ limits, each one unit-tested as a pure function:
    / `audit` only panes **in its own subtree**; a lead steers its own team, never
    a sibling's. **You control everything**: a root pane (the one atrium opened, or
    any `ctl` run from outside a pane) is the operator and reaches every pane.
+   Reaching a pane is not typing into it: below `skip`, `send` text and a wake
+   are typed only into an **agent's** pane (a shell would run them); every
+   `send` arrives behind atrium's header, so it is a message and never a
+   command of the agent CLI; and a slash command is run with `ctl command`,
+   from a list the human wrote; see
+   [what the ceiling covers](#what-the-ceiling-covers-on-the-control-plane).
    One deliberate exception: a **bus wake** — the framed line an event becomes
    in the pane of a subscriber or an addressee (`bus pub --to`) — may also go
    *up* the tree, to the panes that spawned the publisher, and to any pane that
@@ -317,7 +344,10 @@ limits, each one unit-tested as a pure function:
 6. **Audit.** Every request is recorded: caller, action, a **secret-free** detail
    (`send` logs the text *length*, never the body; identities by name only), and
    outcome, to an in-memory ring, readable live via `ctl audit` (subtree-scoped
-   like any read). Opt in to a persistent JSONL mirror with
+   like any read). A request is recorded with or without a credential, so
+   nothing it carried is kept raw: each field is scrubbed of control,
+   direction and zero-width characters and cut to 128 characters, and every
+   entry's detail and note to 512. Opt in to a persistent JSONL mirror with
    **`ATRIUM_CTL_AUDIT=<file>`**; a file it can't open is flashed once, and the log
    keeps running in memory.
 7. **Visibility is the safety story.** Nothing a `ctl`-spawned agent does is
@@ -328,7 +358,8 @@ limits, each one unit-tested as a pure function:
    comes from a file the hosting atrium was given, names the verbs its holder
    may use, and never reaches a pane's environment. An operator reaches the
    whole session for those verbs, but its spawn is bounded by the launch trust
-   and takes a bare command name, and its text is typed only into agent panes.
+   and takes a bare command name, and its text is typed only into agent
+   panes, behind `[atrium: from operator:<name>] `.
    Every operator request is audited as `operator:<name>`. A pane and an
    operator are separate namespaces: neither token is ever taken for the
    other. File permissions keep other users out, not a same-user pane; the

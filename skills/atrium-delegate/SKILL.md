@@ -85,10 +85,13 @@ poll. Then read its checkpoint (`board get <part>`, `git show <sha>`) and check
 the work against the brief, then reap it. Don't leave a finished teammate
 running.
 
+A message a teammate sends you with `ctl send` arrives marked with who sent it, as `[atrium: from pane <id> (<role>)] <text>` (or `operator:<name>`); `<id>` is the pane id to answer with `atrium ctl send <id>`. What you send arrives the same way, so the text is always read as a message, never as a command. If a delivery of yours is dropped (the target exited, or never reached its prompt), you get one `[atrium bus #` line saying so. To run a slash command in a teammate (`/compact`, `/clear`), use `atrium ctl command <target> /<name>`: it works only for names the human listed under `commands` in the fleet file or the config, and a refusal says so. A `send` into a shell pane is refused below `--trust skip`.
+
 ## Full surface & discovery
 
     atrium ctl spawn [--role R] [--identity X] [--here | --window] [--no-focus] [--beside N] [--mode plan|accept|automode|skip] [--worktree W] -- <cmd...>
     atrium ctl send <target> <text> | status [target] | list | kill <target> | audit [N]
+    atrium ctl command <target> /<name>     # one slash command the human listed under "commands"; no arguments
     atrium ctl answer <target> | wait <target> [--for answer|idle|exit] [--timeout S]
     atrium ctl ask <target> [--timeout S] <question...> | asked <target> <id> | who <path>
     atrium ctl bus pub <topic> [--to <role>[,...]] <field=value...> | bus sub <topic...>

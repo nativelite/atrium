@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`atrium ctl command <target> /<name>`: run one slash command in a
+  teammate's pane.** The name is typed as its own prompt line, with no
+  header, and submitted once the pane is at its prompt (through the mod's
+  inbox where a pane has one). It is delivered only when the name is on the
+  session's command allowlist, to an agent's pane, in the caller's own subtree
+  (the same scope as `send`), at any trust; there are no arguments in this
+  release, and `!` is not expressible. An operator needs `command` in its
+  token entry. Audited with the name. `mod`'s subagent tool also closes the
+  pane it opened when its own task send is refused, instead of leaving an idle
+  agent behind.
+- **`commands`: the slash commands `ctl command` may deliver.** An array in
+  the user config and in a fleet (`"commands": ["/compact", "/clear"]`), empty
+  by default. A fleet's list replaces the config's, an empty one included, and
+  the launch banner shows it. Each name is `/` then 1 to 64 of
+  `a-z A-Z 0-9 _ - :`, checked when the file is loaded; no ctl request can add
+  to the list. Each entry is a grant to every pane that can reach another:
+  `/permissions`, `/add-dir`, `/plugin` or a custom command there hands the
+  sender whatever that command can change. A session recovered with
+  `atrium recover` uses the config's list.
 - **Running atrium in a container, documented** (`docs/containers.md`): one
   session per container, the fixed control socket, `ctl ping` as a liveness
   probe and `ctl metrics` behind a sidecar, operator tokens from a mounted
@@ -133,6 +152,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   words, without the request value it quotes (`unknown command`, not
   `unknown command "…"`). The reply to the caller is unchanged.
 - `ctl::Request`'s `Debug` output shows `<redacted>` for a pane token.
+
+### Security
+Ways a pane could step over the session's trust ceiling through the control
+plane, in every release that has one (`--allow-ctl`, up to and including
+0.46.0). Each needed a pane token, which every pane of a ctl session holds;
+none needed anything else. They are behaviour changes: each refusal says why
+and what to do instead.
+
+- **`ctl spawn` takes a bare command name, from every caller, and on Windows
+  runs the file it names on `PATH`.** The agent allowlist reads a command by
+  its file stem, and a command with a path separator is run as given. So an
+  agent held to `plan` or `accept` could run
+  `atrium ctl spawn -- \\host\share\claude.exe` (or `./x/claude.sh`,
+  `/tmp/claude`): it passed as `claude`, and what started was a program of the
+  agent's choosing that ignores the posture flags atrium appends. A name with
+  an extension did the same on Windows: `claude.bat` (or `claude.exe` where
+  claude is an npm shim, or `claude.`) passed as `claude`, was found nowhere
+  on `PATH`, and was run by `cmd.exe` from the pane's working directory, so a
+  text file in the project was enough; so did the name of an agent that is not
+  installed, which the system looked for in atrium's working directory. Now
+  the command a spawn request names must be 1 to 64 of `A-Z a-z 0-9 _ -`, not
+  starting with `-` (no `/`, `\`, `:` or `.`); atrium resolves it itself, on
+  every platform, over the absolute directories of `PATH` (relative and empty
+  entries are not searched: on macOS and Linux the child looked a bare name up
+  after changing into the pane's directory, so `./node_modules/.bin` ahead of
+  the real entry let a pane plant `node_modules/.bin/codex`), spawns that file
+  by its full path, and refuses a name it does not find. Not changed: a fleet file's `cmd` may still be a path (a person writes
+  the file and the banner shows it); `respawn` replays a pane's recorded
+  command, and no request can alter that record; a spawn with no command still
+  starts the caller's own kind. To keep a path: put the command in a fleet
+  file, or its directory on `PATH` where atrium is launched. If you spawned
+  `claude.cmd` or `claude.exe` by that name, spawn `claude`.
+- **A pane's `send` is not typed into a pane that is not an agent's, below
+  `--trust skip`.** `send` types its text into the target and submits it. A
+  root pane reaches every pane, a fleet may declare shell panes, and a plain
+  `atrium --allow-ctl` hosts your shell as pane 0: an agent in a root pane
+  could `ctl send 0 "curl … | sh"` and have the shell run it, at any trust. A
+  `send` whose target was not spawned as an agent CLI (`claude`, a claude
+  alias, `codex`, `gemini`, `aider`, `cursor-agent`) is now refused unless the
+  session was launched at `skip` (no `--trust` counts as below `skip`). One
+  case is still taken: a pane whose own mod declared `inbox` collects its
+  deliveries itself and is never typed into; if that mod goes before it
+  collected, the delivery is dropped and the bar says so. The same rule,
+  without the two exceptions, already held for operators. To keep the old
+  behaviour: launch at `--trust skip`, or type into the shell yourself (the
+  keyboard is not a ctl caller and is unaffected). A command you allowed with
+  `ATRIUM_CTL_ALLOW` is not an agent for this.
+- **A bus wake is not typed into a pane that is not an agent's, below
+  `skip`.** A wake is one framed line, typed and submitted, and only control
+  characters are taken out of its body: a shell handed
+  `[atrium bus #7 …] done & calc` runs `calc` (cmd.exe), and `$(…)` or a
+  backquote does the same in `sh`. That held for a pane's `bus pub` and for
+  the collision and respawn decisions atrium posts from what panes report,
+  which in a plain `atrium --allow-ctl` were addressed to the root shell. Such
+  a wake is now skipped, and the publisher's reply says so (`"note": "not
+  woken: pane 0 is not an agent's pane …"`, with that pane left out of
+  `subscribers`); the event is still on the bus, for `bus feed` and the
+  decisions panel. At `skip` a wake is typed into a shell as before, `&`
+  included: nothing is gated there.
+- **Every `ctl send` into an agent now starts with an attribution header.**
+  Claude Code runs a prompt that starts with `!` as a shell command, with no
+  model decision and no permission prompt, and reads `/` as a command of its
+  own, `#` as a memory note and `@` as a mention. So a lead held to `plan`
+  could `ctl send <worker> "!rm -rf x"`, or `"/permissions"`, into any pane of
+  its subtree. What is delivered is now `[atrium: from <label>] ` and then
+  the text. The label is the broker's record of the sender: `pane 3 (lead)`
+  for a pane (its ctl id first, the number `ctl send` takes, then its role;
+  `pane 3` when it has none) or `operator:<name>`. A role cannot close or
+  forge the frame. On an empty prompt no character a caller chose is the
+  first one, so a text may start with anything and is read as text; nothing
+  is refused for how it starts, and the operator's rule against a leading `!`
+  or `/` is gone with the reason for it. The header is on a pane's send to
+  itself and on a send handed to a mod's inbox too. If something of yours
+  parsed a delivered send by its first characters, it now finds the header
+  first. `ctl spawn` now refuses `atrium` as a role, as it does `operator`.
+- **Neither of atrium's frames can be forged in a send or in a wake.** The
+  bus frame (`[atrium bus #…`) was defanged in a wake's own fields only, in
+  that exact spelling. In every caller-supplied text that reaches a prompt (a
+  send's text; a wake's body, detail, sender label and topic; the names in a
+  decision atrium posts) an opening square bracket or a look-alike that is
+  followed, after any whitespace or hidden characters, by `atrium` in any
+  case now becomes `(`. So a wake, which travels up the tree and to every
+  subscriber, cannot carry a `[atrium: from operator:x] …` line, and a send
+  cannot carry a second bus line.
+- **One `send` is one prompt, and one delivery at a time per pane.** A line
+  break inside the text can no longer submit and let the next line open a
+  fresh prompt. Into claude and codex on macOS and Linux (and an agent CLI
+  whose app turned paste mode on) the text travels as one bracketed paste, as
+  before. Into every agent's pane on Windows, and elsewhere into an agent CLI
+  that is neither and did not ask for paste mode, each line break is now
+  written as ` ↵ ` and a tab as a space, so the text arrives as one line;
+  before, the raw line breaks were typed. A pane whose mod takes its inbox
+  still gets the lines, and a pane that is not an agent's (a `skip` session)
+  is typed into exactly as before. Two deliveries for one pane that became
+  ready in the same moment were both typed before either Enter, so two sends
+  merged into one prompt; now a delivery waits while another for the same
+  pane is between its first byte and its Enter, and 1.5 s after it.
+- **A pane's `send` is plain text, below `skip`.** It carried any control
+  character unfiltered: `ESC [ Z` (Shift+Tab) cycles Claude Code's permission
+  mode, `ESC [ 201 ~` ends a paste early, Ctrl+C, Esc and the arrows drive a
+  dialog. Refused now, like an operator's always was: no control character but
+  a newline and a tab (`\r\n` is taken as a newline; a carriage return on its
+  own is refused), and none of the characters that do not show as themselves
+  (bidi marks and overrides, zero-width characters, the soft hyphen, Hangul
+  fillers, variation selectors, tag characters; the list is in
+  `docs/control-plane.md`). At `skip` a pane's text is not vetted.
+- **A delivery is no longer typed into a claude or codex pane that never
+  showed its prompt, and a dropped delivery is reported.** A claude or codex
+  pane with no status yet is typed into once its prompt hint is on screen. If
+  the hint had not appeared after 300 s the text was typed anyway, into
+  whatever the pane was showing (a sign-in, a trust question), where a digit
+  picks an option and the Enter confirms it. That delivery is now dropped. A
+  dropped delivery (this one, one whose target exited, one for a pane text may
+  no longer be typed into) is said on the bar, recorded in the audit log as
+  `delivery-dropped` under its sender, and announced to a sending agent pane
+  by one `fyi` on the `atrium` topic. What a delivery can still be typed
+  into is listed under the limits below.
+- **A slash command needs a list you wrote.** With the header, `ctl send
+  <pane> /clear` is text. The way to run a slash command in a teammate is the
+  new `ctl command` (below), which delivers only names on the session's
+  `commands` allowlist, empty by default. To keep what a lead did before, list
+  the commands it used: `"commands": ["/compact", "/clear"]`.
+- **An argument of a spawned agent's command may not open with `!`, `/`, `#`
+  or `@`**, below `skip` for a pane and at any trust for an operator: a
+  positional argument is the new agent's first prompt, and no header can go in
+  front of it. `ctl spawn -- claude "!rm -rf x"` was the same step over the
+  ceiling. Spawn the agent and `send` it the text instead. A command allowed
+  with `ATRIUM_CTL_ALLOW` keeps its own arguments (`cmd /Q`).
+- **The audit log keeps no raw request text.** A request is recorded whether
+  or not it carried a credential, and its detail was built from its fields as
+  sent: `hello mod=<an escape sequence>` with no token put the sequence in the
+  log and in the terminal of whoever read it, and a 60 KiB `target` filled it.
+  Every field is now scrubbed of control, direction and zero-width characters
+  and cut to 128 characters (a list shows eight items; a `who` path keeps its
+  end, the file name), and every entry's `detail` and `note` are scrubbed and
+  cut to 512 where the entry is made, for all callers. Ordinary entries read
+  exactly as before.
+
+Not closed by this, and documented as limits (`docs/control-plane.md`, "What
+this does not cover"): the header is first only on an empty prompt, and a
+human's draft untouched for 300 s has a delivery appended to it; an idle
+agent showing a picker of its own, and gemini, aider or cursor-agent two
+seconds after their screen went still, are typed into whatever they show;
+`PATH` is trusted as set, an absolute entry inside the project included; on
+Windows an npm-installed claude is a `.cmd` shim that starts `node` by name,
+which `cmd.exe` looks for in the pane's working directory first; and
+multi-line text into a Windows agent pane without the mod arrives as one
+line.
 
 ### Fixed
 - **An outer tmux no longer reaches a pane (#22).** Started inside a real

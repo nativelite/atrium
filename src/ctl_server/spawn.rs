@@ -246,6 +246,82 @@ pub(crate) fn spawn_worker_here(
     }
 }
 
+/// The file a ctl spawn's bare command names on `PATH`, as an absolute path:
+/// what a spawn runs in place of the name, on every platform.
+///
+/// A name left for the system to find is not found on `PATH` alone. On
+/// Windows a name atrium's own lookup misses is handed over as it is, and
+/// `CreateProcess` then searches atrium's working directory, and `cmd.exe`
+/// (which runs a batch shim) the pane's. Elsewhere the child resolves the
+/// name itself, after it has changed into the pane's directory, so a relative
+/// `PATH` entry (`./node_modules/.bin`, `.`, an empty one) names a folder
+/// inside the project or the worktree a spawn asked for: a pane held to
+/// `accept` could plant `node_modules/.bin/codex` there and have a spawn run
+/// it with no posture. So the lookup is done here, over the **absolute**
+/// directories of `PATH` only, and a name it does not find is refused. On
+/// Windows it tries the system's extensions (`PATHEXT`); elsewhere the name
+/// as it is, which must be a regular file with an execute bit.
+///
+/// An absolute entry is searched wherever it points, a folder inside the
+/// project included (`/work/app/node_modules/.bin`): `PATH` is trusted as the
+/// human set it.
+///
+/// `Ok(None)` for a command that already is a path: the only one that reaches
+/// here is the caller's own recorded command (a spawn with none given), which
+/// a fleet file or the launch approved as written. Pure over its inputs and
+/// the file system.
+pub(crate) fn pin_to_path(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+    pathext: Option<&str>,
+) -> Result<Option<String>, String> {
+    if command.contains(['/', '\\']) {
+        return Ok(None);
+    }
+    let dirs: Vec<std::path::PathBuf> = path
+        .map(|p| {
+            std::env::split_paths(p)
+                .filter(|d| d.is_absolute())
+                .collect()
+        })
+        .unwrap_or_default();
+    let found = if cfg!(windows) {
+        let exts: Vec<String> = pathext
+            .unwrap_or(".COM;.EXE;.BAT;.CMD")
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(str::to_string)
+            .collect();
+        atrium::resolve::resolve(command, &dirs, &exts)
+    } else {
+        dirs.iter()
+            .map(|d| d.join(command))
+            .find(|f| is_executable_file(f))
+    };
+    match found {
+        Some(found) => Ok(Some(found.to_string_lossy().into_owned())),
+        None => Err(format!(
+            "spawn refused: {command:?} was not found in any directory of PATH (relative and \
+             empty entries, which mean the current directory, are not searched). A ctl spawn \
+             runs the file its command names on PATH and nothing else; install it, or put \
+             its directory on PATH, as an absolute path, before launching atrium"
+        )),
+    }
+}
+
+/// A regular file the current user could execute (any execute bit).
+#[cfg(unix)]
+fn is_executable_file(file: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(file).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+/// Off unix the extension decides what runs; this branch is not taken there.
+#[cfg(not(unix))]
+fn is_executable_file(file: &std::path::Path) -> bool {
+    file.is_file()
+}
+
 /// `ctl spawn`: the guards, in order — may this caller create teammates, is the
 /// role free, is the argv one a teammate may run, the effective trust mode, the
 /// depth cap, the pane cap, and credential delegation — then a new window, or
@@ -313,6 +389,32 @@ pub(crate) fn spawn(
     // No command: the caller's own kind. A codex lead gets codex teammates
     // and a claude lead claude ones unless the spawn names the other after
     // `--`; from a pane that is no agent (a shell, the operator), claude.
+    //
+    // The command a request names is a bare name, for every caller. The
+    // allowlist below looks at the file stem alone and a command with a
+    // separator is run as given, so `\\host\share\claude.exe` or
+    // `./x/claude.sh` would pass as `claude` and start a program of the
+    // caller's choosing, which honours none of the posture flags atrium
+    // appends: a way past the session's trust ceiling for any pane holding a
+    // token. Checked on what the request carries, before the caller's own kind
+    // is filled in below: that one is the command atrium itself recorded for
+    // the calling pane (a fleet file's, the launch's, or an earlier spawn that
+    // passed this check), never a request's.
+    if sp
+        .argv
+        .first()
+        .is_some_and(|program| !ctl::is_ctl_command(program))
+    {
+        return ctl::reply_err(ctl::SPAWN_NEEDS_BARE_COMMAND);
+    }
+    // A positional argument of an agent's command is its first prompt, and
+    // atrium cannot put its header in front of that one: an argument that
+    // starts with a character the agent CLI reads specially is refused
+    // ([`ctl::vet_spawn_arg`]), on every argument. (An operator's argv was
+    // refused for this at any trust, by its vetting.)
+    if let Err(why) = ctl::vet_spawn_args(&sp.argv, ctl::TextFrom::Pane, trust_mode()) {
+        return ctl::reply_err(why);
+    }
     let mut notes: Vec<String> = Vec::new();
     if sp.argv.is_empty() {
         let own = caller
@@ -381,6 +483,17 @@ pub(crate) fn spawn(
         privileged,
     ) {
         return ctl::reply_err(&msg);
+    }
+    // The command is pinned to the file it names on PATH, and that file is
+    // what is spawned and recorded; see [`pin_to_path`].
+    {
+        let path = std::env::var_os("PATH");
+        let pathext = std::env::var("PATHEXT").ok();
+        match pin_to_path(&sp.argv[0], path.as_deref(), pathext.as_deref()) {
+            Ok(Some(pinned)) => sp.argv[0] = pinned,
+            Ok(None) => {}
+            Err(why) => return ctl::reply_err(&why),
+        }
     }
     if sp.new_window {
         spawn_worker_window(cx, &sp, caller, new_depth, effective, note)
