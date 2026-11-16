@@ -180,7 +180,7 @@ fn a_placeholder_is_atriums_own_waiting_program_beside_its_lead() {
     let (lead_id, token) = lead(&mut fx, &standin, "lead", None);
     let v = fx.apply(&operators(&[]), &as_pane(&token, HOLD));
     assert!(ok(&v), "{v}");
-    assert!(v.get("role").is_none_or(|r| *r == Value::Null), "{v}");
+    assert!(v.get("role").map_or(true, |r| *r == Value::Null), "{v}");
     let id = AgentId(v.get("pane").and_then(Value::as_i64).unwrap() as usize);
     assert_eq!(s(&fx.last(), "detail"), "hold beside=- size=-");
     // Beside the lead, in the lead's window, as its child.
